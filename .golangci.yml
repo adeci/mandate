@@ -1,0 +1,26 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - gocritic
+    - misspell
+    - nilerr
+    - noctx
+    - unconvert
+    - usestdlibvars
+  exclusions:
+    rules:
+      # Best-effort cleanup and terminal/HTTP writes whose failure has no
+      # useful handling.
+      - linters: [errcheck]
+        text: "Error return value of `[^`]*\\b(Close|close|stop|Remove|Fprint|Fprintf|Fprintln|Write|WriteString)` is not checked"
+      # Tests drive real sockets and HTTP with short-lived contexts.
+      - linters: [noctx, errcheck]
+        path: _test\.go
+
+formatters:
+  enable:
+    - gofumpt
