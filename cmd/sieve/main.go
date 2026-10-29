@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/adeci/sieve/internal/admin"
+	"github.com/adeci/sieve/internal/client"
 	"github.com/adeci/sieve/internal/discord"
 	"github.com/adeci/sieve/internal/exitcode"
 	"github.com/adeci/sieve/internal/gateway"
@@ -19,12 +20,18 @@ import (
 
 const usage = `usage: sieve <command> [args]
 
-commands:
-  gateway                 serve the read-only SQL gateway
-  whatsapp run|pair       WhatsApp linked-device ingester
-  messages run|pair       Google Messages (SMS/RCS) ingester
-  discord serve           Discord on-demand reader (gateway-only socket)
-  list <data.db>          list containers and senders (for exposure.toml)
+for agents (set SIEVE_URL and SIEVE_TOKEN):
+  query SQL [PARAM...]    run a read-only query
+  schema                  list the views you can query
+  discord sync|search|fetch
+                          read Discord on demand
+
+on the host:
+  gateway                 serve the gateway
+  whatsapp run|pair       WhatsApp linked device
+  messages run|pair       Google Messages (SMS/RCS)
+  discord serve           Discord reader behind the gateway
+  list [--senders] DB     list chat and sender IDs for exposure.toml
 `
 
 func main() {
@@ -43,6 +50,10 @@ func run() int {
 	cmd, args := os.Args[1], os.Args[2:]
 	var err error
 	switch cmd {
+	case "query":
+		err = client.Query(ctx, args)
+	case "schema":
+		err = client.Schema(ctx, args)
 	case "gateway":
 		err = gateway.Command(ctx, args)
 	case "whatsapp":
@@ -50,7 +61,11 @@ func run() int {
 	case "messages":
 		err = gmessages.Command(ctx, args)
 	case "discord":
-		err = discord.Command(ctx, args)
+		if len(args) > 0 && args[0] == "serve" {
+			err = discord.Command(ctx, args)
+		} else {
+			err = client.Discord(ctx, args)
+		}
 	case "list":
 		err = admin.List(ctx, args)
 	case "-h", "--help", "help":

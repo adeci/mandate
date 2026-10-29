@@ -145,10 +145,11 @@ func TestDiscordProxyRelaysPacingRefusal(t *testing.T) {
 	}
 }
 
-func TestDiscordEndpointsAbsentWithoutSocket(t *testing.T) {
+func TestDiscordDisabled(t *testing.T) {
 	t.Parallel()
 	h := discordHandler(t, "")
-	if rec := post(h, "/v1/discord/search", `{"guild_id":"g-fun"}`); rec.Code != http.StatusNotFound && rec.Code != http.StatusMethodNotAllowed {
-		t.Errorf("status %d, want endpoint absent", rec.Code)
+	rec := post(h, "/v1/discord/search", `{"guild_id":"g-fun"}`)
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "discord is not enabled") {
+		t.Errorf("status %d %s, want a clear 404", rec.Code, rec.Body)
 	}
 }

@@ -128,6 +128,10 @@ func newHandler(cfg Config, token string) *handler {
 	h.mux.HandleFunc("POST /v1/query", h.authed(h.query))
 	if cfg.DiscordSocket != "" {
 		newDiscordProxy(h, cfg.DiscordSocket).register(h.mux)
+	} else {
+		h.mux.HandleFunc("POST /v1/discord/", h.authed(func(w http.ResponseWriter, _ *http.Request) {
+			writeError(w, http.StatusNotFound, "discord is not enabled on this gateway")
+		}))
 	}
 	return h
 }

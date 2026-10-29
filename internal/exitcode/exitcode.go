@@ -1,13 +1,20 @@
-// Package exitcode maps errors to process exit codes systemd can act on.
+// Package exitcode maps errors to process exit codes systemd and scripts can act on.
 package exitcode
 
 import "errors"
 
-// NeedsOwner is in the unit's RestartPreventExitStatus, so the unit stays
-// failed instead of restarting forever.
-const NeedsOwner = 3
+const (
+	// NeedsOwner is in the unit's RestartPreventExitStatus, so the unit stays
+	// failed instead of restarting forever.
+	NeedsOwner = 3
+	// TryLater is EX_TEMPFAIL from sysexits.h.
+	TryLater = 75
+)
 
-var ErrNeedsOwner = errors.New("owner action required")
+var (
+	ErrNeedsOwner = errors.New("owner action required")
+	ErrTryLater   = errors.New("try again later")
+)
 
 func For(err error) int {
 	switch {
@@ -15,6 +22,8 @@ func For(err error) int {
 		return 0
 	case errors.Is(err, ErrNeedsOwner):
 		return NeedsOwner
+	case errors.Is(err, ErrTryLater):
+		return TryLater
 	default:
 		return 1
 	}
