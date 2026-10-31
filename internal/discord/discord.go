@@ -13,7 +13,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 	_ "time/tzdata" // --timezone must resolve on hosts without zoneinfo
 
@@ -23,7 +25,6 @@ import (
 
 	"github.com/adeci/mandate/internal/approval"
 	"github.com/adeci/mandate/internal/connector"
-	"github.com/adeci/mandate/internal/exitcode"
 	"github.com/adeci/mandate/internal/store"
 )
 
@@ -199,6 +200,7 @@ func run(ctx context.Context, cfg config) error {
 		fatal: make(chan error, 1),
 		log:   cfg.log,
 	}
+	w.snapshot()
 	workerDone := make(chan struct{})
 	go func() {
 		defer close(workerDone)
@@ -252,9 +254,39 @@ type worker struct {
 	clock   clock
 	ctx     context.Context // canceled when the service stops
 	jobs    chan *job
-	fatal   chan error
-	stopped error // set after a stop condition; later calls fail fast
+	fatal   chan error // stop conditions a restart may clear
+	stopped error      // set after a stop condition; later calls fail fast
 	log     *slog.Logger
+
+	// What Health reads; the pacer and state belong to the worker goroutine.
+	mu    sync.Mutex
+	pace  state
+	owner string // what the owner must do, after an owner stop
+}
+
+// snapshot runs on the worker goroutine, or before it starts.
+func (w *worker) snapshot() {
+	st := w.svc.up.st
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.pace = state{CooldownUntil: st.CooldownUntil, BreakUntil: st.BreakUntil, Requests: slices.Clone(st.Requests)}
+	var stop *ownerStop
+	if errors.As(w.stopped, &stop) {
+		w.owner = stop.Error()
+	}
+}
+
+func (w *worker) Health(context.Context) connector.Health {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.owner != "" {
+		return connector.Health{State: connector.NeedsSetup, Detail: w.owner}
+	}
+	p := &pacer{st: &w.pace, hours: w.svc.up.pace.hours}
+	if until, why := p.rest(w.clock.Now()); !until.IsZero() {
+		return connector.Health{State: connector.Resting, Detail: why, Until: until}
+	}
+	return connector.Health{State: connector.Healthy}
 }
 
 func (w *worker) loop() {
@@ -272,11 +304,15 @@ func (w *worker) loop() {
 			v, err := j.run(ctx, j.deadline)
 			stop()
 			cancel()
-			j.done <- jobResult{v: v, err: err}
 			if f := w.svc.up.fatal; f != nil {
 				w.stopped = f
-				w.fatal <- f
+				var stop *ownerStop
+				if !errors.As(f, &stop) {
+					w.fatal <- f
+				}
 			}
+			w.snapshot()
+			j.done <- jobResult{v: v, err: err}
 		}
 	}
 }
@@ -401,6 +437,7 @@ func toConnectorError(err error) *connector.Error {
 		notReady *notReadyError
 		bad      *badRequestError
 		up       *upstreamError
+		stop     *ownerStop
 	)
 	switch {
 	case errors.As(err, &paced):
@@ -409,8 +446,8 @@ func toConnectorError(err error) *connector.Error {
 		return &connector.Error{Status: http.StatusNotFound, Message: denied.Error()}
 	case errors.As(err, &notReady):
 		return &connector.Error{Status: http.StatusServiceUnavailable, Message: notReady.Error(), RetryAfter: retrySeconds(notReady.retryAfter)}
-	case errors.Is(err, exitcode.ErrNeedsOwner):
-		return &connector.Error{Status: http.StatusServiceUnavailable, Message: "discord account needs manual action; the service is stopping"}
+	case errors.As(err, &stop):
+		return &connector.Error{Status: http.StatusServiceUnavailable, Message: stop.Error()}
 	case errors.As(err, &bad):
 		return &connector.Error{Status: http.StatusBadRequest, Message: bad.Error()}
 	case errors.As(err, &up):

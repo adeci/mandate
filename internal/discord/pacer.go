@@ -256,3 +256,22 @@ func (p *pacer) updateBucket(now time.Time, route, bucket, remaining, resetAfter
 	}
 	p.exhausted[key] = now.Add(time.Duration(secs * float64(time.Second)))
 }
+
+// rest returns when the long blocks in force at now end, and the first one's
+// name; zero if none applies.
+func (p *pacer) rest(now time.Time) (time.Time, string) {
+	var until time.Time
+	var reason string
+	t := now
+	for range 16 {
+		next, why, long := p.blocker(t, "")
+		if !long || !next.After(t) {
+			break
+		}
+		if reason == "" {
+			reason = why
+		}
+		t, until = next, next
+	}
+	return until, reason
+}

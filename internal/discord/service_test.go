@@ -25,7 +25,6 @@ import (
 	"github.com/adeci/mandate/internal/approval"
 	"github.com/adeci/mandate/internal/approval/approvaltest"
 	"github.com/adeci/mandate/internal/connector"
-	"github.com/adeci/mandate/internal/exitcode"
 	"github.com/adeci/mandate/internal/store"
 )
 
@@ -683,6 +682,9 @@ func TestCooldown(t *testing.T) {
 			if !strings.Contains(h.logs.String(), "level=WARN") {
 				t.Error("cooldown not logged at warn")
 			}
+			if health, err := h.client.Health(context.Background()); err != nil || health.State != connector.Resting || !health.Until.Equal(s.CooldownUntil) {
+				t.Errorf("health after cooldown = %+v, %v", health, err)
+			}
 
 			// The cooldown survives a restart and refuses without a request.
 			before := len(h.discord.all())
@@ -734,37 +736,92 @@ func TestSearchNotReadyRetries(t *testing.T) {
 	}
 }
 
+// An owner stop keeps the service up, reporting what the owner must do,
+// and nothing reaches Discord until it restarts.
 func TestOwnerStopConditions(t *testing.T) {
 	path := api("/channels/" + dmID + "/messages")
 	tests := []struct {
 		name   string
 		status int
 		body   any
+		fix    string
 	}{
-		{"401", 401, map[string]any{"message": "401: Unauthorized", "code": 0}},
-		{"captcha", 400, map[string]any{"captcha_key": []string{"captcha-required"}, "captcha_sitekey": "a9b5fb07", "captcha_service": "hcaptcha"}},
-		{"account verification", 403, map[string]any{"message": "You need to verify your account in order to perform this action.", "code": 40002}},
-		{"phone verification", 403, map[string]any{"message": "You need to verify your phone number in order to perform this action.", "code": 70007}},
-		{"unauthorized code", 403, map[string]any{"message": "Unauthorized", "code": 40001}},
-		{"anti-abuse block", 403, map[string]any{"message": "Unknown Message", "code": 10008}},
+		{"401", 401, map[string]any{"message": "401: Unauthorized", "code": 0}, fixToken},
+		{"captcha", 400, map[string]any{"captcha_key": []string{"captcha-required"}, "captcha_sitekey": "a9b5fb07", "captcha_service": "hcaptcha"}, fixVerify},
+		{"account verification", 403, map[string]any{"message": "You need to verify your account in order to perform this action.", "code": 40002}, fixVerify},
+		{"phone verification", 403, map[string]any{"message": "You need to verify your phone number in order to perform this action.", "code": 70007}, fixVerify},
+		{"unauthorized code", 403, map[string]any{"message": "Unauthorized", "code": 40001}, fixToken},
+		{"anti-abuse block", 403, map[string]any{"message": "Unknown Message", "code": 10008}, fixAccount},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newHarness(t, nil)
 			h.discord.reply(path, tt.status, tt.body)
 			h.start()
-			h.callErr("fetch", map[string]string{"channel_id": dmID}, http.StatusServiceUnavailable)
-			err := h.wait()
-			h.cancel()
-			h.cancel = nil
-			if !errors.Is(err, exitcode.ErrNeedsOwner) {
-				t.Fatalf("run returned %v, want ErrNeedsOwner", err)
+			e := h.callErr("fetch", map[string]string{"channel_id": dmID}, http.StatusServiceUnavailable)
+			if !strings.HasSuffix(e.Message, tt.fix) {
+				t.Errorf("refusal %q does not say what to do", e.Message)
 			}
-			if exitcode.For(err) != exitcode.NeedsOwner {
-				t.Errorf("exit code %d", exitcode.For(err))
+			before := len(h.discord.all())
+			health, err := h.client.Health(context.Background())
+			if err != nil || health.State != connector.NeedsSetup || health.Detail != e.Message {
+				t.Errorf("health = %+v, %v", health, err)
 			}
-			if n := len(h.discord.to(path)); n != 1 {
+			if again := h.callErr("sync", map[string]string{}, http.StatusServiceUnavailable); again.Message != e.Message {
+				t.Errorf("later refusal %q", again.Message)
+			}
+			select {
+			case err := <-h.done:
+				t.Fatalf("service exited: %v", err)
+			default:
+			}
+			if n := len(h.discord.all()) - before; n != 0 {
 				t.Errorf("%d requests after a stop condition", n)
+			}
+			if err := h.stop(); err != nil {
+				t.Errorf("stop: %v", err)
+			}
+		})
+	}
+}
+
+func TestHealthResting(t *testing.T) {
+	budget := func(s *state) {
+		for i := range dailyBudget {
+			s.Requests = append(s.Requests, noon.Add(-23*time.Hour+time.Duration(i)*time.Second))
+		}
+	}
+	tests := []struct {
+		name   string
+		seed   func(*state)
+		at     time.Time
+		until  time.Time
+		reason string
+	}{
+		{name: "ok", at: noon},
+		{name: "cooldown", seed: func(s *state) { s.CooldownUntil = noon.Add(3 * time.Hour) }, at: noon, until: noon.Add(3 * time.Hour), reason: "cooldown"},
+		{name: "outside active hours", at: noon.Add(-10 * time.Hour), until: noon.Add(-4 * time.Hour), reason: "outside active hours"},
+		{name: "daily budget", seed: budget, at: noon, until: noon.Add(time.Hour + time.Millisecond), reason: "daily budget"},
+		{
+			name: "cooldown ending at night", seed: func(s *state) { s.CooldownUntil = noon.Add(13 * time.Hour) },
+			at: noon, until: noon.Add(20 * time.Hour), reason: "cooldown",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, tt.seed)
+			h.clock.now = tt.at
+			h.start()
+			health, err := h.client.Health(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := connector.Health{State: connector.Healthy}
+			if tt.reason != "" {
+				want = connector.Health{State: connector.Resting, Detail: tt.reason, Until: tt.until}
+			}
+			if health.State != want.State || health.Detail != want.Detail || !health.Until.Equal(want.Until) {
+				t.Fatalf("health = %+v, want %+v", health, want)
 			}
 		})
 	}

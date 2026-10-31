@@ -13,8 +13,6 @@ import (
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
-
-	"github.com/adeci/mandate/internal/exitcode"
 )
 
 const (
@@ -34,18 +32,33 @@ type transport interface {
 	Do(req *fhttp.Request) (*fhttp.Response, error)
 }
 
+const (
+	fixToken   = "put a fresh user token in the token file, then restart mandate-discord"
+	fixVerify  = "log in to Discord in a browser and complete verification, then restart mandate-discord"
+	fixAccount = "log in to Discord in a browser and resolve what it shows, then restart mandate-discord"
+)
+
 // ownerCodes are JSON error codes that mean the account needs manual action
 // (https://docs.discord.food/topics/errors and the datamined code list).
-var ownerCodes = map[int]string{
-	20013: "account disabled",
-	40001: "unauthorized",
-	40002: "account verification required",
-	40068: "account quarantined",
-	40333: "request blocked by Cloudflare",
-	50178: "account verification required",
-	60004: "verified account required",
-	70007: "phone verification required",
+var ownerCodes = map[int]ownerStop{
+	20013: {"account disabled", fixAccount},
+	40001: {"unauthorized", fixToken},
+	40002: {"account verification required", fixVerify},
+	40068: {"account quarantined", fixAccount},
+	40333: {"request blocked by Cloudflare", fixVerify},
+	50178: {"account verification required", fixVerify},
+	60004: {"verified account required", fixVerify},
+	70007: {"phone verification required", fixVerify},
 }
+
+// ownerStop is a condition only the owner can clear. Every later read is
+// refused until the service restarts, so nothing probes the account meanwhile.
+type ownerStop struct {
+	reason string
+	action string // what the owner must do
+}
+
+func (e *ownerStop) Error() string { return "discord " + e.reason + ": " + e.action }
 
 type pacedError struct {
 	retryAfter time.Duration
@@ -89,10 +102,6 @@ func retrySeconds(d time.Duration) int {
 	return max(1, int(math.Ceil(d.Seconds())))
 }
 
-func ownerError(reason string) error {
-	return fmt.Errorf("discord: %s: %w", reason, exitcode.ErrNeedsOwner)
-}
-
 // route is built only from validated IDs.
 type route struct {
 	template string     // path template for logs, e.g. /channels/{id}/messages
@@ -119,7 +128,7 @@ type upstream struct {
 	st        *state
 	statePath string
 	log       *slog.Logger
-	fatal     error // set once the account needs manual action; every later call fails
+	fatal     error // set once the account needs manual action or state can't be saved; every later call fails
 }
 
 func (u *upstream) denied(key, what string) error {
@@ -150,10 +159,11 @@ func (u *upstream) get(ctx context.Context, dl time.Time, r route, out any) erro
 			return err
 		}
 		now := u.clock.Now()
-		if reason := ownerProblem(resp.StatusCode, body); reason != "" {
-			u.fatal = ownerError(reason)
-			u.log.Error("discord account needs manual action; stopping", "reason", reason, "status", resp.StatusCode, "route", r.template)
-			return u.fatal
+		if stop := ownerProblem(resp.StatusCode, body); stop != nil {
+			u.fatal = stop
+			u.log.Error("discord account needs manual action; refusing reads until restarted",
+				"reason", stop.reason, "status", resp.StatusCode, "route", r.template)
+			return stop
 		}
 		switch s := resp.StatusCode; {
 		case s == fhttp.StatusAccepted:
@@ -427,27 +437,27 @@ func statusOf(resp *fhttp.Response) int {
 	return resp.StatusCode
 }
 
-func ownerProblem(status int, body []byte) string {
+func ownerProblem(status int, body []byte) *ownerStop {
 	if status == fhttp.StatusUnauthorized {
-		return "token rejected (401)"
+		return &ownerStop{"token rejected (401)", fixToken}
 	}
 	var e struct {
 		Code           int             `json:"code"`
 		CaptchaKey     json.RawMessage `json:"captcha_key"`
 		CaptchaSitekey json.RawMessage `json:"captcha_sitekey"`
 	}
-	if json.Unmarshal(body, &e) != nil {
-		return "" // not an object: a list or non-JSON page
+	// Lists and non-JSON pages don't decode and are never an owner stop.
+	if json.Unmarshal(body, &e) == nil {
+		switch stop, ok := ownerCodes[e.Code]; {
+		case len(e.CaptchaKey) > 0 || len(e.CaptchaSitekey) > 0:
+			return &ownerStop{"captcha required", fixVerify}
+		case ok:
+			return &ownerStop{fmt.Sprintf("%s (code %d)", stop.reason, e.Code), stop.action}
+		case status == fhttp.StatusForbidden && e.Code == 10008:
+			return &ownerStop{"request blocked by anti-abuse (403, code 10008)", fixAccount}
+		}
 	}
-	switch {
-	case len(e.CaptchaKey) > 0 || len(e.CaptchaSitekey) > 0:
-		return "captcha required"
-	case ownerCodes[e.Code] != "":
-		return fmt.Sprintf("%s (code %d)", ownerCodes[e.Code], e.Code)
-	case status == fhttp.StatusForbidden && e.Code == 10008:
-		return "request blocked by anti-abuse (403, code 10008)"
-	}
-	return ""
+	return nil
 }
 
 func retryAfter(resp *fhttp.Response, body []byte) time.Duration {
