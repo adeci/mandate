@@ -23,11 +23,12 @@ let
       pname,
       modRoot ? ".",
       files ? [ ],
+      postInstall ? "",
       description,
     }:
     # Discord's tls-client needs Go 1.27; everything builds with one toolchain.
     (buildGoModule.override { go = go_1_27; }) {
-      inherit pname modRoot;
+      inherit pname modRoot postInstall;
       version = "0.1.0";
 
       src = lib.fileset.toSource {
@@ -60,6 +61,8 @@ let
       pname = "mandate-${name}";
       modRoot = "connectors/${name}";
       files = [ (../connectors + "/${name}") ];
+      # Go names the binary after its directory.
+      postInstall = "mv $out/bin/${name} $out/bin/mandate-${name}";
       inherit description;
     };
 in

@@ -1,6 +1,6 @@
 {
-  "mandate": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-  "mandate-discord": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-  "mandate-http": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-  "mandate-whatsapp": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  "mandate": "sha256-RwtzUgZWrzTDzgbkccBNcz/+lRWolBzvvr+qiI+Aszs=",
+  "mandate-discord": "sha256-kO0DlOm5MZtToIhbACwy2k1UZnBbizX1WnhGQbUtNQM=",
+  "mandate-http": "sha256-EwiOuJ1KPZ9EoFyOGS/pIJpOE3x/hmdI2uMS+o67bmw=",
+  "mandate-whatsapp": "sha256-cGFZvC7mH/JpPbReI9mkiySnyGbWw44EmP0KmhtKmWA="
 }
