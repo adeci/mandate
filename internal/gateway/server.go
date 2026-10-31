@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -32,7 +33,8 @@ type Config struct {
 	Sources      map[string]string // source name -> data.db path
 	MaxRows      int
 	Timeout      time.Duration
-	// Connector name (equal to its source name) -> socket.
+	// Connector name -> socket. A connector without a source of the same
+	// name may not touch containers at all.
 	Connectors map[string]string
 	// Empty disables /v1/actions.
 	ApprovalsSocket string
@@ -40,7 +42,7 @@ type Config struct {
 	HTTPProxySocket string
 }
 
-// sourceFlag parses name=path for a known source; connectors share the names.
+// sourceFlag parses name=path for a known source.
 type sourceFlag map[string]string
 
 func (s sourceFlag) String() string { return fmt.Sprint(map[string]string(s)) }
@@ -61,6 +63,26 @@ func (s sourceFlag) Set(v string) error {
 	return nil
 }
 
+var connectorName = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+
+// connectorFlag parses name=socket. A connector named like a source is
+// filtered through that source's views; others have no containers to show.
+type connectorFlag map[string]string
+
+func (c connectorFlag) String() string { return fmt.Sprint(map[string]string(c)) }
+
+func (c connectorFlag) Set(v string) error {
+	name, path, ok := strings.Cut(v, "=")
+	if !ok || path == "" {
+		return fmt.Errorf("want name=path, got %q", v)
+	}
+	if !connectorName.MatchString(name) {
+		return fmt.Errorf("connector name %q must match %s", name, connectorName)
+	}
+	c[name] = path
+	return nil
+}
+
 func Command(ctx context.Context, args []string) error {
 	cfg := Config{Sources: map[string]string{}, Connectors: map[string]string{}}
 	fs := flag.NewFlagSet("gateway", flag.ContinueOnError)
@@ -70,7 +92,7 @@ func Command(ctx context.Context, args []string) error {
 	fs.Var(sourceFlag(cfg.Sources), "source", "source database as name=path (repeatable; names: sms, whatsapp, discord)")
 	fs.IntVar(&cfg.MaxRows, "max-rows", 5000, "maximum rows per query")
 	fs.DurationVar(&cfg.Timeout, "timeout", 5*time.Second, "maximum query execution time")
-	fs.Var(sourceFlag(cfg.Connectors), "connector", "connector socket as name=path (repeatable; name is its source)")
+	fs.Var(connectorFlag(cfg.Connectors), "connector", "connector socket as name=path (repeatable; a source of the same name filters it)")
 	fs.StringVar(&cfg.ApprovalsSocket, "approvals-socket", "", "approvals unit socket (enables /v1/actions)")
 	fs.StringVar(&cfg.HTTPProxySocket, "http-proxy-socket", "", "HTTP proxy socket (enables /v1/http)")
 	if err := fs.Parse(args); err != nil {

@@ -418,3 +418,96 @@ func TestSchemaListsReachableConnectors(t *testing.T) {
 		t.Errorf("read from down connector: %d %s", rec.Code, rec.Body)
 	}
 }
+
+// fakeHTTP is shaped like the HTTP proxy connector: it has no data source.
+type fakeHTTP struct {
+	calls     atomic.Int32
+	container string
+}
+
+func (f *fakeHTTP) Spec() connector.Spec {
+	return connector.Spec{Name: "http", Ops: []connector.Op{
+		{Name: "request", Kind: connector.Write, Params: []connector.Param{
+			{Name: "service", Required: true},
+			{Name: "method", Required: true},
+			{Name: "path", Required: true},
+			{Name: "body", Editable: true},
+		}},
+		{Name: "notify", Kind: connector.Write, Params: []connector.Param{{Name: "chat", Container: true}}},
+		{Name: "peek", Kind: connector.Read, Params: []connector.Param{{Name: "chat", Container: true}}},
+	}}
+}
+
+func (f *fakeHTTP) Read(context.Context, string, map[string]string) (json.RawMessage, error) {
+	f.calls.Add(1)
+	return json.RawMessage(`{}`), nil
+}
+
+func (f *fakeHTTP) Prepare(_ context.Context, _ string, args map[string]string) (connector.Prepared, error) {
+	f.calls.Add(1)
+	return connector.Prepared{Args: args, Container: f.container}, nil
+}
+
+func (f *fakeHTTP) Execute(context.Context, approval.Record) connector.Result {
+	return connector.Result{Status: connector.Failed}
+}
+
+func TestSourcelessConnectorNeverTargetsContainers(t *testing.T) {
+	t.Parallel()
+	f := &fakeHTTP{}
+	srv := &connector.Server{Connector: f, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	r := newRig(t, func(c *Config) { c.Connectors["http"] = serveUnix(t, "http", srv.Handler()) })
+
+	rec := call(r.h, http.MethodPost, "/v1/actions",
+		`{"connector":"http","op":"request","args":{"service":"github","method":"POST","path":"/repos/a/b/issues","body":"{}"}}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("propose: %d %s", rec.Code, rec.Body)
+	}
+	r.approvals.mu.Lock()
+	got := r.approvals.submitted
+	r.approvals.mu.Unlock()
+	if len(got) != 1 || got[0].Connector != "http" || got[0].Args["path"] != "/repos/a/b/issues" {
+		t.Fatalf("submitted %+v", got)
+	}
+
+	for name, tc := range map[string]struct{ path, body string }{
+		"write with container param": {"/v1/actions", `{"connector":"http","op":"notify","args":{"chat":"c-memes"}}`},
+		"read with container param":  {"/v1/read/http/peek", `{"args":{"chat":"c-memes"}}`},
+	} {
+		if rec := call(r.h, http.MethodPost, tc.path, tc.body); rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "no data source") {
+			t.Errorf("%s: %d %s, want 403", name, rec.Code, rec.Body)
+		}
+	}
+	if n := f.calls.Load(); n != 1 {
+		t.Errorf("connector calls = %d, want 1 (container args refused before the connector)", n)
+	}
+
+	f.container = "c-memes"
+	rec = call(r.h, http.MethodPost, "/v1/actions",
+		`{"connector":"http","op":"request","args":{"service":"github","method":"GET","path":"/"}}`)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("prepared container without source: %d %s, want 403", rec.Code, rec.Body)
+	}
+	if n := r.approvals.calls.Load(); n != 1 {
+		t.Errorf("approvals calls = %d, want 1", n)
+	}
+}
+
+func TestConnectorFlagNames(t *testing.T) {
+	t.Parallel()
+	for v, ok := range map[string]bool{
+		"http=/run/h.sock":     true,
+		"my-api2=/run/a.sock":  true,
+		"Http=/run/h.sock":     false,
+		"2fa=/run/x.sock":      false,
+		"a/b=/run/x.sock":      false,
+		"http=":                false,
+		"discord=/run/d.sock":  true,
+		"-discord=/run/d.sock": false,
+		"disc ord=/run/d.sock": false,
+	} {
+		if err := (connectorFlag{}).Set(v); (err == nil) != ok {
+			t.Errorf("%q: err = %v, want ok=%v", v, err, ok)
+		}
+	}
+}

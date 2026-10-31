@@ -98,6 +98,8 @@ func (c *connectors) specs(ctx context.Context) []connector.Spec {
 }
 
 // lookup resolves connector and op and checks args against the op's params.
+// Without a source there are no filtered views to check containers against,
+// so container values are refused outright.
 func (h *handler) lookup(w http.ResponseWriter, r *http.Request, name, opName string, kind connector.Kind, args map[string]string) (connector.Op, bool) {
 	if _, ok := h.connectors.calls[name]; !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("no connector %q", name))
@@ -118,7 +120,19 @@ func (h *handler) lookup(w http.ResponseWriter, r *http.Request, name, opName st
 		writeError(w, http.StatusBadRequest, err.Error())
 		return connector.Op{}, false
 	}
+	if _, ok := h.cfg.Sources[name]; !ok {
+		for _, p := range op.Params {
+			if p.Container && args[p.Name] != "" {
+				writeError(w, http.StatusForbidden, noSource(name))
+				return connector.Op{}, false
+			}
+		}
+	}
 	return op, true
+}
+
+func noSource(name string) string {
+	return fmt.Sprintf("connector %s has no data source on this gateway, so it cannot target chats or channels", name)
 }
 
 func checkArgs(op connector.Op, args map[string]string) error {
@@ -283,6 +297,11 @@ func (h *handler) propose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if prepared.Container != "" {
+		if _, ok := h.cfg.Sources[req.Connector]; !ok {
+			slog.Info("propose", append(attrs, "refused", "container without source")...)
+			writeError(w, http.StatusForbidden, noSource(req.Connector))
+			return
+		}
 		hidden, err := h.writeHidden(req.Connector, prepared.Container)
 		if err != nil {
 			slog.Error("exposure check", "connector", req.Connector, "err", err)
@@ -320,10 +339,7 @@ func (h *handler) writeHidden(source, id string) (bool, error) {
 	if slices.Contains(exp.HideContainers, id) || slices.Contains(exp.HideSenders, id) {
 		return true, nil
 	}
-	path, ok := h.cfg.Sources[source]
-	if !ok {
-		return false, nil
-	}
+	path := h.cfg.Sources[source]
 	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 		return false, nil
 	}
