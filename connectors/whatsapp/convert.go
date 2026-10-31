@@ -52,10 +52,7 @@ func preferPN(j, alt types.JID, pn pnResolver) types.JID {
 	if alt.Server == types.DefaultUserServer {
 		return alt.ToNonAD()
 	}
-	if pn != nil {
-		return pn(j)
-	}
-	return j
+	return pn(j)
 }
 
 // Status updates, outgoing broadcast lists, newsletters, and bots are not ingested.
@@ -124,10 +121,7 @@ func groupContainer(info *types.GroupInfo, pn pnResolver, name func(types.JID) s
 	}
 	for _, p := range info.Participants {
 		j := preferPN(p.JID, p.PhoneNumber, pn)
-		part := store.Participant{ID: j.String()}
-		if name != nil {
-			part.Name = name(j)
-		}
+		part := store.Participant{ID: j.String(), Name: name(j)}
 		if part.Name == "" {
 			part.Name = p.DisplayName
 		}

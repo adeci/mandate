@@ -27,7 +27,6 @@ const (
 	firstCodeWait = 30 * time.Second
 )
 
-// waClient is the part of *whatsmeow.Client the connector uses.
 type waClient interface {
 	IsConnected() bool
 	IsLoggedIn() bool
@@ -38,8 +37,6 @@ type waClient interface {
 	Disconnect()
 }
 
-// waConnector links the device from the console and sends approved text
-// messages.
 type waConnector struct {
 	st  *store.Store
 	log *slog.Logger
@@ -84,7 +81,6 @@ func (c *waConnector) current() (waClient, *wastore.Device, bool) {
 	return c.cli, c.dev, c.linked
 }
 
-// connect connects a linked device; an unlinked one waits for Setup.
 func (c *waConnector) connect() error {
 	cli, _, linked := c.current()
 	if !linked {
@@ -286,7 +282,6 @@ func (c *waConnector) pair(p *pairing) {
 	c.endPairing(p, err)
 }
 
-// endPairing ends p with err, or as expired unless it succeeded.
 func (c *waConnector) endPairing(p *pairing, err error) {
 	c.mu.Lock()
 	switch {

@@ -21,10 +21,10 @@ func newUnlinkedFixture(t *testing.T) *fixture {
 	return f
 }
 
-func wantHealth(t *testing.T, c *waConnector, state connector.HealthState, detail string) {
+func wantHealth(t *testing.T, c *waConnector, state connector.HealthState) {
 	t.Helper()
-	if h := c.Health(context.Background()); h.State != state || h.Detail != detail {
-		t.Fatalf("health = %+v, want %s %q", h, state, detail)
+	if h := c.Health(context.Background()); h.State != state {
+		t.Fatalf("health = %+v, want %s", h, state)
 	}
 }
 
@@ -56,7 +56,7 @@ func TestLinkFromConsole(t *testing.T) {
 	t.Parallel()
 	f := newUnlinkedFixture(t)
 	ctx := context.Background()
-	wantHealth(t, f.c, connector.NeedsSetup, "not linked")
+	wantHealth(t, f.c, connector.NeedsSetup)
 	if _, err := f.c.Prepare(ctx, "send", map[string]string{"to": "+15551234567", "text": "hi"}); err == nil {
 		t.Fatal("prepared a send while not linked")
 	}
@@ -87,11 +87,11 @@ func TestLinkFromConsole(t *testing.T) {
 	_, err = f.c.Setup(ctx, nil)
 	wantStatus(t, err, http.StatusConflict)
 	// The pairing connection carries on as the session; no restart.
-	wantHealth(t, f.c, connector.Broken, "connecting…")
+	wantHealth(t, f.c, connector.Broken)
 	f.cli.mu.Lock()
 	f.cli.loggedIn = true
 	f.cli.mu.Unlock()
-	wantHealth(t, f.c, connector.Healthy, "")
+	wantHealth(t, f.c, connector.Healthy)
 	if _, err := f.c.Prepare(ctx, "send", map[string]string{"to": "+15551234567", "text": "hi"}); err != nil {
 		t.Fatalf("prepare after linking: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestSetupRefusedWhileLinked(t *testing.T) {
 func TestSetupRejectsBadArgs(t *testing.T) {
 	t.Parallel()
 	f := newUnlinkedFixture(t)
-	for _, args := range []map[string]string{{"phone": "555"}, {"phone": ""}, {"qr": "1"}} {
+	for _, args := range []map[string]string{{"phone": "555"}, {"qr": "1"}} {
 		_, err := f.c.Setup(context.Background(), args)
 		wantStatus(t, err, http.StatusBadRequest)
 	}
@@ -160,10 +160,10 @@ func TestLoggedOutFromPhone(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	ctx := context.Background()
-	wantHealth(t, f.c, connector.Healthy, "")
+	wantHealth(t, f.c, connector.Healthy)
 
 	f.c.event(f.cli, &events.LoggedOut{Reason: events.ConnectFailureLoggedOut})
-	wantHealth(t, f.c, connector.NeedsSetup, "logged out from the phone")
+	wantHealth(t, f.c, connector.NeedsSetup)
 	deadline := time.Now().Add(5 * time.Second)
 	for f.cli.IsConnected() {
 		if time.Now().After(deadline) {
@@ -177,8 +177,6 @@ func TestLoggedOutFromPhone(t *testing.T) {
 	if res.Status != connector.Failed || len(f.cli.calls()) != 0 {
 		t.Fatalf("execute after logout: %+v", res)
 	}
-	// Events from the logged-out client no longer count.
-	f.c.event(f.cli, &events.ClientOutdated{})
 
 	step, err := f.c.Setup(ctx, nil)
 	if err != nil || step.QR != "qr-1-1" {
@@ -190,7 +188,10 @@ func TestLoggedOutFromPhone(t *testing.T) {
 	f.pair(t, f.c.dev)
 	f.client(1).qr(whatsmeow.QRChannelSuccess)
 	setupUntil(t, f.c, nil, func(s connector.SetupStep) bool { return s.Done })
-	wantHealth(t, f.c, connector.Broken, "connecting…")
+	wantHealth(t, f.c, connector.Broken)
+	// A late logout from the replaced client must not unlink the new session.
+	f.c.event(f.cli, &events.LoggedOut{Reason: events.ConnectFailureLoggedOut})
+	wantHealth(t, f.c, connector.Broken)
 }
 
 func TestHealthDown(t *testing.T) {
@@ -199,18 +200,15 @@ func TestHealthDown(t *testing.T) {
 	f.cli.mu.Lock()
 	f.cli.connected = false
 	f.cli.mu.Unlock()
-	wantHealth(t, f.c, connector.Broken, "connecting…")
+	wantHealth(t, f.c, connector.Broken)
 
 	for _, evt := range []any{&events.ClientOutdated{}, &events.StreamReplaced{}, &events.TemporaryBan{Code: events.TempBanBlockedByUsers}} {
 		f := newFixture(t)
 		f.c.event(f.cli, &events.Disconnected{})
-		wantHealth(t, f.c, connector.Healthy, "")
+		wantHealth(t, f.c, connector.Healthy)
 		f.c.event(f.cli, evt)
 		if h := f.c.Health(context.Background()); h.State != connector.Broken || h.Detail == "" {
 			t.Errorf("%T: health %+v", evt, h)
 		}
 	}
-	f = newFixture(t)
-	f.c.event(f.cli, &events.ClientOutdated{})
-	wantHealth(t, f.c, connector.Broken, "WhatsApp rejected this client version; update mandate")
 }

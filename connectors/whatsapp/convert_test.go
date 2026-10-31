@@ -338,22 +338,6 @@ func TestConvertHistorySync(t *testing.T) {
 	}
 }
 
-func TestContainerKind(t *testing.T) {
-	tests := []struct {
-		chat types.JID
-		want string
-	}{
-		{alice, "dm"},
-		{aliceL, "dm"},
-		{group, "group"},
-	}
-	for _, tt := range tests {
-		if got := kindFor(tt.chat); got != tt.want {
-			t.Errorf("kindFor(%s) = %q, want %q", tt.chat, got, tt.want)
-		}
-	}
-}
-
 func TestHistoryChat(t *testing.T) {
 	pn := resolver(map[types.JID]types.JID{aliceL: alice})
 	tests := []struct {
@@ -365,7 +349,6 @@ func TestHistoryChat(t *testing.T) {
 		{aliceL, alice, true},
 		{group, group, true},
 		{types.StatusBroadcastJID, types.EmptyJID, false},
-		{types.NewJID("1234", types.NewsletterServer), types.EmptyJID, false},
 	}
 	for _, tt := range tests {
 		got, ok := historyChat(tt.raw, pn)

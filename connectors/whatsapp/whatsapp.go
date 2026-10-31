@@ -31,9 +31,6 @@ func main() {
 	connector.Main(start)
 }
 
-// start opens the message store and the whatsmeow session and connects a
-// linked device; an unlinked one waits for the owner to link it from the
-// console.
 func start(ctx context.Context, env *connector.Env, _ struct{}) (connector.Connector, error) {
 	ctx = withLibraryLogger(ctx)
 	st, err := store.Open(ctx, env.DataPath())
