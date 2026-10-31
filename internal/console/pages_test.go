@@ -192,17 +192,17 @@ func TestOtherProtocolIsDown(t *testing.T) {
 	var called atomic.Int32
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /spec", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, connector.Spec{
+		connector.WriteJSON(w, http.StatusOK, connector.Spec{
 			Protocol: 2, Name: "next", Ops: []connector.Op{{Name: "send", Kind: connector.Write}},
 			Setup: []connector.Param{{Name: "account"}},
 		})
 	})
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, connector.Health{State: connector.NeedsSetup})
+		connector.WriteJSON(w, http.StatusOK, connector.Health{State: connector.NeedsSetup})
 	})
 	mux.HandleFunc("POST /", func(w http.ResponseWriter, _ *http.Request) {
 		called.Add(1)
-		writeJSON(w, http.StatusOK, map[string]any{})
+		connector.WriteJSON(w, http.StatusOK, map[string]any{})
 	})
 	h := startWith(t, func(cfg *Config, dir string) {
 		sock := filepath.Join(dir, "next.sock")

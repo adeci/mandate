@@ -81,7 +81,7 @@ func (s *Server) api(h func(http.ResponseWriter, *http.Request, session)) http.H
 	return func(w http.ResponseWriter, r *http.Request) {
 		sess, ok := s.session(r)
 		if !ok {
-			writeErr(w, &connector.Error{Status: http.StatusUnauthorized, Message: "log in with your passkey first"})
+			connector.WriteError(w, &connector.Error{Status: http.StatusUnauthorized, Message: "log in with your passkey first"})
 			return
 		}
 		h(w, r, sess)
@@ -170,10 +170,10 @@ func (l *loginChallenges) spend(c []byte, now time.Time) error {
 
 func (s *Server) loginOptions(w http.ResponseWriter, _ *http.Request) {
 	if len(s.cfg.Approvers) == 0 {
-		writeErr(w, &connector.Error{Status: http.StatusServiceUnavailable, Message: "no passkeys are pinned yet"})
+		connector.WriteError(w, &connector.Error{Status: http.StatusServiceUnavailable, Message: "no passkeys are pinned yet"})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.requestOptions(s.logins.issue(s.now())))
+	connector.WriteJSON(w, http.StatusOK, s.requestOptions(s.logins.issue(s.now())))
 }
 
 type loginRequest struct {
@@ -187,19 +187,19 @@ type loginResponse struct {
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
-	if !decode(w, r, &req) {
+	if !connector.DecodeJSON(w, r, &req, maxBody) {
 		return
 	}
 	a, err := s.verifyLogin(req.Assertion)
 	if err != nil {
 		s.cfg.Log.Warn("login refused", "err", err)
-		writeErr(w, &connector.Error{Status: http.StatusForbidden, Message: err.Error()})
+		connector.WriteError(w, &connector.Error{Status: http.StatusForbidden, Message: err.Error()})
 		return
 	}
 	token := rand.Text() + rand.Text()
 	now := s.now()
 	if err := s.db.createSession(r.Context(), tokenHash(token), a.CredentialID, now, now.Add(sessionTTL)); err != nil {
-		writeErr(w, err)
+		connector.WriteError(w, err)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -212,7 +212,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteStrictMode,
 	})
 	s.cfg.Log.Info("logged in", "passkey", a.Name)
-	writeJSON(w, http.StatusOK, loginResponse{Next: localPath(req.Next)})
+	connector.WriteJSON(w, http.StatusOK, loginResponse{Next: localPath(req.Next)})
 }
 
 func (s *Server) verifyLogin(assertion json.RawMessage) (approval.Approver, error) {

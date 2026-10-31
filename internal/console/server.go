@@ -175,24 +175,24 @@ func (s *Server) ProposalHandler() http.Handler {
 
 func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	var req proposal.Request
-	if !decode(w, r, &req) {
+	if !connector.DecodeJSON(w, r, &req, maxBody) {
 		return
 	}
 	ctx := r.Context()
 	c, ok := s.conns[req.Connector]
 	if !ok {
-		writeErr(w, &connector.Error{Status: http.StatusNotFound, Message: fmt.Sprintf("no connector %q", req.Connector)})
+		connector.WriteError(w, &connector.Error{Status: http.StatusNotFound, Message: fmt.Sprintf("no connector %q", req.Connector)})
 		return
 	}
 	now := s.now()
 	if _, err := c.op(ctx, req.Op, now); err != nil {
-		writeErr(w, upstream(err))
+		connector.WriteError(w, upstream(err))
 		return
 	}
 	// Args and display come from the connector, never from the gateway.
 	p, err := c.client.Prepare(ctx, req.Op, req.Args)
 	if err != nil {
-		writeErr(w, upstream(err))
+		connector.WriteError(w, upstream(err))
 		return
 	}
 	pr := row{
@@ -206,21 +206,21 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, errTooMany) {
 			err = &connector.Error{Status: http.StatusTooManyRequests, Message: fmt.Sprintf("%d proposals are already waiting for the owner", maxPending)}
 		}
-		writeErr(w, err)
+		connector.WriteError(w, err)
 		return
 	}
 	s.cfg.Log.Info("proposed", "id", pr.ID, "connector", req.Connector, "op", req.Op)
 	pr.URL = s.url(pr.ID)
-	writeJSON(w, http.StatusCreated, pr.Proposal)
+	connector.WriteJSON(w, http.StatusCreated, pr.Proposal)
 }
 
 func (s *Server) getProposal(w http.ResponseWriter, r *http.Request) {
 	pr, err := s.load(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeErr(w, err)
+		connector.WriteError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, pr.Proposal)
+	connector.WriteJSON(w, http.StatusOK, pr.Proposal)
 }
 
 // load expires due proposals and returns one with its URL filled in.
@@ -286,27 +286,27 @@ type challengeResponse struct {
 // challenge; earlier ones stay valid until one is used.
 func (s *Server) challenge(w http.ResponseWriter, r *http.Request, sess session) {
 	var req challengeRequest
-	if !decode(w, r, &req) {
+	if !connector.DecodeJSON(w, r, &req, maxBody) {
 		return
 	}
 	ctx := r.Context()
 	pr, err := s.load(ctx, r.PathValue("id"))
 	if err != nil {
-		writeErr(w, err)
+		connector.WriteError(w, err)
 		return
 	}
 	if pr.Status != proposal.Pending {
-		writeErr(w, &connector.Error{Status: http.StatusConflict, Message: "request is " + string(pr.Status)})
+		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: "request is " + string(pr.Status)})
 		return
 	}
 	c, ok := s.conns[pr.Connector]
 	if !ok {
-		writeErr(w, &connector.Error{Status: http.StatusBadGateway, Message: fmt.Sprintf("connector %q is no longer configured", pr.Connector)})
+		connector.WriteError(w, &connector.Error{Status: http.StatusBadGateway, Message: fmt.Sprintf("connector %q is no longer configured", pr.Connector)})
 		return
 	}
 	op, err := c.op(ctx, pr.Op, s.now())
 	if err != nil {
-		writeErr(w, upstream(err))
+		connector.WriteError(w, upstream(err))
 		return
 	}
 	editable := map[string]bool{}
@@ -316,14 +316,14 @@ func (s *Server) challenge(w http.ResponseWriter, r *http.Request, sess session)
 	args := maps.Clone(pr.Args)
 	for k, v := range req.Edits {
 		if !editable[k] {
-			writeErr(w, connector.Invalid("%s is not editable", k))
+			connector.WriteError(w, connector.Invalid("%s is not editable", k))
 			return
 		}
 		args[k] = v
 	}
 	p, err := c.client.Prepare(ctx, pr.Op, args)
 	if err != nil {
-		writeErr(w, upstream(err))
+		connector.WriteError(w, upstream(err))
 		return
 	}
 	record, err := approval.Encode(approval.Record{
@@ -331,21 +331,21 @@ func (s *Server) challenge(w http.ResponseWriter, r *http.Request, sess session)
 		Note: pr.Note, CreatedAt: pr.CreatedAt, ExpiresAt: pr.ExpiresAt,
 	})
 	if err != nil {
-		writeErr(w, err)
+		connector.WriteError(w, err)
 		return
 	}
 	ch := challenge{Nonce: make([]byte, 16), Proposal: pr.ID, Record: record, IssuedAt: s.cfg.Now().UTC(), Session: sess.hash}
 	rand.Read(ch.Nonce)
 	if err := s.db.addChallenge(ctx, ch, s.now()); err != nil {
-		writeErr(w, conflict(err))
+		connector.WriteError(w, conflict(err))
 		return
 	}
 	preview, err := s.renderString("fields", fieldViews(p.Display, nil, nil))
 	if err != nil {
-		writeErr(w, err)
+		connector.WriteError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, challengeResponse{
+	connector.WriteJSON(w, http.StatusOK, challengeResponse{
 		Nonce:   b64(ch.Nonce),
 		Options: s.requestOptions(approval.Challenge(record, ch.Nonce, ch.IssuedAt)),
 		Display: p.Display,
@@ -360,37 +360,37 @@ type approveRequest struct {
 
 func (s *Server) approve(w http.ResponseWriter, r *http.Request, sess session) {
 	var req approveRequest
-	if !decode(w, r, &req) {
+	if !connector.DecodeJSON(w, r, &req, maxBody) {
 		return
 	}
 	nonce, err := base64.RawURLEncoding.DecodeString(req.Nonce)
 	if err != nil {
-		writeErr(w, connector.Invalid("invalid nonce"))
+		connector.WriteError(w, connector.Invalid("invalid nonce"))
 		return
 	}
 	id := r.PathValue("id")
 	ch, err := s.db.challenge(r.Context(), nonce)
 	if errors.Is(err, errNotFound) || (err == nil && ch.Proposal != id) {
-		writeErr(w, &connector.Error{Status: http.StatusConflict, Message: "this approval was already used or has expired; start again"})
+		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: "this approval was already used or has expired; start again"})
 		return
 	}
 	if err != nil {
-		writeErr(w, err)
+		connector.WriteError(w, err)
 		return
 	}
 	// The page that asked for the challenge is the one that showed it.
 	if string(ch.Session) != string(sess.hash) {
-		writeErr(w, &connector.Error{Status: http.StatusForbidden, Message: "this approval was started in another session"})
+		connector.WriteError(w, &connector.Error{Status: http.StatusForbidden, Message: "this approval was started in another session"})
 		return
 	}
 	pr, err := s.load(r.Context(), id)
 	if err != nil {
-		writeErr(w, err)
+		connector.WriteError(w, err)
 		return
 	}
 	c, ok := s.conns[pr.Connector]
 	if !ok {
-		writeErr(w, &connector.Error{Status: http.StatusBadGateway, Message: fmt.Sprintf("connector %q is no longer configured", pr.Connector)})
+		connector.WriteError(w, &connector.Error{Status: http.StatusBadGateway, Message: fmt.Sprintf("connector %q is no longer configured", pr.Connector)})
 		return
 	}
 	a := approval.Approval{Record: ch.Record, Nonce: ch.Nonce, IssuedAt: ch.IssuedAt, Assertion: req.Assertion}
@@ -399,11 +399,11 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request, sess session) {
 	rec, err := s.verifier.Verify(a)
 	if err != nil {
 		s.cfg.Log.Warn("approval refused", "id", id, "err", err)
-		writeErr(w, &connector.Error{Status: http.StatusForbidden, Message: err.Error()})
+		connector.WriteError(w, &connector.Error{Status: http.StatusForbidden, Message: err.Error()})
 		return
 	}
 	if rec.ID != id {
-		writeErr(w, &connector.Error{Status: http.StatusForbidden, Message: "approval is for a different request"})
+		connector.WriteError(w, &connector.Error{Status: http.StatusForbidden, Message: "approval is for a different request"})
 		return
 	}
 	approver, _, _ := s.findApprover(assertionRawID(req.Assertion))
@@ -411,7 +411,7 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request, sess session) {
 	// away: once claimed, the outcome must be recorded.
 	ctx := context.WithoutCancel(r.Context())
 	if err := s.db.claim(ctx, ch, rec, req.Assertion, approver.Name, s.now()); err != nil {
-		writeErr(w, conflict(err))
+		connector.WriteError(w, conflict(err))
 		return
 	}
 	res := s.execute(ctx, c, a)
@@ -419,15 +419,15 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request, sess session) {
 	if err := s.db.finish(ctx, id, res); err != nil {
 		// The proposal stays executing and becomes unknown on restart.
 		s.cfg.Log.Error("store result", "id", id, "status", res.Status, "err", err)
-		writeErr(w, err)
+		connector.WriteError(w, err)
 		return
 	}
 	out, err := s.load(ctx, id)
 	if err != nil {
-		writeErr(w, err)
+		connector.WriteError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, out.Proposal)
+	connector.WriteJSON(w, http.StatusOK, out.Proposal)
 }
 
 // execute hands the approval to the connector exactly once. Only failures
@@ -502,31 +502,3 @@ func conflict(err error) error {
 }
 
 func b64(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
-
-func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
-		writeErr(w, connector.Invalid("invalid request: %v", err))
-		return false
-	}
-	return true
-}
-
-// writeErr answers in connector.Error's shape, which proposal.Client decodes.
-func writeErr(w http.ResponseWriter, err error) {
-	var e *connector.Error
-	if !errors.As(err, &e) {
-		e = &connector.Error{Status: http.StatusInternalServerError, Message: err.Error()}
-	}
-	if e.Status == 0 {
-		e.Status = http.StatusBadRequest
-	}
-	writeJSON(w, e.Status, e)
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
-}

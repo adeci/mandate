@@ -74,10 +74,10 @@ func (s *Server) connections(ctx context.Context) []connView {
 func (s *Server) connectionHealth(w http.ResponseWriter, r *http.Request, _ session) {
 	c, ok := s.conns[r.PathValue("name")]
 	if !ok {
-		writeErr(w, &connector.Error{Status: http.StatusNotFound, Message: "no such connection"})
+		connector.WriteError(w, &connector.Error{Status: http.StatusNotFound, Message: "no such connection"})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.view(r.Context(), c).Health)
+	connector.WriteJSON(w, http.StatusOK, s.view(r.Context(), c).Health)
 }
 
 // setupRequest carries the connector's declared setup inputs; empty ones
@@ -96,28 +96,28 @@ type setupView struct {
 func (s *Server) setup(w http.ResponseWriter, r *http.Request, _ session) {
 	c, ok := s.conns[r.PathValue("name")]
 	if !ok {
-		writeErr(w, &connector.Error{Status: http.StatusNotFound, Message: "no such connection"})
+		connector.WriteError(w, &connector.Error{Status: http.StatusNotFound, Message: "no such connection"})
 		return
 	}
 	var req setupRequest
-	if !decode(w, r, &req) {
+	if !connector.DecodeJSON(w, r, &req, maxBody) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), setupTimeout)
 	defer cancel()
 	spec, err := c.getSpec(ctx, s.now())
 	if pe, ok := errors.AsType[*connector.ProtocolError](err); ok {
-		writeErr(w, &connector.Error{Status: http.StatusBadGateway, Message: c.name + " " + pe.Error()})
+		connector.WriteError(w, &connector.Error{Status: http.StatusBadGateway, Message: c.name + " " + pe.Error()})
 		return
 	}
 	if err != nil {
-		writeErr(w, upstream(err))
+		connector.WriteError(w, upstream(err))
 		return
 	}
 	args := map[string]string{}
 	for k, v := range req.Args {
 		if !slices.ContainsFunc(spec.Setup, func(p connector.Param) bool { return p.Name == k }) {
-			writeErr(w, &connector.Error{Status: http.StatusBadRequest, Message: fmt.Sprintf("%s takes no setup input %q", c.name, k)})
+			connector.WriteError(w, &connector.Error{Status: http.StatusBadRequest, Message: fmt.Sprintf("%s takes no setup input %q", c.name, k)})
 			return
 		}
 		if v != "" {
@@ -126,17 +126,17 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request, _ session) {
 	}
 	step, err := c.client.Setup(ctx, args)
 	if err != nil {
-		writeErr(w, upstream(err))
+		connector.WriteError(w, upstream(err))
 		return
 	}
 	v := setupView{Code: step.Code, Instructions: step.Instructions, Done: step.Done}
 	if step.QR != "" {
 		if v.QR, err = qrSVG(step.QR); err != nil {
-			writeErr(w, fmt.Errorf("render QR code: %w", err))
+			connector.WriteError(w, fmt.Errorf("render QR code: %w", err))
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, v)
+	connector.WriteJSON(w, http.StatusOK, v)
 }
 
 // qrSVG draws text as a QR code with a 4-module quiet zone, black on white

@@ -74,11 +74,11 @@ func (s *Server) sessionEnroll(w http.ResponseWriter, r *http.Request, _ session
 
 func (s *Server) startEnroll(w http.ResponseWriter, r *http.Request) {
 	var req enrollRequest
-	if !decode(w, r, &req) {
+	if !connector.DecodeJSON(w, r, &req, maxBody) {
 		return
 	}
 	if !validName(req.Name) {
-		writeErr(w, connector.Invalid("name must be 1-64 letters, digits, spaces, or -_."))
+		connector.WriteError(w, connector.Invalid("name must be 1-64 letters, digits, spaces, or -_."))
 		return
 	}
 	now := s.cfg.Now()
@@ -100,7 +100,7 @@ func (s *Server) startEnroll(w http.ResponseWriter, r *http.Request) {
 	s.enrolls[token] = e
 	s.enrollMu.Unlock()
 	s.cfg.Log.Info("enrollment link issued", "name", req.Name, "expires", e.expires)
-	writeJSON(w, http.StatusOK, enrollResponse{URL: s.cfg.Origin + "/enroll/" + token, Token: token, ExpiresAt: e.expires})
+	connector.WriteJSON(w, http.StatusOK, enrollResponse{URL: s.cfg.Origin + "/enroll/" + token, Token: token, ExpiresAt: e.expires})
 }
 
 // liveEnrollment returns the unexpired enrollment for token; take also
@@ -152,7 +152,7 @@ type creationOptions struct {
 func (s *Server) enrollOptions(w http.ResponseWriter, r *http.Request) {
 	e, ok := s.liveEnrollment(r.PathValue("token"), false)
 	if !ok {
-		writeErr(w, errEnrollGone)
+		connector.WriteError(w, errEnrollGone)
 		return
 	}
 	opts := creationOptions{
@@ -167,7 +167,7 @@ func (s *Server) enrollOptions(w http.ResponseWriter, r *http.Request) {
 	}
 	known, err := s.db.passkeys(r.Context())
 	if err != nil {
-		writeErr(w, err)
+		connector.WriteError(w, err)
 		return
 	}
 	excluded := map[string]bool{}
@@ -180,7 +180,7 @@ func (s *Server) enrollOptions(w http.ResponseWriter, r *http.Request) {
 	for id := range excluded {
 		opts.ExcludeCredentials = append(opts.ExcludeCredentials, credentialDescriptor{Type: "public-key", ID: id})
 	}
-	writeJSON(w, http.StatusOK, opts)
+	connector.WriteJSON(w, http.StatusOK, opts)
 }
 
 // enrolled is what the page shows after a registration.
@@ -209,22 +209,22 @@ func nixEntry(a approval.Approver) string {
 func (s *Server) finishEnroll(w http.ResponseWriter, r *http.Request) {
 	e, ok := s.liveEnrollment(r.PathValue("token"), true)
 	if !ok {
-		writeErr(w, errEnrollGone)
+		connector.WriteError(w, errEnrollGone)
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
-		writeErr(w, connector.Invalid("read request: %v", err))
+		connector.WriteError(w, connector.Invalid("read request: %v", err))
 		return
 	}
 	p, err := s.verifyRegistration(e, body)
 	if err != nil {
 		s.cfg.Log.Warn("enrollment failed", "name", e.name, "err", err)
-		writeErr(w, connector.Invalid("%v", err))
+		connector.WriteError(w, connector.Invalid("%v", err))
 		return
 	}
 	if err := s.db.addPasskey(r.Context(), p); err != nil {
-		writeErr(w, err)
+		connector.WriteError(w, err)
 		return
 	}
 	if err := appendEnrolled(filepath.Join(s.cfg.StateDir, "enrolled.json"), p.Approver); err != nil {
@@ -232,7 +232,7 @@ func (s *Server) finishEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	line, _ := json.Marshal(p.Approver)
 	s.cfg.Log.Info("passkey enrolled; pin it in the approvers to trust it", "approver", string(line), "synced", p.Synced)
-	writeJSON(w, http.StatusOK, enrolled{Approver: p.Approver, Synced: p.Synced, Kind: kind(p.Synced), Nix: nixEntry(p.Approver)})
+	connector.WriteJSON(w, http.StatusOK, enrolled{Approver: p.Approver, Synced: p.Synced, Kind: kind(p.Synced), Nix: nixEntry(p.Approver)})
 }
 
 func (s *Server) verifyRegistration(e *enrollment, body []byte) (passkey, error) {
