@@ -42,7 +42,10 @@ type fakeDiscord struct {
 	prepares atomic.Int32
 	read     func(ctx context.Context, op string, args map[string]string) (json.RawMessage, error)
 	prepare  func(args map[string]string) (connector.Prepared, error)
+	health   connector.Health
 }
+
+func (f *fakeDiscord) Health(context.Context) connector.Health { return f.health }
 
 func (f *fakeDiscord) Spec() connector.Spec {
 	return connector.Spec{Name: "discord", Ops: []connector.Op{
@@ -83,6 +86,19 @@ type fakeApprovals struct {
 	mu        sync.Mutex
 	submitted []proposal.Request
 	proposals map[string]proposal.Proposal
+	gets      int
+}
+
+func (a *fakeApprovals) set(p proposal.Proposal) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.proposals[p.ID] = p
+}
+
+func (a *fakeApprovals) getCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.gets
 }
 
 func (a *fakeApprovals) handler() http.Handler {
@@ -105,6 +121,7 @@ func (a *fakeApprovals) handler() http.Handler {
 		a.calls.Add(1)
 		a.mu.Lock()
 		defer a.mu.Unlock()
+		a.gets++
 		p, ok := a.proposals[r.PathValue("id")]
 		if !ok {
 			writeError(w, http.StatusNotFound, "no such proposal")
@@ -126,7 +143,8 @@ func newRig(t *testing.T, edit func(*Config)) *rig {
 	exposure := filepath.Join(t.TempDir(), "exposure.toml")
 	mustDo(t, os.WriteFile(exposure, []byte(testExposure), 0o600))
 	d := &fakeDiscord{
-		t: t,
+		t:      t,
+		health: connector.Health{State: connector.Healthy},
 		read: func(context.Context, string, map[string]string) (json.RawMessage, error) {
 			return json.RawMessage(`{}`), nil
 		},
@@ -354,7 +372,115 @@ func TestProposeSubmitsPreparedArgs(t *testing.T) {
 	}
 }
 
-func TestActionStatusPassThrough(t *testing.T) {
+func TestProposeRefusesHiddenAlias(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, nil)
+	r.discord.prepare = func(args map[string]string) (connector.Prepared, error) {
+		// A new DM, found by a name whose other ID is the hidden person.
+		return connector.Prepared{Args: args, Container: "dm-new", Aliases: []string{"dm-new-lid", args["to"]}}, nil
+	}
+	for _, alias := range []string{"u-hidden", "g-work", "c-general"} {
+		rec := call(r.h, http.MethodPost, "/v1/actions", `{"connector":"discord","op":"send","args":{"to":"`+alias+`","text":"hi"}}`)
+		if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "unknown or hidden") {
+			t.Errorf("alias %s: %d %s, want 404", alias, rec.Code, rec.Body)
+		}
+	}
+	if n := r.approvals.calls.Load(); n != 0 {
+		t.Fatalf("hidden aliases reached approvals %d times", n)
+	}
+	rec := call(r.h, http.MethodPost, "/v1/actions", `{"connector":"discord","op":"send","args":{"to":"u2","text":"hi"}}`)
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("visible aliases: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestAmbiguousNameHidesHiddenCandidates(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, nil)
+	visible := connector.Candidate{ID: "c-memes", Label: "#memes (Fun)"}
+	hiddenOnes := []connector.Candidate{
+		{ID: "c-general", Label: "#general (Work)"},
+		{ID: "dm-3", Aliases: []string{"u-hidden"}, Label: "Hidden Person"},
+		{ID: "g-work", Label: "Work"},
+	}
+	var candidates []connector.Candidate
+	r.discord.prepare = func(args map[string]string) (connector.Prepared, error) {
+		if args["to"] == "g-work" {
+			return connector.Prepared{Args: args, Container: "g-work"}, nil
+		}
+		return connector.Prepared{}, &connector.Error{Status: http.StatusConflict, Message: `"me" matches several chats`, Candidates: candidates}
+	}
+	propose := func(to string) *httptest.ResponseRecorder {
+		return call(r.h, http.MethodPost, "/v1/actions", `{"connector":"discord","op":"send","args":{"to":"`+to+`","text":"hi"}}`)
+	}
+
+	candidates = append([]connector.Candidate{visible}, hiddenOnes...)
+	rec := propose("me")
+	var e connector.Error
+	mustDo(t, json.Unmarshal(rec.Body.Bytes(), &e))
+	if rec.Code != http.StatusConflict || !strings.Contains(e.Message, "#memes (Fun) (c-memes)") ||
+		len(e.Candidates) != 1 || e.Candidates[0].ID != "c-memes" {
+		t.Errorf("mixed candidates: %d %s", rec.Code, rec.Body)
+	}
+	for _, c := range hiddenOnes {
+		for _, leak := range append([]string{c.ID, c.Label}, c.Aliases...) {
+			if strings.Contains(rec.Body.String(), leak) {
+				t.Errorf("hidden candidate leaked %q: %s", leak, rec.Body)
+			}
+		}
+	}
+
+	candidates = hiddenOnes
+	rec = propose("me")
+	unknown := propose("g-work")
+	if rec.Code != unknown.Code || rec.Body.String() != unknown.Body.String() {
+		t.Errorf("all-hidden candidates: %d %s\nwant exactly the unknown-target answer: %d %s", rec.Code, rec.Body, unknown.Code, unknown.Body)
+	}
+	if n := r.approvals.calls.Load(); n != 0 {
+		t.Errorf("ambiguous names reached approvals %d times", n)
+	}
+}
+
+func TestUnhealthyConnectorIsNotCalled(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, func(c *Config) { c.ConsoleURL = "https://console.example/" })
+	read := func() *httptest.ResponseRecorder {
+		return call(r.h, http.MethodPost, "/v1/read/discord/fetch", `{"args":{"channel_id":"c-memes"}}`)
+	}
+	propose := func() *httptest.ResponseRecorder {
+		return call(r.h, http.MethodPost, "/v1/actions", `{"connector":"discord","op":"send","args":{"to":"c-memes","text":"hi"}}`)
+	}
+
+	r.discord.health = connector.Health{State: connector.NeedsSetup, Detail: "Discord token was revoked"}
+	for name, rec := range map[string]*httptest.ResponseRecorder{"read": read(), "propose": propose()} {
+		want := "discord needs the owner: Discord token was revoked. Ask them to check https://console.example/connections"
+		if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("%s while needing setup: %d %s", name, rec.Code, rec.Body)
+		}
+	}
+
+	r.discord.health = connector.Health{State: connector.Resting, Detail: "daily budget used", Until: time.Now().Add(90 * time.Second)}
+	for name, rec := range map[string]*httptest.ResponseRecorder{"read": read(), "propose": propose()} {
+		var e connector.Error
+		mustDo(t, json.Unmarshal(rec.Body.Bytes(), &e))
+		if rec.Code != http.StatusTooManyRequests || e.RetryAfter < 85 || e.RetryAfter > 91 {
+			t.Errorf("%s while resting: %d %s, want 429 retry after ~90s", name, rec.Code, rec.Body)
+		}
+	}
+
+	rec := call(r.h, http.MethodGet, "/v1/schema", "")
+	if !strings.Contains(rec.Body.String(), `"health":{"state":"resting","detail":"daily budget used"`) {
+		t.Errorf("schema lacks health: %s", rec.Body)
+	}
+	if n, m := r.discord.reads.Load(), r.discord.prepares.Load(); n+m != 0 {
+		t.Errorf("unhealthy connector called: %d reads, %d prepares", n, m)
+	}
+	if n := r.approvals.calls.Load(); n != 0 {
+		t.Errorf("approvals called %d times", n)
+	}
+}
+
+func TestStatusPassThrough(t *testing.T) {
 	t.Parallel()
 	r := newRig(t, nil)
 	want := proposal.Proposal{
@@ -364,7 +490,7 @@ func TestActionStatusPassThrough(t *testing.T) {
 		CreatedAt: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC),
 		ExpiresAt: time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC),
 	}
-	r.approvals.proposals["p7"] = want
+	r.approvals.set(want)
 
 	rec := call(r.h, http.MethodGet, "/v1/actions/p7", "")
 	if rec.Code != http.StatusOK {
@@ -379,6 +505,75 @@ func TestActionStatusPassThrough(t *testing.T) {
 	}
 	if rec := call(r.h, http.MethodGet, "/v1/actions/p7%3Fx=1", ""); rec.Code != http.StatusBadRequest {
 		t.Errorf("id with query characters: %d %s", rec.Code, rec.Body)
+	}
+	for _, wait := range []string{"-1", "1.5", "soon"} {
+		if rec := call(r.h, http.MethodGet, "/v1/actions/p7?wait="+wait, ""); rec.Code != http.StatusBadRequest {
+			t.Errorf("wait=%s: %d %s", wait, rec.Code, rec.Body)
+		}
+	}
+}
+
+func TestStatusLongPollReturnsOnDecision(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, nil)
+	pending := proposal.Proposal{ID: "p1", Connector: "discord", Op: "send", Status: proposal.Pending}
+	r.approvals.set(pending)
+	go func() {
+		for r.approvals.getCount() < 2 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		pending.Status = proposal.Executing
+		r.approvals.set(pending)
+		for r.approvals.getCount() < 3 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		pending.Status = proposal.Rejected
+		r.approvals.set(pending)
+	}()
+	start := time.Now()
+	rec := call(r.h, http.MethodGet, "/v1/actions/p1?wait=30", "")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"status":"rejected"`) {
+		t.Fatalf("long-poll: %d %s, want rejected", rec.Code, rec.Body)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Errorf("long-poll took %v after the decision", d)
+	}
+}
+
+func TestStatusLongPollTimesOutPending(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, nil)
+	r.approvals.set(proposal.Proposal{ID: "p1", Status: proposal.Pending})
+	start := time.Now()
+	rec := call(r.h, http.MethodGet, "/v1/actions/p1?wait=1", "")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"status":"pending"`) {
+		t.Fatalf("timed-out long-poll: %d %s, want pending", rec.Code, rec.Body)
+	}
+	if d := time.Since(start); d < time.Second || d > 5*time.Second {
+		t.Errorf("wait=1 answered after %v", d)
+	}
+	if n := r.approvals.getCount(); n < 2 {
+		t.Errorf("console asked %d times, want a re-check before giving up", n)
+	}
+
+	start = time.Now()
+	if rec := call(r.h, http.MethodGet, "/v1/actions/p1", ""); rec.Code != http.StatusOK || time.Since(start) > time.Second {
+		t.Errorf("no wait: %d after %v, want an immediate answer", rec.Code, time.Since(start))
+	}
+}
+
+func TestStatusLongPollStopsWhenAgentLeaves(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, nil)
+	r.approvals.set(proposal.Proposal{ID: "p1", Status: proposal.Pending})
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/v1/actions/p1?wait=900", nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	start := time.Now()
+	r.h.ServeHTTP(httptest.NewRecorder(), req)
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("long-poll outlived its client by %v", d)
 	}
 }
 
@@ -408,11 +603,12 @@ func TestSchemaListsReachableConnectors(t *testing.T) {
 		t.Fatalf("schema: %d %s", rec.Code, rec.Body)
 	}
 	var s struct {
-		Connectors []connector.Spec `json:"connectors"`
+		Connectors []connectorInfo `json:"connectors"`
 	}
 	mustDo(t, json.Unmarshal(rec.Body.Bytes(), &s))
-	if len(s.Connectors) != 1 || s.Connectors[0].Name != "discord" || len(s.Connectors[0].Ops) != 4 {
-		t.Errorf("connectors = %+v, want only discord with its ops", s.Connectors)
+	if len(s.Connectors) != 1 || s.Connectors[0].Name != "discord" || len(s.Connectors[0].Ops) != 4 ||
+		s.Connectors[0].Health.State != connector.Healthy {
+		t.Errorf("connectors = %+v, want only discord with its ops, healthy", s.Connectors)
 	}
 	if rec := call(r.h, http.MethodPost, "/v1/read/whatsapp/fetch", `{"args":{}}`); rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("read from down connector: %d %s", rec.Code, rec.Body)

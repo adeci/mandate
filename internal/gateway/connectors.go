@@ -8,10 +8,12 @@ import (
 	"io/fs"
 	"log/slog"
 	"maps"
+	"math"
 	"net/http"
 	"os"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +31,11 @@ const (
 	callTimeout = 30 * time.Second
 	specTimeout = 3 * time.Second
 	specTTL     = 30 * time.Second
+
+	// maxWait caps an action long-poll; pollInterval is how often it asks the
+	// console meanwhile.
+	maxWait      = 900 * time.Second
+	pollInterval = time.Second
 )
 
 type connectors struct {
@@ -83,23 +90,40 @@ func (c *connectors) spec(ctx context.Context, name string) (connector.Spec, err
 	return s, nil
 }
 
-// specs lists the connectors that answer, by name.
-func (c *connectors) specs(ctx context.Context) []connector.Spec {
-	out := []connector.Spec{}
+func (c *connectors) health(ctx context.Context, name string) (connector.Health, error) {
+	ctx, cancel := context.WithTimeout(ctx, specTimeout)
+	defer cancel()
+	return c.calls[name].Health(ctx)
+}
+
+type connectorInfo struct {
+	connector.Spec
+	Health connector.Health `json:"health"`
+}
+
+// list describes the connectors that answer, by name.
+func (c *connectors) list(ctx context.Context) []connectorInfo {
+	out := []connectorInfo{}
 	for _, name := range slices.Sorted(maps.Keys(c.calls)) {
 		s, err := c.spec(ctx, name)
 		if err != nil {
 			slog.Warn("connector spec", "connector", name, "err", err)
 			continue
 		}
-		out = append(out, s)
+		hl, err := c.health(ctx, name)
+		if err != nil {
+			slog.Warn("connector health", "connector", name, "err", err)
+			hl = connector.Health{State: connector.Broken, Detail: "not answering"}
+		}
+		out = append(out, connectorInfo{Spec: s, Health: hl})
 	}
 	return out
 }
 
-// lookup resolves connector and op and checks args against the op's params.
-// Without a source there are no filtered views to check containers against,
-// so container values are refused outright.
+// lookup resolves connector and op, checks args against the op's params, and
+// refuses connectors that are not healthy before they are called. Without a
+// source there are no filtered views to check containers against, so
+// container values are refused outright.
 func (h *handler) lookup(w http.ResponseWriter, r *http.Request, name, opName string, kind connector.Kind, args map[string]string) (connector.Op, bool) {
 	if _, ok := h.connectors.calls[name]; !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("no connector %q", name))
@@ -108,12 +132,12 @@ func (h *handler) lookup(w http.ResponseWriter, r *http.Request, name, opName st
 	spec, err := h.connectors.spec(r.Context(), name)
 	if err != nil {
 		slog.Error("connector spec", "connector", name, "err", err)
-		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("connector %s is unavailable", name))
+		writeError(w, http.StatusServiceUnavailable, unavailable("connector "+name))
 		return connector.Op{}, false
 	}
 	op, ok := spec.Op(opName)
 	if !ok || op.Kind != kind {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("connector %s has no %s op %q", name, kind, opName))
+		writeError(w, http.StatusNotFound, fmt.Sprintf("connector %s has no %s op %q; see mandate guide for its ops", name, kind, opName))
 		return connector.Op{}, false
 	}
 	if err := checkArgs(op, args); err != nil {
@@ -128,7 +152,43 @@ func (h *handler) lookup(w http.ResponseWriter, r *http.Request, name, opName st
 			}
 		}
 	}
-	return op, true
+	return op, h.healthy(w, r, name)
+}
+
+func (h *handler) healthy(w http.ResponseWriter, r *http.Request, name string) bool {
+	hl, err := h.connectors.health(r.Context(), name)
+	if err != nil {
+		slog.Error("connector health", "connector", name, "err", err)
+		writeError(w, http.StatusServiceUnavailable, unavailable("connector "+name))
+		return false
+	}
+	detail := hl.Detail
+	if detail == "" {
+		detail = string(hl.State)
+	}
+	switch hl.State {
+	case connector.Healthy:
+		return true
+	case connector.Resting:
+		retry := max(int(math.Ceil(time.Until(hl.Until).Seconds())), 1)
+		if hl.Until.IsZero() {
+			retry = 60
+		}
+		writeJSON(w, http.StatusTooManyRequests, connector.Error{
+			Message: fmt.Sprintf("%s is resting: %s", name, detail), RetryAfter: retry,
+		})
+		return false
+	}
+	console := "the console"
+	if h.cfg.ConsoleURL != "" {
+		console = strings.TrimRight(h.cfg.ConsoleURL, "/") + "/connections"
+	}
+	writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("%s needs the owner: %s. Ask them to check %s", name, detail, console))
+	return false
+}
+
+func unavailable(who string) string {
+	return who + " is unavailable; try again in a minute, and tell the owner if it persists"
 }
 
 func noSource(name string) string {
@@ -159,7 +219,49 @@ func relay(w http.ResponseWriter, who string, err error) {
 		return
 	}
 	slog.Error("call failed", "peer", who, "err", err)
-	writeError(w, http.StatusServiceUnavailable, who+" is unavailable")
+	writeError(w, http.StatusServiceUnavailable, unavailable(who))
+}
+
+// relayConnector is relay for connector refusals, which may list candidates
+// for an ambiguous name. Hidden candidates are dropped; if none is left the
+// answer is the one for an unknown target, so a hidden match is not revealed.
+func (h *handler) relayConnector(w http.ResponseWriter, name string, err error) {
+	e, ok := errors.AsType[*connector.Error](err)
+	if !ok || len(e.Candidates) == 0 {
+		relay(w, "connector "+name, err)
+		return
+	}
+	var visible []connector.Candidate
+	if _, ok := h.cfg.Sources[name]; ok {
+		for _, c := range e.Candidates {
+			hidden, err := h.hidden(name, append([]string{c.ID}, c.Aliases...))
+			if err != nil {
+				slog.Error("exposure check", "connector", name, "err", err)
+				writeError(w, http.StatusServiceUnavailable, "gateway unavailable")
+				return
+			}
+			if !hidden {
+				visible = append(visible, c)
+			}
+		}
+	}
+	if len(visible) == 0 {
+		unknownTarget(w, name)
+		return
+	}
+	labels := make([]string, len(visible))
+	for i, c := range visible {
+		labels[i] = fmt.Sprintf("%s (%s)", c.Label, c.ID)
+	}
+	writeJSON(w, e.Status, connector.Error{
+		Message:    fmt.Sprintf("%s: %s; pass one of these IDs instead", e.Message, strings.Join(labels, ", ")),
+		Candidates: visible,
+	})
+}
+
+func unknownTarget(w http.ResponseWriter, name string) {
+	writeError(w, http.StatusNotFound,
+		fmt.Sprintf("%s target is unknown or hidden; look it up in %s_containers and pass its id", name, name))
 }
 
 type readRequest struct {
@@ -191,7 +293,7 @@ func (h *handler) read(w http.ResponseWriter, r *http.Request) {
 	attrs := []any{"remote", r.RemoteAddr, "connector", name, "op", opName, "duration_ms", time.Since(start).Milliseconds()}
 	if err != nil {
 		slog.Info("read", append(attrs, "err", err.Error())...)
-		relay(w, "connector "+name, err)
+		h.relayConnector(w, name, err)
 		return
 	}
 	var res connector.ReadResult
@@ -293,7 +395,7 @@ func (h *handler) propose(w http.ResponseWriter, r *http.Request) {
 	prepared, err := h.connectors.calls[req.Connector].Prepare(r.Context(), req.Op, req.Args)
 	if err != nil {
 		slog.Info("propose", append(attrs, "err", err.Error())...)
-		relay(w, "connector "+req.Connector, err)
+		h.relayConnector(w, req.Connector, err)
 		return
 	}
 	if prepared.Container != "" {
@@ -302,7 +404,7 @@ func (h *handler) propose(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, noSource(req.Connector))
 			return
 		}
-		hidden, err := h.writeHidden(req.Connector, prepared.Container)
+		hidden, err := h.hidden(req.Connector, append([]string{prepared.Container}, prepared.Aliases...))
 		if err != nil {
 			slog.Error("exposure check", "connector", req.Connector, "err", err)
 			writeError(w, http.StatusServiceUnavailable, "gateway unavailable")
@@ -310,7 +412,7 @@ func (h *handler) propose(w http.ResponseWriter, r *http.Request) {
 		}
 		if hidden {
 			slog.Info("propose", append(attrs, "refused", "hidden container")...)
-			writeError(w, http.StatusNotFound, fmt.Sprintf("%s target is unknown or hidden", req.Connector))
+			unknownTarget(w, req.Connector)
 			return
 		}
 	}
@@ -326,18 +428,21 @@ func (h *handler) propose(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, p)
 }
 
-// writeHidden mirrors the containers view's filter (the id or its parent is
+// hidden mirrors the containers view's filter (the id or its parent is
 // hidden) against the hide lists directly: a write may target a chat with no
 // stored row yet, such as a new WhatsApp contact. A DM's container is the
-// other person, so hidden senders count as hidden targets too.
-func (h *handler) writeHidden(source, id string) (bool, error) {
+// other person, so hidden senders count as hidden targets too. ids are one
+// container's IDs; any of them being hidden hides it.
+func (h *handler) hidden(source string, ids []string) (bool, error) {
 	pol, err := h.policy.get()
 	if err != nil {
 		return false, err
 	}
-	exp := pol.exposure.source(source)
-	if slices.Contains(exp.HideContainers, id) || slices.Contains(exp.HideSenders, id) {
-		return true, nil
+	exp := pol.sources[source]
+	for _, id := range ids {
+		if slices.Contains(exp.HideContainers, id) || slices.Contains(exp.HideSenders, id) {
+			return true, nil
+		}
 	}
 	path := h.cfg.Sources[source]
 	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
@@ -356,22 +461,33 @@ func (h *handler) writeHidden(source, id string) (bool, error) {
 		return false, fmt.Errorf("look up %s container: %w", source, err)
 	}
 	defer stmt.Close()
-	if err := stmt.BindText(1, id); err != nil {
-		return false, err
+	for _, id := range ids {
+		if err := stmt.BindText(1, id); err != nil {
+			return false, err
+		}
+		var parent string
+		if stmt.Step() {
+			parent = stmt.ColumnText(0)
+		}
+		if err := stmt.Err(); err != nil {
+			return false, fmt.Errorf("look up %s container: %w", source, err)
+		}
+		if err := stmt.Reset(); err != nil {
+			return false, err
+		}
+		if parent != "" && slices.Contains(exp.HideContainers, parent) {
+			return true, nil
+		}
 	}
-	var parent string
-	if stmt.Step() {
-		parent = stmt.ColumnText(0)
-	}
-	if err := stmt.Err(); err != nil {
-		return false, fmt.Errorf("look up %s container: %w", source, err)
-	}
-	return parent != "" && slices.Contains(exp.HideContainers, parent), nil
+	return false, nil
 }
 
 var proposalID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
-func (h *handler) action(w http.ResponseWriter, r *http.Request) {
+// status answers a proposal's state. With wait=SECONDS it long-polls the
+// console until the proposal is settled or the wait is over, so an agent can
+// block in one call instead of spending a turn per poll.
+func (h *handler) status(w http.ResponseWriter, r *http.Request) {
 	if h.approvals == nil {
 		writeError(w, http.StatusNotFound, "proposals are not enabled on this gateway")
 		return
@@ -381,10 +497,36 @@ func (h *handler) action(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid proposal id")
 		return
 	}
-	p, err := h.approvals.Get(r.Context(), id)
-	if err != nil {
-		relay(w, "approvals", err)
-		return
+	var wait time.Duration
+	if v := r.URL.Query().Get("wait"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "wait must be whole seconds, e.g. wait=600")
+			return
+		}
+		wait = min(time.Duration(n)*time.Second, maxWait)
 	}
-	writeJSON(w, http.StatusOK, p)
+	deadline := time.Now().Add(wait)
+	for {
+		p, err := h.approvals.Get(r.Context(), id)
+		if err != nil {
+			relay(w, "approvals", err)
+			return
+		}
+		if settled(p.Status) || !time.Now().Before(deadline) {
+			writeJSON(w, http.StatusOK, p)
+			return
+		}
+		t := time.NewTimer(min(pollInterval, time.Until(deadline)))
+		select {
+		case <-r.Context().Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+	}
+}
+
+func settled(s proposal.Status) bool {
+	return s != proposal.Pending && s != proposal.Executing
 }

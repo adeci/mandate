@@ -3,10 +3,12 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -20,17 +22,17 @@ func fixture(t *testing.T) map[string]string {
 	ctx := context.Background()
 	at := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 
-	sms, err := store.Open(ctx, filepath.Join(dir, "sms.db"))
+	wa, err := store.Open(ctx, filepath.Join(dir, "whatsapp.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sms.Close()
+	defer wa.Close()
 	for _, c := range []store.Container{
 		{ID: "conv-family", Kind: "group", Name: "Family", IsGroup: true},
 		{ID: "conv-private", Kind: "dm", Name: "Private"},
 		{ID: "conv-bank", Kind: "dm", Name: "72975"},
 	} {
-		mustDo(t, sms.UpsertContainer(ctx, c))
+		mustDo(t, wa.UpsertContainer(ctx, c))
 	}
 	for i, m := range []store.Message{
 		{ID: "m1", ContainerID: "conv-family", SenderID: "+15550001", SenderName: "Mom", Body: "dinner at 7?"},
@@ -40,7 +42,7 @@ func fixture(t *testing.T) map[string]string {
 		{ID: "m5", ContainerID: "conv-family", SenderID: "+15550001", Body: "Your login code is 482913, don't share"},
 	} {
 		m.SentAt = at.Add(time.Duration(i) * time.Minute)
-		mustDo(t, sms.UpsertMessage(ctx, m))
+		mustDo(t, wa.UpsertMessage(ctx, m))
 	}
 
 	dc, err := store.Open(ctx, filepath.Join(dir, "discord.db"))
@@ -60,14 +62,14 @@ func fixture(t *testing.T) map[string]string {
 	mustDo(t, dc.UpsertMessage(ctx, store.Message{ID: "d2", ContainerID: "c-memes", SenderID: "u2", Body: "lol", SentAt: at}))
 
 	return map[string]string{
-		"sms":      filepath.Join(dir, "sms.db"),
+		"whatsapp": filepath.Join(dir, "whatsapp.db"),
 		"discord":  filepath.Join(dir, "discord.db"),
-		"whatsapp": filepath.Join(dir, "missing-whatsapp.db"),
+		"signal":   filepath.Join(dir, "missing-signal.db"),
 	}
 }
 
 const testExposure = `
-[sms]
+[whatsapp]
 hide_containers = ["conv-private"]
 hide_senders = ["+15550002"]
 
@@ -78,11 +80,12 @@ hide_senders = ["u-hidden"]
 
 func openTest(t *testing.T) *queryConn {
 	t.Helper()
-	pol, err := parseExposure(testExposure)
+	sources := fixture(t)
+	pol, err := parseExposure(testExposure, slices.Sorted(maps.Keys(sources)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	q, err := openQueryConn(fixture(t), pol)
+	q, err := openQueryConn(sources, pol)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +103,7 @@ func query(t *testing.T, q *queryConn, sql string, params ...any) (*queryResult,
 func TestExposureFiltering(t *testing.T) {
 	q := openTest(t)
 
-	res, err := query(t, q, `SELECT id, body, is_auth FROM sms_messages ORDER BY seq`)
+	res, err := query(t, q, `SELECT id, body, is_auth FROM whatsapp_messages ORDER BY seq`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,17 +145,17 @@ func TestExposureFiltering(t *testing.T) {
 func TestBotCannotBypassViews(t *testing.T) {
 	q := openTest(t)
 	for _, sql := range []string{
-		`SELECT * FROM src_sms.messages`,
-		`SELECT body FROM src_sms.messages WHERE id = 'm2'`,
+		`SELECT * FROM src_whatsapp.messages`,
+		`SELECT body FROM src_whatsapp.messages WHERE id = 'm2'`,
 		`SELECT * FROM _hidden`,
 		`SELECT sql FROM sqlite_temp_master`,
 		`SELECT * FROM sqlite_schema`,
-		`SELECT * FROM pragma_table_info('sms_messages')`,
+		`SELECT * FROM pragma_table_info('whatsapp_messages')`,
 		`SELECT * FROM pragma_database_list`,
-		`WITH sms_messages AS (SELECT * FROM src_sms.messages) SELECT * FROM sms_messages`,
-		`WITH x AS (SELECT * FROM src_sms.messages) SELECT * FROM x`,
-		`SELECT * FROM sms_messages UNION ALL SELECT seq, id, container_id, NULL, NULL, sender_id, sender_name, sent_at, is_from_me, body, 0, media_type, reply_to_id, edited_at, deleted FROM src_sms.messages`,
-		`SELECT (SELECT body FROM src_sms.messages LIMIT 1)`,
+		`WITH whatsapp_messages AS (SELECT * FROM src_whatsapp.messages) SELECT * FROM whatsapp_messages`,
+		`WITH x AS (SELECT * FROM src_whatsapp.messages) SELECT * FROM x`,
+		`SELECT * FROM whatsapp_messages UNION ALL SELECT seq, id, container_id, NULL, NULL, sender_id, sender_name, sent_at, is_from_me, body, 0, media_type, reply_to_id, edited_at, deleted FROM src_whatsapp.messages`,
+		`SELECT (SELECT body FROM src_whatsapp.messages LIMIT 1)`,
 		`SELECT load_extension('x')`,
 	} {
 		if res, err := query(t, q, sql); err == nil {
@@ -164,15 +167,15 @@ func TestBotCannotBypassViews(t *testing.T) {
 func TestBotCannotWrite(t *testing.T) {
 	q := openTest(t)
 	for _, sql := range []string{
-		`INSERT INTO _hidden VALUES ('sms', 'sender', 'x')`,
+		`INSERT INTO _hidden VALUES ('whatsapp', 'sender', 'x')`,
 		`DELETE FROM _hidden`,
-		`DROP VIEW sms_messages`,
-		`CREATE TEMP VIEW leak AS SELECT * FROM src_sms.messages`,
+		`DROP VIEW whatsapp_messages`,
+		`CREATE TEMP VIEW leak AS SELECT * FROM src_whatsapp.messages`,
 		`CREATE TEMP TABLE t(x)`,
 		`ATTACH DATABASE 'file:/tmp/x.db' AS x`,
-		`DETACH DATABASE src_sms`,
+		`DETACH DATABASE src_whatsapp`,
 		`PRAGMA query_only = 0`,
-		`PRAGMA table_info(sms_messages)`,
+		`PRAGMA table_info(whatsapp_messages)`,
 		`SELECT 1; DELETE FROM _hidden`,
 		`BEGIN`,
 		`VACUUM`,
@@ -182,7 +185,7 @@ func TestBotCannotWrite(t *testing.T) {
 		}
 	}
 	// The policy survives the attempts.
-	res, err := query(t, q, `SELECT count(*) FROM sms_messages WHERE sender_id = '+15550002'`)
+	res, err := query(t, q, `SELECT count(*) FROM whatsapp_messages WHERE sender_id = '+15550002'`)
 	if err != nil || res.Rows[0][0] != int64(0) {
 		t.Fatalf("hidden sender visible after write attempts: %v %v", res, err)
 	}
@@ -192,8 +195,8 @@ func TestQueryFeatures(t *testing.T) {
 	q := openTest(t)
 
 	res, err := query(t, q, `
-WITH recent AS (SELECT * FROM sms_messages WHERE sent_at >= ?1)
-SELECT c.name, count(*) FROM recent r JOIN sms_containers c ON c.id = r.container_id GROUP BY c.name ORDER BY c.name`,
+WITH recent AS (SELECT * FROM whatsapp_messages WHERE sent_at >= ?1)
+SELECT c.name, count(*) FROM recent r JOIN whatsapp_containers c ON c.id = r.container_id GROUP BY c.name ORDER BY c.name`,
 		"2026-10-01T00:00:00.000Z")
 	if err != nil {
 		t.Fatal(err)
@@ -222,20 +225,51 @@ SELECT c.name, count(*) FROM recent r JOIN sms_containers c ON c.id = r.containe
 		t.Errorf("interrupt took %v", time.Since(start))
 	}
 
-	if _, err := query(t, q, `SELECT * FROM whatsapp_messages`); err == nil {
+	if _, err := query(t, q, `SELECT * FROM signal_messages`); err == nil {
 		t.Error("view for missing source exists")
 	}
 }
 
 func TestParseExposureStrict(t *testing.T) {
-	if _, err := parseExposure("[sms]\nhide_sender = [\"+1\"]\n"); err == nil || !strings.Contains(err.Error(), "unknown keys") {
-		t.Errorf("typo accepted: %v", err)
+	sources := []string{"discord", "whatsapp"}
+	for name, conf := range map[string]string{
+		"typo in key":          "[whatsapp]\nhide_sender = [\"+1\"]\n",
+		"unconfigured source":  "[whatsap]\nhide_senders = [\"+1\"]\n",
+		"removed source":       "[sms]\nhide_containers = [\"x\"]\n",
+		"top-level key":        "hide_senders = [\"+1\"]\n",
+		"invalid auth pattern": "[auth]\nextra_body_patterns = [\"(\"]\n",
+	} {
+		if _, err := parseExposure(conf, sources); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
 	}
-	if _, err := parseExposure("[auth]\nextra_body_patterns = [\"(\"]\n"); err == nil {
-		t.Error("invalid regex accepted")
+	pol, err := parseExposure(testExposure+"[auth]\nextra_sender_patterns = [\"^bank$\"]\n", sources)
+	if err != nil {
+		t.Fatalf("valid config rejected: %v", err)
 	}
-	if _, err := parseExposure(""); err != nil {
+	if got := pol.sources["discord"].HideContainers; len(got) != 1 || got[0] != "g-work" {
+		t.Errorf("discord hide_containers = %v", got)
+	}
+	if !pol.classifier.IsAuth("whatsapp", "bank", "hello") {
+		t.Error("[auth] patterns not applied")
+	}
+	if _, err := parseExposure("", nil); err != nil {
 		t.Errorf("empty config rejected: %v", err)
+	}
+}
+
+func TestSourceFlagNames(t *testing.T) {
+	for v, ok := range map[string]bool{
+		"whatsapp=/var/lib/w/data.db": true,
+		"signal-2=/x.db":              true,
+		"auth=/x.db":                  false,
+		"SMS=/x.db":                   false,
+		"../x=/x.db":                  false,
+		"whatsapp=":                   false,
+	} {
+		if err := (sourceFlag{}).Set(v); (err == nil) != ok {
+			t.Errorf("%q: err = %v, want ok=%v", v, err, ok)
+		}
 	}
 }
 
@@ -262,7 +296,7 @@ func TestHTTP(t *testing.T) {
 	if rec := do("POST", "/v1/query", "Bearer wrong", `{"sql":"SELECT 1"}`); rec.Code != http.StatusUnauthorized {
 		t.Errorf("wrong token: %d", rec.Code)
 	}
-	rec := do("POST", "/v1/query", "Bearer "+token, `{"sql":"SELECT count(*) FROM sms_messages"}`)
+	rec := do("POST", "/v1/query", "Bearer "+token, `{"sql":"SELECT count(*) FROM whatsapp_messages"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("query: %d %s", rec.Code, rec.Body)
 	}
@@ -273,13 +307,13 @@ func TestHTTP(t *testing.T) {
 	}
 
 	rec = do("GET", "/v1/schema", "Bearer "+token, "")
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"sms_messages"`) || strings.Contains(rec.Body.String(), "_hidden") {
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"whatsapp_messages"`) || strings.Contains(rec.Body.String(), "_hidden") {
 		t.Errorf("schema: %d %s", rec.Code, rec.Body)
 	}
 
 	// A broken exposure file fails closed instead of serving unfiltered data.
 	time.Sleep(10 * time.Millisecond)
-	mustDo(t, os.WriteFile(exposure, []byte("[sms]\nhide_sendrs = []\n"), 0o600))
+	mustDo(t, os.WriteFile(exposure, []byte("[whatsap]\nhide_senders = []\n"), 0o600))
 	if rec := do("POST", "/v1/query", "Bearer "+token, `{"sql":"SELECT 1"}`); rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("broken exposure: %d %s", rec.Code, rec.Body)
 	}

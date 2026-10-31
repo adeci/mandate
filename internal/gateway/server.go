@@ -11,10 +11,12 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -38,11 +40,15 @@ type Config struct {
 	Connectors map[string]string
 	// Empty disables /v1/actions.
 	ApprovalsSocket string
+	// ConsoleURL is where the owner fixes connectors; it goes into errors
+	// that ask the agent to fetch them.
+	ConsoleURL string
 	// Empty disables /v1/http.
 	HTTPProxySocket string
 }
 
-// sourceFlag parses name=path for a known source.
+// sourceFlag parses name=path. The name prefixes the source's views and
+// keys its exposure.toml section.
 type sourceFlag map[string]string
 
 func (s sourceFlag) String() string { return fmt.Sprint(map[string]string(s)) }
@@ -52,18 +58,17 @@ func (s sourceFlag) Set(v string) error {
 	if !ok || path == "" {
 		return fmt.Errorf("want name=path, got %q", v)
 	}
-	known := false
-	for _, k := range knownSources {
-		known = known || k == name
+	if !validName.MatchString(name) {
+		return fmt.Errorf("source name %q must match %s", name, validName)
 	}
-	if !known {
-		return fmt.Errorf("unknown source %q (known: %s)", name, strings.Join(knownSources, ", "))
+	if name == "auth" {
+		return errors.New(`source name "auth" is taken by the [auth] section of exposure.toml`)
 	}
 	s[name] = path
 	return nil
 }
 
-var connectorName = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+var validName = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 
 // connectorFlag parses name=socket. A connector named like a source is
 // filtered through that source's views; others have no containers to show.
@@ -76,8 +81,8 @@ func (c connectorFlag) Set(v string) error {
 	if !ok || path == "" {
 		return fmt.Errorf("want name=path, got %q", v)
 	}
-	if !connectorName.MatchString(name) {
-		return fmt.Errorf("connector name %q must match %s", name, connectorName)
+	if !validName.MatchString(name) {
+		return fmt.Errorf("connector name %q must match %s", name, validName)
 	}
 	c[name] = path
 	return nil
@@ -89,12 +94,13 @@ func Command(ctx context.Context, args []string) error {
 	fs.StringVar(&cfg.Listen, "listen", "127.0.0.1:8780", "listen address")
 	fs.StringVar(&cfg.TokenFile, "token-file", "", "file containing the bearer token (required)")
 	fs.StringVar(&cfg.ExposureFile, "exposure", "/var/lib/mandate-gateway/exposure.toml", "exposure config (missing = nothing hidden)")
-	fs.Var(sourceFlag(cfg.Sources), "source", "source database as name=path (repeatable; names: sms, whatsapp, discord)")
+	fs.Var(sourceFlag(cfg.Sources), "source", "source database as name=path (repeatable)")
 	fs.IntVar(&cfg.MaxRows, "max-rows", 5000, "maximum rows per query")
 	fs.DurationVar(&cfg.Timeout, "timeout", 5*time.Second, "maximum query execution time")
 	fs.Var(connectorFlag(cfg.Connectors), "connector", "connector socket as name=path (repeatable; a source of the same name filters it)")
 	fs.StringVar(&cfg.ApprovalsSocket, "approvals-socket", "", "approvals unit socket (enables /v1/actions)")
 	fs.StringVar(&cfg.HTTPProxySocket, "http-proxy-socket", "", "HTTP proxy socket (enables /v1/http)")
+	fs.StringVar(&cfg.ConsoleURL, "console-url", "", "console base URL, shown to agents when a connector needs the owner")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -124,8 +130,9 @@ func Serve(ctx context.Context, cfg Config) error {
 		Handler:           h,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      readTimeout + 10*time.Second,
-		IdleTimeout:       60 * time.Second,
+		// Fits the longest answer: an action long-poll plus its last fetch.
+		WriteTimeout: maxWait + callTimeout + 10*time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
@@ -154,7 +161,7 @@ func newHandler(cfg Config, token string) *handler {
 	h := &handler{
 		cfg:        cfg,
 		tokenHash:  sha256.Sum256([]byte(token)),
-		policy:     &policyLoader{path: cfg.ExposureFile},
+		policy:     &policyLoader{path: cfg.ExposureFile, sources: slices.Sorted(maps.Keys(cfg.Sources))},
 		mux:        http.NewServeMux(),
 		connectors: newConnectors(cfg.Connectors),
 	}
@@ -166,7 +173,7 @@ func newHandler(cfg Config, token string) *handler {
 	h.mux.HandleFunc("POST /v1/query", h.authed(h.query))
 	h.mux.HandleFunc("POST /v1/read/{connector}/{op}", h.authed(h.read))
 	h.mux.HandleFunc("POST /v1/actions", h.authed(h.propose))
-	h.mux.HandleFunc("GET /v1/actions/{id}", h.authed(h.action))
+	h.mux.HandleFunc("GET /v1/actions/{id}", h.authed(h.status))
 	if cfg.HTTPProxySocket != "" {
 		h.mux.HandleFunc("/v1/http/{service}/{path...}", h.authed(newHTTPProxy(cfg.HTTPProxySocket).forward))
 	} else {
@@ -214,20 +221,9 @@ func (h *handler) schema(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "describe failed")
 		return
 	}
-	usage := map[string]string{
-		"query": `POST /v1/query {"sql": "SELECT ...", "params": [...]}: one read-only SELECT over the listed views; positional params bind to ?1, ?2, ...`,
-		"read":  `POST /v1/read/{connector}/{op} {"args": {...}}: run a connector read op; fetched messages come back as rows of <connector>_messages`,
-	}
-	if h.approvals != nil {
-		usage["actions"] = `POST /v1/actions {"connector", "op", "args", "note"}: propose a write op for the owner to approve; poll GET /v1/actions/{id} for its status`
-	}
-	if h.cfg.HTTPProxySocket != "" {
-		usage["http"] = `ANY /v1/http/{service}/{path}: call an HTTP API through the proxy, which adds credentials`
-	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"views":      views,
-		"connectors": h.connectors.specs(r.Context()),
-		"usage":      usage,
+		"connectors": h.connectors.list(r.Context()),
 		"limits": map[string]any{
 			"max_rows":   h.cfg.MaxRows,
 			"timeout_ms": h.cfg.Timeout.Milliseconds(),

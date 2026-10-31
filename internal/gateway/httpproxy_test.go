@@ -33,20 +33,19 @@ func TestHTTPPassthrough(t *testing.T) {
 	socket, got := fakeHTTPProxy(t, func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/vnd.github+json")
 		w.Header().Set("Set-Cookie", "session=upstream")
-		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte(`{"number":7}`))
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"message":"Not Found"}`))
 	})
 	r := newRig(t, func(c *Config) { c.HTTPProxySocket = socket })
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/http/github/repos/a/b%2Fc/issues?per_page=5&q=x%20y", strings.NewReader(`{"title":"t"}`))
+	req := httptest.NewRequest(http.MethodGet, "/v1/http/github/repos/a/b%2Fc/issues?per_page=5&q=x%20y", nil)
 	req.Header.Set("Authorization", "Bearer "+testToken)
-	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-Forwarded-For", "10.0.0.1")
 	rec := httptest.NewRecorder()
 	r.h.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusCreated || rec.Body.String() != `{"number":7}` ||
+	if rec.Code != http.StatusNotFound || rec.Body.String() != `{"message":"Not Found"}` ||
 		rec.Header().Get("Content-Type") != "application/vnd.github+json" || rec.Header().Get("Set-Cookie") != "" {
 		t.Errorf("response: %d %v %s", rec.Code, rec.Header(), rec.Body)
 	}
@@ -55,11 +54,29 @@ func TestHTTPPassthrough(t *testing.T) {
 		t.Fatal("proxy not called")
 	}
 	want := forwarded{
-		method: http.MethodPost, path: "/forward/github/repos/a/b%2Fc/issues", query: "per_page=5&q=x%20y",
-		contentType: "application/json", accept: "application/vnd.github+json", body: `{"title":"t"}`,
+		method: http.MethodGet, path: "/forward/github/repos/a/b%2Fc/issues", query: "per_page=5&q=x%20y",
+		accept: "application/vnd.github+json",
 	}
 	if *f != want {
 		t.Errorf("forwarded %+v\nwant      %+v", *f, want)
+	}
+}
+
+func TestHTTPPassthroughRefusesWrites(t *testing.T) {
+	t.Parallel()
+	socket, got := fakeHTTPProxy(t, func(w http.ResponseWriter) {})
+	r := newRig(t, func(c *Config) { c.HTTPProxySocket = socket })
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, "PURGE"} {
+		rec := call(r.h, method, "/v1/http/github/graphql", `{"query":"mutation {}"}`)
+		if rec.Code != http.StatusMethodNotAllowed || !strings.Contains(rec.Body.String(), "mandate http "+method+" github") {
+			t.Errorf("%s: %d %s, want 405 pointing at a proposal", method, rec.Code, rec.Body)
+		}
+	}
+	if got.Load() != nil {
+		t.Fatal("a write reached the proxy")
+	}
+	if rec := call(r.h, http.MethodHead, "/v1/http/github/user", ""); rec.Code != http.StatusOK || got.Load().method != http.MethodHead {
+		t.Errorf("HEAD: %d", rec.Code)
 	}
 }
 

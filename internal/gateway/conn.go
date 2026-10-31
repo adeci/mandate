@@ -8,18 +8,18 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"math"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/ncruces/go-sqlite3"
 )
 
-var knownSources = []string{"sms", "whatsapp", "discord"}
-
 var viewDocs = map[string]string{
-	"containers": "Conversations/chats (sms, whatsapp) or guilds/channels/threads/DMs (discord). kind: dm, group, guild, channel, thread. parent_id links discord channels/threads to their guild.",
-	"messages":   "Messages, oldest seq first. seq is monotonic per source: poll with seq > :cursor for new messages. Times are UTC ISO-8601 text. body is NULL and is_auth = 1 for messages that carry login codes or links.",
+	"containers": "Chats, or guilds/channels/threads/DMs. kind: dm, group, guild, channel, thread. parent_id links channels and threads to their guild.",
+	"messages":   "Messages. seq grows in the order messages are stored, not sent: poll with seq > :cursor for new ones, ORDER BY sent_at for chronology. Times are UTC ISO-8601 text. body is NULL and is_auth = 1 for messages that carry login codes or links.",
 }
 
 // Security model: client SQL may only read public views. Each public view
@@ -64,18 +64,15 @@ func openQueryConn(sources map[string]string, pol *policy) (_ *queryConn, err er
 		return nil, err
 	}
 
-	for _, name := range knownSources {
-		path, ok := sources[name]
-		if !ok {
-			continue
-		}
+	for _, name := range slices.Sorted(maps.Keys(sources)) {
+		path := sources[name]
 		if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 			continue // ingester has not run yet
 		}
 		if err := attachReadOnly(conn, "src_"+name, path); err != nil {
 			return nil, fmt.Errorf("attach %s: %w", name, err)
 		}
-		exp := pol.exposure.source(name)
+		exp := pol.sources[name]
 		if err := insertHidden(conn, name, "container", exp.HideContainers); err != nil {
 			return nil, err
 		}
