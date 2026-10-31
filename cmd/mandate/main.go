@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/adeci/mandate/internal/admin"
+	"github.com/adeci/mandate/internal/approvals"
 	"github.com/adeci/mandate/internal/client"
 	"github.com/adeci/mandate/internal/discord"
 	"github.com/adeci/mandate/internal/exitcode"
@@ -38,6 +39,9 @@ on the host:
   messages run|pair       Google Messages (SMS/RCS)
   discord serve           Discord reader behind the gateway
   http-proxy              token-holding proxy for HTTP APIs
+  approvals               serve the approval pages and proposal API
+  approver enroll --name NAME
+                          print a one-time passkey enrollment link (as root)
   list [--senders] DB     list chat and sender IDs for exposure.toml
 `
 
@@ -79,6 +83,10 @@ func run() int {
 		err = discord.Command(ctx, args)
 	case "http-proxy":
 		err = httpproxy.Command(ctx, args)
+	case "approvals":
+		err = approvals.Command(ctx, args)
+	case "approver":
+		err = approvals.Enroll(ctx, args)
 	case "list":
 		err = admin.List(ctx, args)
 	case "-h", "--help", "help":
