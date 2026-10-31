@@ -5,6 +5,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -49,10 +50,11 @@ func (c Config) Validate() error {
 
 func main() {
 	connector.Main(func(ctx context.Context, env *connector.Env, c Config) (connector.Connector, error) {
-		// Sent as X-Discord-Timezone, so it must be a name a browser reports.
-		tz := os.Getenv("TZ")
+		// Sent as X-Discord-Timezone, so it must be a name a browser reports;
+		// unset means UTC, as everywhere else on Unix.
+		tz := cmp.Or(os.Getenv("TZ"), "UTC")
 		loc, err := time.LoadLocation(tz)
-		if tz == "" || strings.HasPrefix(tz, ":") || err != nil {
+		if strings.HasPrefix(tz, ":") || err != nil {
 			return nil, fmt.Errorf("TZ must name an IANA time zone such as Europe/Berlin, got %q", tz)
 		}
 		hours, err := c.hours(loc)
