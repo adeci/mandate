@@ -22,15 +22,18 @@ import (
 const usage = `usage: mandate <command> [args]
 
 for agents (set MANDATE_URL and MANDATE_TOKEN):
+  guide                   print the agent guide (markdown, from the live schema)
   query SQL [PARAM...]    run a read-only query
   schema                  list the views and connector ops
   read CONNECTOR OP [KEY=VALUE...]
                           run a connector read op
-  propose CONNECTOR OP [KEY=VALUE...] [--note TEXT]
-                          propose a write for the owner to approve
-  action ID               show a proposal; exits 75 while it is pending
-  http METHOD SERVICE PATH [--data JSON]
-                          call an HTTP API through the proxy
+  propose CONNECTOR OP [KEY=VALUE...] [--note TEXT] [--wait DURATION]
+                          propose a write; prints the URL to send the owner
+  status ID [--wait DURATION]
+                          show a proposal; --wait blocks until the owner decides
+  http METHOD SERVICE PATH [--data BODY] [--note TEXT] [--wait DURATION]
+                          GET/HEAD read through the proxy; other methods propose
+  exit: 0 done, 75 pending/paced/timed out, 1 rejected/expired/failed/unknown/error, 2 usage
 
 on the host:
   gateway                 serve the gateway
@@ -59,6 +62,8 @@ func run() int {
 	cmd, args := os.Args[1], os.Args[2:]
 	var err error
 	switch cmd {
+	case "guide":
+		err = client.Guide(ctx, args)
 	case "query":
 		err = client.Query(ctx, args)
 	case "schema":
@@ -67,8 +72,8 @@ func run() int {
 		err = client.Read(ctx, args)
 	case "propose":
 		err = client.Propose(ctx, args)
-	case "action":
-		err = client.Action(ctx, args)
+	case "status":
+		err = client.Status(ctx, args)
 	case "http":
 		err = client.HTTP(ctx, args)
 	case "gateway":

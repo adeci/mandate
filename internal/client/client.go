@@ -19,101 +19,77 @@ import (
 
 	"github.com/adeci/mandate/internal/connector"
 	"github.com/adeci/mandate/internal/exitcode"
-	"github.com/adeci/mandate/internal/proposal"
 )
 
 // Above the gateway's own 120 s connector read timeout, so its answer always
-// wins.
+// wins. Long-polls add their wait on top.
 const requestTimeout = 150 * time.Second
 
 const (
+	queryUsage   = "usage: mandate query SQL [PARAM...]"
+	schemaUsage  = "usage: mandate schema"
+	guideUsage   = "usage: mandate guide"
 	readUsage    = "usage: mandate read CONNECTOR OP [KEY=VALUE...]"
-	proposeUsage = "usage: mandate propose CONNECTOR OP [KEY=VALUE...] [--note TEXT]"
-	actionUsage  = "usage: mandate action ID"
-	httpUsage    = "usage: mandate http METHOD SERVICE PATH [--data JSON]"
+	proposeUsage = "usage: mandate propose CONNECTOR OP [KEY=VALUE...] [--note TEXT] [--wait DURATION]"
+	statusUsage  = "usage: mandate status ID [--wait DURATION]"
+	httpUsage    = "usage: mandate http METHOD SERVICE PATH [--data BODY] [--note TEXT] [--wait DURATION]"
 )
 
 type client struct {
-	url   string
-	token string
-	http  *http.Client
-	out   io.Writer
-	table bool
+	url    string
+	token  string
+	http   *http.Client
+	out    io.Writer
+	errOut io.Writer
+	table  bool
 }
 
 // fromEnv reads MANDATE_URL and MANDATE_TOKEN (or MANDATE_TOKEN_FILE).
-func fromEnv(getenv func(string) string, out io.Writer, table bool) (*client, error) {
+func fromEnv(getenv func(string) string, out, errOut io.Writer, table bool) (*client, error) {
 	url := strings.TrimRight(getenv("MANDATE_URL"), "/")
 	if url == "" {
-		return nil, errors.New("MANDATE_URL is not set (e.g. http://lachesis:8780)")
+		return nil, errors.New("MANDATE_URL is not set (e.g. http://lachesis:8780); ask the owner for the gateway address")
 	}
 	token := getenv("MANDATE_TOKEN")
 	if token == "" && getenv("MANDATE_TOKEN_FILE") != "" {
 		b, err := os.ReadFile(getenv("MANDATE_TOKEN_FILE"))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read MANDATE_TOKEN_FILE: %w", err)
 		}
 		token = strings.TrimSpace(string(b))
 	}
 	if token == "" {
-		return nil, errors.New("MANDATE_TOKEN or MANDATE_TOKEN_FILE is not set")
+		return nil, errors.New("MANDATE_TOKEN or MANDATE_TOKEN_FILE is not set; ask the owner to configure this agent")
 	}
-	return &client{url: url, token: token, http: &http.Client{Timeout: requestTimeout}, out: out, table: table}, nil
+	return &client{url: url, token: token, http: &http.Client{}, out: out, errOut: errOut, table: table}, nil
 }
 
 func newClient() (*client, error) {
 	fi, err := os.Stdout.Stat()
 	table := err == nil && fi.Mode()&os.ModeCharDevice != 0
-	return fromEnv(os.Getenv, os.Stdout, table)
+	return fromEnv(os.Getenv, os.Stdout, os.Stderr, table)
 }
 
 // Query runs `mandate query SQL [PARAM...]`.
-func Query(ctx context.Context, args []string) error {
-	if len(args) == 0 {
-		return errors.New("usage: mandate query SQL [PARAM...]")
-	}
-	c, err := newClient()
-	if err != nil {
-		return err
-	}
-	params := make([]any, len(args)-1)
-	for i, p := range args[1:] {
-		params[i] = p
-	}
-	return c.rows(ctx, "/v1/query", map[string]any{"sql": args[0], "params": params})
-}
+func Query(ctx context.Context, args []string) error { return run(ctx, args, (*client).query) }
 
 // Schema runs `mandate schema`.
-func Schema(ctx context.Context, args []string) error {
-	if len(args) != 0 {
-		return errors.New("usage: mandate schema")
-	}
-	c, err := newClient()
-	if err != nil {
-		return err
-	}
-	return c.schema(ctx)
-}
+func Schema(ctx context.Context, args []string) error { return run(ctx, args, (*client).schema) }
+
+// Guide runs `mandate guide`.
+func Guide(ctx context.Context, args []string) error { return run(ctx, args, (*client).guide) }
 
 // Read runs `mandate read CONNECTOR OP [KEY=VALUE...]`.
-func Read(ctx context.Context, args []string) error {
-	return run(ctx, args, (*client).read)
-}
+func Read(ctx context.Context, args []string) error { return run(ctx, args, (*client).read) }
 
-// Propose runs `mandate propose CONNECTOR OP [KEY=VALUE...] [--note TEXT]`.
-func Propose(ctx context.Context, args []string) error {
-	return run(ctx, args, (*client).propose)
-}
+// Propose runs `mandate propose CONNECTOR OP [KEY=VALUE...] [--note TEXT] [--wait DURATION]`.
+func Propose(ctx context.Context, args []string) error { return run(ctx, args, (*client).propose) }
 
-// Action runs `mandate action ID`.
-func Action(ctx context.Context, args []string) error {
-	return run(ctx, args, (*client).action)
-}
+// Status runs `mandate status ID [--wait DURATION]`.
+func Status(ctx context.Context, args []string) error { return run(ctx, args, (*client).status) }
 
-// HTTP runs `mandate http METHOD SERVICE PATH [--data JSON]`.
-func HTTP(ctx context.Context, args []string) error {
-	return run(ctx, args, (*client).passthrough)
-}
+// HTTP runs `mandate http METHOD SERVICE PATH [--data BODY] [--note TEXT] [--wait DURATION]`.
+func HTTP(ctx context.Context, args []string) error { return run(ctx, args, (*client).httpRequest) }
 
 func run(ctx context.Context, args []string, cmd func(*client, context.Context, []string) error) error {
 	c, err := newClient()
@@ -123,115 +99,43 @@ func run(ctx context.Context, args []string, cmd func(*client, context.Context, 
 	return cmd(c, ctx, args)
 }
 
+// exitError carries a message for the agent and the exit status it maps to
+// (via exitcode.For on code), without the code's own text.
+type exitError struct {
+	msg  string
+	code error
+}
+
+func (e *exitError) Error() string { return e.msg }
+func (e *exitError) Unwrap() error { return e.code }
+
+func usage(text string, err error) error {
+	if err != nil {
+		text = err.Error() + "\n" + text
+	}
+	return &exitError{msg: text, code: exitcode.ErrUsage}
+}
+
+func (c *client) query(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return usage(queryUsage, nil)
+	}
+	params := make([]any, len(args)-1)
+	for i, p := range args[1:] {
+		params[i] = p
+	}
+	return c.rows(ctx, "/v1/query", map[string]any{"sql": args[0], "params": params})
+}
+
 func (c *client) read(ctx context.Context, args []string) error {
 	if len(args) < 2 {
-		return errors.New(readUsage)
+		return usage(readUsage, nil)
 	}
 	kv, err := keyValues(args[2:])
 	if err != nil {
-		return fmt.Errorf("%w\n%s", err, readUsage)
+		return usage(readUsage, err)
 	}
 	return c.rows(ctx, "/v1/read/"+url.PathEscape(args[0])+"/"+url.PathEscape(args[1]), map[string]any{"args": kv})
-}
-
-func (c *client) propose(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("propose", flag.ContinueOnError)
-	note := fs.String("note", "", "why, shown to the owner")
-	positional, err := parseInterspersed(fs, args)
-	if err != nil {
-		return fmt.Errorf("%w\n%s", err, proposeUsage)
-	}
-	if len(positional) < 2 {
-		return errors.New(proposeUsage)
-	}
-	kv, err := keyValues(positional[2:])
-	if err != nil {
-		return fmt.Errorf("%w\n%s", err, proposeUsage)
-	}
-	var raw json.RawMessage
-	if err := c.post(ctx, "/v1/actions", proposal.Request{
-		Connector: positional[0], Op: positional[1], Args: kv, Note: *note,
-	}, &raw); err != nil {
-		return err
-	}
-	if !c.table {
-		_, err := c.out.Write(append(raw, '\n'))
-		return err
-	}
-	var p proposal.Proposal
-	if err := json.Unmarshal(raw, &p); err != nil {
-		return err
-	}
-	printProposal(c.out, p)
-	fmt.Fprintf(c.out, "waiting for the owner; check with: mandate action %s\n", p.ID)
-	return nil
-}
-
-func (c *client) action(ctx context.Context, args []string) error {
-	if len(args) != 1 {
-		return errors.New(actionUsage)
-	}
-	var raw json.RawMessage
-	if err := c.get(ctx, "/v1/actions/"+url.PathEscape(args[0]), &raw); err != nil {
-		return err
-	}
-	var p proposal.Proposal
-	if err := json.Unmarshal(raw, &p); err != nil {
-		return err
-	}
-	if c.table {
-		printProposal(c.out, p)
-	} else if _, err := c.out.Write(append(raw, '\n')); err != nil {
-		return err
-	}
-	if p.Status == proposal.Pending || p.Status == proposal.Executing {
-		return fmt.Errorf("proposal %s is %s; the owner has not decided yet, check again later: %w",
-			p.ID, p.Status, exitcode.ErrTryLater)
-	}
-	return nil
-}
-
-func printProposal(w io.Writer, p proposal.Proposal) {
-	fmt.Fprintf(w, "%s  %s  %s %s\n", p.ID, p.Status, p.Connector, p.Op)
-	for _, f := range p.Display {
-		fmt.Fprintf(w, "  %s: %s\n", f.Label, f.Value)
-	}
-	if r := p.Result; r != nil {
-		fmt.Fprintf(w, "result: %s", r.Status)
-		if r.Ref != "" {
-			fmt.Fprintf(w, " ref=%s", r.Ref)
-		}
-		if r.Detail != "" {
-			fmt.Fprintf(w, " (%s)", r.Detail)
-		}
-		fmt.Fprintln(w)
-	}
-}
-
-func (c *client) passthrough(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("http", flag.ContinueOnError)
-	data := fs.String("data", "", "JSON request body")
-	positional, err := parseInterspersed(fs, args)
-	if err != nil {
-		return fmt.Errorf("%w\n%s", err, httpUsage)
-	}
-	if len(positional) != 3 {
-		return errors.New(httpUsage)
-	}
-	var body []byte
-	if *data != "" {
-		if !json.Valid([]byte(*data)) {
-			return errors.New("--data is not valid JSON")
-		}
-		body = []byte(*data)
-	}
-	method, service, path := strings.ToUpper(positional[0]), positional[1], strings.TrimPrefix(positional[2], "/")
-	out, err := c.send(ctx, method, "/v1/http/"+url.PathEscape(service)+"/"+path, body)
-	if err != nil {
-		return err
-	}
-	_, err = c.out.Write(out)
-	return err
 }
 
 // keyValues parses KEY=VALUE args; values may contain '='.
@@ -328,7 +232,25 @@ func cell(v any) string {
 	}
 }
 
-func (c *client) schema(ctx context.Context) error {
+type schemaInfo struct {
+	Views []struct {
+		Name        string   `json:"name"`
+		Description string   `json:"description"`
+		Columns     []string `json:"columns"`
+	} `json:"views"`
+	Connectors []struct {
+		connector.Spec
+		Health connector.Health `json:"health"`
+	} `json:"connectors"`
+	Limits struct {
+		MaxRows int `json:"max_rows"`
+	} `json:"limits"`
+}
+
+func (c *client) schema(ctx context.Context, args []string) error {
+	if len(args) != 0 {
+		return usage(schemaUsage, nil)
+	}
 	var raw json.RawMessage
 	if err := c.get(ctx, "/v1/schema", &raw); err != nil {
 		return err
@@ -337,14 +259,7 @@ func (c *client) schema(ctx context.Context) error {
 		_, err := c.out.Write(append(raw, '\n'))
 		return err
 	}
-	var s struct {
-		Views []struct {
-			Name        string   `json:"name"`
-			Description string   `json:"description"`
-			Columns     []string `json:"columns"`
-		} `json:"views"`
-		Connectors []connector.Spec `json:"connectors"`
-	}
+	var s schemaInfo
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return err
 	}
@@ -352,34 +267,11 @@ func (c *client) schema(ctx context.Context) error {
 		fmt.Fprintf(c.out, "%s (%s)\n  %s\n\n", v.Name, strings.Join(v.Columns, ", "), v.Description)
 	}
 	for _, spec := range s.Connectors {
-		fmt.Fprintf(c.out, "connector %s\n", spec.Name)
+		fmt.Fprintf(c.out, "connector %s: %s\n", spec.Name, health(spec.Health))
 		for _, op := range spec.Ops {
-			verb := "read"
-			if op.Kind == connector.Write {
-				verb = "propose"
-			}
-			fmt.Fprintf(c.out, "  mandate %s %s %s", verb, spec.Name, op.Name)
+			fmt.Fprintf(c.out, "  %s\n    %s\n", opUsage(spec.Name, op), op.Summary)
 			for _, p := range op.Params {
-				if p.Required {
-					fmt.Fprintf(c.out, " %s=...", p.Name)
-				} else {
-					fmt.Fprintf(c.out, " [%s=...]", p.Name)
-				}
-			}
-			fmt.Fprintf(c.out, "\n    %s\n", op.Summary)
-			for _, p := range op.Params {
-				var tags []string
-				if p.Container {
-					tags = append(tags, "container")
-				}
-				if p.Editable {
-					tags = append(tags, "owner may edit")
-				}
-				suffix := ""
-				if len(tags) > 0 {
-					suffix = " (" + strings.Join(tags, ", ") + ")"
-				}
-				fmt.Fprintf(c.out, "    %s: %s%s\n", p.Name, p.Doc, suffix)
+				fmt.Fprintf(c.out, "    %s: %s%s\n", p.Name, p.Doc, paramTags(p))
 			}
 		}
 		fmt.Fprintln(c.out)
@@ -387,8 +279,57 @@ func (c *client) schema(ctx context.Context) error {
 	return nil
 }
 
+func opUsage(name string, op connector.Op) string {
+	verb := "read"
+	if op.Kind == connector.Write {
+		verb = "propose"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "mandate %s %s %s", verb, name, op.Name)
+	for _, p := range op.Params {
+		if p.Required {
+			fmt.Fprintf(&b, " %s=...", p.Name)
+		} else {
+			fmt.Fprintf(&b, " [%s=...]", p.Name)
+		}
+	}
+	return b.String()
+}
+
+func paramTags(p connector.Param) string {
+	var tags []string
+	if p.Container {
+		tags = append(tags, "container")
+	}
+	if p.Editable {
+		tags = append(tags, "owner may edit")
+	}
+	if len(tags) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(tags, ", ") + ")"
+}
+
+func health(h connector.Health) string {
+	s := string(h.State)
+	switch h.State {
+	case connector.Healthy:
+		return s
+	case connector.Resting:
+		if !h.Until.IsZero() {
+			s += " until " + h.Until.UTC().Format(time.RFC3339)
+		}
+	default:
+		s = "needs the owner (" + s + ")"
+	}
+	if h.Detail != "" {
+		s += ": " + h.Detail
+	}
+	return s
+}
+
 func (c *client) get(ctx context.Context, path string, out any) error {
-	data, err := c.send(ctx, http.MethodGet, path, nil)
+	data, err := c.send(ctx, requestTimeout, http.MethodGet, path, nil)
 	if err != nil {
 		return err
 	}
@@ -400,7 +341,7 @@ func (c *client) post(ctx context.Context, path string, body, out any) error {
 	if err != nil {
 		return err
 	}
-	data, err := c.send(ctx, http.MethodPost, path, b)
+	data, err := c.send(ctx, requestTimeout, http.MethodPost, path, b)
 	if err != nil {
 		return err
 	}
@@ -408,8 +349,10 @@ func (c *client) post(ctx context.Context, path string, body, out any) error {
 }
 
 // send returns the body of a 2xx response; anything else is an error carrying
-// the gateway's message, wrapping ErrTryLater on 429.
-func (c *client) send(ctx context.Context, method, path string, body []byte) ([]byte, error) {
+// the gateway's message, mapped to exit 75 on 429.
+func (c *client) send(ctx context.Context, timeout time.Duration, method, path string, body []byte) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	var rd io.Reader
 	if body != nil {
 		rd = bytes.NewReader(body)
@@ -424,7 +367,7 @@ func (c *client) send(ctx context.Context, method, path string, body []byte) ([]
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w; check MANDATE_URL, and tell the owner if the gateway stays unreachable", err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
@@ -441,9 +384,14 @@ func (c *client) send(ctx context.Context, method, path string, body []byte) ([]
 	if json.Unmarshal(data, &e) != nil || e.Error == "" {
 		e.Error = strings.TrimSpace(string(data))
 	}
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, fmt.Errorf("%s; retry in %s: %w", e.Error,
-			time.Duration(e.RetryAfterSeconds)*time.Second, exitcode.ErrTryLater)
+	switch resp.StatusCode {
+	case http.StatusTooManyRequests:
+		return nil, &exitError{
+			msg:  fmt.Sprintf("%s; retry in %s", e.Error, time.Duration(e.RetryAfterSeconds)*time.Second),
+			code: exitcode.ErrTryLater,
+		}
+	case http.StatusUnauthorized:
+		return nil, errors.New("the gateway refused the token; ask the owner to check MANDATE_TOKEN")
 	}
 	return nil, fmt.Errorf("%s (HTTP %d)", e.Error, resp.StatusCode)
 }

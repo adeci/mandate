@@ -8,8 +8,11 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/adeci/mandate/internal/exitcode"
 )
@@ -40,7 +43,7 @@ func testClient(t *testing.T, url string, table bool) (*client, *bytes.Buffer) {
 	t.Helper()
 	var out bytes.Buffer
 	env := map[string]string{"MANDATE_URL": url + "/", "MANDATE_TOKEN": "secret"}
-	c, err := fromEnv(func(k string) string { return env[k] }, &out, table)
+	c, err := fromEnv(func(k string) string { return env[k] }, &out, io.Discard, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,19 +98,31 @@ func TestRequests(t *testing.T) {
 			body:  `{"connector":"whatsapp","op":"send","args":{"text":"running late","to":"Farid"},"note":"Alex asked"}`,
 			ctype: "application/json",
 		},
-		"action": {
-			cmd:  (*client).action,
+		"status": {
+			cmd:  (*client).status,
 			args: []string{"p1"}, method: "GET", path: "/v1/actions/p1",
 		},
-		"http with data": {
-			cmd:    (*client).passthrough,
-			args:   []string{"post", "github", "/repos/a/b/issues?x=1", "--data", `{"title":"t"}`},
-			method: "POST", path: "/v1/http/github/repos/a/b/issues", query: "x=1",
-			body: `{"title":"t"}`, ctype: "application/json",
+		"http get reads through the passthrough": {
+			cmd:  (*client).httpRequest,
+			args: []string{"get", "github", "/repos/a/b/issues?state=open"}, method: "GET", path: "/v1/http/github/repos/a/b/issues", query: "state=open",
 		},
-		"http get has no body": {
-			cmd:  (*client).passthrough,
-			args: []string{"GET", "github", "user"}, method: "GET", path: "/v1/http/github/user",
+		"http head reads too": {
+			cmd:  (*client).httpRequest,
+			args: []string{"HEAD", "github", "user"}, method: "HEAD", path: "/v1/http/github/user",
+		},
+		"http post becomes a proposal": {
+			cmd:    (*client).httpRequest,
+			args:   []string{"post", "github", "repos/a/b/issues", "--data", `{"title":"t"}`, "--note", "bug report"},
+			method: "POST", path: "/v1/actions",
+			body:  `{"connector":"http","op":"request","args":{"body":"{\"title\":\"t\"}","method":"POST","path":"/repos/a/b/issues","service":"github"},"note":"bug report"}`,
+			ctype: "application/json",
+		},
+		"http delete without body": {
+			cmd:    (*client).httpRequest,
+			args:   []string{"DELETE", "github", "/repos/a/b/labels/x"},
+			method: "POST", path: "/v1/actions",
+			body:  `{"connector":"http","op":"request","args":{"method":"DELETE","path":"/repos/a/b/labels/x","service":"github"}}`,
+			ctype: "application/json",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -126,40 +141,131 @@ func TestRequests(t *testing.T) {
 	}
 }
 
-func TestProposePrintsIDAndStatus(t *testing.T) {
+func TestProposePrintsURL(t *testing.T) {
 	t.Parallel()
-	srv, _ := gateway(t, http.StatusAccepted,
-		`{"id":"p1","connector":"whatsapp","op":"send","status":"pending","display":[{"label":"To","value":"Farid"}]}`)
+	const reply = `{"id":"p1","connector":"whatsapp","op":"send","status":"pending","display":[{"label":"To","value":"Farid"}],"url":"https://console/p/p1"}`
+	srv, _ := gateway(t, http.StatusAccepted, reply)
 	c, out := testClient(t, srv.URL, true)
 	if err := c.propose(t.Context(), []string{"whatsapp", "send", "to=Farid"}); err != nil {
 		t.Fatalf("propose: %v (exit %d)", err, exitcode.For(err))
 	}
-	if s := out.String(); !strings.HasPrefix(s, "p1  pending  whatsapp send\n  To: Farid\n") || !strings.Contains(s, "mandate action p1") {
+	if s := out.String(); !strings.HasPrefix(s, "p1  pending  whatsapp send\n  To: Farid\n") ||
+		!strings.Contains(s, "https://console/p/p1") || !strings.Contains(s, "mandate status p1 --wait") {
 		t.Errorf("output:\n%s", s)
+	}
+
+	c, out = testClient(t, srv.URL, false)
+	if err := c.propose(t.Context(), []string{"whatsapp", "send", "to=Farid"}); err != nil {
+		t.Fatalf("piped propose: %v", err)
+	}
+	if strings.TrimSpace(out.String()) != reply {
+		t.Errorf("piped output is not the proposal JSON: %s", out)
 	}
 }
 
-func TestActionExitCodes(t *testing.T) {
+// actions fakes the gateway's proposal endpoints: POST answers pending, and
+// GET answers pending until decided after `after` GETs. A pending long-poll
+// times out after 1 s whatever its wait.
+type actions struct {
+	mu      sync.Mutex
+	decided string
+	after   int
+	gets    int
+	waits   []string
+}
+
+func (a *actions) serve(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusAccepted)
+			w.Write([]byte(`{"id":"p1","status":"pending","url":"https://console/p/p1"}`))
+			return
+		}
+		a.mu.Lock()
+		a.gets++
+		a.waits = append(a.waits, r.URL.Query().Get("wait"))
+		status := "pending"
+		if a.decided != "" && a.gets > a.after {
+			status = a.decided
+		}
+		a.mu.Unlock()
+		if status == "pending" {
+			if n, _ := strconv.Atoi(r.URL.Query().Get("wait")); n > 0 {
+				time.Sleep(time.Second)
+			}
+		}
+		w.Write([]byte(`{"id":"p1","status":"` + status + `","url":"https://console/p/p1","result":{"status":"done","ref":"m9","detail":"boom"}}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func TestStatusExitCodes(t *testing.T) {
 	t.Parallel()
-	for status, want := range map[string]int{
-		"pending":   exitcode.TryLater,
-		"executing": exitcode.TryLater,
-		"done":      0,
-		"unknown":   0,
-		"rejected":  0,
+	for status, want := range map[string]struct {
+		exit int
+		msg  string
+	}{
+		"pending":   {exitcode.TryLater, "https://console/p/p1"},
+		"executing": {exitcode.TryLater, "mandate status p1 --wait"},
+		"done":      {0, ""},
+		"rejected":  {1, "rejected by the owner; don't retry unless they ask"},
+		"expired":   {1, "expired"},
+		"failed":    {1, "failed: boom"},
+		"unknown":   {1, "may have been sent: boom; never retry automatically"},
 	} {
-		srv, _ := gateway(t, http.StatusOK, `{"id":"p1","status":"`+status+`","result":{"status":"done","ref":"m9"}}`)
-		c, out := testClient(t, srv.URL, true)
-		err := c.action(t.Context(), []string{"p1"})
-		if exitcode.For(err) != want {
-			t.Errorf("%s: exit %d (%v), want %d", status, exitcode.For(err), err, want)
+		a := &actions{decided: status}
+		c, out := testClient(t, a.serve(t), false)
+		err := c.status(t.Context(), []string{"p1"})
+		if exitcode.For(err) != want.exit || (err != nil && !strings.Contains(err.Error(), want.msg)) {
+			t.Errorf("%s: exit %d (%v), want %d %q", status, exitcode.For(err), err, want.exit, want.msg)
 		}
-		if want != 0 && !strings.Contains(err.Error(), "proposal p1 is "+status) {
-			t.Errorf("%s: unclear message %q", status, err)
-		}
-		if !strings.Contains(out.String(), "p1  "+status) || !strings.Contains(out.String(), "ref=m9") {
+		if !strings.Contains(out.String(), `"status":"`+status+`"`) {
 			t.Errorf("%s: output %q", status, out)
 		}
+	}
+}
+
+func TestWaitBlocksUntilDecided(t *testing.T) {
+	t.Parallel()
+	a := &actions{decided: "done", after: 1}
+	c, out := testClient(t, a.serve(t), false)
+	// The first long-poll runs out at the fake's 1 s; the next sees the decision.
+	if err := c.propose(t.Context(), []string{"whatsapp", "send", "to=Farid", "--wait", "1h"}); err != nil {
+		t.Fatalf("propose --wait: %v", err)
+	}
+	if lines := strings.Split(strings.TrimSpace(out.String()), "\n"); len(lines) != 2 ||
+		!strings.Contains(lines[0], `"url":"https://console/p/p1"`) || !strings.Contains(lines[1], `"status":"done"`) {
+		t.Errorf("output: %s", out)
+	}
+	a.mu.Lock()
+	if a.waits[0] != "900" {
+		t.Errorf("first long-poll wait=%s, want the 900 s cap", a.waits[0])
+	}
+	a.mu.Unlock()
+
+	a = &actions{decided: "rejected", after: 0}
+	c, _ = testClient(t, a.serve(t), false)
+	if err := c.status(t.Context(), []string{"p1", "--wait", "15m"}); exitcode.For(err) != 1 {
+		t.Errorf("rejected while waiting: exit %d (%v)", exitcode.For(err), err)
+	}
+}
+
+func TestWaitTimesOut(t *testing.T) {
+	t.Parallel()
+	a := &actions{}
+	c, out := testClient(t, a.serve(t), false)
+	start := time.Now()
+	err := c.httpRequest(t.Context(), []string{"POST", "github", "/repos/a/b/issues", "--data", "{}", "--wait", "1500ms"})
+	if exitcode.For(err) != exitcode.TryLater || !strings.Contains(err.Error(), "still pending after 1.5s") {
+		t.Errorf("timeout: exit %d (%v)", exitcode.For(err), err)
+	}
+	if d := time.Since(start); d < 1500*time.Millisecond || d > 5*time.Second {
+		t.Errorf("--wait 1500ms returned after %v", d)
+	}
+	if n := strings.Count(out.String(), `"status":"pending"`); n != 2 {
+		t.Errorf("output: %s, want the proposal then its final state", out)
 	}
 }
 
@@ -168,7 +274,7 @@ func TestErrors(t *testing.T) {
 	srv, _ := gateway(t, http.StatusTooManyRequests, `{"error":"daily budget used","retry_after_seconds":3600}`)
 	c, _ := testClient(t, srv.URL, false)
 	err := c.read(t.Context(), []string{"discord", "fetch", "channel_id=456"})
-	if exitcode.For(err) != exitcode.TryLater || !strings.Contains(err.Error(), "retry in 1h0m0s") {
+	if exitcode.For(err) != exitcode.TryLater || err.Error() != "daily budget used; retry in 1h0m0s" {
 		t.Errorf("429: %v (exit %d)", err, exitcode.For(err))
 	}
 
@@ -182,14 +288,16 @@ func TestErrors(t *testing.T) {
 	srv, rec := gateway(t, http.StatusOK, `{}`)
 	c, _ = testClient(t, srv.URL, false)
 	for name, err := range map[string]error{
-		"read without op":     c.read(t.Context(), []string{"discord"}),
-		"arg without =":       c.read(t.Context(), []string{"discord", "fetch", "456"}),
-		"duplicate arg":       c.propose(t.Context(), []string{"whatsapp", "send", "to=a", "to=b"}),
-		"action without id":   c.action(t.Context(), nil),
-		"http missing path":   c.passthrough(t.Context(), []string{"GET", "github"}),
-		"http invalid --data": c.passthrough(t.Context(), []string{"POST", "github", "x", "--data", "{"}),
+		"read without op":      c.read(t.Context(), []string{"discord"}),
+		"arg without =":        c.read(t.Context(), []string{"discord", "fetch", "456"}),
+		"duplicate arg":        c.propose(t.Context(), []string{"whatsapp", "send", "to=a", "to=b"}),
+		"bad --wait":           c.propose(t.Context(), []string{"whatsapp", "send", "to=a", "--wait", "15"}),
+		"status without id":    c.status(t.Context(), nil),
+		"http missing path":    c.httpRequest(t.Context(), []string{"GET", "github"}),
+		"http get with --data": c.httpRequest(t.Context(), []string{"GET", "github", "x", "--data", "{}"}),
+		"query without sql":    c.query(t.Context(), nil),
 	} {
-		if exitcode.For(err) != 1 {
+		if exitcode.For(err) != exitcode.Usage {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
@@ -208,7 +316,7 @@ func TestSchemaListsConnectorOps(t *testing.T) {
 			{"name":"chat","doc":"chat ID","required":true,"container":true},
 			{"name":"count","doc":"how many"}]}]}]}`)
 	c, out := testClient(t, srv.URL, true)
-	if err := c.schema(t.Context()); err != nil {
+	if err := c.schema(t.Context(), nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
@@ -223,19 +331,63 @@ func TestSchemaListsConnectorOps(t *testing.T) {
 	}
 }
 
+func TestGuideFromSchema(t *testing.T) {
+	t.Parallel()
+	srv, rec := gateway(t, http.StatusOK, `{
+		"views":[{"name":"whatsapp_messages","description":"Messages. seq grows.","columns":["seq","container_name","sender_name","body"]},
+			{"name":"whatsapp_containers","description":"Chats.","columns":["id","name"]}],
+		"connectors":[
+			{"name":"whatsapp","health":{"state":"setup","detail":"not linked"},"ops":[
+				{"name":"send","kind":"write","summary":"Send a message","params":[
+					{"name":"to","doc":"chat or contact","required":true,"container":true},
+					{"name":"text","doc":"message text","required":true,"editable":true}]}]},
+			{"name":"http","health":{"state":"ok"},"doc":"Reads allowed: GET /repos/adeci/*","ops":[
+				{"name":"request","kind":"write","summary":"Call an API","params":[{"name":"service","doc":"one of: github","required":true}]}]}],
+		"limits":{"max_rows":5000}}`)
+	c, out := testClient(t, srv.URL, false)
+	if err := c.guide(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if rec.path != "/v1/schema" {
+		t.Errorf("guide fetched %s", rec.path)
+	}
+	for _, want := range []string{
+		"`whatsapp_messages`: Messages. seq grows.\n  Columns: seq, container_name, sender_name, body",
+		"FROM whatsapp_messages WHERE body LIKE ?1",
+		"FROM whatsapp_containers",
+		"### whatsapp (needs the owner (setup): not linked)",
+		"`mandate propose whatsapp send to=... text=...`: Send a message",
+		"  - text: message text (owner may edit)",
+		"Reads allowed: GET /repos/adeci/*",
+		"`mandate http GET SERVICE PATH`",
+		"never ask the owner for passwords",
+		"send the owner the proposal's url",
+		"- 75: ",
+		"- 1: rejected",
+		"- 2: ",
+	} {
+		if !strings.Contains(strings.ToLower(out.String()), strings.ToLower(want)) {
+			t.Errorf("guide lacks %q", want)
+		}
+	}
+	if t.Failed() {
+		t.Log(out)
+	}
+}
+
 func TestFromEnv(t *testing.T) {
 	t.Parallel()
 	for name, env := range map[string]map[string]string{
 		"no url":   {"MANDATE_TOKEN": "x"},
 		"no token": {"MANDATE_URL": "http://x"},
 	} {
-		if _, err := fromEnv(func(k string) string { return env[k] }, nil, false); err == nil {
+		if _, err := fromEnv(func(k string) string { return env[k] }, nil, nil, false); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
 	_, err := fromEnv(func(k string) string {
 		return map[string]string{"MANDATE_URL": "http://x", "MANDATE_TOKEN_FILE": "/nonexistent"}[k]
-	}, nil, false)
+	}, nil, nil, false)
 	if !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("missing token file: %v", err)
 	}
