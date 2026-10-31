@@ -23,9 +23,14 @@ const usage = `usage: mandate <command> [args]
 
 for agents (set MANDATE_URL and MANDATE_TOKEN):
   query SQL [PARAM...]    run a read-only query
-  schema                  list the views you can query
-  discord sync|search|fetch
-                          read Discord on demand
+  schema                  list the views and connector ops
+  read CONNECTOR OP [KEY=VALUE...]
+                          run a connector read op
+  propose CONNECTOR OP [KEY=VALUE...] [--note TEXT]
+                          propose a write for the owner to approve
+  action ID               show a proposal; exits 75 while it is pending
+  http METHOD SERVICE PATH [--data JSON]
+                          call an HTTP API through the proxy
 
 on the host:
   gateway                 serve the gateway
@@ -56,6 +61,14 @@ func run() int {
 		err = client.Query(ctx, args)
 	case "schema":
 		err = client.Schema(ctx, args)
+	case "read":
+		err = client.Read(ctx, args)
+	case "propose":
+		err = client.Propose(ctx, args)
+	case "action":
+		err = client.Action(ctx, args)
+	case "http":
+		err = client.HTTP(ctx, args)
 	case "gateway":
 		err = gateway.Command(ctx, args)
 	case "whatsapp":
@@ -63,11 +76,7 @@ func run() int {
 	case "messages":
 		err = gmessages.Command(ctx, args)
 	case "discord":
-		if len(args) > 0 && args[0] == "serve" {
-			err = discord.Command(ctx, args)
-		} else {
-			err = client.Discord(ctx, args)
-		}
+		err = discord.Command(ctx, args)
 	case "http-proxy":
 		err = httpproxy.Command(ctx, args)
 	case "list":
