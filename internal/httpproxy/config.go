@@ -100,6 +100,7 @@ type service struct {
 	value  string
 	reads  []pattern
 	writes []pattern
+	rules  Service
 }
 
 func compile(s Service) (*service, error) {
@@ -129,8 +130,13 @@ func compile(s Service) (*service, error) {
 	if len(s.Reads)+len(s.Writes) == 0 {
 		return nil, fail("no reads or writes")
 	}
-	svc := &service{name: s.Name, base: base, header: t.Header, prefix: t.Prefix, file: t.File}
+	svc := &service{name: s.Name, base: base, header: t.Header, prefix: t.Prefix, file: t.File, rules: s}
 	for _, r := range s.Reads {
+		// Reads run with the token and no approval, so they must not be able
+		// to change anything; a POST (GraphQL included) can.
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			return nil, fail("reads: method %q is not allowed, reads are GET or HEAD only; use writes", r.Method)
+		}
 		p, err := compilePattern(r)
 		if err != nil {
 			return nil, fail("reads: %v", err)

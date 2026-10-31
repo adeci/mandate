@@ -21,7 +21,7 @@ func svc(name, base, token, reads, writes string) string {
 		token = `{"header":"Authorization","prefix":"Bearer ","file":"github"}`
 	}
 	if reads == "" {
-		reads = `[{"method":"GET","path":"/repos/*/*/issues"},{"method":"POST","path":"/graphql"}]`
+		reads = `[{"method":"GET","path":"/repos/*/*/issues"},{"method":"HEAD","path":"/repos/*/*/issues"}]`
 	}
 	if writes == "" {
 		writes = `[{"method":"POST","path":"/repos/*/*/issues"}]`
@@ -76,6 +76,8 @@ func TestParseConfig(t *testing.T) {
 		"dot in rule":       "[" + svc("", "", "", "", `[{"method":"POST","path":"/repos/../admin"}]`) + "]",
 		"relative rule":     "[" + svc("", "", "", `[{"method":"GET","path":"repos"}]`, "") + "]",
 		"empty segment":     "[" + svc("", "", "", `[{"method":"GET","path":"/repos//x"}]`, "") + "]",
+		"post read":         "[" + svc("", "", "", `[{"method":"POST","path":"/graphql"}]`, "") + "]",
+		"delete read":       "[" + svc("", "", "", `[{"method":"DELETE","path":"/repos/*/*"}]`, "") + "]",
 	}
 	for name, c := range invalid {
 		if _, err := ParseConfig([]byte(c)); err == nil {

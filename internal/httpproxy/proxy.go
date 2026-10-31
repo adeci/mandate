@@ -24,17 +24,12 @@ import (
 )
 
 const (
-	maxRequest  = 1 << 20
 	maxResponse = 10 << 20
-	maxDetail   = 512
-	// detailRead must exceed maxDetail by more than the longest token: a
-	// token cut off at the read limit is only partly scrubbed, and that
-	// part has to fall outside the Detail that is kept.
-	detailRead = 64 << 10
-	minToken   = 16
-	maxToken   = 4096
-	timeout    = 60 * time.Second
-	redacted   = "[redacted]"
+	maxOutput   = 64 << 10
+	minToken    = 16
+	maxToken    = 4096
+	timeout     = 60 * time.Second
+	redacted    = "[redacted]"
 )
 
 // Proxy serves reads and approved writes for the configured services.
@@ -130,10 +125,6 @@ func (p *Proxy) scrub(b []byte) []byte {
 
 func (p *Proxy) scrubString(s string) string { return string(p.scrub([]byte(s))) }
 
-func (p *Proxy) leaks(s string) bool {
-	return slices.ContainsFunc(p.secrets, func(b []byte) bool { return strings.Contains(s, string(b)) })
-}
-
 // target is the upstream URL for a normalized path below the service's base.
 func (s *service) target(path string, segs []string, rawQuery string) string {
 	u := *s.base
@@ -159,13 +150,13 @@ func (p *Proxy) Handler(srv *connector.Server) http.Handler {
 	})
 }
 
-// Response headers that describe the upstream connection or session rather
-// than the resource.
-var dropResponse = map[string]bool{
-	"Set-Cookie": true, "Set-Cookie2": true,
-	"Connection": true, "Keep-Alive": true, "Proxy-Authenticate": true, "Proxy-Connection": true,
-	"Te": true, "Trailer": true, "Transfer-Encoding": true, "Upgrade": true,
-	"Content-Length": true,
+// Response headers an agent needs to page, cache and back off; every other
+// upstream header is dropped.
+var passResponse = []string{"Content-Type", "Location", "Link", "Etag", "Last-Modified", "Retry-After"}
+
+func passHeader(k string) bool {
+	return slices.Contains(passResponse, k) ||
+		strings.HasPrefix(k, "X-Ratelimit-") || strings.HasPrefix(k, "Ratelimit-") || k == "Ratelimit"
 }
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, rest string) {
@@ -184,19 +175,14 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, rest string) {
 		writeErr(w, http.StatusForbidden, fmt.Sprintf("%s %s is not an allowed read for %s", r.Method, canon, svc.name))
 		return
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequest))
-	if err != nil {
-		writeErr(w, http.StatusRequestEntityTooLarge, "request body is too large")
-		return
-	}
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, svc.target(canon, segs, r.URL.RawQuery), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, svc.target(canon, segs, r.URL.RawQuery), nil)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	// Only these come from the agent; Authorization, Cookie, Host,
 	// X-Forwarded-* and the rest never reach the upstream.
-	for _, h := range []string{"Accept", "Content-Type"} {
+	for _, h := range []string{"Accept", "If-None-Match", "If-Modified-Since"} {
 		if v := r.Header.Values(h); len(v) > 0 {
 			req.Header[h] = v
 		}
@@ -229,7 +215,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, rest string) {
 	}
 	out = p.scrub(out)
 	for k, vs := range resp.Header {
-		if dropResponse[k] || k == "Content-Encoding" || p.leaks(k) {
+		if !passHeader(k) {
 			continue
 		}
 		for _, v := range vs {
@@ -251,7 +237,7 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 const opRequest = "request"
 
 func (p *Proxy) Spec() connector.Spec {
-	return connector.Spec{Name: "http", Ops: []connector.Op{{
+	return connector.Spec{Name: "http", Doc: p.doc(), Ops: []connector.Op{{
 		Name:    opRequest,
 		Kind:    connector.Write,
 		Summary: "Send an HTTP request to a configured API with its stored token",
@@ -262,6 +248,28 @@ func (p *Proxy) Spec() connector.Spec {
 			{Name: "body", Doc: "request body; JSON is sent as application/json, anything else as text/plain", Editable: true},
 		},
 	}}}
+}
+
+func (p *Proxy) doc() string {
+	var b strings.Builder
+	b.WriteString("Reads: `mandate http GET <service> <path>`. Writes are proposals of the `request` op that the owner approves.\n")
+	for _, name := range p.names {
+		s := p.services[name]
+		fmt.Fprintf(&b, "\n## %s (%s)\n", name, s.base.Host)
+		for _, set := range []struct {
+			title string
+			rules []Rule
+		}{{"Reads", s.rules.Reads}, {"Writes", s.rules.Writes}} {
+			if len(set.rules) == 0 {
+				continue
+			}
+			fmt.Fprintf(&b, "%s:\n", set.title)
+			for _, r := range set.rules {
+				fmt.Fprintf(&b, "- `%s %s`\n", r.Method, r.Path)
+			}
+		}
+	}
+	return b.String()
 }
 
 type write struct {
@@ -374,20 +382,29 @@ func (p *Proxy) Execute(ctx context.Context, rec approval.Record) connector.Resu
 		return connector.Result{Status: status, Detail: msg}
 	}
 	defer resp.Body.Close()
-	out, _ := io.ReadAll(io.LimitReader(resp.Body, detailRead))
-	detail := resp.Status
-	if s := truncate(p.scrubString(string(out)), maxDetail); s != "" {
-		detail += ": " + s
+	// Scrub the whole body before cutting it, so no partial token survives
+	// at the cut.
+	out, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponse))
+	status := connector.Unknown
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		status = connector.Done
+	case resp.StatusCode >= 400 && resp.StatusCode < 500:
+		status = connector.Failed
 	}
-	log.Info("write sent", "status", resp.StatusCode)
-	return connector.Result{Status: connector.Done, Ref: strconv.Itoa(resp.StatusCode), Detail: detail}
+	log.Info("write sent", "status", resp.StatusCode, "result", status)
+	return connector.Result{
+		Status: status,
+		Ref:    strconv.Itoa(resp.StatusCode),
+		Detail: p.scrubString(resp.Status),
+		Output: truncate(string(p.scrub(out)), maxOutput),
+	}
 }
 
 func truncate(s string, n int) string {
-	s = strings.TrimSpace(s)
 	if len(s) <= n {
 		return s
 	}
 	// Drops a rune cut in half at n.
-	return strings.ToValidUTF8(s[:n], "") + "…"
+	return strings.ToValidUTF8(s[:n], "") + fmt.Sprintf("\n[truncated: %d of %d bytes shown]", n, len(s))
 }

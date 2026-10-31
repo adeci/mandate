@@ -67,6 +67,11 @@ func echo(w http.ResponseWriter, r *http.Request) {
 	auth := r.Header.Get("Authorization")
 	w.Header().Set("Set-Cookie", "session=abc; HttpOnly")
 	w.Header().Set("X-Echo", auth)
+	w.Header().Set("Link", "<https://up/x?access_token="+url.QueryEscape(strings.TrimPrefix(auth, "Bearer "))+`>; rel="next"`)
+	w.Header().Set("Etag", `"v2"`)
+	w.Header().Set("X-Ratelimit-Remaining", "42")
+	w.Header().Set("Ratelimit-Policy", "100;w=60")
+	w.Header().Set("Retry-After", "5")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	fmt.Fprintf(w, `{"auth":%q,"escaped":%q,"query":"%s"}`, auth, auth, url.QueryEscape(auth))
@@ -89,7 +94,7 @@ func start(t *testing.T, h http.HandlerFunc) *harness {
 	}
 	services, err := ParseConfig([]byte(`[{"name":"github","base_url":"` + up.URL + `",
 		"token":{"header":"Authorization","prefix":"Bearer ","file":"github"},
-		"reads":[{"method":"GET","path":"/repos/*/*/issues"},{"method":"POST","path":"/graphql"}],
+		"reads":[{"method":"GET","path":"/repos/*/*/issues"}],
 		"writes":[{"method":"POST","path":"/repos/*/*/issues"}]}]`))
 	if err != nil {
 		t.Fatal(err)
@@ -178,7 +183,7 @@ func TestForwardInjectsTokenAndStripsAgentHeaders(t *testing.T) {
 		"Forwarded":           "for=10.0.0.1",
 		"X-Real-Ip":           "10.0.0.1",
 		"Accept":              "application/vnd.github+json",
-		"Content-Type":        "application/json",
+		"If-None-Match":       `"v1"`,
 		"Accept-Encoding":     "br",
 	}, "")
 	if resp.StatusCode != http.StatusCreated {
@@ -203,20 +208,29 @@ func TestForwardInjectsTokenAndStripsAgentHeaders(t *testing.T) {
 			t.Errorf("upstream got %s: %s", k, v)
 		}
 	}
-	if got.header.Get("Accept") != "application/vnd.github+json" || got.header.Get("Content-Type") != "application/json" {
-		t.Errorf("Accept/Content-Type not forwarded: %v", got.header)
+	if got.header.Get("Accept") != "application/vnd.github+json" || got.header.Get("If-None-Match") != `"v1"` {
+		t.Errorf("Accept/If-None-Match not forwarded: %v", got.header)
+	}
+	if got.header.Get("Content-Type") != "" {
+		t.Errorf("Content-Type forwarded on a read: %v", got.header)
 	}
 	if ae := got.header.Get("Accept-Encoding"); ae == "br" {
 		t.Error("agent's Accept-Encoding was forwarded")
 	}
 
-	if c := resp.Header.Values("Set-Cookie"); len(c) != 0 {
-		t.Errorf("Set-Cookie reached the agent: %q", c)
+	for _, k := range []string{"Set-Cookie", "X-Echo"} {
+		if c := resp.Header.Values(k); len(c) != 0 {
+			t.Errorf("%s reached the agent: %q", k, c)
+		}
+	}
+	if resp.Header.Get("Etag") != `"v2"` || resp.Header.Get("X-Ratelimit-Remaining") != "42" ||
+		resp.Header.Get("Ratelimit-Policy") != "100;w=60" || resp.Header.Get("Retry-After") != "5" {
+		t.Errorf("useful headers dropped: %v", resp.Header)
 	}
 	if leaksToken(body) || leaksToken(fmt.Sprint(resp.Header)) {
 		t.Errorf("token leaked: %v %s", resp.Header, body)
 	}
-	if !strings.Contains(body, redacted) || resp.Header.Get("X-Echo") != "Bearer "+redacted {
+	if !strings.Contains(body, redacted) || !strings.Contains(resp.Header.Get("Link"), redacted) {
 		t.Errorf("echoed token not redacted: %v %s", resp.Header, body)
 	}
 }
@@ -279,7 +293,8 @@ func TestForwardRefusesUnknownServiceAndRoute(t *testing.T) {
 		{"DELETE", "/forward/github/repos/a/b/issues", http.StatusForbidden},
 		// A write rule is not a read rule.
 		{"POST", "/forward/github/repos/a/b/issues", http.StatusForbidden},
-		{"GET", "/forward/github/graphql", http.StatusForbidden},
+		// A read rule can't be a POST, so a GraphQL query has no way in.
+		{"POST", "/forward/github/graphql", http.StatusForbidden},
 	} {
 		resp, body := h.raw(t, tt.method, tt.target, nil, "")
 		if resp.StatusCode != tt.status {
@@ -288,14 +303,6 @@ func TestForwardRefusesUnknownServiceAndRoute(t *testing.T) {
 	}
 	if n := len(h.up.requests()); n != 0 {
 		t.Fatalf("upstream saw %d requests", n)
-	}
-
-	resp, body := h.raw(t, "POST", "/forward/github/graphql", map[string]string{"Content-Type": "application/json"}, `{"query":"{viewer{login}}"}`)
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("graphql: %d %s", resp.StatusCode, body)
-	}
-	if reqs := h.up.requests(); len(reqs) != 1 || reqs[0].body != `{"query":"{viewer{login}}"}` {
-		t.Fatalf("graphql body not forwarded: %+v", reqs)
 	}
 }
 
@@ -339,11 +346,11 @@ func TestApprovedWriteRunsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Status != connector.Done || res.Ref != "201" || !strings.HasPrefix(res.Detail, "201 Created: ") {
+	if res.Status != connector.Done || res.Ref != "201" || res.Detail != "201 Created" {
 		t.Fatalf("result %+v", res)
 	}
-	if leaksToken(res.Detail) || !strings.Contains(res.Detail, redacted) {
-		t.Fatalf("detail not scrubbed: %s", res.Detail)
+	if leaksToken(res.Output) || !strings.Contains(res.Output, `"auth":"Bearer `+redacted) {
+		t.Fatalf("output not scrubbed: %s", res.Output)
 	}
 	if _, err := h.client.Execute(context.Background(), a); !isStatus(err, http.StatusConflict) {
 		t.Fatalf("replay: %v", err)
@@ -438,22 +445,66 @@ func TestExecuteClassifiesFailures(t *testing.T) {
 	}
 }
 
-func TestExecuteTruncatesDetail(t *testing.T) {
+func TestExecuteMapsStatus(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		code int
+		want connector.Status
+	}{
+		{http.StatusCreated, connector.Done},
+		{http.StatusNotFound, connector.Failed},
+		{http.StatusUnprocessableEntity, connector.Failed},
+		{http.StatusInternalServerError, connector.Unknown},
+		{http.StatusBadGateway, connector.Unknown},
+	} {
+		h := start(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(tt.code) })
+		rec := approval.Record{ID: "p1", Connector: "http", Op: "request", Args: map[string]string{
+			"service": "github", "method": "POST", "path": "/repos/a/b/issues",
+		}}
+		res := h.proxy.Execute(context.Background(), rec)
+		if res.Status != tt.want || res.Ref != fmt.Sprint(tt.code) || !strings.HasPrefix(res.Detail, fmt.Sprint(tt.code)) {
+			t.Errorf("%d: %+v", tt.code, res)
+		}
+		if n := len(h.up.requests()); n != 1 {
+			t.Errorf("%d: upstream saw %d requests", tt.code, n)
+		}
+	}
+}
+
+func TestExecuteCapsOutput(t *testing.T) {
 	t.Parallel()
 	h := start(t, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnprocessableEntity)
-		io.WriteString(w, strings.Repeat("é", maxDetail))
+		w.WriteHeader(http.StatusCreated)
+		// The token straddles the cap, so scrubbing after cutting would
+		// leave part of it.
+		io.WriteString(w, strings.Repeat("é", maxOutput/2-4))
 		io.WriteString(w, r.Header.Get("Authorization"))
+		io.WriteString(w, strings.Repeat("x", 1000))
 	})
 	rec := approval.Record{ID: "p1", Connector: "http", Op: "request", Args: map[string]string{
 		"service": "github", "method": "POST", "path": "/repos/a/b/issues",
 	}}
 	res := h.proxy.Execute(context.Background(), rec)
-	if res.Status != connector.Done || res.Ref != "422" || len(res.Detail) > maxDetail+64 || leaksToken(res.Detail) {
-		t.Fatalf("result %+v", res)
+	if res.Status != connector.Done || len(res.Output) > maxOutput+100 || !strings.Contains(res.Output, "truncated") {
+		t.Fatalf("status %s, output %d bytes", res.Status, len(res.Output))
 	}
-	if !strings.HasSuffix(res.Detail, "é…") {
-		t.Fatalf("detail cut mid-rune: %q", res.Detail[len(res.Detail)-8:])
+	if strings.Contains(res.Output, "ghp_") || strings.Contains(res.Output, token[:8]) {
+		t.Fatalf("partial token in output: %q", res.Output[maxOutput-16:maxOutput+8])
+	}
+}
+
+func TestSpecDocListsRules(t *testing.T) {
+	t.Parallel()
+	h := start(t, echo)
+	spec, err := h.client.Spec(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := strings.TrimPrefix(h.up.URL, "http://")
+	for _, want := range []string{"github", host, "GET /repos/*/*/issues", "POST /repos/*/*/issues", "mandate http GET"} {
+		if !strings.Contains(spec.Doc, want) {
+			t.Errorf("doc lacks %q:\n%s", want, spec.Doc)
+		}
 	}
 }
 
