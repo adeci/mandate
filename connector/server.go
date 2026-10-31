@@ -2,7 +2,6 @@ package connector
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -12,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/adeci/mandate/approval"
@@ -28,8 +28,6 @@ type Server struct {
 	Log       *slog.Logger
 }
 
-// Handler returns the protocol routes, for mounting next to other routes on
-// one socket.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /spec", s.spec)
@@ -38,7 +36,26 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /read", s.read)
 	mux.HandleFunc("POST /prepare", s.prepare)
 	mux.HandleFunc("POST /execute", s.execute)
-	return mux
+	f, ok := s.Connector.(Forwarder)
+	if !ok {
+		return mux
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Route on the raw request target: ServeMux would clean "..", "//"
+		// and redirect instead of refusing, and the decoded URL loses %2F.
+		raw, _, _ := strings.Cut(r.RequestURI, "?")
+		rest, ok := strings.CutPrefix(raw, "/forward/")
+		if !ok {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			WriteError(w, &Error{Status: http.StatusMethodNotAllowed, Message: "raw reads are GET or HEAD"})
+			return
+		}
+		f.Forward(w, r, rest)
+	})
 }
 
 // Serve serves the protocol on a Unix socket at path until ctx is done.
@@ -92,7 +109,8 @@ func ListenUnix(path string) (net.Listener, error) {
 func (s *Server) spec(w http.ResponseWriter, _ *http.Request) {
 	spec := s.Connector.Spec()
 	spec.Protocol = ProtocolVersion
-	writeJSON(w, http.StatusOK, spec)
+	_, spec.Forward = s.Connector.(Forwarder)
+	WriteJSON(w, http.StatusOK, spec)
 }
 
 type opRequest struct {
@@ -105,7 +123,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	if c, ok := s.Connector.(Checker); ok {
 		h = c.Health(r.Context())
 	}
-	writeJSON(w, http.StatusOK, h)
+	WriteJSON(w, http.StatusOK, h)
 }
 
 type setupRequest struct {
@@ -114,36 +132,36 @@ type setupRequest struct {
 
 func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 	var req setupRequest
-	if !decode(w, r, &req) {
+	if !DecodeJSON(w, r, &req, maxBody) {
 		return
 	}
 	c, ok := s.Connector.(Setupper)
 	if !ok {
-		writeErr(w, &Error{Status: http.StatusNotFound, Message: "this connector needs no setup"})
+		WriteError(w, &Error{Status: http.StatusNotFound, Message: "this connector needs no setup"})
 		return
 	}
 	step, err := c.Setup(r.Context(), req.Args)
 	if err != nil {
-		writeErr(w, err)
+		WriteError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, step)
+	WriteJSON(w, http.StatusOK, step)
 }
 
 func (s *Server) read(w http.ResponseWriter, r *http.Request) {
 	var req opRequest
-	if !decode(w, r, &req) {
+	if !DecodeJSON(w, r, &req, maxBody) {
 		return
 	}
 	reader, ok := s.Connector.(Reader)
 	op, known := s.Connector.Spec().Op(req.Op)
 	if !ok || !known || op.Kind != Read {
-		writeErr(w, &Error{Status: http.StatusNotFound, Message: fmt.Sprintf("no read op %q", req.Op)})
+		WriteError(w, &Error{Status: http.StatusNotFound, Message: fmt.Sprintf("no read op %q", req.Op)})
 		return
 	}
 	out, err := reader.Read(r.Context(), req.Op, req.Args)
 	if err != nil {
-		writeErr(w, err)
+		WriteError(w, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -152,52 +170,52 @@ func (s *Server) read(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) prepare(w http.ResponseWriter, r *http.Request) {
 	var req opRequest
-	if !decode(w, r, &req) {
+	if !DecodeJSON(w, r, &req, maxBody) {
 		return
 	}
 	op, ok := s.Connector.Spec().Op(req.Op)
 	if !ok || op.Kind != Write {
-		writeErr(w, &Error{Status: http.StatusNotFound, Message: fmt.Sprintf("no write op %q", req.Op)})
+		WriteError(w, &Error{Status: http.StatusNotFound, Message: fmt.Sprintf("no write op %q", req.Op)})
 		return
 	}
 	p, err := s.Connector.Prepare(r.Context(), req.Op, req.Args)
 	if err != nil {
-		writeErr(w, err)
+		WriteError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, p)
+	WriteJSON(w, http.StatusOK, p)
 }
 
 func (s *Server) execute(w http.ResponseWriter, r *http.Request) {
 	var a approval.Approval
-	if !decode(w, r, &a) {
+	if !DecodeJSON(w, r, &a, maxBody) {
 		return
 	}
 	if s.Verifier == nil {
-		writeErr(w, &Error{Status: http.StatusForbidden, Message: "this connector has no approvers, so it refuses writes"})
+		WriteError(w, &Error{Status: http.StatusForbidden, Message: "this connector has no approvers, so it refuses writes"})
 		return
 	}
 	rec, err := s.Verifier.Verify(a)
 	if err != nil {
 		s.Log.Warn("approval rejected", "err", err)
-		writeErr(w, &Error{Status: http.StatusForbidden, Message: err.Error()})
+		WriteError(w, &Error{Status: http.StatusForbidden, Message: err.Error()})
 		return
 	}
 	spec := s.Connector.Spec()
 	op, ok := spec.Op(rec.Op)
 	if rec.Connector != spec.Name || !ok || op.Kind != Write {
-		writeErr(w, &Error{Status: http.StatusForbidden, Message: "approval is for a different connector or op"})
+		WriteError(w, &Error{Status: http.StatusForbidden, Message: "approval is for a different connector or op"})
 		return
 	}
 	// Re-render from the approved args; a record whose display disagrees with
 	// its args showed the owner something other than what would run.
 	p, err := s.Connector.Prepare(r.Context(), rec.Op, rec.Args)
 	if err != nil {
-		writeErr(w, err)
+		WriteError(w, err)
 		return
 	}
 	if !maps.Equal(p.Args, rec.Args) || !slices.Equal(p.Display, rec.Display) {
-		writeErr(w, &Error{Status: http.StatusConflict, Message: "approved record no longer matches what would run; propose again"})
+		WriteError(w, &Error{Status: http.StatusConflict, Message: "approved record no longer matches what would run; propose again"})
 		return
 	}
 	if err := s.Seen.Use(a.Nonce, a.IssuedAt); err != nil {
@@ -205,39 +223,10 @@ func (s *Server) execute(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, approval.ErrReplay) {
 			status = http.StatusConflict
 		}
-		writeErr(w, &Error{Status: status, Message: err.Error()})
+		WriteError(w, &Error{Status: status, Message: err.Error()})
 		return
 	}
 	res := s.Connector.Execute(r.Context(), rec)
 	s.Log.Info("executed", "id", rec.ID, "op", rec.Op, "status", res.Status, "ref", res.Ref)
-	writeJSON(w, http.StatusOK, res)
-}
-
-func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
-		writeErr(w, &Error{Status: http.StatusBadRequest, Message: "invalid request: " + err.Error()})
-		return false
-	}
-	return true
-}
-
-func writeErr(w http.ResponseWriter, err error) {
-	var e *Error
-	if !errors.As(err, &e) {
-		e = &Error{Status: http.StatusInternalServerError, Message: err.Error()}
-	}
-	if e.Status == 0 {
-		e.Status = http.StatusBadRequest
-	}
-	writeJSON(w, e.Status, e)
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		slog.Warn("write response", "err", err)
-	}
+	WriteJSON(w, http.StatusOK, res)
 }

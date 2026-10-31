@@ -114,7 +114,7 @@ func start(t *testing.T, h http.HandlerFunc) *harness {
 	sock := filepath.Join(dir, "p.sock")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- connector.ServeUnix(ctx, sock, p.Mount(srv.Handler())) }()
+	go func() { done <- srv.Serve(ctx, sock) }()
 	t.Cleanup(func() { cancel(); <-done })
 	c := connector.Dial(sock, 5*time.Second)
 	for i := 0; ; i++ {
@@ -286,11 +286,11 @@ func TestForwardRefusesUnknownServiceAndRoute(t *testing.T) {
 		{"GET", "/forward/github", http.StatusBadRequest},
 		{"GET", "/forward/github/user", http.StatusForbidden},
 		{"GET", "/forward/github/repos/a/b/issues/1", http.StatusForbidden},
-		{"DELETE", "/forward/github/repos/a/b/issues", http.StatusForbidden},
-		// A write rule is not a read rule.
-		{"POST", "/forward/github/repos/a/b/issues", http.StatusForbidden},
-		// A read rule can't be a POST, so a GraphQL query has no way in.
-		{"POST", "/forward/github/graphql", http.StatusForbidden},
+		// Only GET and HEAD are reads, so neither a write rule nor a GraphQL
+		// query has a way in.
+		{"DELETE", "/forward/github/repos/a/b/issues", http.StatusMethodNotAllowed},
+		{"POST", "/forward/github/repos/a/b/issues", http.StatusMethodNotAllowed},
+		{"POST", "/forward/github/graphql", http.StatusMethodNotAllowed},
 	} {
 		resp, body := h.raw(t, tt.method, tt.target, nil, "")
 		if resp.StatusCode != tt.status {
@@ -495,8 +495,11 @@ func TestSpecDocListsRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !spec.Forward {
+		t.Error("spec does not declare Forward")
+	}
 	host := strings.TrimPrefix(h.up.URL, "http://")
-	for _, want := range []string{"github", host, "GET /repos/*/*/issues", "POST /repos/*/*/issues", "mandate http GET"} {
+	for _, want := range []string{"github", host, "GET /repos/*/*/issues", "POST /repos/*/*/issues", "mandate get http", "mandate propose http request"} {
 		if !strings.Contains(spec.Doc, want) {
 			t.Errorf("doc lacks %q:\n%s", want, spec.Doc)
 		}

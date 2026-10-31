@@ -73,8 +73,8 @@ Output is JSON when piped: rows come as {"columns":[...],"rows":[[...]]}.
 				fmt.Fprintf(w, "  - %s: %s%s\n", p.Name, p.Doc, paramTags(p))
 			}
 		}
-		if spec.Name == "http" {
-			fmt.Fprint(w, "\nShortcut: `mandate http GET SERVICE PATH` reads directly; `mandate http POST SERVICE PATH --data BODY` (or PUT, PATCH, DELETE) proposes `http request`.\n")
+		if spec.Forward {
+			fmt.Fprintf(w, "- `mandate get %s PATH [--head]`: raw read, printed as the service answers it; PATH may carry a ?query. Writes are always proposals.\n", spec.Name)
 		}
 	}
 

@@ -115,7 +115,7 @@ func (a *fakeConsole) handler() http.Handler {
 		a.submitted = append(a.submitted, req)
 		p := proposal.Proposal{ID: "p1", Connector: req.Connector, Op: req.Op, Note: req.Note, Status: proposal.Pending}
 		a.proposals[p.ID] = p
-		writeJSON(w, http.StatusOK, p)
+		connector.WriteJSON(w, http.StatusOK, p)
 	})
 	mux.HandleFunc("GET /proposals/{id}", func(w http.ResponseWriter, r *http.Request) {
 		a.calls.Add(1)
@@ -127,7 +127,7 @@ func (a *fakeConsole) handler() http.Handler {
 			writeError(w, http.StatusNotFound, "no such proposal")
 			return
 		}
-		writeJSON(w, http.StatusOK, p)
+		connector.WriteJSON(w, http.StatusOK, p)
 	})
 	return mux
 }
@@ -620,16 +620,16 @@ func TestOtherProtocolIsDownAndRefused(t *testing.T) {
 	var called atomic.Int32
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /spec", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, connector.Spec{Protocol: 2, Name: "next", Ops: []connector.Op{
+		connector.WriteJSON(w, http.StatusOK, connector.Spec{Protocol: 2, Name: "next", Ops: []connector.Op{
 			{Name: "fetch", Kind: connector.Read}, {Name: "send", Kind: connector.Write},
 		}})
 	})
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, connector.Health{State: connector.Healthy})
+		connector.WriteJSON(w, http.StatusOK, connector.Health{State: connector.Healthy})
 	})
 	mux.HandleFunc("POST /", func(w http.ResponseWriter, _ *http.Request) {
 		called.Add(1)
-		writeJSON(w, http.StatusOK, map[string]any{})
+		connector.WriteJSON(w, http.StatusOK, map[string]any{})
 	})
 	r := newRig(t, func(c *Config) { c.Connectors["next"] = serveUnix(t, "next", mux) })
 

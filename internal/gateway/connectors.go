@@ -127,23 +127,33 @@ func (c *connectors) list(ctx context.Context) []connectorInfo {
 	return out
 }
 
+// spec answers for a connector that is unknown, unreachable or speaks
+// another protocol.
+func (h *handler) spec(w http.ResponseWriter, r *http.Request, name string) (connector.Spec, bool) {
+	if _, ok := h.connectors.calls[name]; !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("no connector %q", name))
+		return connector.Spec{}, false
+	}
+	spec, err := h.connectors.spec(r.Context(), name)
+	if pe, ok := errors.AsType[*connector.ProtocolError](err); ok {
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("connector %s %s; tell the owner", name, pe))
+		return connector.Spec{}, false
+	}
+	if err != nil {
+		slog.Error("connector spec", "connector", name, "err", err)
+		writeError(w, http.StatusServiceUnavailable, unavailable("connector "+name))
+		return connector.Spec{}, false
+	}
+	return spec, true
+}
+
 // lookup resolves connector and op, checks args against the op's params, and
 // refuses connectors that are not healthy before they are called. Without a
 // source there are no filtered views to check containers against, so
 // container values are refused outright.
 func (h *handler) lookup(w http.ResponseWriter, r *http.Request, name, opName string, kind connector.Kind, args map[string]string) (connector.Op, bool) {
-	if _, ok := h.connectors.calls[name]; !ok {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("no connector %q", name))
-		return connector.Op{}, false
-	}
-	spec, err := h.connectors.spec(r.Context(), name)
-	if pe, ok := errors.AsType[*connector.ProtocolError](err); ok {
-		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("connector %s %s; tell the owner", name, pe))
-		return connector.Op{}, false
-	}
-	if err != nil {
-		slog.Error("connector spec", "connector", name, "err", err)
-		writeError(w, http.StatusServiceUnavailable, unavailable("connector "+name))
+	spec, ok := h.spec(w, r, name)
+	if !ok {
 		return connector.Op{}, false
 	}
 	op, ok := spec.Op(opName)
@@ -185,9 +195,10 @@ func (h *handler) healthy(w http.ResponseWriter, r *http.Request, name string) b
 		if hl.Until.IsZero() {
 			retry = 60
 		}
-		writeJSON(w, http.StatusTooManyRequests, connector.Error{
+		connector.WriteJSON(w, http.StatusTooManyRequests, connector.Error{
 			Message: fmt.Sprintf("%s is resting: %s", name, detail), RetryAfter: retry,
 		})
+
 		return false
 	}
 	console := "the console"
@@ -226,7 +237,7 @@ func checkArgs(op connector.Op, args map[string]string) error {
 // and message; anything else means the peer is unreachable.
 func relay(w http.ResponseWriter, who string, err error) {
 	if e, ok := errors.AsType[*connector.Error](err); ok {
-		writeJSON(w, e.Status, e)
+		connector.WriteJSON(w, e.Status, e)
 		return
 	}
 	slog.Error("call failed", "peer", who, "err", err)
@@ -264,7 +275,7 @@ func (h *handler) relayConnector(w http.ResponseWriter, name string, err error) 
 	for i, c := range visible {
 		labels[i] = fmt.Sprintf("%s (%s)", c.Label, c.ID)
 	}
-	writeJSON(w, e.Status, connector.Error{
+	connector.WriteJSON(w, e.Status, connector.Error{
 		Message:    fmt.Sprintf("%s: %s; pass one of these IDs instead", e.Message, strings.Join(labels, ", ")),
 		Candidates: visible,
 	})
@@ -283,7 +294,7 @@ func (h *handler) read(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	name, opName := r.PathValue("connector"), r.PathValue("op")
 	var req readRequest
-	if !decodeStrict(w, r, &req) {
+	if !connector.DecodeJSON(w, r, &req, maxRequestBytes) {
 		return
 	}
 	op, ok := h.lookup(w, r, name, opName, connector.Read, req.Args)
@@ -315,7 +326,7 @@ func (h *handler) read(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("read", append(attrs, "messages", len(res.MessageIDs), "containers", res.Containers)...)
 	if len(res.MessageIDs) == 0 {
-		writeJSON(w, http.StatusOK, map[string]int{"containers": res.Containers, "total_results": res.TotalResults})
+		connector.WriteJSON(w, http.StatusOK, map[string]int{"containers": res.Containers, "total_results": res.TotalResults})
 		return
 	}
 	h.answer(w, r, name, res)
@@ -383,7 +394,7 @@ func (h *handler) answer(w http.ResponseWriter, r *http.Request, source string, 
 	slices.SortFunc(res.Rows, func(a, b []any) int {
 		return order[a[idCol].(string)] - order[b[idCol].(string)]
 	})
-	writeJSON(w, http.StatusOK, struct {
+	connector.WriteJSON(w, http.StatusOK, struct {
 		*queryResult
 		TotalResults int `json:"total_results,omitempty"`
 	}{res, rr.TotalResults})
@@ -396,7 +407,7 @@ func (h *handler) propose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req proposal.Request
-	if !decodeStrict(w, r, &req) {
+	if !connector.DecodeJSON(w, r, &req, maxRequestBytes) {
 		return
 	}
 	if _, ok := h.lookup(w, r, req.Connector, req.Op, connector.Write, req.Args); !ok {
@@ -436,7 +447,7 @@ func (h *handler) propose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("propose", append(attrs, "id", p.ID, "duration_ms", time.Since(start).Milliseconds())...)
-	writeJSON(w, http.StatusAccepted, p)
+	connector.WriteJSON(w, http.StatusAccepted, p)
 }
 
 // hidden mirrors the containers view's filter (the id or its parent is
@@ -525,7 +536,7 @@ func (h *handler) status(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if settled(p.Status) || !time.Now().Before(deadline) {
-			writeJSON(w, http.StatusOK, p)
+			connector.WriteJSON(w, http.StatusOK, p)
 			return
 		}
 		t := time.NewTimer(min(pollInterval, time.Until(deadline)))

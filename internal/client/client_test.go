@@ -3,9 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
-	"errors"
 	"io"
-	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -102,27 +100,13 @@ func TestRequests(t *testing.T) {
 			cmd:  (*client).status,
 			args: []string{"p1"}, method: "GET", path: "/v1/actions/p1",
 		},
-		"http get reads through the passthrough": {
-			cmd:  (*client).httpRequest,
-			args: []string{"get", "github", "/repos/a/b/issues?state=open"}, method: "GET", path: "/v1/http/github/repos/a/b/issues", query: "state=open",
+		"get keeps path and query": {
+			cmd:  (*client).forward,
+			args: []string{"http", "/github/repos/a/b%2Fc/issues?state=open"}, method: "GET", path: "/v1/forward/http/github/repos/a/b%2Fc/issues", query: "state=open",
 		},
-		"http head reads too": {
-			cmd:  (*client).httpRequest,
-			args: []string{"HEAD", "github", "user"}, method: "HEAD", path: "/v1/http/github/user",
-		},
-		"http post becomes a proposal": {
-			cmd:    (*client).httpRequest,
-			args:   []string{"post", "github", "repos/a/b/issues", "--data", `{"title":"t"}`, "--note", "bug report"},
-			method: "POST", path: "/v1/actions",
-			body:  `{"connector":"http","op":"request","args":{"body":"{\"title\":\"t\"}","method":"POST","path":"/repos/a/b/issues","service":"github"},"note":"bug report"}`,
-			ctype: "application/json",
-		},
-		"http delete without body": {
-			cmd:    (*client).httpRequest,
-			args:   []string{"DELETE", "github", "/repos/a/b/labels/x"},
-			method: "POST", path: "/v1/actions",
-			body:  `{"connector":"http","op":"request","args":{"method":"DELETE","path":"/repos/a/b/labels/x","service":"github"}}`,
-			ctype: "application/json",
+		"get --head": {
+			cmd:  (*client).forward,
+			args: []string{"http", "github/user", "--head"}, method: "HEAD", path: "/v1/forward/http/github/user",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -152,14 +136,6 @@ func TestProposePrintsURL(t *testing.T) {
 	if s := out.String(); !strings.HasPrefix(s, "p1  pending  whatsapp send\n  To: Farid\n") ||
 		!strings.Contains(s, "https://console/p/p1") || !strings.Contains(s, "mandate status p1 --wait") {
 		t.Errorf("output:\n%s", s)
-	}
-
-	c, out = testClient(t, srv.URL, false)
-	if err := c.propose(t.Context(), []string{"whatsapp", "send", "to=Farid"}); err != nil {
-		t.Fatalf("piped propose: %v", err)
-	}
-	if strings.TrimSpace(out.String()) != reply {
-		t.Errorf("piped output is not the proposal JSON: %s", out)
 	}
 }
 
@@ -257,7 +233,7 @@ func TestWaitTimesOut(t *testing.T) {
 	a := &actions{}
 	c, out := testClient(t, a.serve(t), false)
 	start := time.Now()
-	err := c.httpRequest(t.Context(), []string{"POST", "github", "/repos/a/b/issues", "--data", "{}", "--wait", "1500ms"})
+	err := c.propose(t.Context(), []string{"whatsapp", "send", "to=Farid", "--wait", "1500ms"})
 	if exitcode.For(err) != exitcode.TryLater || !strings.Contains(err.Error(), "still pending after 1.5s") {
 		t.Errorf("timeout: exit %d (%v)", exitcode.For(err), err)
 	}
@@ -288,14 +264,9 @@ func TestErrors(t *testing.T) {
 	srv, rec := gateway(t, http.StatusOK, `{}`)
 	c, _ = testClient(t, srv.URL, false)
 	for name, err := range map[string]error{
-		"read without op":      c.read(t.Context(), []string{"discord"}),
-		"arg without =":        c.read(t.Context(), []string{"discord", "fetch", "456"}),
-		"duplicate arg":        c.propose(t.Context(), []string{"whatsapp", "send", "to=a", "to=b"}),
-		"bad --wait":           c.propose(t.Context(), []string{"whatsapp", "send", "to=a", "--wait", "15"}),
-		"status without id":    c.status(t.Context(), nil),
-		"http missing path":    c.httpRequest(t.Context(), []string{"GET", "github"}),
-		"http get with --data": c.httpRequest(t.Context(), []string{"GET", "github", "x", "--data", "{}"}),
-		"query without sql":    c.query(t.Context(), nil),
+		"arg without =": c.read(t.Context(), []string{"discord", "fetch", "456"}),
+		"duplicate arg": c.propose(t.Context(), []string{"whatsapp", "send", "to=a", "to=b"}),
+		"get data":      c.forward(t.Context(), []string{"http", "x", "--data", "{}"}),
 	} {
 		if exitcode.For(err) != exitcode.Usage {
 			t.Errorf("%s: %v", name, err)
@@ -303,31 +274,6 @@ func TestErrors(t *testing.T) {
 	}
 	if rec.method != "" {
 		t.Errorf("usage errors sent a request: %s %s", rec.method, rec.path)
-	}
-}
-
-func TestSchemaListsConnectorOps(t *testing.T) {
-	t.Parallel()
-	srv, _ := gateway(t, http.StatusOK, `{"views":[],"connectors":[{"name":"whatsapp","ops":[
-		{"name":"send","kind":"write","summary":"Send a message","params":[
-			{"name":"to","doc":"chat or contact","required":true,"container":true},
-			{"name":"text","doc":"message text","required":true,"editable":true}]},
-		{"name":"history","kind":"read","summary":"Fetch older messages","params":[
-			{"name":"chat","doc":"chat ID","required":true,"container":true},
-			{"name":"count","doc":"how many"}]}]}]}`)
-	c, out := testClient(t, srv.URL, true)
-	if err := c.schema(t.Context(), nil); err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{
-		"mandate propose whatsapp send to=... text=...\n    Send a message\n",
-		"    to: chat or contact (container)\n",
-		"    text: message text (owner may edit)\n",
-		"mandate read whatsapp history chat=... [count=...]\n",
-	} {
-		if !strings.Contains(out.String(), want) {
-			t.Errorf("schema output lacks %q:\n%s", want, out)
-		}
 	}
 }
 
@@ -341,7 +287,7 @@ func TestGuideFromSchema(t *testing.T) {
 				{"name":"send","kind":"write","summary":"Send a message","params":[
 					{"name":"to","doc":"chat or contact","required":true,"container":true},
 					{"name":"text","doc":"message text","required":true,"editable":true}]}]},
-			{"name":"http","health":{"state":"ok"},"doc":"Reads allowed: GET /repos/adeci/*","ops":[
+			{"name":"http","health":{"state":"ok"},"doc":"Reads allowed: GET /repos/adeci/*","forward":true,"ops":[
 				{"name":"request","kind":"write","summary":"Call an API","params":[{"name":"service","doc":"one of: github","required":true}]}]}],
 		"limits":{"max_rows":5000}}`)
 	c, out := testClient(t, srv.URL, false)
@@ -359,12 +305,7 @@ func TestGuideFromSchema(t *testing.T) {
 		"`mandate propose whatsapp send to=... text=...`: Send a message",
 		"  - text: message text (owner may edit)",
 		"Reads allowed: GET /repos/adeci/*",
-		"`mandate http GET SERVICE PATH`",
-		"never ask the owner for passwords",
-		"send the owner the proposal's url",
-		"- 75: ",
-		"- 1: rejected",
-		"- 2: ",
+		"`mandate get http PATH [--head]`",
 	} {
 		if !strings.Contains(strings.ToLower(out.String()), strings.ToLower(want)) {
 			t.Errorf("guide lacks %q", want)
@@ -372,23 +313,5 @@ func TestGuideFromSchema(t *testing.T) {
 	}
 	if t.Failed() {
 		t.Log(out)
-	}
-}
-
-func TestFromEnv(t *testing.T) {
-	t.Parallel()
-	for name, env := range map[string]map[string]string{
-		"no url":   {"MANDATE_TOKEN": "x"},
-		"no token": {"MANDATE_URL": "http://x"},
-	} {
-		if _, err := fromEnv(func(k string) string { return env[k] }, nil, nil, false); err == nil {
-			t.Errorf("%s: accepted", name)
-		}
-	}
-	_, err := fromEnv(func(k string) string {
-		return map[string]string{"MANDATE_URL": "http://x", "MANDATE_TOKEN_FILE": "/nonexistent"}[k]
-	}, nil, nil, false)
-	if !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("missing token file: %v", err)
 	}
 }

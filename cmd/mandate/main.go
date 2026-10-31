@@ -24,12 +24,12 @@ for agents (set MANDATE_URL and MANDATE_TOKEN):
   schema                  list the views and connector ops
   read CONNECTOR OP [KEY=VALUE...]
                           run a connector read op
+  get CONNECTOR PATH [--head]
+                          raw read from a connector that serves them, e.g. an API
   propose CONNECTOR OP [KEY=VALUE...] [--note TEXT] [--wait DURATION]
                           propose a write; prints the URL to send the owner
   status ID [--wait DURATION]
                           show a proposal; --wait blocks until the owner decides
-  http METHOD SERVICE PATH [--data BODY] [--note TEXT] [--wait DURATION]
-                          GET/HEAD read through the proxy; other methods propose
   exit: 0 done, 75 pending/paced/timed out, 1 rejected/expired/failed/unknown/error, 2 usage
 
 on the host:
@@ -68,8 +68,8 @@ func run() int {
 		err = client.Propose(ctx, args)
 	case "status":
 		err = client.Status(ctx, args)
-	case "http":
-		err = client.HTTP(ctx, args)
+	case "get":
+		err = client.Get(ctx, args)
 	case "gateway":
 		err = gateway.Command(ctx, args)
 	case "console":

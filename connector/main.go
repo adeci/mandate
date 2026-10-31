@@ -10,7 +10,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -55,12 +54,6 @@ func (e *Env) Credential(name string) ([]byte, error) {
 // Fail stops the connector after a fault only a restart can clear; Main
 // exits non-zero with err. Conditions the owner must fix belong in Health.
 func (e *Env) Fail(err error) { e.fail(err) }
-
-// Mounter is implemented by connectors that serve more than the protocol on
-// their socket. Mount returns the socket's handler, given the protocol's.
-type Mounter interface {
-	Mount(protocol http.Handler) http.Handler
-}
 
 // Main runs a connector program:
 //
@@ -140,12 +133,8 @@ func run[C any](ctx context.Context, name string, args []string, credDir string,
 	if c, ok := srv.Connector.(io.Closer); ok {
 		defer func() { err = errors.Join(err, c.Close()) }()
 	}
-	h := srv.Handler()
-	if m, ok := srv.Connector.(Mounter); ok {
-		h = m.Mount(h)
-	}
 	env.Log.Info("serving", "socket", *socket)
-	if err := ServeUnix(ctx, *socket, h); err != nil {
+	if err := srv.Serve(ctx, *socket); err != nil {
 		return err
 	}
 	if cause := context.Cause(ctx); !errors.Is(cause, context.Canceled) {

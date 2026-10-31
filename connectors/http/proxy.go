@@ -130,21 +130,6 @@ func (s *service) target(path string, segs []string, rawQuery string) string {
 	return u.String()
 }
 
-// Mount serves the read passthrough at /forward/ and the connector protocol
-// on everything else.
-func (p *Proxy) Mount(protocol http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Route on the raw request target: ServeMux would clean "..", "//"
-		// and redirect instead of refusing, and the decoded URL loses %2F.
-		raw, _, _ := strings.Cut(r.RequestURI, "?")
-		if rest, ok := strings.CutPrefix(raw, "/forward/"); ok {
-			p.forward(w, r, rest)
-			return
-		}
-		protocol.ServeHTTP(w, r)
-	})
-}
-
 // Response headers an agent needs to page, cache and back off; every other
 // upstream header is dropped.
 var passResponse = []string{"Content-Type", "Location", "Link", "Etag", "Last-Modified", "Retry-After"}
@@ -154,25 +139,27 @@ func passHeader(k string) bool {
 		strings.HasPrefix(k, "X-Ratelimit-") || strings.HasPrefix(k, "Ratelimit-") || k == "Ratelimit"
 }
 
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, rest string) {
+// Forward serves the allowlisted reads, with the service's token added and
+// scrubbed from what comes back.
+func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, rest string) {
 	name, path, _ := strings.Cut(rest, "/")
 	svc, ok := p.services[name]
 	if !ok {
-		writeErr(w, http.StatusNotFound, fmt.Sprintf("unknown service %q", name))
+		connector.WriteError(w, &connector.Error{Status: http.StatusNotFound, Message: fmt.Sprintf("unknown service %q", name)})
 		return
 	}
 	canon, segs, err := normalize("/" + path)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		connector.WriteError(w, &connector.Error{Status: http.StatusBadRequest, Message: err.Error()})
 		return
 	}
 	if !allowed(svc.reads, r.Method, segs) {
-		writeErr(w, http.StatusForbidden, fmt.Sprintf("%s %s is not an allowed read for %s", r.Method, canon, svc.name))
+		connector.WriteError(w, &connector.Error{Status: http.StatusForbidden, Message: fmt.Sprintf("%s %s is not an allowed read for %s", r.Method, canon, svc.name)})
 		return
 	}
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, svc.target(canon, segs, r.URL.RawQuery), nil)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		connector.WriteError(w, &connector.Error{Status: http.StatusBadRequest, Message: err.Error()})
 		return
 	}
 	// Only these come from the agent; Authorization, Cookie, Host,
@@ -189,23 +176,23 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, rest string) {
 	if err != nil {
 		msg := p.scrubString(err.Error())
 		log.Warn("forward failed", "err", msg)
-		writeErr(w, http.StatusBadGateway, msg)
+		connector.WriteError(w, &connector.Error{Status: http.StatusBadGateway, Message: msg})
 		return
 	}
 	defer resp.Body.Close()
 	// The transport decompresses gzip it asked for itself; any other
 	// encoding can't be scrubbed.
 	if ce := resp.Header.Get("Content-Encoding"); ce != "" && !strings.EqualFold(ce, "identity") {
-		writeErr(w, http.StatusBadGateway, fmt.Sprintf("upstream sent a %s-encoded body", ce))
+		connector.WriteError(w, &connector.Error{Status: http.StatusBadGateway, Message: fmt.Sprintf("upstream sent a %s-encoded body", ce)})
 		return
 	}
 	out, err := io.ReadAll(io.LimitReader(resp.Body, maxResponse+1))
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, p.scrubString(err.Error()))
+		connector.WriteError(w, &connector.Error{Status: http.StatusBadGateway, Message: p.scrubString(err.Error())})
 		return
 	}
 	if len(out) > maxResponse {
-		writeErr(w, http.StatusBadGateway, fmt.Sprintf("upstream response exceeds %d bytes", maxResponse))
+		connector.WriteError(w, &connector.Error{Status: http.StatusBadGateway, Message: fmt.Sprintf("upstream response exceeds %d bytes", maxResponse)})
 		return
 	}
 	out = p.scrub(out)
@@ -221,12 +208,6 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, rest string) {
 	w.WriteHeader(resp.StatusCode)
 	w.Write(out)
 	log.Info("forwarded", "status", resp.StatusCode, "bytes", len(out))
-}
-
-func writeErr(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(connector.Error{Message: msg})
 }
 
 const opRequest = "request"
@@ -247,7 +228,8 @@ func (p *Proxy) Spec() connector.Spec {
 
 func (p *Proxy) doc() string {
 	var b strings.Builder
-	b.WriteString("Reads: `mandate http GET <service> <path>`. Writes are proposals of the `request` op that the owner approves.\n")
+	b.WriteString("Reads: `mandate get http <service>/<path>`, e.g. `mandate get http github/repos/OWNER/REPO/issues?state=open`.\n")
+	b.WriteString("Writes: `mandate propose http request service=… method=… path=… body=…`, which the owner approves.\n")
 	for _, name := range p.names {
 		s := p.services[name]
 		fmt.Fprintf(&b, "\n## %s (%s)\n", name, s.base.Host)

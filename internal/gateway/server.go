@@ -1,12 +1,11 @@
 // Package gateway is the agent API: read-only SQL over filtered views of the
-// source databases, connector reads, write proposals, and an HTTP passthrough.
+// source databases, connector reads, write proposals, and raw reads.
 package gateway
 
 import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/internal/proposal"
 )
 
@@ -43,8 +43,6 @@ type Config struct {
 	// ConsoleURL is where the owner fixes connectors; it goes into errors
 	// that ask the agent to fetch them.
 	ConsoleURL string
-	// Empty disables /v1/http.
-	HTTPProxySocket string
 }
 
 // sourceFlag parses name=path. The name prefixes the source's views and
@@ -99,7 +97,6 @@ func Command(ctx context.Context, args []string) error {
 	fs.DurationVar(&cfg.Timeout, "timeout", 5*time.Second, "maximum query execution time")
 	fs.Var(connectorFlag(cfg.Connectors), "connector", "connector socket as name=path (repeatable; a source of the same name filters it)")
 	fs.StringVar(&cfg.ConsoleSocket, "console-socket", "", "console proposal socket (enables /v1/actions)")
-	fs.StringVar(&cfg.HTTPProxySocket, "http-proxy-socket", "", "HTTP proxy socket (enables /v1/http)")
 	fs.StringVar(&cfg.ConsoleURL, "console-url", "", "console base URL, shown to agents when a connector needs the owner")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -137,7 +134,7 @@ func Serve(ctx context.Context, cfg Config) error {
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	slog.Info("gateway listening", "addr", ln.Addr().String(), "sources", cfg.Sources, "connectors", cfg.Connectors,
-		"console", cfg.ConsoleSocket != "", "http_proxy", cfg.HTTPProxySocket != "")
+		"console", cfg.ConsoleSocket != "")
 	select {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -174,13 +171,7 @@ func newHandler(cfg Config, token string) *handler {
 	h.mux.HandleFunc("POST /v1/read/{connector}/{op}", h.authed(h.read))
 	h.mux.HandleFunc("POST /v1/actions", h.authed(h.propose))
 	h.mux.HandleFunc("GET /v1/actions/{id}", h.authed(h.status))
-	if cfg.HTTPProxySocket != "" {
-		h.mux.HandleFunc("/v1/http/{service}/{path...}", h.authed(newHTTPProxy(cfg.HTTPProxySocket).forward))
-	} else {
-		h.mux.HandleFunc("/v1/http/", h.authed(func(w http.ResponseWriter, _ *http.Request) {
-			writeError(w, http.StatusNotFound, "the HTTP proxy is not enabled on this gateway")
-		}))
-	}
+	h.mux.HandleFunc("/v1/forward/{connector}/{path...}", h.authed(h.forward))
 	return h
 }
 
@@ -221,7 +212,7 @@ func (h *handler) schema(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "describe failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	connector.WriteJSON(w, http.StatusOK, map[string]any{
 		"views":      views,
 		"connectors": h.connectors.list(r.Context()),
 		"limits": map[string]any{
@@ -239,10 +230,7 @@ type queryRequest struct {
 func (h *handler) query(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	var req queryRequest
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBytes))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
+	if !connector.DecodeJSON(w, r, &req, maxRequestBytes) {
 		return
 	}
 	if strings.TrimSpace(req.SQL) == "" || len(req.SQL) > maxSQLBytes {
@@ -269,32 +257,9 @@ func (h *handler) query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("query", append(attrs, "rows", len(res.Rows), "truncated", res.Truncated)...)
-	writeJSON(w, http.StatusOK, res)
-}
-
-func decodeStrict(w http.ResponseWriter, r *http.Request, v any) bool {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBytes))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "request too large")
-		} else {
-			writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
-		}
-		return false
-	}
-	return true
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		slog.Warn("write response", "err", err)
-	}
+	connector.WriteJSON(w, http.StatusOK, res)
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+	connector.WriteError(w, &connector.Error{Status: status, Message: msg})
 }

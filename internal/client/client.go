@@ -32,7 +32,7 @@ const (
 	readUsage    = "usage: mandate read CONNECTOR OP [KEY=VALUE...]"
 	proposeUsage = "usage: mandate propose CONNECTOR OP [KEY=VALUE...] [--note TEXT] [--wait DURATION]"
 	statusUsage  = "usage: mandate status ID [--wait DURATION]"
-	httpUsage    = "usage: mandate http METHOD SERVICE PATH [--data BODY] [--note TEXT] [--wait DURATION]"
+	getUsage     = "usage: mandate get CONNECTOR PATH [--head]"
 )
 
 type client struct {
@@ -88,8 +88,8 @@ func Propose(ctx context.Context, args []string) error { return run(ctx, args, (
 // Status runs `mandate status ID [--wait DURATION]`.
 func Status(ctx context.Context, args []string) error { return run(ctx, args, (*client).status) }
 
-// HTTP runs `mandate http METHOD SERVICE PATH [--data BODY] [--note TEXT] [--wait DURATION]`.
-func HTTP(ctx context.Context, args []string) error { return run(ctx, args, (*client).httpRequest) }
+// Get runs `mandate get CONNECTOR PATH [--head]`.
+func Get(ctx context.Context, args []string) error { return run(ctx, args, (*client).forward) }
 
 func run(ctx context.Context, args []string, cmd func(*client, context.Context, []string) error) error {
 	c, err := newClient()
@@ -136,6 +136,34 @@ func (c *client) read(ctx context.Context, args []string) error {
 		return usage(readUsage, err)
 	}
 	return c.rows(ctx, "/v1/read/"+url.PathEscape(args[0])+"/"+url.PathEscape(args[1]), map[string]any{"args": kv})
+}
+
+// forward is a raw read: PATH, with any query, goes to the connector as
+// typed. The body is printed as is; --head prints the headers instead.
+func (c *client) forward(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("get", flag.ContinueOnError)
+	head := fs.Bool("head", false, "send HEAD and print the response headers")
+	positional, err := parseInterspersed(fs, args)
+	if err != nil {
+		return usage(getUsage, err)
+	}
+	if len(positional) != 2 {
+		return usage(getUsage, nil)
+	}
+	path := "/v1/forward/" + url.PathEscape(positional[0]) + "/" + strings.TrimPrefix(positional[1], "/")
+	method := http.MethodGet
+	if *head {
+		method = http.MethodHead
+	}
+	header, data, err := c.do(ctx, requestTimeout, method, path, nil)
+	if err != nil {
+		return err
+	}
+	if *head {
+		return header.Write(c.out)
+	}
+	_, err = c.out.Write(data)
+	return err
 }
 
 // keyValues parses KEY=VALUE args; values may contain '='.
@@ -274,6 +302,9 @@ func (c *client) schema(ctx context.Context, args []string) error {
 				fmt.Fprintf(c.out, "    %s: %s%s\n", p.Name, p.Doc, paramTags(p))
 			}
 		}
+		if spec.Forward {
+			fmt.Fprintf(c.out, "  mandate get %s PATH [--head]\n    raw read\n", spec.Name)
+		}
 		fmt.Fprintln(c.out)
 	}
 	return nil
@@ -351,6 +382,11 @@ func (c *client) post(ctx context.Context, path string, body, out any) error {
 // send returns the body of a 2xx response; anything else is an error carrying
 // the gateway's message, mapped to exit 75 on 429.
 func (c *client) send(ctx context.Context, timeout time.Duration, method, path string, body []byte) ([]byte, error) {
+	_, data, err := c.do(ctx, timeout, method, path, body)
+	return data, err
+}
+
+func (c *client) do(ctx context.Context, timeout time.Duration, method, path string, body []byte) (http.Header, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var rd io.Reader
@@ -359,7 +395,7 @@ func (c *client) send(ctx context.Context, timeout time.Duration, method, path s
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.url+path, rd)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	if body != nil {
@@ -367,15 +403,15 @@ func (c *client) send(ctx context.Context, timeout time.Duration, method, path s
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w; check MANDATE_URL, and tell the owner if the gateway stays unreachable", err)
+		return nil, nil, fmt.Errorf("%w; check MANDATE_URL, and tell the owner if the gateway stays unreachable", err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if resp.StatusCode/100 == 2 {
-		return data, nil
+		return resp.Header, data, nil
 	}
 	var e struct {
 		Error             string `json:"error"`
@@ -384,14 +420,17 @@ func (c *client) send(ctx context.Context, timeout time.Duration, method, path s
 	if json.Unmarshal(data, &e) != nil || e.Error == "" {
 		e.Error = strings.TrimSpace(string(data))
 	}
+	if e.Error == "" {
+		e.Error = http.StatusText(resp.StatusCode)
+	}
 	switch resp.StatusCode {
 	case http.StatusTooManyRequests:
-		return nil, &exitError{
+		return nil, nil, &exitError{
 			msg:  fmt.Sprintf("%s; retry in %s", e.Error, time.Duration(e.RetryAfterSeconds)*time.Second),
 			code: exitcode.ErrTryLater,
 		}
 	case http.StatusUnauthorized:
-		return nil, errors.New("the gateway refused the token; ask the owner to check MANDATE_TOKEN")
+		return nil, nil, errors.New("the gateway refused the token; ask the owner to check MANDATE_TOKEN")
 	}
-	return nil, fmt.Errorf("%s (HTTP %d)", e.Error, resp.StatusCode)
+	return nil, nil, fmt.Errorf("%s (HTTP %d)", e.Error, resp.StatusCode)
 }

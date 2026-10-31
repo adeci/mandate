@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/adeci/mandate/internal/exitcode"
@@ -37,40 +36,6 @@ func (c *client) propose(ctx context.Context, args []string) error {
 		return usage(proposeUsage, err)
 	}
 	return c.submit(ctx, proposal.Request{Connector: positional[0], Op: positional[1], Args: kv, Note: *note}, *wait)
-}
-
-// httpRequest reads with GET and HEAD through the gateway's passthrough;
-// any other method changes something, so it becomes an `http request`
-// proposal.
-func (c *client) httpRequest(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("http", flag.ContinueOnError)
-	data := fs.String("data", "", "request body")
-	note := fs.String("note", "", "why, shown to the owner")
-	wait := fs.Duration("wait", 0, "block until the owner decides, up to this long (e.g. 15m)")
-	positional, err := parseInterspersed(fs, args)
-	if err != nil {
-		return usage(httpUsage, err)
-	}
-	if len(positional) != 3 {
-		return usage(httpUsage, nil)
-	}
-	method, service, path := strings.ToUpper(positional[0]), positional[1], positional[2]
-	if method != http.MethodGet && method != http.MethodHead {
-		kv := map[string]string{"service": service, "method": method, "path": "/" + strings.TrimPrefix(path, "/")}
-		if *data != "" {
-			kv["body"] = *data
-		}
-		return c.submit(ctx, proposal.Request{Connector: "http", Op: "request", Args: kv, Note: *note}, *wait)
-	}
-	if *data != "" || *note != "" || *wait != 0 {
-		return usage(httpUsage, fmt.Errorf("--data, --note and --wait are for writes; %s reads directly", method))
-	}
-	out, err := c.send(ctx, requestTimeout, method, "/v1/http/"+url.PathEscape(service)+"/"+strings.TrimPrefix(path, "/"), nil)
-	if err != nil {
-		return err
-	}
-	_, err = c.out.Write(out)
-	return err
 }
 
 func (c *client) submit(ctx context.Context, req proposal.Request, wait time.Duration) error {

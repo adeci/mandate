@@ -30,7 +30,20 @@ func Dial(path string, timeout time.Duration) *Client {
 				return d.DialContext(ctx, "unix", path)
 			},
 		},
+		// A connector's redirect is an answer to relay, never one to follow.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}
+}
+
+// Forward sends a raw read to /forward/ plus target, an escaped path with an
+// optional query, as is. The caller closes the response body.
+func (c *Client) Forward(ctx context.Context, method, target string, header http.Header) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, "http://connector/forward/"+target, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = header
+	return c.http.Do(req)
 }
 
 // Spec fails with a *ProtocolError for a connector that speaks another

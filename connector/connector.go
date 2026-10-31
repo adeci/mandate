@@ -8,6 +8,7 @@
 //	POST /read     run a read op (no approval; results land in the connector's data.db)
 //	POST /prepare  validate and normalize a write, render what the owner will see
 //	POST /execute  run an approved write, verifying the approval itself
+//	GET  /forward/{path...}  raw read, only for connectors that are a Forwarder
 //
 // A connector program is usually just a call to Main.
 package connector
@@ -17,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/adeci/mandate/approval"
@@ -44,6 +46,9 @@ type Spec struct {
 	// Doc is markdown for agents beyond the ops, e.g. which API paths the
 	// http connector allows.
 	Doc string `json:"doc,omitempty"`
+	// Forward is set by Server for a Forwarder: the gateway relays agents'
+	// GET and HEAD to /forward/ without approval.
+	Forward bool `json:"forward,omitempty"`
 }
 
 type Op struct {
@@ -129,6 +134,13 @@ type Connector interface {
 // It returns an encoded ReadResult.
 type Reader interface {
 	Read(ctx context.Context, op string, args map[string]string) (json.RawMessage, error)
+}
+
+// Forwarder is implemented by connectors that serve raw reads. Forward gets
+// only GET and HEAD; path is the escaped request path after /forward/, not
+// cleaned, so ".." and %2F reach the connector to refuse or keep.
+type Forwarder interface {
+	Forward(w http.ResponseWriter, r *http.Request, path string)
 }
 
 type HealthState string
