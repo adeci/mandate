@@ -106,8 +106,7 @@ func start(t *testing.T) *harness {
 	return &harness{fake: f, client: c, key: key}
 }
 
-// approved prepares args and signs the resulting record, as the approvals
-// unit does.
+// approved prepares args and signs the resulting record, as the console does.
 func (h *harness) approved(t *testing.T, edit func(*approval.Record)) approval.Approval {
 	t.Helper()
 	p, err := h.client.Prepare(context.Background(), "send", map[string]string{"to": "Farid", "text": "running late"})

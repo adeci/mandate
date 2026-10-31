@@ -21,8 +21,8 @@ func Command(ctx context.Context, args []string) error {
 	credDir := flags.String("credentials-dir", os.Getenv("CREDENTIALS_DIRECTORY"), "directory holding the token files (default $CREDENTIALS_DIRECTORY)")
 	listen := flags.String("listen", "", "Unix socket to serve on (required)")
 	approversPath := flags.String("approvers", "", "JSON file of passkeys that may approve writes; without it writes are refused")
-	rpID := flags.String("rp-id", "", "WebAuthn relying party ID of the approvals page")
-	origin := flags.String("origin", "", "origin of the approvals page, e.g. https://approve.example.ts.net")
+	rpID := flags.String("rp-id", "", "WebAuthn relying party ID of the console")
+	origin := flags.String("origin", "", "origin of the console, e.g. https://mandate.example.com")
 	seenPath := flags.String("seen", "", "file recording spent approval nonces")
 	if err := flags.Parse(args); err != nil {
 		return err

@@ -317,8 +317,7 @@ func TestForwardCapsResponse(t *testing.T) {
 	}
 }
 
-// approved prepares args and signs the resulting record, as the approvals
-// unit does.
+// approved prepares args and signs the resulting record, as the console does.
 func (h *harness) approved(t *testing.T, args map[string]string) approval.Approval {
 	t.Helper()
 	p, err := h.client.Prepare(context.Background(), "request", args)
