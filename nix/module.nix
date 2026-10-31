@@ -23,7 +23,21 @@ let
   origin =
     "https://${cfg.console.hostname}"
     + lib.optionalString (cfg.console.port != 443) ":${toString cfg.console.port}";
-  approvers = pkgs.writeText "mandate-approvers.json" (builtins.toJSON cfg.console.approvers);
+
+  # Deletes every key so the admin password can add a first one again.
+  resetKeys = pkgs.writeShellApplication {
+    name = "mandate-reset-keys";
+    text = ''
+      units=(mandate-console ${
+        lib.concatMapStringsSep " " (n: "mandate-${n}") (lib.attrNames connectors)
+      })
+      systemctl stop "''${units[@]}"
+      rm -f ${state "console"}/keys.json ${
+        lib.concatMapStringsSep " " (n: "${state n}/private/keys.json") (lib.attrNames connectors)
+      }
+      systemctl start "''${units[@]}"
+    '';
+  };
 
   # Only the tailnet and localhost may connect.
   tailnetOnly = {
@@ -85,7 +99,7 @@ let
 
   configFile = name: c: json.generate "mandate-${name}.json" c.settings;
 
-  # Fails the system build, not the deploy, when settings don't validate.
+  # Checks connector settings at build time.
   configCheck =
     name: c:
     pkgs.runCommand "mandate-${name}-config-check" { } ''
@@ -105,8 +119,7 @@ let
       // {
         User = "mandate-${name}";
         Group = "mandate-${name}";
-        # data.db here is readable by the gateway's group; the connector keeps
-        # sessions in private/, which only its own user can traverse.
+        # The gateway's group can read data.db; sessions stay in private/.
         StateDirectory = "mandate-${name}";
         StateDirectoryMode = "0750";
         RuntimeDirectory = "mandate-${name}";
@@ -122,11 +135,8 @@ let
             "--config"
             (configFile name c)
           ]
-          # Connectors verify every approval themselves; without these flags
-          # they refuse all writes.
+          # Lets connectors verify approvals.
           ++ lib.optionals cfg.console.enable [
-            "--approvers"
-            approvers
             "--rp-id"
             cfg.console.hostname
             "--origin"
@@ -149,7 +159,7 @@ let
             self.packages.${system}."mandate-${name}"
               or (throw "services.mandate.connectors.${name}.package must be set: ${name} isn't a built-in connector");
           defaultText = lib.literalMD "the built-in connector of that name (`whatsapp`, `discord`, `http`)";
-          description = "The connector program; it must speak the mandate connector protocol.";
+          description = "The connector program.";
         };
         settings = lib.mkOption {
           inherit (json) type;
@@ -215,20 +225,18 @@ in
         }
       '';
       description = ''
-        Connectors by name. Each runs as its own user with only its own
-        credentials and serves the connector protocol on a Unix socket.
+        Connectors by name. Each runs as its own user with its own credentials.
       '';
     };
 
     console = {
-      enable = lib.mkEnableOption "the console, where you link connectors and approve each write with a passkey";
+      enable = lib.mkEnableOption "the console, where you link connectors and approve writes";
 
       hostname = lib.mkOption {
         type = lib.types.str;
         example = "mandate.example.com";
         description = ''
-          Hostname of the console, which is also the passkey relying party:
-          changing it invalidates every enrolled passkey.
+          Console hostname. Passkeys are bound to it.
         '';
       };
 
@@ -240,7 +248,7 @@ in
 
       tlsCertFile = lib.mkOption {
         type = lib.types.externalPath;
-        description = "TLS certificate for the hostname. Loaded via LoadCredential; restart mandate-console after renewing.";
+        description = "TLS certificate for the hostname. Loaded via LoadCredential; restart mandate-console after renewing it.";
       };
 
       tlsKeyFile = lib.mkOption {
@@ -248,23 +256,10 @@ in
         description = "TLS key for the hostname. Loaded via LoadCredential.";
       };
 
-      approvers = lib.mkOption {
-        type = lib.types.listOf (
-          lib.types.submodule {
-            options = {
-              name = lib.mkOption { type = lib.types.str; };
-              credential_id = lib.mkOption { type = lib.types.str; };
-              public_key = lib.mkOption { type = lib.types.str; };
-            };
-          }
-        );
-        default = [ ];
-        example = lib.literalExpression "lib.importJSON ./approvers.json";
-        description = ''
-          Passkeys that may sign in and approve writes, as shown by the
-          console after adding one. Keys are trusted only from here, so a
-          compromised console can't add its own.
-        '';
+      adminPasswordHashFile = lib.mkOption {
+        type = lib.types.externalPath;
+        example = "/run/secrets/mandate-admin-password-hash";
+        description = "bcrypt hash of the admin password. Loaded via LoadCredential.";
       };
     };
   };
@@ -277,7 +272,7 @@ in
           message = "services.mandate.connectors.${name}: names are lowercase letters, digits and dashes";
         }) (lib.attrNames connectors);
 
-        environment.systemPackages = [ cfg.package ];
+        environment.systemPackages = [ cfg.package ] ++ lib.optional cfg.console.enable resetKeys;
         system.checks = lib.mapAttrsToList configCheck connectors;
 
         users.users =
@@ -364,8 +359,6 @@ in
             // {
               User = "mandate-console";
               Group = "mandate-console";
-              # Sessions and decided proposals are the console's alone; the
-              # gateway only reaches the proposal socket.
               StateDirectory = "mandate-console";
               StateDirectoryMode = "0700";
               RuntimeDirectory = "mandate-console";
@@ -375,6 +368,7 @@ in
               LoadCredential = [
                 "tls-cert:${cfg.console.tlsCertFile}"
                 "tls-key:${cfg.console.tlsKeyFile}"
+                "admin-password-hash:${cfg.console.adminPasswordHashFile}"
               ];
               ExecStart =
                 utils.escapeSystemdExecArgs (
@@ -387,17 +381,14 @@ in
                     ":${toString cfg.console.port}"
                     "--state"
                     (state "console")
-                    "--approvers"
-                    approvers
                     "--socket"
                     proposalSocket
-                    "--admin-socket"
-                    "/run/mandate-console/admin.sock"
                   ]
                   ++ connectorArgs
                 )
                 + credential "--tls-cert" "tls-cert"
-                + credential "--tls-key" "tls-key";
+                + credential "--tls-key" "tls-key"
+                + credential "--admin-password-hash-file" "admin-password-hash";
               Restart = "always";
               RestartSec = "5s";
             };
