@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,22 +17,7 @@ import (
 	"github.com/adeci/mandate/internal/gateway"
 )
 
-const usage = `usage: mandate <command> [args]
-
-for agents (set MANDATE_URL and MANDATE_TOKEN):
-  guide                   print the agent guide (markdown, from the live schema)
-  query SQL [PARAM...]    run a read-only query
-  schema                  list the views and connector ops
-  read CONNECTOR OP [KEY=VALUE...]
-                          run a connector read op
-  get CONNECTOR PATH [--head]
-                          raw read from a connector that serves them, e.g. an API
-  propose CONNECTOR OP [KEY=VALUE...] [--note TEXT] [--wait DURATION]
-                          propose a write; prints the URL to send the owner
-  status ID [--wait DURATION]
-                          show a proposal; --wait blocks until the owner decides
-  exit: 0 done, 75 pending/paced/timed out, 1 rejected/expired/failed/unknown/error, 2 usage
-
+const hostUsage = `
 on the host:
   gateway                 serve the gateway
   console                 serve the owner's console and the proposal API
@@ -46,30 +32,18 @@ func main() {
 
 // run returns the status instead of exiting so deferred cleanup runs.
 func run() int {
-	if len(os.Args) < 2 {
-		fmt.Fprint(os.Stderr, usage)
-		return 2
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if len(os.Args) < 2 {
+		usage(ctx, os.Stderr)
+		return 2
+	}
 
 	cmd, args := os.Args[1], os.Args[2:]
 	var err error
 	switch cmd {
-	case "guide":
-		err = client.Guide(ctx, args)
-	case "query":
-		err = client.Query(ctx, args)
-	case "schema":
-		err = client.Schema(ctx, args)
-	case "read":
-		err = client.Read(ctx, args)
-	case "propose":
-		err = client.Propose(ctx, args)
 	case "status":
 		err = client.Status(ctx, args)
-	case "get":
-		err = client.Get(ctx, args)
 	case "gateway":
 		err = gateway.Command(ctx, args)
 	case "console":
@@ -79,14 +53,18 @@ func run() int {
 	case "list":
 		err = admin.List(ctx, args)
 	case "-h", "--help", "help":
-		fmt.Print(usage)
+		usage(ctx, os.Stdout)
 		return 0
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage)
-		return 2
+		err = client.Connector(ctx, cmd, args)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mandate %s: %v\n", cmd, err)
 	}
 	return exitcode.For(err)
+}
+
+func usage(ctx context.Context, w io.Writer) {
+	client.Help(ctx, w)
+	fmt.Fprint(w, hostUsage)
 }

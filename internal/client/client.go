@@ -17,7 +17,6 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/internal/exitcode"
 )
 
@@ -26,13 +25,13 @@ import (
 const requestTimeout = 150 * time.Second
 
 const (
-	queryUsage   = "usage: mandate query SQL [PARAM...]"
-	schemaUsage  = "usage: mandate schema"
-	guideUsage   = "usage: mandate guide"
-	readUsage    = "usage: mandate read CONNECTOR OP [KEY=VALUE...]"
-	proposeUsage = "usage: mandate propose CONNECTOR OP [KEY=VALUE...] [--note TEXT] [--wait DURATION]"
-	statusUsage  = "usage: mandate status ID [--wait DURATION]"
-	getUsage     = "usage: mandate get CONNECTOR PATH [--head]"
+	chatsUsage    = "mandate %s chats [--search TEXT] [--limit 20]"
+	messagesUsage = "mandate %s messages CHAT_ID [--limit 20] [--before SEQ]"
+	searchUsage   = "mandate %s search TEXT [--chat CHAT_ID] [--since YYYY-MM-DD] [--limit 50] [--before SEQ]"
+	sendUsage     = "mandate %s send CHAT_ID TEXT [--note WHY] [--wait DUR]"
+	opUsage       = "mandate %s %s [KEY=VALUE...] [--note WHY] [--wait DUR]"
+	getUsage      = "mandate %s get PATH [--head]"
+	statusUsage   = "mandate status ID [--wait DUR]"
 )
 
 type client struct {
@@ -41,10 +40,11 @@ type client struct {
 	http   *http.Client
 	out    io.Writer
 	errOut io.Writer
-	table  bool
+	tty    bool
+	json   bool
 }
 
-func fromEnv(getenv func(string) string, out, errOut io.Writer, table bool) (*client, error) {
+func fromEnv(getenv func(string) string, out, errOut io.Writer, tty bool) (*client, error) {
 	url := strings.TrimRight(getenv("MANDATE_URL"), "/")
 	if url == "" {
 		return nil, errors.New("MANDATE_URL is not set (e.g. http://lachesis:8780); ask the owner for the gateway address")
@@ -60,35 +60,30 @@ func fromEnv(getenv func(string) string, out, errOut io.Writer, table bool) (*cl
 	if token == "" {
 		return nil, errors.New("MANDATE_TOKEN or MANDATE_TOKEN_FILE is not set; ask the owner to configure this agent")
 	}
-	return &client{url: url, token: token, http: &http.Client{}, out: out, errOut: errOut, table: table}, nil
+	return &client{url: url, token: token, http: &http.Client{}, out: out, errOut: errOut, tty: tty}, nil
 }
 
 func newClient() (*client, error) {
 	fi, err := os.Stdout.Stat()
-	table := err == nil && fi.Mode()&os.ModeCharDevice != 0
-	return fromEnv(os.Getenv, os.Stdout, os.Stderr, table)
+	tty := err == nil && fi.Mode()&os.ModeCharDevice != 0
+	return fromEnv(os.Getenv, os.Stdout, os.Stderr, tty)
 }
 
-func Query(ctx context.Context, args []string) error { return run(ctx, args, (*client).query) }
-
-func Schema(ctx context.Context, args []string) error { return run(ctx, args, (*client).schema) }
-
-func Guide(ctx context.Context, args []string) error { return run(ctx, args, (*client).guide) }
-
-func Read(ctx context.Context, args []string) error { return run(ctx, args, (*client).read) }
-
-func Propose(ctx context.Context, args []string) error { return run(ctx, args, (*client).propose) }
-
-func Status(ctx context.Context, args []string) error { return run(ctx, args, (*client).status) }
-
-func Get(ctx context.Context, args []string) error { return run(ctx, args, (*client).forward) }
-
-func run(ctx context.Context, args []string, cmd func(*client, context.Context, []string) error) error {
+// Connector runs mandate NAME ARGS.
+func Connector(ctx context.Context, name string, args []string) error {
 	c, err := newClient()
 	if err != nil {
 		return err
 	}
-	return cmd(c, ctx, args)
+	return c.connector(ctx, name, args)
+}
+
+func Status(ctx context.Context, args []string) error {
+	c, err := newClient()
+	if err != nil {
+		return err
+	}
+	return c.status(ctx, args)
 }
 
 // exitError carries a message for the agent and the exit status it maps to,
@@ -102,60 +97,139 @@ func (e *exitError) Error() string { return e.msg }
 func (e *exitError) Unwrap() error { return e.code }
 
 func usage(text string, err error) error {
+	text = "usage: " + text
 	if err != nil {
 		text = err.Error() + "\n" + text
 	}
 	return &exitError{msg: text, code: exitcode.ErrUsage}
 }
 
-func (c *client) query(ctx context.Context, args []string) error {
-	if len(args) == 0 {
-		return usage(queryUsage, nil)
+func (c *client) connector(ctx context.Context, name string, args []string) error {
+	if len(args) == 0 || isHelp(args[0]) {
+		return c.connectorHelp(ctx, name)
 	}
-	params := make([]any, len(args)-1)
-	for i, p := range args[1:] {
-		params[i] = p
+	cmd, args := args[0], args[1:]
+	base := "/v1/" + url.PathEscape(name) + "/"
+	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	switch cmd {
+	case "chats":
+		help := fmt.Sprintf(chatsUsage, name)
+		search := fs.String("search", "", "")
+		limit := fs.Int("limit", 0, "")
+		if _, err := c.parse(fs, help, args, 0, 0); err != nil {
+			return err
+		}
+		return c.rows(ctx, base+"chats", query("search", *search, "limit", *limit))
+	case "messages":
+		help := fmt.Sprintf(messagesUsage, name)
+		limit := fs.Int("limit", 0, "")
+		before := fs.Int("before", 0, "")
+		pos, err := c.parse(fs, help, args, 1, 1)
+		if err != nil {
+			return err
+		}
+		return c.rows(ctx, base+"messages", query("chat", pos[0], "limit", *limit, "before", *before))
+	case "search":
+		help := fmt.Sprintf(searchUsage, name)
+		chat := fs.String("chat", "", "")
+		since := fs.String("since", "", "")
+		limit := fs.Int("limit", 0, "")
+		before := fs.Int("before", 0, "")
+		pos, err := c.parse(fs, help, args, 1, -1)
+		if err != nil {
+			return err
+		}
+		return c.rows(ctx, base+"search", query("text", strings.Join(pos, " "), "chat", *chat, "since", *since, "limit", *limit, "before", *before))
+	case "send":
+		help := fmt.Sprintf(sendUsage, name)
+		note := fs.String("note", "", "")
+		wait := fs.Duration("wait", 0, "")
+		pos, err := c.parse(fs, help, args, 2, -1)
+		if err != nil {
+			return err
+		}
+		if *wait < 0 {
+			return usage(help, errNegativeWait)
+		}
+		return c.submit(ctx, base+"send", map[string]string{"chat": pos[0], "text": strings.Join(pos[1:], " ")}, *note, *wait)
+	case "get":
+		return c.forward(ctx, name, args)
 	}
-	return c.rows(ctx, "/v1/query", map[string]any{"sql": args[0], "params": params})
-}
-
-func (c *client) read(ctx context.Context, args []string) error {
-	if len(args) < 2 {
-		return usage(readUsage, nil)
-	}
-	kv, err := keyValues(args[2:])
-	if err != nil {
-		return usage(readUsage, err)
-	}
-	return c.rows(ctx, "/v1/read/"+url.PathEscape(args[0])+"/"+url.PathEscape(args[1]), map[string]any{"args": kv})
-}
-
-// forward is a raw read: PATH, with any query, goes to the connector as
-// typed. The body is printed as is; --head prints the headers instead.
-func (c *client) forward(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("get", flag.ContinueOnError)
-	head := fs.Bool("head", false, "send HEAD and print the response headers")
-	positional, err := parseInterspersed(fs, args)
-	if err != nil {
-		return usage(getUsage, err)
-	}
-	if len(positional) != 2 {
-		return usage(getUsage, nil)
-	}
-	path := "/v1/forward/" + url.PathEscape(positional[0]) + "/" + strings.TrimPrefix(positional[1], "/")
-	method := http.MethodGet
-	if *head {
-		method = http.MethodHead
-	}
-	header, data, err := c.do(ctx, requestTimeout, method, path, nil)
+	help := fmt.Sprintf(opUsage, name, cmd)
+	note := fs.String("note", "", "")
+	wait := fs.Duration("wait", 0, "")
+	pos, err := c.parse(fs, help, args, 0, -1)
 	if err != nil {
 		return err
 	}
-	if *head {
-		return header.Write(c.out)
+	if *wait < 0 {
+		return usage(help, errNegativeWait)
 	}
-	_, err = c.out.Write(data)
-	return err
+	kv, err := keyValues(pos)
+	if err != nil {
+		return usage(help, err)
+	}
+	return c.submit(ctx, base+url.PathEscape(cmd), kv, *note, *wait)
+}
+
+func isHelp(s string) bool { return s == "-h" || s == "--help" || s == "help" }
+
+var errNegativeWait = errors.New("--wait must not be negative")
+
+// parse takes flags anywhere among args, adds --json, and wants between lo
+// and hi positional arguments (hi < 0: no limit).
+func (c *client) parse(fs *flag.FlagSet, help string, args []string, lo, hi int) ([]string, error) {
+	fs.BoolVar(&c.json, "json", false, "")
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
+		return nil, usage(help, err)
+	}
+	if len(pos) < lo || hi >= 0 && len(pos) > hi {
+		return nil, usage(help, nil)
+	}
+	return pos, nil
+}
+
+// parseInterspersed lets flags follow positional arguments, which the flag
+// package alone does not. Everything after "--" is positional.
+func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	fs.SetOutput(io.Discard)
+	var positional []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		rest := fs.Args()
+		if n := len(args) - len(rest); n > 0 && args[n-1] == "--" {
+			return append(positional, rest...), nil
+		}
+		if len(rest) == 0 {
+			return positional, nil
+		}
+		positional = append(positional, rest[0])
+		args = rest[1:]
+	}
+}
+
+// query builds a query string from key, value pairs, leaving out zero values.
+func query(kv ...any) string {
+	q := url.Values{}
+	for i := 0; i < len(kv); i += 2 {
+		switch v := kv[i+1].(type) {
+		case string:
+			if v != "" {
+				q.Set(kv[i].(string), v)
+			}
+		case int:
+			if v != 0 {
+				q.Set(kv[i].(string), strconv.Itoa(v))
+			}
+		}
+	}
+	if len(q) == 0 {
+		return ""
+	}
+	return "?" + q.Encode()
 }
 
 func keyValues(args []string) (map[string]string, error) {
@@ -173,67 +247,92 @@ func keyValues(args []string) (map[string]string, error) {
 	return kv, nil
 }
 
-// parseInterspersed lets flags follow positional arguments, which the flag
-// package alone does not.
-func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
-	fs.SetOutput(io.Discard)
-	var positional []string
-	for {
-		if err := fs.Parse(args); err != nil {
-			return nil, err
-		}
-		args = fs.Args()
-		if len(args) == 0 {
-			return positional, nil
-		}
-		positional = append(positional, args[0])
-		args = args[1:]
+// forward is a raw read: PATH, with any query, goes to the connector as
+// typed. The body is printed as is; --head prints the headers instead.
+func (c *client) forward(ctx context.Context, name string, args []string) error {
+	help := fmt.Sprintf(getUsage, name)
+	fs := flag.NewFlagSet("get", flag.ContinueOnError)
+	head := fs.Bool("head", false, "")
+	positional, err := parseInterspersed(fs, args)
+	if err != nil {
+		return usage(help, err)
 	}
+	if len(positional) != 1 {
+		return usage(help, nil)
+	}
+	path := "/v1/forward/" + url.PathEscape(name) + "/" + strings.TrimPrefix(positional[0], "/")
+	method := http.MethodGet
+	if *head {
+		method = http.MethodHead
+	}
+	_, header, data, err := c.do(ctx, requestTimeout, method, path, nil)
+	if err != nil {
+		return err
+	}
+	if *head {
+		return header.Write(c.out)
+	}
+	_, err = c.out.Write(data)
+	return err
 }
 
-type rowsResponse struct {
+type table struct {
 	Columns      []string `json:"columns"`
 	Rows         [][]any  `json:"rows"`
-	Truncated    bool     `json:"truncated"`
+	More         bool     `json:"more"`
+	NextBefore   int64    `json:"next_before"`
 	TotalResults int      `json:"total_results"`
 	Containers   int      `json:"containers"`
 }
 
-func (c *client) rows(ctx context.Context, path string, body any) error {
-	var raw json.RawMessage
-	if err := c.post(ctx, path, body, &raw); err != nil {
+func (c *client) rows(ctx context.Context, path, query string) error {
+	_, _, raw, err := c.do(ctx, requestTimeout, http.MethodGet, path+query, nil)
+	if err != nil {
 		return err
 	}
-	if !c.table {
-		_, err := c.out.Write(append(raw, '\n'))
+	return c.table(raw)
+}
+
+// table prints rows as TSV, or aligned on a terminal; the footer goes to
+// stderr so stdout stays parseable.
+func (c *client) table(raw []byte) error {
+	if c.json {
+		_, err := c.out.Write(append(bytes.TrimRight(raw, "\n"), '\n'))
 		return err
 	}
-	var res rowsResponse
-	if err := json.Unmarshal(raw, &res); err != nil {
+	var t table
+	if err := json.Unmarshal(raw, &t); err != nil {
 		return err
 	}
-	// Reads that store containers but return no messages, e.g. syncs.
-	if res.Columns == nil {
-		_, err := fmt.Fprintf(c.out, "%d containers synced, %d results\n", res.Containers, res.TotalResults)
-		return err
+	w := c.out
+	var tw *tabwriter.Writer
+	if c.tty {
+		tw = tabwriter.NewWriter(c.out, 0, 0, 2, ' ', 0)
+		w = tw
 	}
-	w := tabwriter.NewWriter(c.out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, strings.Join(res.Columns, "\t"))
-	for _, row := range res.Rows {
+	fmt.Fprintln(w, strings.Join(t.Columns, "\t"))
+	for _, row := range t.Rows {
 		cells := make([]string, len(row))
 		for i, v := range row {
 			cells[i] = cell(v)
 		}
 		fmt.Fprintln(w, strings.Join(cells, "\t"))
 	}
-	if err := w.Flush(); err != nil {
-		return err
+	if tw != nil {
+		if err := tw.Flush(); err != nil {
+			return err
+		}
 	}
 	switch {
-	case res.Truncated:
-		fmt.Fprintf(c.out, "(truncated at %d rows)\n", len(res.Rows))
-	case res.TotalResults > len(res.Rows):
-		fmt.Fprintf(c.out, "(%d of %d results)\n", len(res.Rows), res.TotalResults)
+	case t.NextBefore > 0:
+		fmt.Fprintf(c.errOut, "next: --before %d\n", t.NextBefore)
+	case t.More:
+		fmt.Fprintln(c.errOut, "more: raise --limit or narrow the search")
+	case t.TotalResults > len(t.Rows):
+		fmt.Fprintf(c.errOut, "%d of %d results\n", len(t.Rows), t.TotalResults)
+	}
+	if t.Containers > 0 {
+		fmt.Fprintf(c.errOut, "%d chats updated\n", t.Containers)
 	}
 	return nil
 }
@@ -251,135 +350,20 @@ func cell(v any) string {
 	}
 }
 
-type schemaInfo struct {
-	Views []struct {
-		Name        string   `json:"name"`
-		Description string   `json:"description"`
-		Columns     []string `json:"columns"`
-	} `json:"views"`
-	Connectors []struct {
-		connector.Spec
-		Health connector.Health `json:"health"`
-	} `json:"connectors"`
-	Limits struct {
-		MaxRows int `json:"max_rows"`
-	} `json:"limits"`
-}
-
-func (c *client) schema(ctx context.Context, args []string) error {
-	if len(args) != 0 {
-		return usage(schemaUsage, nil)
-	}
-	var raw json.RawMessage
-	if err := c.get(ctx, "/v1/schema", &raw); err != nil {
-		return err
-	}
-	if !c.table {
-		_, err := c.out.Write(append(raw, '\n'))
-		return err
-	}
-	var s schemaInfo
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return err
-	}
-	for _, v := range s.Views {
-		fmt.Fprintf(c.out, "%s (%s)\n  %s\n\n", v.Name, strings.Join(v.Columns, ", "), v.Description)
-	}
-	for _, spec := range s.Connectors {
-		fmt.Fprintf(c.out, "connector %s: %s\n", spec.Name, health(spec.Health))
-		for _, op := range spec.Ops {
-			fmt.Fprintf(c.out, "  %s\n    %s\n", opUsage(spec.Name, op), op.Summary)
-			for _, p := range op.Params {
-				fmt.Fprintf(c.out, "    %s: %s%s\n", p.Name, p.Doc, paramTags(p))
-			}
-		}
-		if spec.Forward {
-			fmt.Fprintf(c.out, "  mandate get %s PATH [--head]\n    raw read\n", spec.Name)
-		}
-		fmt.Fprintln(c.out)
-	}
-	return nil
-}
-
-func opUsage(name string, op connector.Op) string {
-	verb := "read"
-	if op.Kind == connector.Write {
-		verb = "propose"
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "mandate %s %s %s", verb, name, op.Name)
-	for _, p := range op.Params {
-		if p.Required {
-			fmt.Fprintf(&b, " %s=...", p.Name)
-		} else {
-			fmt.Fprintf(&b, " [%s=...]", p.Name)
-		}
-	}
-	return b.String()
-}
-
-func paramTags(p connector.Param) string {
-	var tags []string
-	if p.Container {
-		tags = append(tags, "container")
-	}
-	if p.Editable {
-		tags = append(tags, "owner may edit")
-	}
-	if len(tags) == 0 {
-		return ""
-	}
-	return " (" + strings.Join(tags, ", ") + ")"
-}
-
-func health(h connector.Health) string {
-	s := string(h.State)
-	switch h.State {
-	case connector.Healthy:
-		return s
-	case connector.Resting:
-		if !h.Until.IsZero() {
-			s += " until " + h.Until.UTC().Format(time.RFC3339)
-		}
-	default:
-		s = "needs the owner (" + s + ")"
-	}
-	if h.Detail != "" {
-		s += ": " + h.Detail
-	}
-	return s
-}
-
-func (c *client) get(ctx context.Context, path string, out any) error {
-	_, data, err := c.do(ctx, requestTimeout, http.MethodGet, path, nil)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(data, out)
-}
-
-func (c *client) post(ctx context.Context, path string, body, out any) error {
-	b, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
-	_, data, err := c.do(ctx, requestTimeout, http.MethodPost, path, b)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(data, out)
-}
-
-func (c *client) do(ctx context.Context, timeout time.Duration, method, path string, body []byte) (http.Header, []byte, error) {
+func (c *client) do(ctx context.Context, timeout time.Duration, method, path string, body any) (int, http.Header, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var rd io.Reader
 	if body != nil {
-		rd = bytes.NewReader(body)
+		b, err := json.Marshal(body)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		rd = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.url+path, rd)
 	if err != nil {
-		return nil, nil, err
+		return 0, nil, nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	if body != nil {
@@ -387,15 +371,15 @@ func (c *client) do(ctx context.Context, timeout time.Duration, method, path str
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w; check MANDATE_URL, and tell the owner if the gateway stays unreachable", err)
+		return 0, nil, nil, fmt.Errorf("%w; check MANDATE_URL, and tell the owner if the gateway stays unreachable", err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
-		return nil, nil, err
+		return 0, nil, nil, err
 	}
 	if resp.StatusCode/100 == 2 {
-		return resp.Header, data, nil
+		return resp.StatusCode, resp.Header, data, nil
 	}
 	var e struct {
 		Error             string `json:"error"`
@@ -409,12 +393,12 @@ func (c *client) do(ctx context.Context, timeout time.Duration, method, path str
 	}
 	switch resp.StatusCode {
 	case http.StatusTooManyRequests:
-		return nil, nil, &exitError{
+		return 0, nil, nil, &exitError{
 			msg:  fmt.Sprintf("%s; retry in %s", e.Error, time.Duration(e.RetryAfterSeconds)*time.Second),
 			code: exitcode.ErrTryLater,
 		}
 	case http.StatusUnauthorized:
-		return nil, nil, errors.New("the gateway refused the token; ask the owner to check MANDATE_TOKEN")
+		return 0, nil, nil, errors.New("the gateway refused the token; ask the owner to check MANDATE_TOKEN")
 	}
-	return nil, nil, fmt.Errorf("%s (HTTP %d)", e.Error, resp.StatusCode)
+	return 0, nil, nil, fmt.Errorf("%s (HTTP %d)", e.Error, resp.StatusCode)
 }

@@ -1,9 +1,9 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -20,57 +20,44 @@ import (
 // maxPoll matches the gateway's long-poll cap; longer waits take several.
 const maxPoll = 900 * time.Second
 
-func (c *client) propose(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("propose", flag.ContinueOnError)
-	note := fs.String("note", "", "why, shown to the owner")
-	wait := fs.Duration("wait", 0, "block until the owner decides, up to this long (e.g. 15m)")
-	positional, err := parseInterspersed(fs, args)
+type opRequest struct {
+	Args map[string]string `json:"args"`
+	Note string            `json:"note,omitempty"`
+}
+
+// submit runs an op. A read answers rows; a write answers 202 with a
+// proposal, which is printed and, with wait, awaited.
+func (c *client) submit(ctx context.Context, path string, args map[string]string, note string, wait time.Duration) error {
+	status, _, raw, err := c.do(ctx, requestTimeout, http.MethodPost, path, opRequest{Args: args, Note: note})
 	if err != nil {
-		return usage(proposeUsage, err)
-	}
-	if len(positional) < 2 {
-		return usage(proposeUsage, nil)
-	}
-	kv, err := keyValues(positional[2:])
-	if err != nil {
-		return usage(proposeUsage, err)
-	}
-	if *wait < 0 {
-		return usage(proposeUsage, errors.New("--wait must not be negative"))
-	}
-	req := proposal.Request{Connector: positional[0], Op: positional[1], Args: kv, Note: *note}
-	var raw json.RawMessage
-	if err := c.post(ctx, "/v1/actions", req, &raw); err != nil {
 		return err
+	}
+	if status != http.StatusAccepted {
+		return c.table(raw)
 	}
 	p, err := c.show(raw)
 	if err != nil {
 		return err
 	}
-	if *wait == 0 {
-		if c.table {
-			fmt.Fprintf(c.out, "then check with: mandate status %s --wait 15m\n", p.ID)
-		}
+	if wait == 0 {
+		fmt.Fprintf(c.errOut, "tell the owner it is waiting, then: mandate status %s --wait 15m\n", p.ID)
 		return nil
 	}
-	fmt.Fprintf(c.errOut, "waiting up to %s for the owner to decide; send them %s\n", *wait, p.URL)
-	return c.await(ctx, p.ID, *wait)
+	fmt.Fprintf(c.errOut, "waiting up to %s for the owner to decide\n", wait)
+	return c.await(ctx, p.ID, wait)
 }
 
 func (c *client) status(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
-	wait := fs.Duration("wait", 0, "block until the owner decides, up to this long (e.g. 15m)")
-	positional, err := parseInterspersed(fs, args)
+	wait := fs.Duration("wait", 0, "")
+	pos, err := c.parse(fs, statusUsage, args, 1, 1)
 	if err != nil {
-		return usage(statusUsage, err)
-	}
-	if len(positional) != 1 {
-		return usage(statusUsage, nil)
+		return err
 	}
 	if *wait < 0 {
-		return usage(statusUsage, errors.New("--wait must not be negative"))
+		return usage(statusUsage, errNegativeWait)
 	}
-	return c.await(ctx, positional[0], *wait)
+	return c.await(ctx, pos[0], *wait)
 }
 
 // await long-polls the gateway until the proposal settles or wait runs out,
@@ -78,14 +65,14 @@ func (c *client) status(ctx context.Context, args []string) error {
 func (c *client) await(ctx context.Context, id string, wait time.Duration) error {
 	deadline := time.Now().Add(wait)
 	for {
-		path := "/v1/actions/" + url.PathEscape(id)
+		path := "/v1/proposals/" + url.PathEscape(id)
 		poll := min(time.Until(deadline), maxPoll)
 		var secs int
 		if poll > 0 {
 			secs = int(math.Ceil(poll.Seconds()))
 			path += "?wait=" + strconv.Itoa(secs)
 		}
-		_, raw, err := c.do(ctx, time.Duration(secs)*time.Second+requestTimeout, http.MethodGet, path, nil)
+		_, _, raw, err := c.do(ctx, time.Duration(secs)*time.Second+requestTimeout, http.MethodGet, path, nil)
 		if err != nil {
 			return err
 		}
@@ -107,13 +94,13 @@ func pending(s proposal.Status) bool {
 	return s == proposal.Pending || s == proposal.Executing
 }
 
-func (c *client) show(raw json.RawMessage) (proposal.Proposal, error) {
+func (c *client) show(raw []byte) (proposal.Proposal, error) {
 	var p proposal.Proposal
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return p, err
 	}
-	if !c.table {
-		_, err := c.out.Write(append(raw, '\n'))
+	if c.json {
+		_, err := c.out.Write(append(bytes.TrimRight(raw, "\n"), '\n'))
 		return p, err
 	}
 	printProposal(c.out, p)
@@ -139,7 +126,7 @@ func printProposal(w io.Writer, p proposal.Proposal) {
 		}
 	}
 	if pending(p.Status) && p.URL != "" {
-		fmt.Fprintf(w, "send the owner this link to approve: %s\n", p.URL)
+		fmt.Fprintf(w, "approve at: %s\n", p.URL)
 	}
 }
 
@@ -157,7 +144,7 @@ func outcome(p proposal.Proposal, waited time.Duration) error {
 			msg += " after " + waited.String()
 		}
 		if p.Status == proposal.Pending {
-			msg += fmt.Sprintf("; make sure the owner has %s, then", p.URL)
+			msg += "; make sure the owner knows it is waiting, then"
 		} else {
 			msg += "; it is running,"
 		}
@@ -170,7 +157,7 @@ func outcome(p proposal.Proposal, waited time.Duration) error {
 	case proposal.Failed:
 		return fmt.Errorf("proposal %s failed%s; it did not go through, fix the cause before proposing again", p.ID, detail)
 	case proposal.Unknown:
-		return fmt.Errorf("proposal %s may have been sent%s; never retry automatically, tell the owner", p.ID, detail)
+		return fmt.Errorf("proposal %s may have been sent%s; don't retry, tell the owner", p.ID, detail)
 	}
 	return fmt.Errorf("proposal %s has status %q; tell the owner", p.ID, p.Status)
 }
