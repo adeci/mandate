@@ -1,7 +1,9 @@
-// Package whatsapp ingests WhatsApp messages as a whatsmeow linked device.
+// Package whatsapp ingests WhatsApp messages as a whatsmeow linked device and
+// serves the whatsapp connector.
 //
-// The ingester is read-only toward WhatsApp: it never sends messages,
-// receipts beyond whatsmeow's automatic protocol acks, presence, or typing.
+// The only messages it sends are writes the owner approved with a passkey,
+// verified by connector.Server. Otherwise it sends nothing: no receipts beyond
+// whatsmeow's automatic protocol acks, no presence, no typing.
 package whatsapp
 
 import (
@@ -10,8 +12,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
 
 	"github.com/mdp/qrterminal/v3"
 	"github.com/rs/zerolog"
@@ -21,11 +25,14 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
+	"github.com/adeci/mandate/internal/approval"
+	"github.com/adeci/mandate/internal/connector"
 	"github.com/adeci/mandate/internal/exitcode"
 	"github.com/adeci/mandate/internal/store"
 )
 
-const usage = `usage: mandate whatsapp run --data PATH --session PATH
+const usage = `usage: mandate whatsapp run --data PATH --session PATH [--listen SOCKET]
+                           [--approvers FILE --rp-id ID --origin URL] [--seen PATH]
        mandate whatsapp pair --session PATH [--phone +E164]`
 
 var errNotPaired = fmt.Errorf(`not paired: run "mandate whatsapp pair": %w`, exitcode.ErrNeedsOwner)
@@ -45,16 +52,36 @@ func Command(ctx context.Context, args []string) error {
 }
 
 func run(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("whatsapp run", flag.ContinueOnError)
-	dataPath := fs.String("data", "", "message store database (required)")
-	sessionPath := fs.String("session", "", "whatsmeow session database (required)")
-	if err := fs.Parse(args); err != nil {
+	flags := flag.NewFlagSet("whatsapp run", flag.ContinueOnError)
+	dataPath := flags.String("data", "", "message store database (required)")
+	sessionPath := flags.String("session", "", "whatsmeow session database (required)")
+	listen := flags.String("listen", "/run/mandate-whatsapp/connector.sock", "connector socket")
+	approversPath := flags.String("approvers", "", "enrolled passkeys (JSON); missing or empty refuses all sends")
+	rpID := flags.String("rp-id", "", "WebAuthn relying party ID of the approval page")
+	origin := flags.String("origin", "", "WebAuthn origin of the approval page")
+	seenPath := flags.String("seen", "", "used-approval log (default: seen.json next to --session)")
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *dataPath == "" || *sessionPath == "" {
-		return errors.New("--data and --session are required")
+	if *dataPath == "" || *sessionPath == "" || *listen == "" {
+		return errors.New("--data, --session, and --listen are required")
+	}
+	if *seenPath == "" {
+		*seenPath = filepath.Join(filepath.Dir(*sessionPath), "seen.json")
 	}
 	ctx = withLibraryLogger(ctx)
+	log := slog.Default().With("source", "whatsapp")
+
+	verifier, err := loadVerifier(*approversPath, *rpID, *origin)
+	if err != nil {
+		return err
+	}
+	var seen *approval.Seen
+	if verifier == nil {
+		log.Warn("no approvers enrolled; sends are refused")
+	} else if seen, err = approval.OpenSeen(*seenPath); err != nil {
+		return fmt.Errorf("open seen log: %w", err)
+	}
 
 	st, err := store.Open(ctx, *dataPath)
 	if err != nil {
@@ -71,7 +98,6 @@ func run(ctx context.Context, args []string) error {
 		return errNotPaired
 	}
 
-	log := slog.Default().With("source", "whatsapp")
 	cli := whatsmeow.NewClient(device, newWALogger("whatsmeow"))
 	cli.BackgroundEventCtx = ctx
 	// Ack only after the handler stored the message; the decrypted-event
@@ -93,19 +119,69 @@ func run(ctx context.Context, args []string) error {
 		return in.handle(ctx, evt)
 	})
 
-	log.Info("connecting", "jid", device.ID.String())
+	srv := &connector.Server{
+		Connector: newConnector(cli, device, st, log),
+		Verifier:  verifier,
+		Seen:      seen,
+		Log:       log,
+	}
+	serveCtx, stopServe := context.WithCancel(ctx)
+	defer stopServe()
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(serveCtx, *listen) }()
+	// Stop serving before disconnecting so an in-flight send can finish.
+	shutdown := func() error {
+		stopServe()
+		err := <-served
+		cli.Disconnect()
+		if err != nil {
+			return fmt.Errorf("serve connector: %w", err)
+		}
+		return nil
+	}
+
+	log.Info("connecting", "jid", device.ID.String(), "listen", *listen)
 	if err := cli.ConnectContext(ctx); err != nil {
-		return fmt.Errorf("connect: %w", err)
+		return errors.Join(fmt.Errorf("connect: %w", err), shutdown())
 	}
 	select {
 	case <-ctx.Done():
-		cli.Disconnect()
+		if err := shutdown(); err != nil {
+			return err
+		}
 		log.Info("disconnected")
 		return nil
 	case err := <-fatal:
+		return errors.Join(err, shutdown())
+	case err := <-served:
 		cli.Disconnect()
-		return err
+		return fmt.Errorf("serve connector: %w", err)
 	}
+}
+
+// loadVerifier returns nil, refusing all sends, unless approvers are enrolled.
+func loadVerifier(path, rpID, origin string) (*approval.Verifier, error) {
+	if path == "" {
+		return nil, nil
+	}
+	fi, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) || (err == nil && fi.Size() == 0) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read approvers: %w", err)
+	}
+	approvers, err := approval.LoadApprovers(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(approvers) == 0 {
+		return nil, nil
+	}
+	if rpID == "" || origin == "" {
+		return nil, errors.New("--rp-id and --origin are required when approvers are enrolled")
+	}
+	return &approval.Verifier{RPID: rpID, Origin: origin, Approvers: approvers}, nil
 }
 
 // permanentError maps events after which whatsmeow will not reconnect.
