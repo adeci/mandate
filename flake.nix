@@ -1,5 +1,5 @@
 {
-  description = "mandate: self-hosted messaging ingestion and read-only SQL gateway for agents";
+  description = "mandate: let agents use your services semi-sanely";
 
   inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 
@@ -33,10 +33,13 @@
         };
     in
     {
-      packages = forAllSystems (pkgs: rec {
-        mandate = pkgs.callPackage ./nix/package.nix { };
-        default = mandate;
-      });
+      packages = forAllSystems (
+        pkgs:
+        let
+          all = pkgs.callPackage ./nix/package.nix { };
+        in
+        all // { default = all.mandate; }
+      );
 
       nixosModules.default = import ./nix/module.nix self;
 
@@ -55,6 +58,7 @@
             pkgs.gopls
             pkgs.golangci-lint
             pkgs.sqlite-interactive
+            pkgs.jq
           ];
           env.GOTOOLCHAIN = "local";
         };

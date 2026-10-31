@@ -5,50 +5,54 @@
 }:
 let
   inherit (pkgs) lib;
-  mandate = self.packages.${pkgs.stdenv.hostPlatform.system}.mandate;
-in
-{
-  package = mandate;
+  packages = lib.removeAttrs self.packages.${pkgs.stdenv.hostPlatform.system} [ "default" ];
 
-  go-tests = mandate.overrideAttrs (old: {
-    pname = "mandate-go-tests";
-    doCheck = true;
-    # -race needs cgo.
-    env = old.env // {
-      CGO_ENABLED = 1;
-    };
-    checkPhase = ''
-      runHook preCheck
-      go test -race -p $NIX_BUILD_CORES ./...
-      runHook postCheck
-    '';
-    installPhase = "touch $out";
-    doInstallCheck = false;
-  });
+  goTests =
+    pkg:
+    pkg.overrideAttrs (old: {
+      pname = "${old.pname}-go-tests";
+      doCheck = true;
+      # -race needs cgo.
+      env = old.env // {
+        CGO_ENABLED = 1;
+      };
+      checkPhase = ''
+        runHook preCheck
+        go test -race -p $NIX_BUILD_CORES ./...
+        runHook postCheck
+      '';
+      installPhase = "touch $out";
+      doInstallCheck = false;
+    });
 
-  golangci-lint = mandate.overrideAttrs (old: {
-    pname = "mandate-golangci-lint";
-    src = lib.fileset.toSource {
-      root = ../.;
+  golangciLint =
+    pkg:
+    pkg.overrideAttrs (old: {
+      pname = "${old.pname}-golangci-lint";
       # Without the config golangci-lint silently falls back to its defaults.
-      fileset = lib.fileset.unions [
-        ../go.mod
-        ../go.sum
-        ../cmd
-        ../internal
-        ../.golangci.yml
-      ];
-    };
-    nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.golangci-lint ];
-    buildPhase = ''
-      runHook preBuild
-      HOME=$TMPDIR golangci-lint run --concurrency $NIX_BUILD_CORES ./...
-      runHook postBuild
-    '';
-    installPhase = "touch $out";
-    doInstallCheck = false;
-  });
+      src = lib.fileset.toSource {
+        root = ../.;
+        fileset = lib.fileset.unions [
+          (lib.fileset.fromSource old.src)
+          ../.golangci.yml
+        ];
+      };
+      nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.golangci-lint ];
+      buildPhase = ''
+        runHook preBuild
+        HOME=$TMPDIR golangci-lint run --config "$NIX_BUILD_TOP/source/.golangci.yml" --concurrency $NIX_BUILD_CORES ./...
+        runHook postBuild
+      '';
+      installPhase = "touch $out";
+      doInstallCheck = false;
+    });
 
+  perPackage = f: suffix: lib.mapAttrs' (name: pkg: lib.nameValuePair "${name}-${suffix}" (f pkg));
+in
+packages
+// perPackage goTests "tests" packages
+// perPackage golangciLint "lint" packages
+// {
   treefmt = pkgs.runCommand "mandate-treefmt" { } ''
     cp -r ${self} src
     chmod -R +w src

@@ -3,37 +3,72 @@
   buildGoModule,
   go_1_27,
 }:
-
-# tls-client (Discord's Chrome fingerprint) requires Go 1.27.
-(buildGoModule.override { go = go_1_27; }) {
-  pname = "mandate";
-  version = "0.1.0";
-
-  src = lib.fileset.toSource {
-    root = ../.;
-    fileset = lib.fileset.unions [
-      ../go.mod
-      ../go.sum
-      ../cmd
-      ../internal
-    ];
-  };
-
-  # Updated by nix/update-vendor-hash.sh.
-  vendorHash = lib.fileContents ./goVendorHash.txt;
-
-  env.CGO_ENABLED = 0;
-  ldflags = [
-    "-s"
-    "-w"
+let
+  # Connector modules replace github.com/adeci/mandate with ../.., so every
+  # build needs the core sources. go.work is left out: vendoring refuses
+  # workspace mode.
+  core = [
+    ../go.mod
+    ../go.sum
+    ../cmd
+    ../internal
+    ../connector
+    ../approval
+    ../store
   ];
+  hashes = lib.importJSON ./vendor-hashes.json;
 
-  # The Go tests run in checks.go-tests (with -race) so they cache separately.
-  doCheck = false;
+  module =
+    {
+      pname,
+      modRoot ? ".",
+      files ? [ ],
+      description,
+    }:
+    # Discord's tls-client needs Go 1.27; everything builds with one toolchain.
+    (buildGoModule.override { go = go_1_27; }) {
+      inherit pname modRoot;
+      version = "0.1.0";
 
-  meta = {
-    description = "Messaging ingestion and read-only SQL gateway for agents";
-    mainProgram = "mandate";
-    platforms = lib.platforms.linux;
+      src = lib.fileset.toSource {
+        root = ../.;
+        fileset = lib.fileset.unions (core ++ files);
+      };
+
+      # Updated by nix/update-vendor-hash.sh.
+      vendorHash = hashes.${pname};
+
+      env.CGO_ENABLED = 0;
+      ldflags = [
+        "-s"
+        "-w"
+      ];
+
+      # The Go tests run in checks (with -race) so they cache separately.
+      doCheck = false;
+
+      meta = {
+        inherit description;
+        mainProgram = pname;
+        platforms = lib.platforms.linux;
+      };
+    };
+
+  connector =
+    name: description:
+    module {
+      pname = "mandate-${name}";
+      modRoot = "connectors/${name}";
+      files = [ (../connectors + "/${name}") ];
+      inherit description;
+    };
+in
+{
+  mandate = module {
+    pname = "mandate";
+    description = "Gateway, console and agent CLI for mandate";
   };
+  mandate-whatsapp = connector "whatsapp" "WhatsApp connector for mandate";
+  mandate-discord = connector "discord" "Discord connector for mandate";
+  mandate-http = connector "http" "HTTP API connector for mandate";
 }

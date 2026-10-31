@@ -59,10 +59,17 @@ pkgs.testers.runNixOSTest {
       enable = true;
       tokenFile = "/etc/mandate-token";
       openFirewallOn = "eth1";
-      whatsapp.enable = true;
-      discord = {
-        enable = true;
-        tokenFile = "/etc/discord-token";
+      connectors = {
+        whatsapp = { };
+        discord.credentials.token = "/etc/discord-token";
+        http = {
+          settings.services.api = {
+            base_url = "http://127.0.0.1:9000";
+            reads = [ "GET /items" ];
+            writes = [ "POST /items" ];
+          };
+          credentials.api = "/etc/api-token";
+        };
       };
       console = {
         enable = true;
@@ -78,12 +85,6 @@ pkgs.testers.runNixOSTest {
           }
         ];
       };
-      http.services.api = {
-        baseUrl = "http://127.0.0.1:9000";
-        tokenFile = "/etc/api-token";
-        reads = [ "GET /items" ];
-        writes = [ "POST /items" ];
-      };
     };
     environment.etc = {
       "mandate-token".text = token;
@@ -94,7 +95,7 @@ pkgs.testers.runNixOSTest {
     };
     systemd.services.recorder = {
       wantedBy = [ "multi-user.target" ];
-      before = [ "mandate-http-proxy.service" ];
+      before = [ "mandate-http.service" ];
       serviceConfig = {
         ExecStart = "${pkgs.python3}/bin/python3 ${recorder}";
         StateDirectory = "recorder";
@@ -120,7 +121,7 @@ pkgs.testers.runNixOSTest {
     from cryptography.hazmat.primitives.asymmetric import ec
 
     start_all()
-    for unit in ["recorder", "mandate-gateway", "mandate-whatsapp", "mandate-discord", "mandate-console", "mandate-http-proxy"]:
+    for unit in ["recorder", "mandate-gateway", "mandate-whatsapp", "mandate-discord", "mandate-console", "mandate-http"]:
         machine.wait_for_unit(f"{unit}.service")
     for port in [8780, 443, 9000]:
         machine.wait_for_open_port(port)
@@ -174,7 +175,7 @@ pkgs.testers.runNixOSTest {
     with subtest("fixture written as the source user is 0640"):
         machine.succeed(
             "cd /var/lib/mandate-whatsapp && sudo -u mandate-whatsapp sh -c "
-            "'umask 0027 && sqlite3 data.db < ${../internal/store/schema.sql} && sqlite3 data.db < ${fixture}'"
+            "'umask 0027 && sqlite3 data.db < ${../store/schema.sql} && sqlite3 data.db < ${fixture}'"
         )
         machine.succeed("stat -c %a /var/lib/mandate-whatsapp/data.db | grep -qx 640")
 
@@ -260,7 +261,7 @@ pkgs.testers.runNixOSTest {
         data = base64.b64encode(json.dumps(forged).encode()).decode()
         code = machine.succeed(
             f"echo {data} | base64 -d | sudo -u mandate-gateway curl -s -o /dev/null -w '%{{http_code}}' "
-            "--unix-socket /run/mandate-http-proxy/connector.sock --data-binary @- http://connector/execute"
+            "--unix-socket /run/mandate-http/connector.sock --data-binary @- http://connector/execute"
         )
         assert code == "403", code
         assert len(recorded()) == 1
@@ -293,9 +294,9 @@ pkgs.testers.runNixOSTest {
     with subtest("replaying the approval does nothing, even after restarts"):
         code, _ = console("POST", f"/r/{pid}/approve", approved)
         assert code == 409, code
-        machine.succeed("systemctl restart mandate-console.service mandate-http-proxy.service")
+        machine.succeed("systemctl restart mandate-console.service mandate-http.service")
         machine.wait_for_open_port(443)
-        machine.wait_for_unit("mandate-http-proxy.service")
+        machine.wait_for_unit("mandate-http.service")
         code, _ = console("POST", f"/r/{pid}/approve", approved)
         assert code == 409, code
         assert len(recorded()) == 2
@@ -306,8 +307,8 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"curl -sf --cacert /etc/mandate-tls/cert.pem --resolve ${host}:443:127.0.0.1 {url} >/dev/null")
         machine.fail("sudo -u mandate-gateway mandate passkey add --name x")
         machine.fail("sudo -u mandate-gateway ls /var/lib/mandate-console")
-        machine.fail("sudo -u mandate-gateway cat /run/credentials/mandate-http-proxy.service/api")
-        machine.fail("sudo -u mandate-whatsapp test -w /run/mandate-http-proxy/connector.sock")
+        machine.fail("sudo -u mandate-gateway cat /run/credentials/mandate-http.service/api")
+        machine.fail("sudo -u mandate-whatsapp test -w /run/mandate-http/connector.sock")
 
     with subtest("outsider cannot reach the gateway or the console"):
         machine.succeed("curl -sf http://127.0.0.1:8780/healthz")
@@ -315,7 +316,7 @@ pkgs.testers.runNixOSTest {
         outsider.fail("curl -sk --max-time 5 https://machine/login")
 
     with subtest("hardened units"):
-        for unit in ["mandate-gateway", "mandate-whatsapp", "mandate-discord", "mandate-console", "mandate-http-proxy"]:
+        for unit in ["mandate-gateway", "mandate-whatsapp", "mandate-discord", "mandate-console", "mandate-http"]:
             machine.succeed(f"systemctl show -p MemoryDenyWriteExecute --value {unit} | grep -qx yes")
         machine.succeed("systemctl show -p CapabilityBoundingSet --value mandate-console | grep -qx cap_net_bind_service")
   '';
