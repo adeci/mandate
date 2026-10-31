@@ -24,12 +24,12 @@ import (
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 
-	"github.com/adeci/sieve/internal/discordapi"
-	"github.com/adeci/sieve/internal/exitcode"
-	"github.com/adeci/sieve/internal/store"
+	"github.com/adeci/mandate/internal/discordapi"
+	"github.com/adeci/mandate/internal/exitcode"
+	"github.com/adeci/mandate/internal/store"
 )
 
-const usage = "usage: sieve discord serve --data PATH --state PATH --token-file PATH --listen PATH [--timezone TZ] [--active-hours HH-HH]"
+const usage = "usage: mandate discord serve --data PATH --state PATH --token-file PATH --listen PATH [--timezone TZ] [--active-hours HH-HH]"
 
 const maxCallBody = 64 << 10
 

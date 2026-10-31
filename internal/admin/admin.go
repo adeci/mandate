@@ -21,7 +21,7 @@ func List(ctx context.Context, args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: sieve list [--senders] <data.db>")
+		return errors.New("usage: mandate list [--senders] <data.db>")
 	}
 	db, err := sql.Open("sqlite3", "file:"+fs.Arg(0)+"?mode=ro")
 	if err != nil {

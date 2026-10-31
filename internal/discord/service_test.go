@@ -22,9 +22,9 @@ import (
 
 	fhttp "github.com/bogdanfinn/fhttp"
 
-	"github.com/adeci/sieve/internal/discordapi"
-	"github.com/adeci/sieve/internal/exitcode"
-	"github.com/adeci/sieve/internal/store"
+	"github.com/adeci/mandate/internal/discordapi"
+	"github.com/adeci/mandate/internal/exitcode"
+	"github.com/adeci/mandate/internal/store"
 )
 
 const (

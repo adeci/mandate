@@ -7,9 +7,9 @@ self:
   ...
 }:
 let
-  cfg = config.services.sieve;
+  cfg = config.services.mandate;
   exe = lib.getExe cfg.package;
-  state = name: "/var/lib/sieve-${name}";
+  state = name: "/var/lib/mandate-${name}";
   # %d (the credentials directory) must reach systemd unescaped, so it is
   # appended after escapeSystemdExecArgs, which would turn it into %%d.
   credentialArg = " --token-file %d/token";
@@ -55,7 +55,7 @@ let
         "--state"
         "${state "discord"}/private/state.json"
         "--listen"
-        "/run/sieve-discord/api.sock"
+        "/run/mandate-discord/api.sock"
       ]
       ++ lib.optionals (config.time.timeZone != null) [
         "--timezone"
@@ -99,21 +99,21 @@ let
   };
 
   sourceService = name: src: {
-    description = "sieve ${name} source";
+    description = "mandate ${name} source";
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
     wantedBy = [ "multi-user.target" ];
     startLimitIntervalSec = 0;
-    # Not started until paired: run `sieve <name> pair` as sieve-<name> first.
+    # Not started until paired: run `mandate <name> pair` as mandate-<name> first.
     unitConfig = lib.optionalAttrs (src.session != null) {
       ConditionPathExists = "${state name}/${src.session}";
     };
     serviceConfig =
       hardening
       // {
-        User = "sieve-${name}";
-        Group = "sieve-${name}";
-        StateDirectory = "sieve-${name}";
+        User = "mandate-${name}";
+        Group = "mandate-${name}";
+        StateDirectory = "mandate-${name}";
         StateDirectoryMode = "0750";
         WorkingDirectory = state name;
         ExecStart =
@@ -125,25 +125,25 @@ let
       }
       // lib.optionalAttrs (name == "discord") {
         LoadCredential = [ "token:${cfg.discord.tokenFile}" ];
-        RuntimeDirectory = "sieve-discord";
+        RuntimeDirectory = "mandate-discord";
         RuntimeDirectoryMode = "0750";
       };
   };
 in
 {
-  options.services.sieve = {
-    enable = lib.mkEnableOption "the sieve read-only SQL gateway (and the sources enabled below)";
+  options.services.mandate = {
+    enable = lib.mkEnableOption "the mandate read-only SQL gateway (and the sources enabled below)";
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.sieve;
-      defaultText = lib.literalExpression "sieve.packages.\${system}.sieve";
-      description = "The sieve package.";
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.mandate;
+      defaultText = lib.literalExpression "mandate.packages.\${system}.mandate";
+      description = "The mandate package.";
     };
 
     tokenFile = lib.mkOption {
       type = lib.types.externalPath;
-      example = "/run/secrets/sieve-token";
+      example = "/run/secrets/mandate-token";
       description = ''
         Bearer token for the gateway (at least 32 characters), outside the
         Nix store. Loaded via LoadCredential.
@@ -180,16 +180,16 @@ in
 
       users.users = lib.mapAttrs' (
         name: _:
-        lib.nameValuePair "sieve-${name}" {
+        lib.nameValuePair "mandate-${name}" {
           isSystemUser = true;
-          group = "sieve-${name}";
+          group = "mandate-${name}";
           home = state name;
         }
       ) sources;
-      users.groups = lib.mapAttrs' (name: _: lib.nameValuePair "sieve-${name}" { }) sources;
+      users.groups = lib.mapAttrs' (name: _: lib.nameValuePair "mandate-${name}" { }) sources;
 
       systemd.services = lib.mapAttrs' (
-        name: src: lib.nameValuePair "sieve-${name}" (sourceService name src)
+        name: src: lib.nameValuePair "mandate-${name}" (sourceService name src)
       ) sources;
 
       # `pair` runs before StateDirectory exists. Session state (incl. SQLite
@@ -197,29 +197,29 @@ in
       # gateway cannot traverse.
       systemd.tmpfiles.rules = lib.concatLists (
         lib.mapAttrsToList (name: _: [
-          "d ${state name} 0750 sieve-${name} sieve-${name} -"
-          "d ${state name}/private 0700 sieve-${name} sieve-${name} -"
+          "d ${state name} 0750 mandate-${name} mandate-${name} -"
+          "d ${state name}/private 0700 mandate-${name} mandate-${name} -"
         ]) sources
       );
     })
 
     (lib.mkIf cfg.enable {
-      users.users.sieve-gateway = {
+      users.users.mandate-gateway = {
         isSystemUser = true;
-        group = "sieve-gateway";
+        group = "mandate-gateway";
         # Read access to each source's data.db (0640) and the Discord socket.
-        extraGroups = map (name: "sieve-${name}") (lib.attrNames sources);
+        extraGroups = map (name: "mandate-${name}") (lib.attrNames sources);
       };
-      users.groups.sieve-gateway = { };
+      users.groups.mandate-gateway = { };
 
-      systemd.services.sieve-gateway = {
-        description = "sieve read-only SQL gateway";
-        after = [ "network.target" ] ++ lib.optional (sources ? discord) "sieve-discord.service";
+      systemd.services.mandate-gateway = {
+        description = "mandate read-only SQL gateway";
+        after = [ "network.target" ] ++ lib.optional (sources ? discord) "mandate-discord.service";
         wantedBy = [ "multi-user.target" ];
         serviceConfig = hardening // {
-          User = "sieve-gateway";
-          Group = "sieve-gateway";
-          StateDirectory = "sieve-gateway";
+          User = "mandate-gateway";
+          Group = "mandate-gateway";
+          StateDirectory = "mandate-gateway";
           StateDirectoryMode = "0750";
           LoadCredential = [ "token:${cfg.tokenFile}" ];
           # Only the tailnet and localhost may connect; no egress at all.
@@ -247,7 +247,7 @@ in
               )
               ++ lib.optionals (sources ? discord) [
                 "--discord-socket"
-                "/run/sieve-discord/api.sock"
+                "/run/mandate-discord/api.sock"
               ]
             )
             + credentialArg;

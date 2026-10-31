@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/adeci/sieve/internal/discordapi"
+	"github.com/adeci/mandate/internal/discordapi"
 )
 
 // discordCallTimeout bounds one proxied call. The Discord service holds a call

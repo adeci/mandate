@@ -59,7 +59,7 @@ func Command(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("gateway", flag.ContinueOnError)
 	fs.StringVar(&cfg.Listen, "listen", "127.0.0.1:8780", "listen address")
 	fs.StringVar(&cfg.TokenFile, "token-file", "", "file containing the bearer token (required)")
-	fs.StringVar(&cfg.ExposureFile, "exposure", "/var/lib/sieve-gateway/exposure.toml", "exposure config (missing = nothing hidden)")
+	fs.StringVar(&cfg.ExposureFile, "exposure", "/var/lib/mandate-gateway/exposure.toml", "exposure config (missing = nothing hidden)")
 	fs.Var(sourceFlag(cfg.Sources), "source", "source database as name=path (repeatable; names: sms, whatsapp, discord)")
 	fs.IntVar(&cfg.MaxRows, "max-rows", 5000, "maximum rows per query")
 	fs.DurationVar(&cfg.Timeout, "timeout", 5*time.Second, "maximum query execution time")

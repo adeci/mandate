@@ -14,7 +14,7 @@ import (
 
 	fhttp "github.com/bogdanfinn/fhttp"
 
-	"github.com/adeci/sieve/internal/exitcode"
+	"github.com/adeci/mandate/internal/exitcode"
 )
 
 const (

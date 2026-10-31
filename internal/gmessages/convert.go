@@ -7,7 +7,7 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/adeci/sieve/internal/store"
+	"github.com/adeci/mandate/internal/store"
 )
 
 // unknownSenderNumber is the placeholder Google Messages uses when the phone

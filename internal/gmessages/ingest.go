@@ -14,8 +14,8 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/adeci/sieve/internal/exitcode"
-	"github.com/adeci/sieve/internal/store"
+	"github.com/adeci/mandate/internal/exitcode"
+	"github.com/adeci/mandate/internal/store"
 )
 
 const (
@@ -156,7 +156,7 @@ func (in *ingester) handleEvent(raw any) {
 		}
 	case *events.ListenFatalError:
 		if errors.Is(evt.Error, events.ErrInvalidCredentials) || evt.Error.Error() == "http 401 while polling" {
-			in.fail(fmt.Errorf("session rejected by Google (%w); re-pair with \"sieve messages pair\": %w", evt.Error, exitcode.ErrNeedsOwner), false)
+			in.fail(fmt.Errorf("session rejected by Google (%w); re-pair with \"mandate messages pair\": %w", evt.Error, exitcode.ErrNeedsOwner), false)
 		} else {
 			in.fail(fmt.Errorf("listen: %w", evt.Error), false)
 		}

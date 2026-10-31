@@ -11,7 +11,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"github.com/adeci/sieve/internal/authfilter"
+	"github.com/adeci/mandate/internal/authfilter"
 )
 
 type SourceExposure struct {

@@ -12,8 +12,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/adeci/sieve/internal/discordapi"
-	"github.com/adeci/sieve/internal/store"
+	"github.com/adeci/mandate/internal/discordapi"
+	"github.com/adeci/mandate/internal/store"
 )
 
 const (

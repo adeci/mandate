@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adeci/sieve/internal/discordapi"
-	"github.com/adeci/sieve/internal/store"
+	"github.com/adeci/mandate/internal/discordapi"
+	"github.com/adeci/mandate/internal/store"
 )
 
 func fakeDiscord(t *testing.T, handler http.HandlerFunc) (socket string, calls *atomic.Int32) {

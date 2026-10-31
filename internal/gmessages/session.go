@@ -8,11 +8,11 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/adeci/sieve/internal/exitcode"
+	"github.com/adeci/mandate/internal/exitcode"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 )
 
-var errNotPaired = fmt.Errorf(`not paired: run "sieve messages pair": %w`, exitcode.ErrNeedsOwner)
+var errNotPaired = fmt.Errorf(`not paired: run "mandate messages pair": %w`, exitcode.ErrNeedsOwner)
 
 // sessionFile persists libgm.AuthData as JSON. The library mutates AuthData in
 // place (token refreshes), so saves serialize on mu.

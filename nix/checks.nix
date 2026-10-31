@@ -5,13 +5,13 @@
 }:
 let
   inherit (pkgs) lib;
-  sieve = self.packages.${pkgs.stdenv.hostPlatform.system}.sieve;
+  mandate = self.packages.${pkgs.stdenv.hostPlatform.system}.mandate;
 in
 {
-  package = sieve;
+  package = mandate;
 
-  go-tests = sieve.overrideAttrs (old: {
-    pname = "sieve-go-tests";
+  go-tests = mandate.overrideAttrs (old: {
+    pname = "mandate-go-tests";
     doCheck = true;
     # -race needs cgo.
     env = old.env // {
@@ -26,8 +26,8 @@ in
     doInstallCheck = false;
   });
 
-  golangci-lint = sieve.overrideAttrs (old: {
-    pname = "sieve-golangci-lint";
+  golangci-lint = mandate.overrideAttrs (old: {
+    pname = "mandate-golangci-lint";
     src = lib.fileset.toSource {
       root = ../.;
       # Without the config golangci-lint silently falls back to its defaults.
@@ -49,7 +49,7 @@ in
     doInstallCheck = false;
   });
 
-  treefmt = pkgs.runCommand "sieve-treefmt" { } ''
+  treefmt = pkgs.runCommand "mandate-treefmt" { } ''
     cp -r ${self} src
     chmod -R +w src
     cd src

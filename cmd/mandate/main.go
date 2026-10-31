@@ -1,4 +1,4 @@
-// Command sieve is a multi-call binary: the read-only gateway and one ingester
+// Command mandate is a multi-call binary: the read-only gateway and one ingester
 // per messaging source.
 package main
 
@@ -9,18 +9,18 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/adeci/sieve/internal/admin"
-	"github.com/adeci/sieve/internal/client"
-	"github.com/adeci/sieve/internal/discord"
-	"github.com/adeci/sieve/internal/exitcode"
-	"github.com/adeci/sieve/internal/gateway"
-	"github.com/adeci/sieve/internal/gmessages"
-	"github.com/adeci/sieve/internal/whatsapp"
+	"github.com/adeci/mandate/internal/admin"
+	"github.com/adeci/mandate/internal/client"
+	"github.com/adeci/mandate/internal/discord"
+	"github.com/adeci/mandate/internal/exitcode"
+	"github.com/adeci/mandate/internal/gateway"
+	"github.com/adeci/mandate/internal/gmessages"
+	"github.com/adeci/mandate/internal/whatsapp"
 )
 
-const usage = `usage: sieve <command> [args]
+const usage = `usage: mandate <command> [args]
 
-for agents (set SIEVE_URL and SIEVE_TOKEN):
+for agents (set MANDATE_URL and MANDATE_TOKEN):
   query SQL [PARAM...]    run a read-only query
   schema                  list the views you can query
   discord sync|search|fetch
@@ -76,7 +76,7 @@ func run() int {
 		return 2
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "sieve %s: %v\n", cmd, err)
+		fmt.Fprintf(os.Stderr, "mandate %s: %v\n", cmd, err)
 	}
 	return exitcode.For(err)
 }

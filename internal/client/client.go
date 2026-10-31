@@ -17,8 +17,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/adeci/sieve/internal/discordapi"
-	"github.com/adeci/sieve/internal/exitcode"
+	"github.com/adeci/mandate/internal/discordapi"
+	"github.com/adeci/mandate/internal/exitcode"
 )
 
 // Above the gateway's own 110 s Discord timeout, so its answer always wins.
@@ -32,22 +32,22 @@ type client struct {
 	table bool
 }
 
-// fromEnv reads SIEVE_URL and SIEVE_TOKEN (or SIEVE_TOKEN_FILE).
+// fromEnv reads MANDATE_URL and MANDATE_TOKEN (or MANDATE_TOKEN_FILE).
 func fromEnv(getenv func(string) string, out io.Writer, table bool) (*client, error) {
-	url := strings.TrimRight(getenv("SIEVE_URL"), "/")
+	url := strings.TrimRight(getenv("MANDATE_URL"), "/")
 	if url == "" {
-		return nil, errors.New("SIEVE_URL is not set (e.g. http://lachesis:8780)")
+		return nil, errors.New("MANDATE_URL is not set (e.g. http://lachesis:8780)")
 	}
-	token := getenv("SIEVE_TOKEN")
-	if token == "" && getenv("SIEVE_TOKEN_FILE") != "" {
-		b, err := os.ReadFile(getenv("SIEVE_TOKEN_FILE"))
+	token := getenv("MANDATE_TOKEN")
+	if token == "" && getenv("MANDATE_TOKEN_FILE") != "" {
+		b, err := os.ReadFile(getenv("MANDATE_TOKEN_FILE"))
 		if err != nil {
 			return nil, err
 		}
 		token = strings.TrimSpace(string(b))
 	}
 	if token == "" {
-		return nil, errors.New("SIEVE_TOKEN or SIEVE_TOKEN_FILE is not set")
+		return nil, errors.New("MANDATE_TOKEN or MANDATE_TOKEN_FILE is not set")
 	}
 	return &client{url: url, token: token, http: &http.Client{Timeout: requestTimeout}, out: out, table: table}, nil
 }
@@ -58,10 +58,10 @@ func newClient() (*client, error) {
 	return fromEnv(os.Getenv, os.Stdout, table)
 }
 
-// Query runs `sieve query SQL [PARAM...]`.
+// Query runs `mandate query SQL [PARAM...]`.
 func Query(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: sieve query SQL [PARAM...]")
+		return errors.New("usage: mandate query SQL [PARAM...]")
 	}
 	c, err := newClient()
 	if err != nil {
@@ -74,10 +74,10 @@ func Query(ctx context.Context, args []string) error {
 	return c.rows(ctx, "/v1/query", map[string]any{"sql": args[0], "params": params})
 }
 
-// Schema runs `sieve schema`.
+// Schema runs `mandate schema`.
 func Schema(ctx context.Context, args []string) error {
 	if len(args) != 0 {
-		return errors.New("usage: sieve schema")
+		return errors.New("usage: mandate schema")
 	}
 	c, err := newClient()
 	if err != nil {
@@ -86,11 +86,11 @@ func Schema(ctx context.Context, args []string) error {
 	return c.schema(ctx)
 }
 
-// Discord runs `sieve discord sync|search|fetch`.
+// Discord runs `mandate discord sync|search|fetch`.
 func Discord(ctx context.Context, args []string) error {
-	const usage = `usage: sieve discord sync [GUILD_ID]
-       sieve discord search GUILD_ID [TEXT] [--author ID] [--channel ID] [--has KIND] [--offset N]
-       sieve discord fetch CHANNEL_ID [--before ID | --after ID | --around ID] [--limit N]`
+	const usage = `usage: mandate discord sync [GUILD_ID]
+       mandate discord search GUILD_ID [TEXT] [--author ID] [--channel ID] [--has KIND] [--offset N]
+       mandate discord fetch CHANNEL_ID [--before ID | --after ID | --around ID] [--limit N]`
 	if len(args) == 0 {
 		return errors.New(usage)
 	}

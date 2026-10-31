@@ -21,14 +21,14 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
-	"github.com/adeci/sieve/internal/exitcode"
-	"github.com/adeci/sieve/internal/store"
+	"github.com/adeci/mandate/internal/exitcode"
+	"github.com/adeci/mandate/internal/store"
 )
 
-const usage = `usage: sieve whatsapp run --data PATH --session PATH
-       sieve whatsapp pair --session PATH [--phone +E164]`
+const usage = `usage: mandate whatsapp run --data PATH --session PATH
+       mandate whatsapp pair --session PATH [--phone +E164]`
 
-var errNotPaired = fmt.Errorf(`not paired: run "sieve whatsapp pair": %w`, exitcode.ErrNeedsOwner)
+var errNotPaired = fmt.Errorf(`not paired: run "mandate whatsapp pair": %w`, exitcode.ErrNeedsOwner)
 
 func Command(ctx context.Context, args []string) error {
 	if len(args) < 1 {
@@ -143,7 +143,7 @@ func pair(ctx context.Context, args []string) error {
 	}
 
 	// Shown under Linked devices on the phone.
-	wastore.SetOSInfo("sieve", [3]uint32{0, 1, 0})
+	wastore.SetOSInfo("mandate", [3]uint32{0, 1, 0})
 	cli := whatsmeow.NewClient(device, newWALogger("whatsmeow"))
 	cli.BackgroundEventCtx = ctx
 	qr, err := cli.GetQRChannel(ctx)
@@ -185,7 +185,7 @@ func pair(ctx context.Context, args []string) error {
 			codeShown = true
 			fmt.Printf("Pairing code: %s\nIn WhatsApp: Settings > Linked devices > Link a device > Link with phone number instead\n", code)
 		case whatsmeow.QRChannelEventPasskeyRequest:
-			return errors.New("phone requested passkey pairing, which sieve does not support; retry with QR or --phone")
+			return errors.New("phone requested passkey pairing, which mandate does not support; retry with QR or --phone")
 		case whatsmeow.QRChannelEventPasskeyResponse:
 			fmt.Printf("Confirm code on phone: %s\n", item.PasskeyConfirmation.Code)
 		case whatsmeow.QRChannelSuccess.Event:

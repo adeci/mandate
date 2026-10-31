@@ -18,17 +18,17 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/util"
 	"go.mau.fi/util/exhttp"
 
-	"github.com/adeci/sieve/internal/exitcode"
-	"github.com/adeci/sieve/internal/store"
+	"github.com/adeci/mandate/internal/exitcode"
+	"github.com/adeci/mandate/internal/store"
 )
 
 const usage = `usage:
-  sieve messages pair --session PATH
-  sieve messages run  --data PATH --session PATH [--backfill N] [--reclaim=true|false]`
+  mandate messages pair --session PATH
+  mandate messages run  --data PATH --session PATH [--backfill N] [--reclaim=true|false]`
 
 const (
 	// deviceName is shown in the phone's "Device pairing" list.
-	deviceName = "sieve"
+	deviceName = "mandate"
 	// qrRefreshInterval and qrMaxAttempts match the bridge's QR login.
 	qrRefreshInterval = 30 * time.Second
 	qrMaxAttempts     = 6
@@ -107,7 +107,7 @@ func pair(ctx context.Context, args []string) error {
 			}
 			log.Info("paired with phone", "phone_id", data.GetMobile().GetSourceID(), "session", *sessionPath)
 			confirmPairing(ctx, cli, sess, log)
-			fmt.Fprintln(os.Stdout, `Paired. Start the ingester with "sieve messages run".`)
+			fmt.Fprintln(os.Stdout, `Paired. Start the ingester with "mandate messages run".`)
 			return nil
 		case <-timer.C:
 			if attempt >= qrMaxAttempts {
@@ -175,7 +175,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 func run(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("messages run", flag.ContinueOnError)
 	dataPath := fs.String("data", "", "store database path")
-	sessionPath := fs.String("session", "", "session state file from \"sieve messages pair\"")
+	sessionPath := fs.String("session", "", "session state file from \"mandate messages pair\"")
 	backfill := fs.Int("backfill", 50, "messages to fetch per conversation on (re)connect; 0 disables")
 	reclaim := fs.Bool("reclaim", true, "re-take the active session when another Messages for Web client takes it")
 	if err := fs.Parse(args); err != nil {
@@ -220,7 +220,7 @@ func run(ctx context.Context, args []string) error {
 			}
 			return fmt.Errorf("pairing no longer valid (%w); %w", err, errNotPaired)
 		case errors.Is(err, events.ErrInvalidCredentials):
-			return fmt.Errorf("session rejected by Google (%w); re-pair with \"sieve messages pair\": %w", err, exitcode.ErrNeedsOwner)
+			return fmt.Errorf("session rejected by Google (%w); re-pair with \"mandate messages pair\": %w", err, exitcode.ErrNeedsOwner)
 		default:
 			return fmt.Errorf("connect: %w", err)
 		}

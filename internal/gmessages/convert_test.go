@@ -7,7 +7,7 @@ import (
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
-	"github.com/adeci/sieve/internal/store"
+	"github.com/adeci/mandate/internal/store"
 )
 
 func participant(pid, number, full, first, formatted string, visible, me bool) *gmproto.Participant {

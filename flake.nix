@@ -1,5 +1,5 @@
 {
-  description = "sieve: self-hosted messaging ingestion and read-only SQL gateway for agents";
+  description = "mandate: self-hosted messaging ingestion and read-only SQL gateway for agents";
 
   inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 
@@ -34,8 +34,8 @@
     in
     {
       packages = forAllSystems (pkgs: rec {
-        sieve = pkgs.callPackage ./nix/package.nix { };
-        default = sieve;
+        mandate = pkgs.callPackage ./nix/package.nix { };
+        default = mandate;
       });
 
       nixosModules.default = import ./nix/module.nix self;

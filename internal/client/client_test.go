@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adeci/sieve/internal/exitcode"
+	"github.com/adeci/mandate/internal/exitcode"
 )
 
 type recorded struct {
@@ -38,7 +38,7 @@ func gateway(t *testing.T, status int, reply string) (*httptest.Server, *recorde
 func testClient(t *testing.T, url string, table bool) (*client, *bytes.Buffer) {
 	t.Helper()
 	var out bytes.Buffer
-	env := map[string]string{"SIEVE_URL": url + "/", "SIEVE_TOKEN": "secret"}
+	env := map[string]string{"MANDATE_URL": url + "/", "MANDATE_TOKEN": "secret"}
 	c, err := fromEnv(func(k string) string { return env[k] }, &out, table)
 	if err != nil {
 		t.Fatal(err)
@@ -131,15 +131,15 @@ func TestErrors(t *testing.T) {
 func TestFromEnv(t *testing.T) {
 	t.Parallel()
 	for name, env := range map[string]map[string]string{
-		"no url":   {"SIEVE_TOKEN": "x"},
-		"no token": {"SIEVE_URL": "http://x"},
+		"no url":   {"MANDATE_TOKEN": "x"},
+		"no token": {"MANDATE_URL": "http://x"},
 	} {
 		if _, err := fromEnv(func(k string) string { return env[k] }, nil, false); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
 	_, err := fromEnv(func(k string) string {
-		return map[string]string{"SIEVE_URL": "http://x", "SIEVE_TOKEN_FILE": "/nonexistent"}[k]
+		return map[string]string{"MANDATE_URL": "http://x", "MANDATE_TOKEN_FILE": "/nonexistent"}[k]
 	}, nil, false)
 	if !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("missing token file: %v", err)

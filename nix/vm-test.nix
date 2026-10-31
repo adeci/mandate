@@ -16,13 +16,13 @@ let
   '';
 in
 pkgs.testers.runNixOSTest {
-  name = "sieve";
+  name = "mandate";
 
   nodes.machine = {
     imports = [ self.nixosModules.default ];
-    services.sieve = {
+    services.mandate = {
       enable = true;
-      tokenFile = "/etc/sieve-token";
+      tokenFile = "/etc/mandate-token";
       openFirewallOn = "eth1";
       whatsapp.enable = true;
       discord = {
@@ -30,7 +30,7 @@ pkgs.testers.runNixOSTest {
         tokenFile = "/etc/discord-token";
       };
     };
-    environment.etc."sieve-token".text = token;
+    environment.etc."mandate-token".text = token;
     environment.etc."discord-token".text = "not-a-real-token";
     environment.systemPackages = [
       pkgs.sqlite
@@ -47,8 +47,8 @@ pkgs.testers.runNixOSTest {
     import json
 
     start_all()
-    machine.wait_for_unit("sieve-gateway.service")
-    machine.wait_for_unit("sieve-discord.service")
+    machine.wait_for_unit("mandate-gateway.service")
+    machine.wait_for_unit("mandate-discord.service")
     machine.wait_for_open_port(8780)
 
     def q(sql):
@@ -59,24 +59,24 @@ pkgs.testers.runNixOSTest {
         ))
 
     with subtest("unpaired source stays down instead of crash-looping"):
-        machine.succeed("systemctl show -p ActiveState --value sieve-whatsapp.service | grep -qx inactive")
+        machine.succeed("systemctl show -p ActiveState --value mandate-whatsapp.service | grep -qx inactive")
 
     with subtest("fixture written as the source user is 0640"):
         machine.succeed(
-            "cd /var/lib/sieve-whatsapp && sudo -u sieve-whatsapp sh -c "
+            "cd /var/lib/mandate-whatsapp && sudo -u mandate-whatsapp sh -c "
             "'umask 0027 && sqlite3 data.db < ${../internal/store/schema.sql} && sqlite3 data.db < ${fixture}'"
         )
-        machine.succeed("stat -c %a /var/lib/sieve-whatsapp/data.db | grep -qx 640")
+        machine.succeed("stat -c %a /var/lib/mandate-whatsapp/data.db | grep -qx 640")
 
     with subtest("exposure and auth filtering"):
-        machine.succeed("printf '[whatsapp]\\nhide_containers = [\"hidden@s.whatsapp.net\"]\\n' > /var/lib/sieve-gateway/exposure.toml")
+        machine.succeed("printf '[whatsapp]\\nhide_containers = [\"hidden@s.whatsapp.net\"]\\n' > /var/lib/mandate-gateway/exposure.toml")
         rows = q("SELECT id, body, is_auth FROM whatsapp_messages ORDER BY seq")["rows"]
         assert rows == [["fam@g.us/1", "dinner at 7?", 0], ["fam@g.us/2", None, 1]], rows
 
     with subtest("broken exposure fails closed, then recovers"):
-        machine.succeed("printf '[whatsapp]\\nhide_container = []\\n' > /var/lib/sieve-gateway/exposure.toml")
+        machine.succeed("printf '[whatsapp]\\nhide_container = []\\n' > /var/lib/mandate-gateway/exposure.toml")
         machine.fail("curl -sf -H 'Authorization: Bearer ${token}' -d '{\"sql\":\"SELECT 1\"}' http://127.0.0.1:8780/v1/query")
-        machine.succeed("printf '[whatsapp]\\nhide_containers = [\"hidden@s.whatsapp.net\"]\\n' > /var/lib/sieve-gateway/exposure.toml")
+        machine.succeed("printf '[whatsapp]\\nhide_containers = [\"hidden@s.whatsapp.net\"]\\n' > /var/lib/mandate-gateway/exposure.toml")
         assert q("SELECT count(*) FROM whatsapp_messages")["rows"] == [[2]]
 
     with subtest("unauthenticated and bypass attempts fail"):
@@ -86,17 +86,17 @@ pkgs.testers.runNixOSTest {
         )
 
     with subtest("gateway user can read but not write source data or sessions"):
-        machine.succeed("sudo -u sieve-gateway sqlite3 'file:/var/lib/sieve-whatsapp/data.db?mode=ro' 'SELECT count(*) FROM messages'")
-        machine.fail("sudo -u sieve-gateway sqlite3 /var/lib/sieve-whatsapp/data.db 'DELETE FROM messages'")
-        machine.fail("sudo -u sieve-gateway touch /var/lib/sieve-whatsapp/x")
-        machine.succeed("stat -c %a /var/lib/sieve-whatsapp/private | grep -qx 700")
-        machine.succeed("sudo -u sieve-whatsapp sqlite3 /var/lib/sieve-whatsapp/private/session.db 'PRAGMA journal_mode=WAL; CREATE TABLE k(x)'")
-        machine.fail("sudo -u sieve-gateway ls /var/lib/sieve-whatsapp/private")
+        machine.succeed("sudo -u mandate-gateway sqlite3 'file:/var/lib/mandate-whatsapp/data.db?mode=ro' 'SELECT count(*) FROM messages'")
+        machine.fail("sudo -u mandate-gateway sqlite3 /var/lib/mandate-whatsapp/data.db 'DELETE FROM messages'")
+        machine.fail("sudo -u mandate-gateway touch /var/lib/mandate-whatsapp/x")
+        machine.succeed("stat -c %a /var/lib/mandate-whatsapp/private | grep -qx 700")
+        machine.succeed("sudo -u mandate-whatsapp sqlite3 /var/lib/mandate-whatsapp/private/session.db 'PRAGMA journal_mode=WAL; CREATE TABLE k(x)'")
+        machine.fail("sudo -u mandate-gateway ls /var/lib/mandate-whatsapp/private")
 
     with subtest("discord: socket reachable only by the gateway, hidden/unknown refused locally"):
-        machine.succeed("test -S /run/sieve-discord/api.sock")
-        machine.succeed("sudo -u sieve-gateway test -w /run/sieve-discord/api.sock")
-        machine.fail("sudo -u sieve-whatsapp test -w /run/sieve-discord/api.sock")
+        machine.succeed("test -S /run/mandate-discord/api.sock")
+        machine.succeed("sudo -u mandate-gateway test -w /run/mandate-discord/api.sock")
+        machine.fail("sudo -u mandate-whatsapp test -w /run/mandate-discord/api.sock")
         out = machine.succeed(
             "curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ${token}' "
             "-d '{\"channel_id\":\"123456789012345678\"}' http://127.0.0.1:8780/v1/discord/fetch"
@@ -108,8 +108,8 @@ pkgs.testers.runNixOSTest {
         outsider.fail("curl -sf --max-time 5 http://machine:8780/healthz")
 
     with subtest("hardened units"):
-        for unit in ["sieve-gateway", "sieve-discord"]:
+        for unit in ["mandate-gateway", "mandate-discord"]:
             machine.succeed(f"systemctl show -p MemoryDenyWriteExecute --value {unit} | grep -qx yes")
-        machine.succeed("systemctl show -p RestartPreventExitStatus --value sieve-discord | grep -q 3")
+        machine.succeed("systemctl show -p RestartPreventExitStatus --value mandate-discord | grep -q 3")
   '';
 }
