@@ -1,5 +1,5 @@
-// Command mandate is a multi-call binary: the read-only gateway and one ingester
-// per messaging source.
+// Command mandate is a multi-call binary: the agent CLI, the gateway, the
+// approvals unit, and one connector per service.
 package main
 
 import (

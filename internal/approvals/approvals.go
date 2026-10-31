@@ -58,8 +58,8 @@ func Command(ctx context.Context, args []string) error {
 	listen := flags.String("https-listen", ":8781", "address for the approval pages")
 	hostname := flags.String("hostname", "", "the pages' hostname, also the WebAuthn RP ID (required)")
 	originPort := flags.Int("origin-port", 0, "port browsers use to reach the pages, if a proxy changes it (default: the --https-listen port)")
-	certFile := flags.String("tls-cert", "", "TLS certificate, reloaded when it changes (required)")
-	keyFile := flags.String("tls-key", "", "TLS key, reloaded when it changes (required)")
+	certFile := flags.String("tls-cert", "", "TLS certificate (required)")
+	keyFile := flags.String("tls-key", "", "TLS key (required)")
 	stateDir := flags.String("state", "", "directory for the database and enrolled.json (required)")
 	approversFile := flags.String("approvers", "", "JSON array of trusted passkeys; missing or empty allows enrollment only")
 	socket := flags.String("socket", "", "Unix socket for the gateway's proposal API (required)")
@@ -115,9 +115,9 @@ func Command(ctx context.Context, args []string) error {
 		}
 	}
 
-	certs, err := newCertReloader(*certFile, *keyFile, log)
+	cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
 	if err != nil {
-		return err
+		return fmt.Errorf("load TLS certificate: %w", err)
 	}
 	srv, err := New(ctx, Config{
 		RPID:       *hostname,
@@ -141,7 +141,7 @@ func Command(ctx context.Context, args []string) error {
 	go func() { errc <- wrap("proposal socket", connector.ServeUnix(ctx, *socket, srv.ProposalHandler())) }()
 	go func() { errc <- wrap("admin socket", serveAdmin(ctx, *adminSocket, srv.AdminHandler())) }()
 	go func() {
-		errc <- wrap("https", serveTLS(ctx, *listen, srv.PageHandler(), certs.get))
+		errc <- wrap("https", serveTLS(ctx, *listen, srv.PageHandler(), cert))
 	}()
 	log.Info("approvals listening", "origin", originOf(*hostname, port), "socket", *socket,
 		"connectors", len(conns), "approvers", len(approvers))
@@ -199,7 +199,7 @@ func serveAdmin(ctx context.Context, path string, h http.Handler) error {
 	return serve(ctx, srv, func() error { return srv.Serve(ln) })
 }
 
-func serveTLS(ctx context.Context, addr string, h http.Handler, getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error)) error {
+func serveTLS(ctx context.Context, addr string, h http.Handler, cert tls.Certificate) error {
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
@@ -213,7 +213,7 @@ func serveTLS(ctx context.Context, addr string, h http.Handler, getCert func(*tl
 		WriteTimeout: executeTimeout + 30*time.Second,
 		IdleTimeout:  2 * time.Minute,
 	}
-	srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: getCert}
+	srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
 	return serve(ctx, srv, func() error { return srv.ServeTLS(ln, "", "") })
 }
 
