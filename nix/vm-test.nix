@@ -219,14 +219,14 @@ pkgs.testers.runNixOSTest {
         assert code == 404 or (code == 429 and "resting" in out["error"]), (code, out)
 
     with subtest("API reads get the token added and the agent's credentials stripped"):
-        code, out = gw("GET", "/v1/http/api/items")
+        code, out = gw("GET", "/v1/forward/http/api/items")
         assert code == 200, (code, out)
         [req] = recorded()
         assert req["headers"]["Authorization"] == "Bearer ${apiToken}", req
         assert "${token}" not in json.dumps(req), req
-        code, _ = gw("GET", "/v1/http/api/admin")
+        code, _ = gw("GET", "/v1/forward/http/api/admin")
         assert code == 403, code
-        code, _ = gw("POST", "/v1/http/api/items", {"text": "no approval"})
+        code, _ = gw("POST", "/v1/forward/http/api/items", {"text": "no approval"})
         assert code == 405, code
         assert len(recorded()) == 1
 
