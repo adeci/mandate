@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -311,4 +312,25 @@ func (c *waConnector) phoneCode(ctx context.Context, p *pairing, phone string) (
 	}
 	p.phone, p.phoneCode = phone, code
 	return code, nil
+}
+
+// phoneDigits accepts an E.164 number or bare digits including the country
+// code, tolerating spaces, dashes, dots, and parentheses.
+func phoneDigits(s string) (string, bool) {
+	s = strings.TrimPrefix(s, "+")
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == ' ' || r == '-' || r == '.' || r == '(' || r == ')':
+		default:
+			return "", false
+		}
+	}
+	d := b.String()
+	if len(d) < 7 || len(d) > 15 || d[0] == '0' {
+		return "", false
+	}
+	return d, true
 }

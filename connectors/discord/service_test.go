@@ -384,7 +384,7 @@ func TestSearchUpsertsAndCaches(t *testing.T) {
 	h := newHarness(t, nil)
 	h.start()
 	var resp connector.ReadResult
-	h.callOK("search", map[string]string{"guild_id": guildID, "content": "rig"}, &resp)
+	h.callOK("guild-search", map[string]string{"guild_id": guildID, "content": "rig"}, &resp)
 	if strings.Join(resp.MessageIDs, ",") != msg1+","+msg2 || resp.TotalResults != 2 {
 		t.Errorf("response %+v", resp)
 	}
@@ -428,7 +428,7 @@ func TestSearchUpsertsAndCaches(t *testing.T) {
 
 	// An identical search within the hour is answered from the cache.
 	var again connector.ReadResult
-	h.callOK("search", map[string]string{"guild_id": guildID, "content": "rig"}, &again)
+	h.callOK("guild-search", map[string]string{"guild_id": guildID, "content": "rig"}, &again)
 	if n := len(h.discord.all()); n != 4 {
 		t.Errorf("cache hit made upstream requests: %d total", n)
 	}
@@ -436,13 +436,13 @@ func TestSearchUpsertsAndCaches(t *testing.T) {
 		t.Errorf("cached response %+v", again)
 	}
 	// The next page needs only the search itself; lists and self are cached.
-	h.callOK("search", map[string]string{"guild_id": guildID, "content": "rig", "offset": "25"}, &again)
+	h.callOK("guild-search", map[string]string{"guild_id": guildID, "content": "rig", "offset": "25"}, &again)
 	if got := h.discord.paths(); len(got) != 5 || got[4] != api("/guilds/"+guildID+"/messages/search") || h.discord.all()[4].query.Get("offset") != "25" {
 		t.Errorf("paged search requests %v", got)
 	}
 	// After an hour the cache expires.
 	h.clock.Advance(time.Hour)
-	h.callOK("search", map[string]string{"guild_id": guildID, "content": "rig"}, &again)
+	h.callOK("guild-search", map[string]string{"guild_id": guildID, "content": "rig"}, &again)
 	if n := len(h.discord.to(api("/guilds/" + guildID + "/messages/search"))); n != 3 {
 		t.Errorf("search requests after expiry: %d", n)
 	}
@@ -581,7 +581,7 @@ func TestPageLoadBuildNumber(t *testing.T) {
 	h.clock.Advance(25 * time.Hour)
 	h.callOK("sync", map[string]string{}, &resp)
 	h.clock.Advance(time.Hour)
-	h.callOK("search", map[string]string{"guild_id": guildID, "content": "x"}, &connector.ReadResult{})
+	h.callOK("guild-search", map[string]string{"guild_id": guildID, "content": "x"}, &connector.ReadResult{})
 	if n := len(h.discord.to("/channels/@me")); n != 2 {
 		t.Errorf("page loaded %d times, want 2", n)
 	}
@@ -707,7 +707,7 @@ func TestSearchNotReadyRetries(t *testing.T) {
 	})
 	h.start()
 	var resp connector.ReadResult
-	h.callOK("search", map[string]string{"guild_id": guildID, "content": "rig"}, &resp)
+	h.callOK("guild-search", map[string]string{"guild_id": guildID, "content": "rig"}, &resp)
 	hits := h.discord.to(path)
 	if len(hits) != 2 || len(resp.MessageIDs) != 2 {
 		t.Fatalf("%d search requests, %d ids", len(hits), len(resp.MessageIDs))
@@ -721,7 +721,7 @@ func TestSearchNotReadyRetries(t *testing.T) {
 
 	// Still not ready after the retry: 503 with a retry hint, no third try.
 	h.discord.reply(path, http.StatusAccepted, map[string]any{"code": 110000, "retry_after": 0})
-	e := h.callErr("search", map[string]string{"guild_id": guildID, "content": "other"}, http.StatusServiceUnavailable)
+	e := h.callErr("guild-search", map[string]string{"guild_id": guildID, "content": "other"}, http.StatusServiceUnavailable)
 	if e.RetryAfter != 5 {
 		t.Errorf("retry_after_seconds = %d, want the 5 s default", e.RetryAfter)
 	}
@@ -830,7 +830,7 @@ func TestDenialCached(t *testing.T) {
 	h.restart()
 	h.clock.Advance(23 * time.Hour)
 	h.callErr("fetch", map[string]string{"channel_id": otherChan}, http.StatusNotFound)
-	h.callErr("search", map[string]string{"guild_id": guildID, "channel_id": otherChan, "content": "x"}, http.StatusNotFound)
+	h.callErr("guild-search", map[string]string{"guild_id": guildID, "channel_id": otherChan, "content": "x"}, http.StatusNotFound)
 	if len(h.discord.all()) != before {
 		t.Errorf("denied channel requested again: %v", h.discord.paths()[before:])
 	}
@@ -840,7 +840,7 @@ func TestDenialCached(t *testing.T) {
 	// A 404 for an unknown guild channel list is cached the same way.
 	h.discord.reply(api("/guilds/"+guildID+"/channels"), http.StatusNotFound, map[string]any{"message": "Unknown Guild", "code": 10004})
 	h.callErr("sync", map[string]string{"guild_id": guildID}, http.StatusNotFound)
-	h.callErr("search", map[string]string{"guild_id": guildID, "content": "x"}, http.StatusNotFound)
+	h.callErr("guild-search", map[string]string{"guild_id": guildID, "content": "x"}, http.StatusNotFound)
 	if n := len(h.discord.to(api("/guilds/" + guildID + "/channels"))); n != 1 {
 		t.Errorf("%d requests to the denied guild", n)
 	}
@@ -861,13 +861,13 @@ func TestValidation(t *testing.T) {
 		{"fetch two anchors", "fetch", map[string]string{"channel_id": dmID, "before": msg1, "after": msg2}},
 		{"fetch limit too big", "fetch", map[string]string{"channel_id": dmID, "limit": "101"}},
 		{"fetch unknown field", "fetch", map[string]string{"channel_id": dmID, "method": "DELETE"}},
-		{"search missing guild", "search", map[string]string{"content": "x"}},
-		{"search bad author", "search", map[string]string{"guild_id": guildID, "author_id": "me"}},
-		{"search bad channel", "search", map[string]string{"guild_id": guildID, "channel_id": "#general"}},
-		{"search bad has", "search", map[string]string{"guild_id": guildID, "has": "pdf"}},
-		{"search huge offset", "search", map[string]string{"guild_id": guildID, "content": "x", "offset": "10000"}},
-		{"search no criteria", "search", map[string]string{"guild_id": guildID}},
-		{"search long content", "search", map[string]string{"guild_id": guildID, "content": strings.Repeat("a", 513)}},
+		{"search missing guild", "guild-search", map[string]string{"content": "x"}},
+		{"search bad author", "guild-search", map[string]string{"guild_id": guildID, "author_id": "me"}},
+		{"search bad channel", "guild-search", map[string]string{"guild_id": guildID, "channel_id": "#general"}},
+		{"search bad has", "guild-search", map[string]string{"guild_id": guildID, "has": "pdf"}},
+		{"search huge offset", "guild-search", map[string]string{"guild_id": guildID, "content": "x", "offset": "10000"}},
+		{"search no criteria", "guild-search", map[string]string{"guild_id": guildID}},
+		{"search long content", "guild-search", map[string]string{"guild_id": guildID, "content": strings.Repeat("a", 513)}},
 		{"sync bad guild", "sync", map[string]string{"guild_id": "x"}},
 		{"fetch limit not a number", "fetch", map[string]string{"channel_id": dmID, "limit": "ten"}},
 	}

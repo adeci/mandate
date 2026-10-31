@@ -12,6 +12,7 @@ import (
 
 	"github.com/adeci/mandate/approval"
 	"github.com/adeci/mandate/connector"
+	"github.com/adeci/mandate/store"
 )
 
 func newUnlinkedFixture(t *testing.T) *fixture {
@@ -57,7 +58,7 @@ func TestLinkFromConsole(t *testing.T) {
 	f := newUnlinkedFixture(t)
 	ctx := context.Background()
 	wantHealth(t, f.c, connector.NeedsSetup)
-	if _, err := f.c.Prepare(ctx, "send", map[string]string{"to": "+15551234567", "text": "hi"}); err == nil {
+	if _, err := f.c.Prepare(ctx, "send", map[string]string{"chat": farid.String(), "text": "hi"}); err == nil {
 		t.Fatal("prepared a send while not linked")
 	}
 
@@ -92,7 +93,10 @@ func TestLinkFromConsole(t *testing.T) {
 	f.cli.loggedIn = true
 	f.cli.mu.Unlock()
 	wantHealth(t, f.c, connector.Healthy)
-	if _, err := f.c.Prepare(ctx, "send", map[string]string{"to": "+15551234567", "text": "hi"}); err != nil {
+	if err := f.st.UpsertContainer(ctx, store.Container{ID: farid.String(), Kind: "dm"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.Prepare(ctx, "send", map[string]string{"chat": farid.String(), "text": "hi"}); err != nil {
 		t.Fatalf("prepare after linking: %v", err)
 	}
 }
@@ -171,9 +175,9 @@ func TestLoggedOutFromPhone(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	_, err := f.c.Prepare(ctx, "send", map[string]string{"to": "Farid", "text": "hi"})
+	_, err := f.c.Prepare(ctx, "send", map[string]string{"chat": farid.String(), "text": "hi"})
 	wantStatus(t, err, http.StatusServiceUnavailable)
-	res := f.c.Execute(ctx, approval.Record{Op: "send", Args: map[string]string{"to": farid.String(), "text": "hi"}})
+	res := f.c.Execute(ctx, approval.Record{Op: "send", Args: map[string]string{"chat": farid.String(), "text": "hi"}})
 	if res.Status != connector.Failed || len(f.cli.calls()) != 0 {
 		t.Fatalf("execute after logout: %+v", res)
 	}

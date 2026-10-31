@@ -223,8 +223,8 @@ func (p *Proxy) Spec() connector.Spec {
 
 func (p *Proxy) doc() string {
 	var b strings.Builder
-	b.WriteString("Reads: `mandate get http <service>/<path>`, e.g. `mandate get http github/repos/OWNER/REPO/issues?state=open`.\n")
-	b.WriteString("Writes: `mandate propose http request service=… method=… path=… body=…`, which the owner approves.\n")
+	b.WriteString("Reads: `mandate http get <service>/<path>`, e.g. `mandate http get github/repos/OWNER/REPO/issues?state=open`.\n")
+	b.WriteString("Writes: `mandate http request service=… method=… path=… body=…`, which the owner approves.\n")
 	for _, name := range p.names {
 		s := p.services[name]
 		fmt.Fprintf(&b, "\n## %s (%s)\n", name, s.base.Host)

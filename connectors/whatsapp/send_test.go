@@ -35,7 +35,6 @@ var (
 	samParkL = types.NewJID("111222333", types.HiddenUserServer)
 	stranger = types.NewJID("15557654321", types.DefaultUserServer)
 	climbing = types.NewJID("120363000000000777", types.GroupServer)
-	samGroup = types.NewJID("120363000000000888", types.GroupServer)
 )
 
 type sent struct {
@@ -211,13 +210,13 @@ func newFixture(t *testing.T) *fixture {
 	if err := dev.LIDs.PutLIDMapping(ctx, samParkL, samPark); err != nil {
 		t.Fatal(err)
 	}
-	for _, g := range []store.Container{
+	for _, c := range []store.Container{
 		{ID: climbing.String(), Kind: "group", IsGroup: true, Name: "Climbing crew"},
-		{ID: samGroup.String(), Kind: "group", IsGroup: true, Name: "Sam"},
-		// DM containers can carry push names; they must not resolve names.
+		{ID: farid.String(), Kind: "dm", Name: "Bank Support"},
+		{ID: samParkL.String(), Kind: "dm"},
 		{ID: stranger.String(), Kind: "dm", Name: "Mom"},
 	} {
-		if err := f.st.UpsertContainer(ctx, g); err != nil {
+		if err := f.st.UpsertContainer(ctx, c); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -226,128 +225,50 @@ func newFixture(t *testing.T) *fixture {
 	return f
 }
 
-func TestPrepareResolvesRecipient(t *testing.T) {
+func TestPrepareKnownChat(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
-	tests := []struct {
-		name        string
-		to          string
-		wantTo      types.JID
-		wantAliases []string
-		want        approval.Field
-	}{
-		{
-			name: "user JID", to: "15551234567@s.whatsapp.net", wantTo: farid,
-			want: approval.Field{Label: "To", Value: "Farid Haddad (+1 555 123 4567)"},
-		},
-		{
-			name: "device JID", to: "15551234567:4@s.whatsapp.net", wantTo: farid,
-			want: approval.Field{Label: "To", Value: "Farid Haddad (+1 555 123 4567)"},
-		},
-		{
-			name: "E.164", to: "+15551234567", wantTo: farid,
-			want: approval.Field{Label: "To", Value: "Farid Haddad (+1 555 123 4567)"},
-		},
-		{
-			name: "number not in contacts", to: "+1 555-765-4321", wantTo: stranger,
-			want: approval.Field{Label: "To", Value: "+1 555 765 4321 (not in your contacts)"},
-		},
-		{
-			name: "full name in any case", to: "farid HADDAD", wantTo: farid,
-			want: approval.Field{Label: "To", Value: "Farid Haddad (+1 555 123 4567)"},
-		},
-		{
-			name: "first name", to: "Farid", wantTo: farid,
-			want: approval.Field{Label: "To", Value: "Farid Haddad (+1 555 123 4567)"},
-		},
-		{
-			name: "contact listed under its LID", to: "Sam Park", wantTo: samPark, wantAliases: []string{samParkL.String()},
-			want: approval.Field{Label: "To", Value: "Sam Park (+44 770 090 0123)"},
-		},
-		{
-			name: "number with a LID", to: "+44 7700 900123", wantTo: samPark, wantAliases: []string{samParkL.String()},
-			want: approval.Field{Label: "To", Value: "Sam Park (+44 770 090 0123)"},
-		},
-		{
-			name: "LID JID", to: samParkL.String(), wantTo: samPark, wantAliases: []string{samParkL.String()},
-			want: approval.Field{Label: "To", Value: "Sam Park (+44 770 090 0123)"},
-		},
-		{
-			name: "group name", to: "climbing crew", wantTo: climbing,
-			want: approval.Field{Label: "Group", Value: "Climbing crew"},
-		},
-		{
-			name: "group JID", to: climbing.String(), wantTo: climbing,
-			want: approval.Field{Label: "Group", Value: "Climbing crew"},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ctx := context.Background()
-			p, err := f.c.Prepare(ctx, "send", map[string]string{"to": tt.to, "text": "on my way"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			want := connector.Prepared{
-				Args:      map[string]string{"to": tt.wantTo.String(), "text": "on my way"},
-				Display:   []approval.Field{tt.want, {Label: "Text", Value: "on my way", Param: "text"}},
-				Container: tt.wantTo.String(),
-				Aliases:   tt.wantAliases,
-			}
-			if !reflect.DeepEqual(p, want) {
-				t.Fatalf("prepared\n got %+v\nwant %+v", p, want)
-			}
-			again, err := f.c.Prepare(ctx, "send", p.Args)
-			if err != nil || !reflect.DeepEqual(again, p) {
-				t.Fatalf("not idempotent: %+v %v", again, err)
-			}
-		})
-	}
-}
-
-// The gateway drops hidden candidates before the agent sees them, so the
-// message itself must not name anyone.
-func TestAmbiguousNameCandidates(t *testing.T) {
-	t.Parallel()
-	f := newFixture(t)
-	_, err := f.c.Prepare(context.Background(), "send", map[string]string{"to": "sam", "text": "hi"})
-	var e *connector.Error
-	if !errors.As(err, &e) || e.Status != http.StatusBadRequest {
-		t.Fatalf("err = %v, want a 400 connector.Error", err)
-	}
-	want := []connector.Candidate{
-		{ID: samGroup.String(), Label: "Sam (group)"},
-		{ID: samLee.String(), Label: "Sam Lee (+1 ••• ••• 1111)"},
-		{ID: samPark.String(), Aliases: []string{samParkL.String()}, Label: "Sam Park (+44 ••• ••• 0123)"},
-	}
-	if !reflect.DeepEqual(e.Candidates, want) {
-		t.Fatalf("candidates\n got %+v\nwant %+v", e.Candidates, want)
-	}
-	for _, leak := range []string{"Lee", "Park", "1111", "0123", "@"} {
-		if strings.Contains(e.Message, leak) {
-			t.Errorf("message %q names a candidate (%q)", e.Message, leak)
+	for chat, want := range map[types.JID]approval.Field{
+		farid:    {Label: "To", Value: "Farid Haddad (+15551234567)"},
+		samParkL: {Label: "To", Value: "Sam Park (+447700900123)"},
+		stranger: {Label: "To", Value: "+15557654321 (not in your contacts)"},
+		climbing: {Label: "Group", Value: "Climbing crew"},
+	} {
+		ctx := context.Background()
+		p, err := f.c.Prepare(ctx, "send", map[string]string{"chat": chat.String(), "text": "on my way"})
+		if err != nil {
+			t.Fatalf("%s: %v", chat, err)
+		}
+		wantP := connector.Prepared{
+			Args:      map[string]string{"chat": chat.String(), "text": "on my way"},
+			Display:   []approval.Field{want, {Label: "Text", Value: "on my way", Param: "text"}},
+			Container: chat.String(),
+		}
+		if !reflect.DeepEqual(p, wantP) {
+			t.Errorf("%s: prepared\n got %+v\nwant %+v", chat, p, wantP)
+		}
+		if again, err := f.c.Prepare(ctx, "send", p.Args); err != nil || !reflect.DeepEqual(again, p) {
+			t.Errorf("%s: not idempotent: %+v %v", chat, again, err)
 		}
 	}
 }
 
-func TestPrepareRejectsBadArgs(t *testing.T) {
+func TestPrepareRefusesUnknownChat(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
-	for name, args := range map[string]map[string]string{
-		"blank text":                 {"to": "Farid", "text": " \n"},
-		"unknown arg":                {"to": "Farid", "text": "hi", "reply_to": "x"},
-		"missing to":                 {"text": "hi"},
-		"broadcast JID":              {"to": "status@broadcast", "text": "hi"},
-		"short digit run":            {"to": "12345", "text": "hi"},
-		"push name":                  {"to": "Mom", "text": "hi"},
-		"unknown group":              {"to": "120363000000000999@g.us", "text": "hi"},
-		"LID without a known number": {"to": "999888777@lid", "text": "hi"},
-		"malformed user JID":         {"to": "+15551234567@s.whatsapp.net", "text": "hi"},
+	for _, chat := range []string{samLee.String(), "Farid", "+15551234567", "15551234567:4@s.whatsapp.net", ""} {
+		_, err := f.c.Prepare(context.Background(), "send", map[string]string{"chat": chat, "text": "hi"})
+		var e *connector.Error
+		if !errors.As(err, &e) || e.Status != http.StatusBadRequest || !strings.Contains(e.Message, "mandate whatsapp chats --search") {
+			t.Errorf("%q: err = %v, want 400 with the chats hint", chat, err)
+		}
+	}
+	for _, args := range []map[string]string{
+		{"chat": farid.String(), "text": " \n"},
+		{"chat": farid.String(), "text": "hi", "reply_to": "x"},
 	} {
-		t.Run(name, func(t *testing.T) {
-			_, err := f.c.Prepare(context.Background(), "send", args)
-			wantStatus(t, err, http.StatusBadRequest)
-		})
+		_, err := f.c.Prepare(context.Background(), "send", args)
+		wantStatus(t, err, http.StatusBadRequest)
 	}
 }
 
@@ -394,7 +315,7 @@ func TestExecute(t *testing.T) {
 			f.cli.connected, f.cli.loggedIn, f.cli.err = tt.connected, tt.loggedIn, tt.sendErr
 			rec := approval.Record{
 				ID: "p1", Connector: "whatsapp", Op: "send",
-				Args: map[string]string{"to": farid.String(), "text": "running late"},
+				Args: map[string]string{"chat": farid.String(), "text": "running late"},
 			}
 
 			res := f.c.Execute(context.Background(), rec)
@@ -420,10 +341,6 @@ func TestExecute(t *testing.T) {
 			}}
 			if !reflect.DeepEqual(msgs, want) {
 				t.Fatalf("stored\n got %+v\nwant %+v", msgs, want)
-			}
-			var name string
-			if err := f.st.DB().QueryRow(`SELECT name FROM containers WHERE id = ?`, farid.String()).Scan(&name); err != nil || name != "Farid Haddad" {
-				t.Fatalf("container name = %q, %v", name, err)
 			}
 		})
 	}
@@ -460,7 +377,7 @@ func TestApprovedSendRunsOnce(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	p, err := client.Prepare(context.Background(), "send", map[string]string{"to": "Farid", "text": "running late"})
+	p, err := client.Prepare(context.Background(), "send", map[string]string{"chat": farid.String(), "text": "running late"})
 	if err != nil {
 		t.Fatal(err)
 	}

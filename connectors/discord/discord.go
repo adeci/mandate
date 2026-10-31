@@ -307,7 +307,7 @@ var spec = connector.Spec{Name: "discord", Ops: []connector.Op{
 		},
 	},
 	{
-		Name: "search", Kind: connector.Read,
+		Name: "guild-search", Kind: connector.Read,
 		Summary: "Search one server's message history the way Discord's search box does, 25 results per page, newest first. " +
 			"Needs at least one of content, author_id, channel_id, or has. Results are cached for an hour.",
 		Params: []connector.Param{
@@ -352,7 +352,7 @@ func (w *worker) Read(ctx context.Context, op string, args map[string]string) (j
 			return nil, toConnectorError(err)
 		}
 		run = func(ctx context.Context, dl time.Time) (connector.ReadResult, error) { return w.svc.sync(ctx, dl, req) }
-	case "search":
+	case "guild-search":
 		req, err := parseSearch(args)
 		if err != nil {
 			return nil, toConnectorError(err)
