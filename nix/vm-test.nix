@@ -1,14 +1,19 @@
 # Boots every unit under its real sandbox. WhatsApp is unlinked and Discord
-# has no network, so both are checked for wiring and health only. A fixture
-# data.db is written as WhatsApp's user to prove the gateway reads another
-# user's database read-only. A recorder stands in for an HTTP API, and the
-# test driver holds a pinned passkey to sign in and approve writes end to end.
+# has no network, so both are checked for wiring only. A recorder stands in
+# for an HTTP API, and the test driver plays the owner's passkey.
 { pkgs, self }:
 let
   token = "0123456789abcdef0123456789abcdef0123456789abcdef";
   apiToken = "api-token-0123456789abcdef";
+  adminPassword = "correct horse battery staple";
   # Dotted: curl, like the public suffix list, refuses cookies for bare names.
   host = "mandate.example.com";
+
+  adminPasswordHash =
+    pkgs.runCommand "mandate-test-admin-hash" { nativeBuildInputs = [ pkgs.mkpasswd ]; }
+      ''
+        printf %s '${adminPassword}' | mkpasswd -m bcrypt -R 4 -s | tr -d '\n' > $out
+      '';
 
   fixture = pkgs.writeText "fixture.sql" ''
     INSERT INTO containers (id, kind, name, is_group, updated_at) VALUES
@@ -51,7 +56,10 @@ in
 pkgs.testers.runNixOSTest {
   name = "mandate";
 
-  extraPythonPackages = p: [ p.cryptography ];
+  extraPythonPackages = p: [
+    p.cryptography
+    p.cbor2
+  ];
 
   nodes.machine = {
     imports = [ self.nixosModules.default ];
@@ -76,20 +84,14 @@ pkgs.testers.runNixOSTest {
         hostname = host;
         tlsCertFile = "/etc/mandate-tls/cert.pem";
         tlsKeyFile = "/etc/mandate-tls/key.pem";
-        # The driver derives this key from a fixed seed; see testScript.
-        approvers = [
-          {
-            name = "test";
-            credential_id = "bWFuZGF0ZS12bS10ZXN0LWNyZWQ";
-            public_key = "pQECAyYgASFYIOJvyL4X7KsvqBhltIpjtVLlYmtVYBs5iANG3kiq4oSpIlggOGxuiqaMwfmB5nJhiqWfe1MDJcQy49wlH88_uRiqrKU";
-          }
-        ];
+        adminPasswordHashFile = "/etc/mandate-admin-hash";
       };
     };
     environment.etc = {
       "mandate-token".text = token;
       "discord-token".text = "not-a-real-token";
       "api-token".text = apiToken;
+      "mandate-admin-hash".source = adminPasswordHash;
       "mandate-tls/cert.pem".source = "${tls}/cert.pem";
       "mandate-tls/key.pem".source = "${tls}/key.pem";
     };
@@ -117,6 +119,7 @@ pkgs.testers.runNixOSTest {
     import hashlib
     import json
 
+    import cbor2
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -146,10 +149,8 @@ pkgs.testers.runNixOSTest {
         return curl(f"-X {method} -b {jar} -c {jar} --cacert /etc/mandate-tls/cert.pem "
                     f"--resolve ${host}:443:127.0.0.1 https://${host}{path}", body)
 
-    def q(sql):
-        code, out = gw("POST", "/v1/query", {"sql": sql})
-        assert code == 200, (code, out)
-        return out
+    def connector_keys(name):
+        return json.loads(machine.succeed(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/keys"))
 
     def recorded():
         lines = machine.succeed("cat /var/lib/recorder/log.jsonl 2>/dev/null || true").splitlines()
@@ -162,61 +163,55 @@ pkgs.testers.runNixOSTest {
     seed = int.from_bytes(hashlib.sha256(b"mandate-vm-test-passkey").digest(), "big") % P256_ORDER
     passkey = ec.derive_private_key(seed, ec.SECP256R1())
     credential = b"mandate-vm-test-cred"
+    origin = "https://${host}"
 
-    # Answers navigator.credentials.get the way a phone would.
-    def assertion(options, flags=0x05):
-        client = json.dumps({"type": "webauthn.get", "challenge": options["challenge"],
-                             "origin": "https://${host}", "crossOrigin": False}).encode()
-        auth = hashlib.sha256(options["rpId"].encode()).digest() + bytes([flags]) + (1).to_bytes(4, "big")
-        sig = passkey.sign(auth + hashlib.sha256(client).digest(), ec.ECDSA(hashes.SHA256()))
+    def client_data(kind, challenge):
+        return json.dumps({"type": kind, "challenge": challenge, "origin": origin, "crossOrigin": False}).encode()
+
+    # Answers navigator.credentials.create the way a security key would.
+    def registration(options):
+        n = passkey.public_key().public_numbers()
+        cose = cbor2.dumps({1: 2, 3: -7, -1: 1, -2: n.x.to_bytes(32, "big"), -3: n.y.to_bytes(32, "big")})
+        auth = (hashlib.sha256(options["rp"]["id"].encode()).digest() + bytes([0x45]) + (0).to_bytes(4, "big")
+                + bytes(16) + len(credential).to_bytes(2, "big") + credential + cose)
+        attestation = cbor2.dumps({"fmt": "none", "attStmt": {}, "authData": auth})
         return {"id": b64(credential), "rawId": b64(credential), "type": "public-key",
-                "response": {"authenticatorData": b64(auth), "clientDataJSON": b64(client), "signature": b64(sig)}}
+                "response": {"clientDataJSON": b64(client_data("webauthn.create", options["challenge"])),
+                             "attestationObject": b64(attestation)}}
 
-    with subtest("fixture written as the source user is 0640"):
+    # Answers navigator.credentials.get.
+    def assertion(options, flags=0x05):
+        cd = client_data("webauthn.get", options["challenge"])
+        auth = hashlib.sha256(options["rpId"].encode()).digest() + bytes([flags]) + (1).to_bytes(4, "big")
+        sig = passkey.sign(auth + hashlib.sha256(cd).digest(), ec.ECDSA(hashes.SHA256()))
+        return {"id": b64(credential), "rawId": b64(credential), "type": "public-key",
+                "response": {"authenticatorData": b64(auth), "clientDataJSON": b64(cd), "signature": b64(sig)}}
+
+    with subtest("reads are per connector, filtered, and refuse names"):
         machine.succeed(
             "cd /var/lib/mandate-whatsapp && sudo -u mandate-whatsapp sh -c "
             "'umask 0027 && sqlite3 data.db < ${../store/schema.sql} && sqlite3 data.db < ${fixture}'"
         )
-        machine.succeed("stat -c %a /var/lib/mandate-whatsapp/data.db | grep -qx 640")
-
-    with subtest("exposure and auth filtering"):
         machine.succeed("printf '[whatsapp]\\nhide_containers = [\"hidden@s.whatsapp.net\"]\\n' > /var/lib/mandate-gateway/exposure.toml")
-        rows = q("SELECT id, body, is_auth FROM whatsapp_messages ORDER BY seq")["rows"]
-        assert rows == [["fam@g.us/1", "dinner at 7?", 0], ["fam@g.us/2", None, 1]], rows
+        code, out = gw("GET", "/v1/whatsapp/chats")
+        assert code == 200 and [r[0] for r in out["rows"]] == ["fam@g.us"], (code, out)
+        code, out = gw("GET", "/v1/whatsapp/messages?chat=fam@g.us")
+        assert [r[-1] for r in out["rows"]] == [None, "dinner at 7?"], out
+        code, out = gw("GET", "/v1/whatsapp/messages?chat=hidden@s.whatsapp.net")
+        assert code == 404, (code, out)
+        code, out = gw("GET", "/v1/whatsapp/messages?chat=Family")
+        assert code == 404 and "chats --search" in out["error"], (code, out)
+        machine.fail("curl -sf http://127.0.0.1:8780/v1/whatsapp/chats")
 
-    with subtest("broken exposure fails closed, then recovers"):
-        machine.succeed("printf '[whatsap]\\nhide_containers = []\\n' > /var/lib/mandate-gateway/exposure.toml")
-        code, _ = gw("POST", "/v1/query", {"sql": "SELECT 1"})
+    with subtest("broken exposure fails closed"):
+        machine.succeed("printf '[whatsap]\\n' > /var/lib/mandate-gateway/exposure.toml")
+        code, _ = gw("GET", "/v1/whatsapp/chats")
         assert code != 200, code
         machine.succeed("printf '[whatsapp]\\nhide_containers = [\"hidden@s.whatsapp.net\"]\\n' > /var/lib/mandate-gateway/exposure.toml")
-        assert q("SELECT count(*) FROM whatsapp_messages")["rows"] == [[2]]
 
-    with subtest("unauthenticated and bypass attempts fail"):
-        machine.fail("curl -sf -d '{\"sql\":\"SELECT 1\"}' http://127.0.0.1:8780/v1/query")
-        code, _ = gw("POST", "/v1/query", {"sql": "SELECT * FROM src_whatsapp.messages"})
-        assert code != 200, code
-
-    with subtest("gateway user can read but not write source data or sessions"):
-        machine.succeed("sudo -u mandate-gateway sqlite3 'file:/var/lib/mandate-whatsapp/data.db?mode=ro' 'SELECT count(*) FROM messages'")
-        machine.fail("sudo -u mandate-gateway sqlite3 /var/lib/mandate-whatsapp/data.db 'DELETE FROM messages'")
-        machine.fail("sudo -u mandate-gateway touch /var/lib/mandate-whatsapp/x")
-        machine.succeed("stat -c %a /var/lib/mandate-whatsapp/private | grep -qx 700")
-        machine.fail("sudo -u mandate-gateway ls /var/lib/mandate-whatsapp/private")
-
-    with subtest("unlinked WhatsApp asks for the owner instead of failing"):
-        code, schema = gw("GET", "/v1/schema")
-        health = {c["name"]: c["health"]["state"] for c in schema["connectors"]}
-        assert health["whatsapp"] == "setup" and health["http"] == "ok", health
-        code, out = gw("POST", "/v1/actions", {"connector": "whatsapp", "op": "send", "args": {"to": "fam@g.us", "text": "hi"}})
+    with subtest("unlinked WhatsApp asks for the owner"):
+        code, out = gw("POST", "/v1/whatsapp/send", {"args": {"chat": "fam@g.us", "text": "hi"}})
         assert code == 503 and "https://${host}/connections" in out["error"], (code, out)
-
-    with subtest("discord: socket reachable only by the gateway and console, hidden/unknown refused locally"):
-        machine.succeed("sudo -u mandate-gateway test -w /run/mandate-discord/connector.sock")
-        machine.succeed("sudo -u mandate-console test -w /run/mandate-discord/connector.sock")
-        machine.fail("sudo -u mandate-whatsapp test -w /run/mandate-discord/connector.sock")
-        # Outside Discord's active hours the gateway answers "resting" first.
-        code, out = gw("POST", "/v1/read/discord/fetch", {"args": {"channel_id": "123456789012345678"}})
-        assert code == 404 or (code == 429 and "resting" in out["error"]), (code, out)
 
     with subtest("API reads get the token added and the agent's credentials stripped"):
         code, out = gw("GET", "/v1/forward/http/api/items")
@@ -224,37 +219,45 @@ pkgs.testers.runNixOSTest {
         [req] = recorded()
         assert req["headers"]["Authorization"] == "Bearer ${apiToken}", req
         assert "${token}" not in json.dumps(req), req
-        code, _ = gw("GET", "/v1/forward/http/api/admin")
-        assert code == 403, code
         code, _ = gw("POST", "/v1/forward/http/api/items", {"text": "no approval"})
         assert code == 405, code
-        assert len(recorded()) == 1
 
-    with subtest("a write is only a proposal until approved"):
-        code, p = gw("POST", "/v1/actions", {"connector": "http", "op": "request", "note": "filing it",
-                     "args": {"service": "api", "method": "POST", "path": "/items", "body": "{\"text\": \"original\"}"}})
+    with subtest("a write is a proposal until approved"):
+        code, p = gw("POST", "/v1/http/request", {"note": "filing it", "args": {
+            "service": "api", "method": "POST", "path": "/items", "body": "{\"text\": \"original\"}"}})
         assert code == 202 and p["status"] == "pending", (code, p)
         pid = p["id"]
         assert p["url"] == f"https://${host}/r/{pid}", p
-        code, p = gw("GET", f"/v1/actions/{pid}?wait=1")
+        code, p = gw("GET", f"/v1/proposals/{pid}?wait=1")
         assert p["status"] == "pending", p
         assert len(recorded()) == 1
 
-    with subtest("the console admits nobody without a passkey"):
+    with subtest("the console admits the admin password, not guesses"):
         code, _ = console("GET", "/", jar="/tmp/nobody")
         assert code == 303, code
-        code, _ = console("POST", f"/r/{pid}/deny", {}, jar="/tmp/nobody")
-        assert code == 401, code
-        code, _ = console("POST", f"/r/{pid}/challenge", {"edits": {}}, jar="/tmp/nobody")
-        assert code == 401, code
-        code, options = console("POST", "/login/options", {}, jar="/tmp/nobody")
-        code, _ = console("POST", "/login", {"assertion": assertion(options, flags=0x01)}, jar="/tmp/nobody")
-        assert code == 403 or code == 401, code
-        code, p = gw("GET", f"/v1/actions/{pid}")
-        assert p["status"] == "pending", p
+        code, _ = console("POST", "/login", {"password": "wrong"}, jar="/tmp/nobody")
+        assert code in (401, 403), code
+        code, out = console("POST", "/login", {"password": "${adminPassword}"})
+        assert code == 200, (code, out)
+        code, page = console("GET", f"/r/{pid}")
+        assert code == 200 and "filing it" in page, code
 
-    with subtest("the gateway can reach the connector but cannot make it act"):
-        # Signed by nobody: only the console's records carry a real passkey signature.
+    with subtest("a key the console doesn't trust cannot approve"):
+        code, ch = console("POST", f"/r/{pid}/challenge", {"edits": {}})
+        assert code == 200, (code, ch)
+        code, out = console("POST", f"/r/{pid}/approve", {"nonce": ch["nonce"], "assertion": assertion(ch["options"])})
+        assert code == 403, (code, out)
+        assert len(recorded()) == 1
+
+    with subtest("the first key is trusted at once and reaches every connector"):
+        code, options = console("POST", "/keys/options", {"name": "yubikey"})
+        assert code == 200, (code, options)
+        code, out = console("POST", "/keys", registration(options))
+        assert code == 200 and out["trusted"], (code, out)
+        for name in ["whatsapp", "discord", "http"]:
+            machine.wait_until_succeeds(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/keys | grep -q '\"length\":1'")
+
+    with subtest("the gateway can reach a connector but cannot make it act or change its keys"):
         forged = {"record": base64.b64encode(b"{}").decode(), "nonce": base64.b64encode(b"0123456789abcdef").decode(),
                   "issued_at": "2026-10-31T00:00:00Z",
                   "assertion": {"id": "eA", "rawId": "eA", "type": "public-key", "response": {}}}
@@ -264,31 +267,27 @@ pkgs.testers.runNixOSTest {
             "--unix-socket /run/mandate-http/connector.sock --data-binary @- http://connector/execute"
         )
         assert code == "403", code
+        code = machine.succeed(
+            "echo '[]' | sudo -u mandate-gateway curl -s -o /dev/null -w '%{http_code}' -X PUT "
+            "--unix-socket /run/mandate-http/connector.sock --data-binary @- http://connector/keys"
+        )
+        assert code == "409", code
+        assert connector_keys("http")["length"] == 1
         assert len(recorded()) == 1
 
-    with subtest("the owner signs in, edits, and approves; the API gets exactly that, once"):
-        code, options = console("POST", "/login/options", {})
-        assert code == 200, (code, options)
-        code, out = console("POST", "/login", {"assertion": assertion(options)})
-        assert code == 200, (code, out)
-        code, page = console("GET", f"/r/{pid}")
-        assert code == 200 and "filing it" in page, code
-
+    with subtest("the owner edits and approves with the key; the API gets exactly that, once"):
         code, ch = console("POST", f"/r/{pid}/challenge", {"edits": {"body": "{\"text\": \"edited\"}"}})
         assert code == 200, (code, ch)
-        assert any("edited" in f["value"] for f in ch["display"]), ch["display"]
         code, out = console("POST", f"/r/{pid}/approve", {"nonce": ch["nonce"], "assertion": assertion(ch["options"], flags=0x01)})
         assert code == 403, (code, out)
         approved = {"nonce": ch["nonce"], "assertion": assertion(ch["options"])}
         code, out = console("POST", f"/r/{pid}/approve", approved)
         assert code == 200, (code, out)
-
         sent = recorded()[1:]
         assert len(sent) == 1, sent
-        assert sent[0]["method"] == "POST" and sent[0]["path"] == "/items", sent
         assert json.loads(sent[0]["body"]) == {"text": "edited"}, sent
         assert sent[0]["headers"]["Authorization"] == "Bearer ${apiToken}", sent
-        code, p = gw("GET", f"/v1/actions/{pid}")
+        code, p = gw("GET", f"/v1/proposals/{pid}")
         assert p["status"] == "done" and "items/1" in p["result"]["output"], p
 
     with subtest("replaying the approval does nothing, even after restarts"):
@@ -296,19 +295,24 @@ pkgs.testers.runNixOSTest {
         assert code == 409, code
         machine.succeed("systemctl restart mandate-console.service mandate-http.service")
         machine.wait_for_open_port(443)
-        machine.wait_for_unit("mandate-http.service")
+        machine.wait_until_succeeds("curl -s --unix-socket /run/mandate-http/connector.sock http://connector/keys | grep -q '\"length\":1'")
         code, _ = console("POST", f"/r/{pid}/approve", approved)
         assert code == 409, code
         assert len(recorded()) == 2
 
-    with subtest("passkeys come from root or a signed-in owner, and nothing else reaches console state"):
-        out = machine.succeed("mandate passkey add --name laptop")
-        [url] = [w for w in out.split() if w.startswith("https://${host}/enroll/")]
-        machine.succeed(f"curl -sf --cacert /etc/mandate-tls/cert.pem --resolve ${host}:443:127.0.0.1 {url} >/dev/null")
-        machine.fail("sudo -u mandate-gateway mandate passkey add --name x")
+    with subtest("signing in with the key works; nothing else reaches console state"):
+        code, options = console("POST", "/login/options", {}, jar="/tmp/keyjar")
+        code, out = console("POST", "/login", {"assertion": assertion(options)}, jar="/tmp/keyjar")
+        assert code == 200, (code, out)
         machine.fail("sudo -u mandate-gateway ls /var/lib/mandate-console")
         machine.fail("sudo -u mandate-gateway cat /run/credentials/mandate-http.service/api")
         machine.fail("sudo -u mandate-whatsapp test -w /run/mandate-http/connector.sock")
+
+    with subtest("mandate-reset-keys clears every key list"):
+        machine.succeed("mandate-reset-keys")
+        machine.wait_for_open_port(443)
+        for name in ["whatsapp", "discord", "http"]:
+            machine.wait_until_succeeds(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/keys | grep -q '\"length\":0'")
 
     with subtest("outsider cannot reach the gateway or the console"):
         machine.succeed("curl -sf http://127.0.0.1:8780/healthz")

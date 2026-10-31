@@ -1,6 +1,6 @@
 {
-  "mandate": "sha256-RwtzUgZWrzTDzgbkccBNcz/+lRWolBzvvr+qiI+Aszs=",
-  "mandate-discord": "sha256-doOGPL5QKy07RaHhbirQS/QUc3JT9jxayGBWpB54m/4=",
-  "mandate-http": "sha256-D6isyqkpG5aXSm4/38iJoirc0kGAHEH6VdUFDaH7QWk=",
-  "mandate-whatsapp": "sha256-3NSKFw8XddTocq5diX2kGcq8pisIWUYiggEFQaB5ZT0="
+  "mandate": "sha256-Qmvz4eVjMRhHVGRd4QAaLHnu622UjreOwY4vPIMHx+I=",
+  "mandate-discord": "sha256-E5pgndO+keYJx3LmzH4YATo6xwpf4VpStlYd3CMAMBY=",
+  "mandate-http": "sha256-vHuTDO0X0c0tB8IZhtwN5kOxUkM+aK/N5PEgTbq3AKI=",
+  "mandate-whatsapp": "sha256-UjFiu503EETRRaKeL7SKsvxuIudIc8LutkV7rPWdhwE="
 }
