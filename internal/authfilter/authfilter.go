@@ -6,13 +6,9 @@ package authfilter
 import (
 	"fmt"
 	"regexp"
-	"strings"
 )
 
 var (
-	// Numeric SMS short codes (bank alerts, 2FA senders). SMS only.
-	shortCode = regexp.MustCompile(`^\+?\d{3,6}$`)
-
 	keyword = regexp.MustCompile(`(?i)\b(?:code|otp|passcode|pass code|password|pin|verif\w*|2fa|two[- ]factor|one[- ]time|login|log in|sign[- ]?in|security|authenticat\w*|confirm\w*|do not share|don'?t share|never share|expires?|valid for)\b`)
 
 	// Code-like tokens: 4-8 digits, digit groups split by space/dash/dot
@@ -46,11 +42,8 @@ func New(extraSender, extraBody []string) (*Classifier, error) {
 	return c, nil
 }
 
-// source is the gateway source name ("sms", "whatsapp", "discord").
+// source is the gateway source name ("whatsapp", "discord").
 func (c *Classifier) IsAuth(source, sender, body string) bool {
-	if source == "sms" && shortCode.MatchString(strings.TrimSpace(sender)) {
-		return true
-	}
 	for _, re := range c.extraSender {
 		if re.MatchString(sender) {
 			return true

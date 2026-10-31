@@ -15,7 +15,6 @@ import (
 	"github.com/adeci/mandate/internal/discord"
 	"github.com/adeci/mandate/internal/exitcode"
 	"github.com/adeci/mandate/internal/gateway"
-	"github.com/adeci/mandate/internal/gmessages"
 	"github.com/adeci/mandate/internal/httpproxy"
 	"github.com/adeci/mandate/internal/whatsapp"
 )
@@ -36,7 +35,6 @@ for agents (set MANDATE_URL and MANDATE_TOKEN):
 on the host:
   gateway                 serve the gateway
   whatsapp run|pair       WhatsApp linked device
-  messages run|pair       Google Messages (SMS/RCS)
   discord serve           Discord reader behind the gateway
   http-proxy              token-holding proxy for HTTP APIs
   approvals               serve the approval pages and proposal API
@@ -77,8 +75,6 @@ func run() int {
 		err = gateway.Command(ctx, args)
 	case "whatsapp":
 		err = whatsapp.Command(ctx, args)
-	case "messages":
-		err = gmessages.Command(ctx, args)
 	case "discord":
 		err = discord.Command(ctx, args)
 	case "http-proxy":

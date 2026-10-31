@@ -1,6 +1,6 @@
-// Package proposal is the API between the gateway and the approvals unit. The
-// gateway submits proposals and reads their status; only the approvals unit
-// stores them, talks to the owner, and hands approved records to connectors.
+// Package proposal is the API between the gateway and the console. The
+// gateway submits proposals and reads their status; only the console stores
+// them, shows them to the owner, and hands approved records to connectors.
 //
 //	POST /proposals        Request -> Proposal
 //	GET  /proposals/{id}   -> Proposal
@@ -46,11 +46,13 @@ type Proposal struct {
 	Note      string            `json:"note,omitempty"`
 	Status    Status            `json:"status"`
 	Result    *connector.Result `json:"result,omitempty"`
-	CreatedAt time.Time         `json:"created_at"`
-	ExpiresAt time.Time         `json:"expires_at"`
+	// URL is the proposal's page in the console; agents send it to the owner.
+	URL       string    `json:"url"`
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// Client is the gateway's handle on the approvals unit's socket.
+// Client is the gateway's handle on the console's proposal socket.
 type Client struct {
 	c *connector.Client
 }

@@ -33,6 +33,8 @@ type Server struct {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /spec", s.spec)
+	mux.HandleFunc("GET /health", s.health)
+	mux.HandleFunc("POST /setup", s.setup)
 	mux.HandleFunc("POST /read", s.read)
 	mux.HandleFunc("POST /prepare", s.prepare)
 	mux.HandleFunc("POST /execute", s.execute)
@@ -94,6 +96,36 @@ func (s *Server) spec(w http.ResponseWriter, _ *http.Request) {
 type opRequest struct {
 	Op   string            `json:"op"`
 	Args map[string]string `json:"args"`
+}
+
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	h := Health{State: Healthy}
+	if c, ok := s.Connector.(Checker); ok {
+		h = c.Health(r.Context())
+	}
+	writeJSON(w, http.StatusOK, h)
+}
+
+type setupRequest struct {
+	Args map[string]string `json:"args"`
+}
+
+func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
+	var req setupRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	c, ok := s.Connector.(Setupper)
+	if !ok {
+		writeErr(w, &Error{Status: http.StatusNotFound, Message: "this connector needs no setup"})
+		return
+	}
+	step, err := c.Setup(r.Context(), req.Args)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, step)
 }
 
 func (s *Server) read(w http.ResponseWriter, r *http.Request) {

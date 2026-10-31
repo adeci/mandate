@@ -39,6 +39,18 @@ func (c *Client) Spec(ctx context.Context) (Spec, error) {
 	return s, err
 }
 
+func (c *Client) Health(ctx context.Context) (Health, error) {
+	var h Health
+	err := c.Do(ctx, http.MethodGet, "/health", nil, &h)
+	return h, err
+}
+
+func (c *Client) Setup(ctx context.Context, args map[string]string) (SetupStep, error) {
+	var s SetupStep
+	err := c.Do(ctx, http.MethodPost, "/setup", setupRequest{Args: args}, &s)
+	return s, err
+}
+
 func (c *Client) Read(ctx context.Context, op string, args map[string]string) (json.RawMessage, error) {
 	var out json.RawMessage
 	err := c.Do(ctx, http.MethodPost, "/read", opRequest{Op: op, Args: args}, &out)

@@ -1,8 +1,10 @@
-// Package connector is the protocol between mandate's gateway and approvals
-// units and the per-service connectors that hold sessions. A connector serves
-// it on a Unix socket:
+// Package connector is the protocol between mandate's gateway and console
+// and the per-service connectors that hold sessions. A connector serves it on
+// a Unix socket:
 //
 //	GET  /spec     ops the connector offers
+//	GET  /health   whether it is working or needs the owner
+//	POST /setup    link it to the owner's account (console only)
 //	POST /read     run a read op (no approval; results land in the connector's data.db)
 //	POST /prepare  validate and normalize a write, render what the owner will see
 //	POST /execute  run an approved write, verifying the approval itself
@@ -13,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/adeci/mandate/internal/approval"
 )
@@ -28,6 +31,9 @@ const (
 type Spec struct {
 	Name string `json:"name"`
 	Ops  []Op   `json:"ops"`
+	// Doc is markdown for agents beyond the ops, e.g. which API paths the
+	// http connector allows.
+	Doc string `json:"doc,omitempty"`
 }
 
 type Op struct {
@@ -64,6 +70,9 @@ type Prepared struct {
 	Args      map[string]string `json:"args"`
 	Display   []approval.Field  `json:"display"`
 	Container string            `json:"container,omitempty"`
+	// Aliases are other IDs of the same container, e.g. a WhatsApp contact's
+	// LID; the write is refused if any of them is hidden.
+	Aliases []string `json:"aliases,omitempty"`
 }
 
 type Status string
@@ -81,6 +90,9 @@ type Result struct {
 	Detail string `json:"detail,omitempty"`
 	// Ref identifies what was created upstream, e.g. a message ID.
 	Ref string `json:"ref,omitempty"`
+	// Output is the service's response for the agent, e.g. an API body,
+	// with credentials scrubbed.
+	Output string `json:"output,omitempty"`
 }
 
 // ReadResult is what read ops return. Messages are stored in the connector's
@@ -109,6 +121,45 @@ type Reader interface {
 	Read(ctx context.Context, op string, args map[string]string) (json.RawMessage, error)
 }
 
+type HealthState string
+
+const (
+	Healthy HealthState = "ok"
+	// NeedsSetup means the owner must act in the console, e.g. link WhatsApp.
+	NeedsSetup HealthState = "setup"
+	// Resting means reads are refused for pacing until Health.Until.
+	Resting HealthState = "resting"
+	Broken  HealthState = "down"
+)
+
+type Health struct {
+	State  HealthState `json:"state"`
+	Detail string      `json:"detail,omitempty"`
+	Until  time.Time   `json:"until,omitzero"`
+}
+
+// Checker is implemented by connectors whose health can change; others are
+// always Healthy.
+type Checker interface {
+	Health(ctx context.Context) Health
+}
+
+// SetupStep is one step of linking a connector, shown in the console.
+type SetupStep struct {
+	// QR is text to render as a QR code for the owner to scan.
+	QR string `json:"qr,omitempty"`
+	// Code is a code the owner types on another device.
+	Code         string `json:"code,omitempty"`
+	Instructions string `json:"instructions,omitempty"`
+	Done         bool   `json:"done,omitempty"`
+}
+
+// Setupper is implemented by connectors the owner links from the console.
+// Setup starts or continues linking; it must refuse while already linked.
+type Setupper interface {
+	Setup(ctx context.Context, args map[string]string) (SetupStep, error)
+}
+
 // Error is a request the connector refused, with a message meant for the
 // agent (e.g. "ambiguous recipient"). Status is the HTTP status to relay.
 type Error struct {
@@ -116,6 +167,16 @@ type Error struct {
 	Message string `json:"error"`
 	// RetryAfter is set when a read is refused for pacing.
 	RetryAfter int `json:"retry_after_seconds,omitempty"`
+	// Candidates are the matches for an ambiguous name. Message must not
+	// name them: the gateway drops hidden ones before the agent sees them.
+	Candidates []Candidate `json:"candidates,omitempty"`
+}
+
+type Candidate struct {
+	// ID is the container the candidate resolves to; Aliases as in Prepared.
+	ID      string   `json:"id"`
+	Aliases []string `json:"aliases,omitempty"`
+	Label   string   `json:"label"`
 }
 
 func (e *Error) Error() string { return e.Message }

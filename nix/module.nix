@@ -62,20 +62,6 @@ let
       ]
       ++ verifyArgs "${state "whatsapp"}/private/seen.json";
     };
-    messages = {
-      source = "sms";
-      session = "private/session.json";
-      connector = false;
-      writes = false;
-      args = [
-        "messages"
-        "run"
-        "--data"
-        "${state "messages"}/data.db"
-        "--session"
-        "${state "messages"}/private/session.json"
-      ];
-    };
     discord = {
       source = "discord";
       session = null;
@@ -323,7 +309,6 @@ in
     };
 
     whatsapp.enable = lib.mkEnableOption "the WhatsApp source (linked device)";
-    messages.enable = lib.mkEnableOption "the Google Messages (SMS/RCS) source";
     discord = {
       enable = lib.mkEnableOption "the Discord source (on-demand reads with a user token)";
       tokenFile = lib.mkOption {
