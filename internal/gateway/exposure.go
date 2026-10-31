@@ -46,13 +46,14 @@ func parseExposure(data string, sources []string) (*policy, error) {
 	pol := &policy{sources: map[string]sourceExposure{}}
 	var auth authExposure
 	for _, name := range slices.Sorted(maps.Keys(sections)) {
-		if name == "auth" {
+		switch {
+		case name == "auth":
 			err = md.PrimitiveDecode(sections[name], &auth)
-		} else if slices.Contains(sources, name) {
+		case slices.Contains(sources, name):
 			var e sourceExposure
 			err = md.PrimitiveDecode(sections[name], &e)
 			pol.sources[name] = e
-		} else {
+		default:
 			err = fmt.Errorf("section [%s] is not a configured source (sources: %s)", name, strings.Join(sources, ", "))
 		}
 		if err != nil {
