@@ -8,7 +8,6 @@ require (
 	github.com/bogdanfinn/tls-client v1.18.0
 	github.com/fxamacker/cbor/v2 v2.9.4
 	github.com/go-webauthn/webauthn v0.18.2
-	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/ncruces/go-sqlite3 v0.35.6
 	github.com/rs/zerolog v1.35.1
 	go.mau.fi/libsignal v0.2.2
@@ -51,7 +50,5 @@ require (
 	golang.org/x/net v0.61.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
-	golang.org/x/term v0.47.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
-	rsc.io/qr v0.2.0 // indirect
 )
