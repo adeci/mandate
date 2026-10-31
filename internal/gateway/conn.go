@@ -53,9 +53,9 @@ func openQueryConn(sources map[string]string, pol *policy) (_ *queryConn, err er
 
 	q := &queryConn{conn: conn, public: map[string]bool{}, secret: map[string]bool{}}
 
-	if err := conn.CreateFunction("is_auth", 3, sqlite3.DETERMINISTIC|sqlite3.INNOCUOUS,
+	if err := conn.CreateFunction("is_auth", 2, sqlite3.DETERMINISTIC|sqlite3.INNOCUOUS,
 		func(ctx sqlite3.Context, arg ...sqlite3.Value) {
-			ctx.ResultBool(pol.classifier.IsAuth(arg[0].Text(), arg[1].Text(), arg[2].Text()))
+			ctx.ResultBool(pol.classifier.IsAuth(arg[0].Text(), arg[1].Text()))
 		}); err != nil {
 		return nil, err
 	}
@@ -148,13 +148,13 @@ WHERE c.id NOT IN %s
 		fmt.Sprintf(`CREATE TEMP VIEW %s AS
 SELECT m.seq, m.id, m.container_id, c.name AS container_name, c.kind AS container_kind,
        m.sender_id, m.sender_name, m.sent_at, m.is_from_me,
-       CASE WHEN is_auth(%s, m.sender_id, m.body) THEN NULL ELSE m.body END AS body,
-       is_auth(%s, m.sender_id, m.body) AS is_auth,
+       CASE WHEN is_auth(m.sender_id, m.body) THEN NULL ELSE m.body END AS body,
+       is_auth(m.sender_id, m.body) AS is_auth,
        m.media_type, m.reply_to_id, m.edited_at, m.deleted
 FROM %s.messages AS m
 JOIN %s AS c ON c.id = m.container_id
 WHERE COALESCE(m.sender_id, '') NOT IN %s`,
-			sqlite3.QuoteIdentifier(secMessages), lit, lit, src, sqlite3.QuoteIdentifier(secContainers), hidden("sender")),
+			sqlite3.QuoteIdentifier(secMessages), src, sqlite3.QuoteIdentifier(secContainers), hidden("sender")),
 
 		fmt.Sprintf(`CREATE TEMP VIEW %s AS SELECT * FROM %s`,
 			sqlite3.QuoteIdentifier(pubContainers), sqlite3.QuoteIdentifier(secContainers)),
@@ -296,7 +296,6 @@ func bindParams(stmt *sqlite3.Stmt, params []any) error {
 	return nil
 }
 
-// describe lists the public views and their columns.
 func (q *queryConn) describe() ([]viewInfo, error) {
 	var out []viewInfo
 	for _, source := range q.sources {

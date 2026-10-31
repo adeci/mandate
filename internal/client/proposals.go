@@ -35,13 +35,10 @@ func (c *client) propose(ctx context.Context, args []string) error {
 	if err != nil {
 		return usage(proposeUsage, err)
 	}
-	return c.submit(ctx, proposal.Request{Connector: positional[0], Op: positional[1], Args: kv, Note: *note}, *wait)
-}
-
-func (c *client) submit(ctx context.Context, req proposal.Request, wait time.Duration) error {
-	if wait < 0 {
+	if *wait < 0 {
 		return usage(proposeUsage, errors.New("--wait must not be negative"))
 	}
+	req := proposal.Request{Connector: positional[0], Op: positional[1], Args: kv, Note: *note}
 	var raw json.RawMessage
 	if err := c.post(ctx, "/v1/actions", req, &raw); err != nil {
 		return err
@@ -50,14 +47,14 @@ func (c *client) submit(ctx context.Context, req proposal.Request, wait time.Dur
 	if err != nil {
 		return err
 	}
-	if wait == 0 {
+	if *wait == 0 {
 		if c.table {
 			fmt.Fprintf(c.out, "then check with: mandate status %s --wait 15m\n", p.ID)
 		}
 		return nil
 	}
-	fmt.Fprintf(c.errOut, "waiting up to %s for the owner to decide; send them %s\n", wait, p.URL)
-	return c.await(ctx, p.ID, wait)
+	fmt.Fprintf(c.errOut, "waiting up to %s for the owner to decide; send them %s\n", *wait, p.URL)
+	return c.await(ctx, p.ID, *wait)
 }
 
 func (c *client) status(ctx context.Context, args []string) error {
@@ -88,7 +85,7 @@ func (c *client) await(ctx context.Context, id string, wait time.Duration) error
 			secs = int(math.Ceil(poll.Seconds()))
 			path += "?wait=" + strconv.Itoa(secs)
 		}
-		raw, err := c.send(ctx, time.Duration(secs)*time.Second+requestTimeout, http.MethodGet, path, nil)
+		_, raw, err := c.do(ctx, time.Duration(secs)*time.Second+requestTimeout, http.MethodGet, path, nil)
 		if err != nil {
 			return err
 		}
@@ -110,7 +107,6 @@ func pending(s proposal.Status) bool {
 	return s == proposal.Pending || s == proposal.Executing
 }
 
-// show prints a proposal: the gateway's JSON when piped, a summary on a TTY.
 func (c *client) show(raw json.RawMessage) (proposal.Proposal, error) {
 	var p proposal.Proposal
 	if err := json.Unmarshal(raw, &p); err != nil {
@@ -147,8 +143,6 @@ func printProposal(w io.Writer, p proposal.Proposal) {
 	}
 }
 
-// outcome maps a proposal's status to an exit code and tells the agent what
-// to do next.
 func outcome(p proposal.Proposal, waited time.Duration) error {
 	detail := ""
 	if p.Result != nil && p.Result.Detail != "" {

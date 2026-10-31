@@ -97,7 +97,6 @@ Statuses: pending, executing, then done, failed or unknown; or rejected, expired
 `)
 }
 
-// writeRecipes shows the common queries against the first source with messages.
 func writeRecipes(w io.Writer, s schemaInfo) {
 	var source string
 	for _, v := range s.Views {

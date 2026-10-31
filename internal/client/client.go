@@ -44,7 +44,6 @@ type client struct {
 	table  bool
 }
 
-// fromEnv reads MANDATE_URL and MANDATE_TOKEN (or MANDATE_TOKEN_FILE).
 func fromEnv(getenv func(string) string, out, errOut io.Writer, table bool) (*client, error) {
 	url := strings.TrimRight(getenv("MANDATE_URL"), "/")
 	if url == "" {
@@ -70,25 +69,18 @@ func newClient() (*client, error) {
 	return fromEnv(os.Getenv, os.Stdout, os.Stderr, table)
 }
 
-// Query runs `mandate query SQL [PARAM...]`.
 func Query(ctx context.Context, args []string) error { return run(ctx, args, (*client).query) }
 
-// Schema runs `mandate schema`.
 func Schema(ctx context.Context, args []string) error { return run(ctx, args, (*client).schema) }
 
-// Guide runs `mandate guide`.
 func Guide(ctx context.Context, args []string) error { return run(ctx, args, (*client).guide) }
 
-// Read runs `mandate read CONNECTOR OP [KEY=VALUE...]`.
 func Read(ctx context.Context, args []string) error { return run(ctx, args, (*client).read) }
 
-// Propose runs `mandate propose CONNECTOR OP [KEY=VALUE...] [--note TEXT] [--wait DURATION]`.
 func Propose(ctx context.Context, args []string) error { return run(ctx, args, (*client).propose) }
 
-// Status runs `mandate status ID [--wait DURATION]`.
 func Status(ctx context.Context, args []string) error { return run(ctx, args, (*client).status) }
 
-// Get runs `mandate get CONNECTOR PATH [--head]`.
 func Get(ctx context.Context, args []string) error { return run(ctx, args, (*client).forward) }
 
 func run(ctx context.Context, args []string, cmd func(*client, context.Context, []string) error) error {
@@ -99,8 +91,8 @@ func run(ctx context.Context, args []string, cmd func(*client, context.Context, 
 	return cmd(c, ctx, args)
 }
 
-// exitError carries a message for the agent and the exit status it maps to
-// (via exitcode.For on code), without the code's own text.
+// exitError carries a message for the agent and the exit status it maps to,
+// without the code's own text.
 type exitError struct {
 	msg  string
 	code error
@@ -166,7 +158,6 @@ func (c *client) forward(ctx context.Context, args []string) error {
 	return err
 }
 
-// keyValues parses KEY=VALUE args; values may contain '='.
 func keyValues(args []string) (map[string]string, error) {
 	kv := make(map[string]string, len(args))
 	for _, a := range args {
@@ -360,7 +351,7 @@ func health(h connector.Health) string {
 }
 
 func (c *client) get(ctx context.Context, path string, out any) error {
-	data, err := c.send(ctx, requestTimeout, http.MethodGet, path, nil)
+	_, data, err := c.do(ctx, requestTimeout, http.MethodGet, path, nil)
 	if err != nil {
 		return err
 	}
@@ -372,18 +363,11 @@ func (c *client) post(ctx context.Context, path string, body, out any) error {
 	if err != nil {
 		return err
 	}
-	data, err := c.send(ctx, requestTimeout, http.MethodPost, path, b)
+	_, data, err := c.do(ctx, requestTimeout, http.MethodPost, path, b)
 	if err != nil {
 		return err
 	}
 	return json.Unmarshal(data, out)
-}
-
-// send returns the body of a 2xx response; anything else is an error carrying
-// the gateway's message, mapped to exit 75 on 429.
-func (c *client) send(ctx context.Context, timeout time.Duration, method, path string, body []byte) ([]byte, error) {
-	_, data, err := c.do(ctx, timeout, method, path, body)
-	return data, err
 }
 
 func (c *client) do(ctx context.Context, timeout time.Duration, method, path string, body []byte) (http.Header, []byte, error) {

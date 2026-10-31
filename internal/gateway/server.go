@@ -45,8 +45,7 @@ type Config struct {
 	ConsoleURL string
 }
 
-// sourceFlag parses name=path. The name prefixes the source's views and
-// keys its exposure.toml section.
+// The name prefixes the source's views and keys its exposure.toml section.
 type sourceFlag map[string]string
 
 func (s sourceFlag) String() string { return fmt.Sprint(map[string]string(s)) }
@@ -68,8 +67,6 @@ func (s sourceFlag) Set(v string) error {
 
 var validName = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 
-// connectorFlag parses name=socket. A connector named like a source is
-// filtered through that source's views; others have no containers to show.
 type connectorFlag map[string]string
 
 func (c connectorFlag) String() string { return fmt.Sprint(map[string]string(c)) }

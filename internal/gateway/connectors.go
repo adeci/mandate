@@ -25,15 +25,12 @@ import (
 )
 
 const (
-	// readTimeout bounds a connector read. Paced reads may wait up to
-	// 90 s for a slot before answering 429.
+	// Paced reads may wait up to 90 s for a slot before answering 429.
 	readTimeout = 120 * time.Second
 	callTimeout = 30 * time.Second
 	specTimeout = 3 * time.Second
 	specTTL     = 30 * time.Second
 
-	// maxWait caps an action long-poll; pollInterval is how often it asks the
-	// console meanwhile.
 	maxWait      = 900 * time.Second
 	pollInterval = time.Second
 )
@@ -101,7 +98,6 @@ type connectorInfo struct {
 	Health connector.Health `json:"health"`
 }
 
-// list describes the connectors that answer, by name.
 func (c *connectors) list(ctx context.Context) []connectorInfo {
 	out := []connectorInfo{}
 	for _, name := range slices.Sorted(maps.Keys(c.calls)) {
@@ -127,8 +123,6 @@ func (c *connectors) list(ctx context.Context) []connectorInfo {
 	return out
 }
 
-// spec answers for a connector that is unknown, unreachable or speaks
-// another protocol.
 func (h *handler) spec(w http.ResponseWriter, r *http.Request, name string) (connector.Spec, bool) {
 	if _, ok := h.connectors.calls[name]; !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("no connector %q", name))
@@ -147,10 +141,8 @@ func (h *handler) spec(w http.ResponseWriter, r *http.Request, name string) (con
 	return spec, true
 }
 
-// lookup resolves connector and op, checks args against the op's params, and
-// refuses connectors that are not healthy before they are called. Without a
-// source there are no filtered views to check containers against, so
-// container values are refused outright.
+// Without a source there are no filtered views to check containers against,
+// so container values are refused outright.
 func (h *handler) lookup(w http.ResponseWriter, r *http.Request, name, opName string, kind connector.Kind, args map[string]string) (connector.Op, bool) {
 	spec, ok := h.spec(w, r, name)
 	if !ok {
@@ -332,8 +324,8 @@ func (h *handler) read(w http.ResponseWriter, r *http.Request) {
 	h.answer(w, r, name, res)
 }
 
-// visible answers 404 unless every id is in the source's containers view.
-// Unknown and hidden look the same to the client.
+// visible answers 404 unless every id is in the source's containers view, so
+// unknown and hidden look the same to the client.
 func (h *handler) visible(ctx context.Context, w http.ResponseWriter, source string, ids []string) bool {
 	if len(ids) == 0 {
 		return true

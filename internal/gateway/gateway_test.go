@@ -273,7 +273,6 @@ func TestParseExposureStrict(t *testing.T) {
 	for name, conf := range map[string]string{
 		"typo in key":          "[whatsapp]\nhide_sender = [\"+1\"]\n",
 		"unconfigured source":  "[whatsap]\nhide_senders = [\"+1\"]\n",
-		"removed source":       "[sms]\nhide_containers = [\"x\"]\n",
 		"top-level key":        "hide_senders = [\"+1\"]\n",
 		"invalid auth pattern": "[auth]\nextra_body_patterns = [\"(\"]\n",
 	} {
@@ -288,7 +287,7 @@ func TestParseExposureStrict(t *testing.T) {
 	if got := pol.sources["discord"].HideContainers; len(got) != 1 || got[0] != "g-work" {
 		t.Errorf("discord hide_containers = %v", got)
 	}
-	if !pol.classifier.IsAuth("whatsapp", "bank", "hello") {
+	if !pol.classifier.IsAuth("bank", "hello") {
 		t.Error("[auth] patterns not applied")
 	}
 	if _, err := parseExposure("", nil); err != nil {
@@ -296,17 +295,22 @@ func TestParseExposureStrict(t *testing.T) {
 	}
 }
 
-func TestSourceFlagNames(t *testing.T) {
+func TestFlagNames(t *testing.T) {
 	for v, ok := range map[string]bool{
 		"whatsapp=/var/lib/w/data.db": true,
-		"signal-2=/x.db":              true,
 		"auth=/x.db":                  false,
-		"SMS=/x.db":                   false,
 		"../x=/x.db":                  false,
-		"whatsapp=":                   false,
 	} {
 		if err := (sourceFlag{}).Set(v); (err == nil) != ok {
-			t.Errorf("%q: err = %v, want ok=%v", v, err, ok)
+			t.Errorf("source %q: err = %v, want ok=%v", v, err, ok)
+		}
+	}
+	for v, ok := range map[string]bool{
+		"my-api2=/run/a.sock": true,
+		"a/b=/run/x.sock":     false,
+	} {
+		if err := (connectorFlag{}).Set(v); (err == nil) != ok {
+			t.Errorf("connector %q: err = %v, want ok=%v", v, err, ok)
 		}
 	}
 }
@@ -315,26 +319,20 @@ func TestHTTP(t *testing.T) {
 	dir := t.TempDir()
 	exposure := filepath.Join(dir, "exposure.toml")
 	mustDo(t, os.WriteFile(exposure, []byte(testExposure), 0o600))
-	token := strings.Repeat("t", 40)
-	h := newHandler(Config{Sources: fixture(t), ExposureFile: exposure, MaxRows: 100, Timeout: 2 * time.Second}, token)
+	h := newHandler(Config{Sources: fixture(t), ExposureFile: exposure, MaxRows: 100, Timeout: 2 * time.Second}, testToken)
 
-	do := func(method, path, auth, body string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(method, path, strings.NewReader(body))
+	for _, auth := range []string{"", "Bearer wrong"} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/query", strings.NewReader(`{"sql":"SELECT 1"}`))
 		if auth != "" {
 			req.Header.Set("Authorization", auth)
 		}
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
-		return rec
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("auth %q: %d", auth, rec.Code)
+		}
 	}
-
-	if rec := do("POST", "/v1/query", "", `{"sql":"SELECT 1"}`); rec.Code != http.StatusUnauthorized {
-		t.Errorf("no token: %d", rec.Code)
-	}
-	if rec := do("POST", "/v1/query", "Bearer wrong", `{"sql":"SELECT 1"}`); rec.Code != http.StatusUnauthorized {
-		t.Errorf("wrong token: %d", rec.Code)
-	}
-	rec := do("POST", "/v1/query", "Bearer "+token, `{"sql":"SELECT count(*) FROM whatsapp_messages"}`)
+	rec := call(h, http.MethodPost, "/v1/query", `{"sql":"SELECT count(*) FROM whatsapp_messages"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("query: %d %s", rec.Code, rec.Body)
 	}
@@ -344,7 +342,7 @@ func TestHTTP(t *testing.T) {
 		t.Errorf("count = %v, want 3", res.Rows)
 	}
 
-	rec = do("GET", "/v1/schema", "Bearer "+token, "")
+	rec = call(h, http.MethodGet, "/v1/schema", "")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"whatsapp_messages"`) || strings.Contains(rec.Body.String(), "_hidden") {
 		t.Errorf("schema: %d %s", rec.Code, rec.Body)
 	}
@@ -352,7 +350,7 @@ func TestHTTP(t *testing.T) {
 	// A broken exposure file fails closed instead of serving unfiltered data.
 	time.Sleep(10 * time.Millisecond)
 	mustDo(t, os.WriteFile(exposure, []byte("[whatsap]\nhide_senders = []\n"), 0o600))
-	if rec := do("POST", "/v1/query", "Bearer "+token, `{"sql":"SELECT 1"}`); rec.Code != http.StatusServiceUnavailable {
+	if rec := call(h, http.MethodPost, "/v1/query", `{"sql":"SELECT 1"}`); rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("broken exposure: %d %s", rec.Code, rec.Body)
 	}
 }

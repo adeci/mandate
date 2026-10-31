@@ -28,7 +28,6 @@ const (
 	Expired  Status = "expired"
 )
 
-// Request is a write an agent wants to make.
 type Request struct {
 	Connector string            `json:"connector"`
 	Op        string            `json:"op"`
@@ -37,7 +36,6 @@ type Request struct {
 	Note string `json:"note,omitempty"`
 }
 
-// Proposal is a request's current state as agents see it.
 type Proposal struct {
 	ID        string            `json:"id"`
 	Connector string            `json:"connector"`
@@ -52,7 +50,6 @@ type Proposal struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// Client is the gateway's handle on the console's proposal socket.
 type Client struct {
 	c *connector.Client
 }
