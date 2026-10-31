@@ -11,6 +11,7 @@ require (
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/ncruces/go-sqlite3 v0.35.6
 	github.com/rs/zerolog v1.35.1
+	go.mau.fi/libsignal v0.2.2
 	go.mau.fi/mautrix-gmessages v0.2610.0
 	go.mau.fi/util v0.11.0
 	go.mau.fi/whatsmeow v0.0.0-20261028111316-d24d079a3755
@@ -46,7 +47,6 @@ require (
 	github.com/tinylib/msgp v1.6.4 // indirect
 	github.com/vektah/gqlparser/v2 v2.5.27 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
-	go.mau.fi/libsignal v0.2.2 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
 	golang.org/x/net v0.61.0 // indirect

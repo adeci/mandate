@@ -19,6 +19,7 @@ import (
 
 	"github.com/mdp/qrterminal/v3"
 	"github.com/rs/zerolog"
+	signalLog "go.mau.fi/libsignal/logger"
 	"go.mau.fi/whatsmeow"
 	wastore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -334,3 +335,23 @@ func (w waLogger) Warnf(msg string, args ...any) { w.l.Warn(fmt.Sprintf(msg, arg
 func (w waLogger) Infof(msg string, args ...any)  { w.l.Info(fmt.Sprintf(msg, args...), "module", w.m) }
 func (w waLogger) Debugf(string, ...any)          {}
 func (w waLogger) Sub(module string) waLog.Logger { return waLogger{l: w.l, m: w.m + "/" + module} }
+
+// libsignal installs its global logger lazily and unsynchronized on first use,
+// from whichever goroutine gets there first, and the default prints to stdout.
+func init() {
+	var l signalLog.Loggable = signalLogger{}
+	signalLog.Setup(&l)
+}
+
+type signalLogger struct{}
+
+func (signalLogger) Debug(string, string) {}
+func (signalLogger) Info(string, string)  {}
+func (signalLogger) Configure(string)     {}
+func (signalLogger) Warning(caller, msg string) {
+	slog.Warn(msg, "module", "libsignal", "caller", caller)
+}
+
+func (signalLogger) Error(caller, msg string) {
+	slog.Error(msg, "module", "libsignal", "caller", caller)
+}
