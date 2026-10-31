@@ -28,18 +28,29 @@ type Server struct {
 	Log       *slog.Logger
 }
 
-// Serve listens on a Unix socket at path until ctx is done.
-func (s *Server) Serve(ctx context.Context, path string) error {
-	ln, err := ListenUnix(path)
-	if err != nil {
-		return err
-	}
+// Handler returns the protocol routes, for mounting next to other routes on
+// one socket.
+func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /spec", s.spec)
 	mux.HandleFunc("POST /read", s.read)
 	mux.HandleFunc("POST /prepare", s.prepare)
 	mux.HandleFunc("POST /execute", s.execute)
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	return mux
+}
+
+// Serve serves the protocol on a Unix socket at path until ctx is done.
+func (s *Server) Serve(ctx context.Context, path string) error {
+	return ServeUnix(ctx, path, s.Handler())
+}
+
+// ServeUnix serves h on a Unix socket at path until ctx is done.
+func ServeUnix(ctx context.Context, path string, h http.Handler) error {
+	ln, err := ListenUnix(path)
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	select {
@@ -126,6 +137,10 @@ func (s *Server) prepare(w http.ResponseWriter, r *http.Request) {
 func (s *Server) execute(w http.ResponseWriter, r *http.Request) {
 	var a approval.Approval
 	if !decode(w, r, &a) {
+		return
+	}
+	if s.Verifier == nil {
+		writeErr(w, &Error{Status: http.StatusForbidden, Message: "this connector has no write ops"})
 		return
 	}
 	rec, err := s.Verifier.Verify(a)
