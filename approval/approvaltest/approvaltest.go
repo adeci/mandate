@@ -25,7 +25,6 @@ const (
 	FlagBE = 0x08
 )
 
-// Authenticator is one software passkey bound to a relying party.
 type Authenticator struct {
 	RPID   string
 	Origin string

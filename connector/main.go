@@ -18,7 +18,6 @@ import (
 	"github.com/adeci/mandate/approval"
 )
 
-// Env is what Main hands a connector at start.
 type Env struct {
 	// StateDir is the connector's state directory. A source keeps its
 	// messages in DataPath, readable by the gateway; anything secret goes

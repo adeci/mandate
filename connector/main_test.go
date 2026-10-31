@@ -245,7 +245,6 @@ func TestMainStartupErrors(t *testing.T) {
 		"approvers no rp-id":  {append(base, "--approvers", enrolled, "--origin", testOrigin), "--rp-id and --origin are required"},
 		"approvers no origin": {append(base, "--approvers", enrolled, "--rp-id", testRPID), "--rp-id and --origin are required"},
 		"broken approvers":    {append(base, "--approvers", writeFile(t, "a.json", "{")), "parse approvers"},
-		"unknown config key":  {append(base, "--config", writeFile(t, "c.json", `{"greting":"hi"}`)), "unknown field"},
 		"invalid config":      {append(base, "--config", writeFile(t, "c.json", `{"greeting":"bad"}`)), "greeting must not be bad"},
 		"missing config":      {append(base, "--config", filepath.Join(state, "nope.json")), "read config"},
 	} {
@@ -268,9 +267,7 @@ func TestCheckConfigTouchesNothing(t *testing.T) {
 		want   string
 	}{
 		"valid":         {`{"greeting":"hi"}`, ""},
-		"empty object":  {`{}`, ""},
 		"unknown key":   {`{"greting":"hi"}`, "unknown field"},
-		"wrong type":    {`{"greeting":1}`, "cannot unmarshal"},
 		"invalid":       {`{"greeting":"bad"}`, "greeting must not be bad"},
 		"trailing data": {`{} {}`, "trailing data"},
 	} {

@@ -14,13 +14,12 @@ import (
 	"github.com/adeci/mandate/approval"
 )
 
-// Client talks to a connector over its Unix socket.
 type Client struct {
 	http *http.Client
 }
 
-// Dial returns a client for the connector socket at path. Timeout bounds each
-// call; reads that wait for pacing need more than the default.
+// Timeout bounds each call; reads that wait for pacing need more than the
+// default.
 func Dial(path string, timeout time.Duration) *Client {
 	return &Client{http: &http.Client{
 		Timeout: timeout,
@@ -60,8 +59,6 @@ func (c *Client) Spec(ctx context.Context) (Spec, error) {
 	return s, nil
 }
 
-// ProtocolError is a connector speaking a protocol version other than
-// ProtocolVersion.
 type ProtocolError struct {
 	Protocol int
 }
@@ -100,8 +97,7 @@ func (c *Client) Execute(ctx context.Context, a approval.Approval) (Result, erro
 	return r, err
 }
 
-// Do sends a JSON request over the socket. Refusals come back as *Error so
-// callers can relay status and message.
+// Do sends a JSON request over the socket; refusals come back as *Error.
 func (c *Client) Do(ctx context.Context, method, path string, body, out any) error {
 	var rd io.Reader
 	if body != nil {

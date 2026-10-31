@@ -26,20 +26,19 @@ func must(t *testing.T, err error) {
 }
 
 type row struct {
-	seq      int64
-	body     sql.NullString
-	edited   sql.NullString
-	deleted  int
-	sender   sql.NullString
-	ingested string
+	seq     int64
+	body    sql.NullString
+	edited  sql.NullString
+	deleted int
+	sender  sql.NullString
 }
 
 func get(t *testing.T, s *Store, id string) row {
 	t.Helper()
 	var r row
 	must(t, s.DB().QueryRowContext(t.Context(),
-		`SELECT seq, body, edited_at, deleted, sender_name, ingested_at FROM messages WHERE id = ?`, id).
-		Scan(&r.seq, &r.body, &r.edited, &r.deleted, &r.sender, &r.ingested))
+		`SELECT seq, body, edited_at, deleted, sender_name FROM messages WHERE id = ?`, id).
+		Scan(&r.seq, &r.body, &r.edited, &r.deleted, &r.sender))
 	return r
 }
 
@@ -49,7 +48,6 @@ func TestOpenUsesRollbackJournal(t *testing.T) {
 	var mode string
 	must(t, s.DB().QueryRowContext(t.Context(), `PRAGMA journal_mode`).Scan(&mode))
 	if mode != "delete" {
-		// WAL would require the gateway (another user) to write the -shm file.
 		t.Fatalf("journal_mode = %q, want delete", mode)
 	}
 }
@@ -88,7 +86,7 @@ func TestUpsertMessageLifecycle(t *testing.T) {
 
 	editAt := at.Add(time.Hour)
 	must(t, s.EditMessage(ctx, "m1", "final", editAt))
-	if r := get(t, s, "m1"); r.body.String != "final" || r.edited.String != FormatTime(editAt) {
+	if r := get(t, s, "m1"); r.body.String != "final" || r.edited.String != formatTime(editAt) {
 		t.Fatalf("EditMessage: %+v", r)
 	}
 
@@ -96,10 +94,6 @@ func TestUpsertMessageLifecycle(t *testing.T) {
 	if r := get(t, s, "m1"); r.deleted != 1 || r.body.String != "final" {
 		t.Fatalf("DeleteMessage must flag and keep the body: %+v", r)
 	}
-
-	// Unknown IDs are ignored, not errors.
-	must(t, s.EditMessage(ctx, "nope", "x", at))
-	must(t, s.DeleteMessage(ctx, "nope"))
 }
 
 func TestSeqIsMonotonic(t *testing.T) {

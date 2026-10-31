@@ -211,14 +211,14 @@ func TestClientRefusesOtherProtocol(t *testing.T) {
 	}()
 	t.Cleanup(func() { cancel(); <-done })
 	c := connector.Dial(sock, 5*time.Second)
-	var err error
+	var pe *connector.ProtocolError
 	for range 100 {
-		if _, err = c.Spec(context.Background()); errors.As(err, new(*connector.ProtocolError)) {
+		if _, err := c.Spec(context.Background()); errors.As(err, &pe) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if err == nil || err.Error() != "speaks protocol 2, this mandate speaks 1" {
-		t.Fatalf("Spec = %v", err)
+	if pe == nil || pe.Protocol != 2 {
+		t.Fatalf("Spec accepted or misreported protocol 2: %v", pe)
 	}
 }

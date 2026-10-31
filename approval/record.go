@@ -14,7 +14,6 @@ import (
 
 const recordVersion = 1
 
-// Record is one proposed action, as approved.
 type Record struct {
 	V         int               `json:"v"`
 	ID        string            `json:"id"`

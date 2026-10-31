@@ -16,8 +16,6 @@ import (
 	_ "github.com/ncruces/go-sqlite3/driver" // registers "sqlite3"
 )
 
-const TimeLayout = "2006-01-02T15:04:05.000Z"
-
 //go:embed schema.sql
 var schema string
 
@@ -121,7 +119,7 @@ ON CONFLICT(id) DO UPDATE SET
     media_type  = COALESCE(excluded.media_type, messages.media_type),
     edited_at   = CASE WHEN excluded.body IS NOT messages.body THEN ?10 ELSE messages.edited_at END,
     body        = excluded.body`,
-		m.ID, m.ContainerID, m.SenderID, m.SenderName, FormatTime(m.SentAt), m.IsFromMe,
+		m.ID, m.ContainerID, m.SenderID, m.SenderName, formatTime(m.SentAt), m.IsFromMe,
 		m.Body, m.MediaType, m.ReplyToID, ts)
 	return err
 }
@@ -130,7 +128,7 @@ ON CONFLICT(id) DO UPDATE SET
 func (s *Store) EditMessage(ctx context.Context, id, body string, at time.Time) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE messages SET body = ?2, edited_at = ?3 WHERE id = ?1`,
-		id, body, FormatTime(at))
+		id, body, formatTime(at))
 	return err
 }
 
@@ -140,6 +138,6 @@ func (s *Store) DeleteMessage(ctx context.Context, id string) error {
 	return err
 }
 
-func FormatTime(t time.Time) string { return t.UTC().Format(TimeLayout) }
+func formatTime(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z") }
 
-func now() string { return FormatTime(time.Now()) }
+func now() string { return formatTime(time.Now()) }

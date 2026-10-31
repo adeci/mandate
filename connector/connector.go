@@ -120,7 +120,6 @@ type ReadResult struct {
 	Containers int `json:"containers,omitempty"`
 }
 
-// Connector is implemented once per service.
 type Connector interface {
 	Spec() Spec
 	// Prepare must be idempotent: preparing its own output returns the same
@@ -130,8 +129,8 @@ type Connector interface {
 	Execute(ctx context.Context, rec approval.Record) Result
 }
 
-// Reader is implemented by connectors with read ops, e.g. on-demand fetches.
-// It returns an encoded ReadResult.
+// Reader is implemented by connectors with read ops. Read returns an encoded
+// ReadResult.
 type Reader interface {
 	Read(ctx context.Context, op string, args map[string]string) (json.RawMessage, error)
 }
@@ -166,7 +165,6 @@ type Checker interface {
 	Health(ctx context.Context) Health
 }
 
-// SetupStep is one step of linking a connector, shown in the console.
 type SetupStep struct {
 	// QR is text to render as a QR code for the owner to scan.
 	QR string `json:"qr,omitempty"`
@@ -208,5 +206,4 @@ func Invalid(format string, a ...any) error {
 	return &Error{Status: 400, Message: fmt.Sprintf(format, a...)}
 }
 
-// ErrUnknownOp is returned for ops the connector doesn't offer.
 var ErrUnknownOp = errors.New("unknown op")

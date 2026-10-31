@@ -58,7 +58,6 @@ func (s *Server) Handler() http.Handler {
 	})
 }
 
-// Serve serves the protocol on a Unix socket at path until ctx is done.
 func (s *Server) Serve(ctx context.Context, path string) error {
 	return ServeUnix(ctx, path, s.Handler())
 }

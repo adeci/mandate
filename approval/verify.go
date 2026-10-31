@@ -58,7 +58,6 @@ type Approver struct {
 	PublicKey    string `json:"public_key"`
 }
 
-// LoadApprovers reads a JSON array of approvers.
 func LoadApprovers(path string) ([]Approver, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -86,7 +85,6 @@ var (
 	ErrExpired   = errors.New("proposal has expired")
 )
 
-// Verifier checks approvals against enrolled passkeys for one relying party.
 type Verifier struct {
 	RPID      string
 	Origin    string

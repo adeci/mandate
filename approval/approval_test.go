@@ -61,7 +61,7 @@ func TestVerifyRejects(t *testing.T) {
 
 	swapped := key.Approve(rec, now)
 	tampered := append([]byte{}, rec...)
-	tampered[len(tampered)-3] ^= 1 // flips a byte of the record after signing
+	tampered[len(tampered)-3] ^= 1
 	swapped.Record = tampered
 
 	expired, _ := approval.Encode(approval.Record{ID: "p2", Connector: "whatsapp", Op: "send", CreatedAt: now.Add(-48 * time.Hour), ExpiresAt: now.Add(-time.Hour)})
