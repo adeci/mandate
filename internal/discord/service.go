@@ -6,13 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"slices"
 	"strconv"
 	"time"
 	"unicode/utf8"
 
-	"github.com/adeci/mandate/internal/discordapi"
+	"github.com/adeci/mandate/internal/connector"
 	"github.com/adeci/mandate/internal/store"
 )
 
@@ -38,6 +39,96 @@ func badRequest(format string, args ...any) error {
 	return &badRequestError{msg: fmt.Sprintf(format, args...)}
 }
 
+// syncRequest refreshes the guild list and DM channels; with GuildID set it
+// also refreshes that guild's channels and threads.
+type syncRequest struct {
+	GuildID string
+}
+
+type searchRequest struct {
+	GuildID, Content, AuthorID, ChannelID string
+	Has                                   string
+	Offset                                int
+}
+
+type fetchRequest struct {
+	ChannelID, Before, After, Around string
+	Limit                            int
+}
+
+// args consumes op arguments; anything left over is refused, so a typo never
+// silently widens a query.
+type args struct {
+	m   map[string]string
+	err error
+}
+
+func newArgs(m map[string]string) *args {
+	return &args{m: maps.Clone(m)}
+}
+
+func (a *args) str(name string) string {
+	v := a.m[name]
+	delete(a.m, name)
+	return v
+}
+
+func (a *args) int(name string) int {
+	v, ok := a.m[name]
+	delete(a.m, name)
+	if !ok || v == "" || a.err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		a.err = badRequest("%s must be an integer", name)
+	}
+	return n
+}
+
+func (a *args) done() error {
+	if a.err != nil {
+		return a.err
+	}
+	for k := range a.m {
+		return badRequest("unknown argument %q", k)
+	}
+	return nil
+}
+
+func parseSync(m map[string]string) (syncRequest, error) {
+	a := newArgs(m)
+	r := syncRequest{GuildID: a.str("guild_id")}
+	if err := a.done(); err != nil {
+		return r, err
+	}
+	return r, validateSync(&r)
+}
+
+func parseSearch(m map[string]string) (searchRequest, error) {
+	a := newArgs(m)
+	r := searchRequest{
+		GuildID: a.str("guild_id"), Content: a.str("content"), AuthorID: a.str("author_id"),
+		ChannelID: a.str("channel_id"), Has: a.str("has"), Offset: a.int("offset"),
+	}
+	if err := a.done(); err != nil {
+		return r, err
+	}
+	return r, validateSearch(&r)
+}
+
+func parseFetch(m map[string]string) (fetchRequest, error) {
+	a := newArgs(m)
+	r := fetchRequest{
+		ChannelID: a.str("channel_id"), Before: a.str("before"), After: a.str("after"),
+		Around: a.str("around"), Limit: a.int("limit"),
+	}
+	if err := a.done(); err != nil {
+		return r, err
+	}
+	return r, validateFetch(&r)
+}
+
 // Only Discord-ID-shaped strings are ever put into upstream URLs.
 func isSnowflake(s string) bool {
 	if len(s) < 15 || len(s) > 21 {
@@ -61,11 +152,11 @@ func checkID(field, v string, required bool) error {
 	return nil
 }
 
-func validateSync(r *discordapi.SyncRequest) error {
+func validateSync(r *syncRequest) error {
 	return checkID("guild_id", r.GuildID, false)
 }
 
-func validateSearch(r *discordapi.SearchRequest) error {
+func validateSearch(r *searchRequest) error {
 	if err := checkID("guild_id", r.GuildID, true); err != nil {
 		return err
 	}
@@ -90,7 +181,7 @@ func validateSearch(r *discordapi.SearchRequest) error {
 	return nil
 }
 
-func validateFetch(r *discordapi.FetchRequest) error {
+func validateFetch(r *fetchRequest) error {
 	if err := checkID("channel_id", r.ChannelID, true); err != nil {
 		return err
 	}
@@ -255,8 +346,8 @@ func (s *service) upsertGuild(ctx context.Context, g *apiGuild, chans []apiChann
 	return n, nil
 }
 
-func (s *service) sync(ctx context.Context, dl time.Time, req discordapi.SyncRequest) (discordapi.SyncResponse, error) {
-	var resp discordapi.SyncResponse
+func (s *service) sync(ctx context.Context, dl time.Time, req syncRequest) (connector.ReadResult, error) {
+	var resp connector.ReadResult
 	gs, err := s.loadGuilds(ctx, dl)
 	if err != nil {
 		return resp, err
@@ -301,39 +392,39 @@ func (s *service) sync(ctx context.Context, dl time.Time, req discordapi.SyncReq
 	return resp, nil
 }
 
-func searchKey(req discordapi.SearchRequest) string {
+func searchKey(req searchRequest) string {
 	b, _ := json.Marshal(req)
 	return string(b)
 }
 
-func (s *service) search(ctx context.Context, dl time.Time, req discordapi.SearchRequest) (discordapi.MessagesResponse, error) {
+func (s *service) search(ctx context.Context, dl time.Time, req searchRequest) (connector.ReadResult, error) {
 	now := s.clock.Now()
 	key := searchKey(req)
 	if err := s.up.denied("guild:"+req.GuildID, "guild "+req.GuildID); err != nil {
-		return discordapi.MessagesResponse{}, err
+		return connector.ReadResult{}, err
 	}
 	if req.ChannelID != "" {
 		if err := s.up.denied("channel:"+req.ChannelID, "channel "+req.ChannelID); err != nil {
-			return discordapi.MessagesResponse{}, err
+			return connector.ReadResult{}, err
 		}
 	}
 	if c, ok := s.searches[key]; ok && now.Sub(c.at) < searchTTL {
-		return discordapi.MessagesResponse{MessageIDs: slices.Clone(c.ids), TotalResults: c.total}, nil
+		return connector.ReadResult{MessageIDs: slices.Clone(c.ids), TotalResults: c.total}, nil
 	}
 	g, err := s.joinedGuild(ctx, dl, req.GuildID)
 	if err != nil {
-		return discordapi.MessagesResponse{}, err
+		return connector.ReadResult{}, err
 	}
 	chans, err := s.loadChannels(ctx, dl, g.ID)
 	if err != nil {
-		return discordapi.MessagesResponse{}, err
+		return connector.ReadResult{}, err
 	}
 	if _, err := s.upsertGuild(ctx, g, chans); err != nil {
-		return discordapi.MessagesResponse{}, err
+		return connector.ReadResult{}, err
 	}
 	self, err := s.selfID(ctx, dl)
 	if err != nil {
-		return discordapi.MessagesResponse{}, err
+		return connector.ReadResult{}, err
 	}
 
 	q := url.Values{}
@@ -367,7 +458,7 @@ func (s *service) search(ctx context.Context, dl time.Time, req discordapi.Searc
 	}
 	var res apiSearchResult
 	if err := s.up.get(ctx, dl, r, &res); err != nil {
-		return discordapi.MessagesResponse{}, err
+		return connector.ReadResult{}, err
 	}
 
 	known := make(map[string]store.Container)
@@ -391,12 +482,12 @@ func (s *service) search(ctx context.Context, dl time.Time, req discordapi.Searc
 				c = fallbackContainer(msg.ContainerID, g.ID)
 			}
 			if err := s.st.UpsertContainer(ctx, c); err != nil {
-				return discordapi.MessagesResponse{}, err
+				return connector.ReadResult{}, err
 			}
 			stored[msg.ContainerID] = true
 		}
 		if err := s.st.UpsertMessage(ctx, msg); err != nil {
-			return discordapi.MessagesResponse{}, err
+			return connector.ReadResult{}, err
 		}
 		ids = append(ids, msg.ID)
 	}
@@ -406,7 +497,7 @@ func (s *service) search(ctx context.Context, dl time.Time, req discordapi.Searc
 		}
 	}
 	s.searches[key] = cachedSearch{at: s.clock.Now(), ids: ids, total: res.TotalResults}
-	return discordapi.MessagesResponse{MessageIDs: slices.Clone(ids), TotalResults: res.TotalResults}, nil
+	return connector.ReadResult{MessageIDs: slices.Clone(ids), TotalResults: res.TotalResults}, nil
 }
 
 // searchReferer is the channel page a search would be typed on: the
@@ -476,17 +567,17 @@ func (s *service) storedContainer(ctx context.Context, id string) (store.Contain
 	return c, err
 }
 
-func (s *service) fetch(ctx context.Context, dl time.Time, req discordapi.FetchRequest) (discordapi.MessagesResponse, error) {
+func (s *service) fetch(ctx context.Context, dl time.Time, req fetchRequest) (connector.ReadResult, error) {
 	if err := s.up.denied("channel:"+req.ChannelID, "channel "+req.ChannelID); err != nil {
-		return discordapi.MessagesResponse{}, err
+		return connector.ReadResult{}, err
 	}
 	c, upsert, err := s.resolveContainer(ctx, dl, req.ChannelID)
 	if err != nil {
-		return discordapi.MessagesResponse{}, err
+		return connector.ReadResult{}, err
 	}
 	self, err := s.selfID(ctx, dl)
 	if err != nil {
-		return discordapi.MessagesResponse{}, err
+		return connector.ReadResult{}, err
 	}
 	limit := req.Limit
 	if limit == 0 {
@@ -518,11 +609,11 @@ func (s *service) fetch(ctx context.Context, dl time.Time, req discordapi.FetchR
 	}
 	var msgs []apiMessage
 	if err := s.up.get(ctx, dl, r, &msgs); err != nil {
-		return discordapi.MessagesResponse{}, err
+		return connector.ReadResult{}, err
 	}
 	if upsert {
 		if err := s.st.UpsertContainer(ctx, c); err != nil {
-			return discordapi.MessagesResponse{}, err
+			return connector.ReadResult{}, err
 		}
 	}
 	ids := make([]string, 0, len(msgs))
@@ -539,9 +630,9 @@ func (s *service) fetch(ctx context.Context, dl time.Time, req discordapi.FetchR
 			continue
 		}
 		if err := s.st.UpsertMessage(ctx, msg); err != nil {
-			return discordapi.MessagesResponse{}, err
+			return connector.ReadResult{}, err
 		}
 		ids = append(ids, msg.ID)
 	}
-	return discordapi.MessagesResponse{MessageIDs: ids}, nil
+	return connector.ReadResult{MessageIDs: ids}, nil
 }

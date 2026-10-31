@@ -22,7 +22,9 @@ import (
 
 	fhttp "github.com/bogdanfinn/fhttp"
 
-	"github.com/adeci/mandate/internal/discordapi"
+	"github.com/adeci/mandate/internal/approval"
+	"github.com/adeci/mandate/internal/approval/approvaltest"
+	"github.com/adeci/mandate/internal/connector"
 	"github.com/adeci/mandate/internal/exitcode"
 	"github.com/adeci/mandate/internal/store"
 )
@@ -140,7 +142,7 @@ type harness struct {
 	logs      *syncBuffer
 	cancel    context.CancelFunc
 	done      chan error
-	client    *http.Client
+	client    *connector.Client
 }
 
 func api(p string) string { return "/api/v9" + p }
@@ -217,12 +219,7 @@ func newHarness(t *testing.T, seed func(*state)) *harness {
 	if err := s.save(h.statePath); err != nil {
 		t.Fatal(err)
 	}
-	h.client = &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "unix", h.socket)
-		},
-	}}
+	h.client = connector.Dial(h.socket, 10*time.Second)
 	t.Cleanup(func() {
 		if h.cancel != nil {
 			h.stop()
@@ -304,41 +301,34 @@ func (h *harness) restart() {
 	h.start()
 }
 
-func (h *harness) call(path string, body any) (int, []byte) {
+func (h *harness) read(op string, args map[string]string) (connector.ReadResult, error) {
 	h.t.Helper()
-	b, err := json.Marshal(body)
+	raw, err := h.client.Read(context.Background(), op, args)
 	if err != nil {
-		h.t.Fatal(err)
+		return connector.ReadResult{}, err
 	}
-	resp, err := h.client.Post("http://discord"+path, "application/json", bytes.NewReader(b))
-	if err != nil {
-		h.t.Fatalf("call %s: %v", path, err)
+	var res connector.ReadResult
+	if err := json.Unmarshal(raw, &res); err != nil {
+		h.t.Fatalf("%s: decode %s: %v", op, raw, err)
 	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	return resp.StatusCode, data
+	return res, nil
 }
 
-func (h *harness) callOK(path string, body, out any) {
+func (h *harness) callOK(op string, args map[string]string, out *connector.ReadResult) {
 	h.t.Helper()
-	status, data := h.call(path, body)
-	if status != http.StatusOK {
-		h.t.Fatalf("%s: status %d: %s", path, status, data)
+	res, err := h.read(op, args)
+	if err != nil {
+		h.t.Fatalf("%s: %v", op, err)
 	}
-	if err := json.Unmarshal(data, out); err != nil {
-		h.t.Fatal(err)
-	}
+	*out = res
 }
 
-func (h *harness) callErr(path string, body any, status int) discordapi.ErrorResponse {
+func (h *harness) callErr(op string, args map[string]string, status int) *connector.Error {
 	h.t.Helper()
-	got, data := h.call(path, body)
-	var e discordapi.ErrorResponse
-	if got != status || json.Unmarshal(data, &e) != nil {
-		h.t.Fatalf("%s: status %d (%s), want %d", path, got, data, status)
+	_, err := h.read(op, args)
+	var e *connector.Error
+	if !errors.As(err, &e) || e.Status != status {
+		h.t.Fatalf("%s: got %v, want status %d", op, err, status)
 	}
 	return e
 }
@@ -390,8 +380,8 @@ func superProps(t *testing.T, hd http.Header) map[string]any {
 func TestSearchUpsertsAndCaches(t *testing.T) {
 	h := newHarness(t, nil)
 	h.start()
-	var resp discordapi.MessagesResponse
-	h.callOK(discordapi.PathSearch, discordapi.SearchRequest{GuildID: guildID, Content: "rig"}, &resp)
+	var resp connector.ReadResult
+	h.callOK("search", map[string]string{"guild_id": guildID, "content": "rig"}, &resp)
 	if strings.Join(resp.MessageIDs, ",") != msg1+","+msg2 || resp.TotalResults != 2 {
 		t.Errorf("response %+v", resp)
 	}
@@ -442,8 +432,8 @@ func TestSearchUpsertsAndCaches(t *testing.T) {
 	}
 
 	// An identical search within the hour is answered from the cache.
-	var again discordapi.MessagesResponse
-	h.callOK(discordapi.PathSearch, discordapi.SearchRequest{GuildID: guildID, Content: "rig"}, &again)
+	var again connector.ReadResult
+	h.callOK("search", map[string]string{"guild_id": guildID, "content": "rig"}, &again)
 	if n := len(h.discord.all()); n != 4 {
 		t.Errorf("cache hit made upstream requests: %d total", n)
 	}
@@ -451,13 +441,13 @@ func TestSearchUpsertsAndCaches(t *testing.T) {
 		t.Errorf("cached response %+v", again)
 	}
 	// The next page needs only the search itself; lists and self are cached.
-	h.callOK(discordapi.PathSearch, discordapi.SearchRequest{GuildID: guildID, Content: "rig", Offset: 25}, &again)
+	h.callOK("search", map[string]string{"guild_id": guildID, "content": "rig", "offset": "25"}, &again)
 	if got := h.discord.paths(); len(got) != 5 || got[4] != api("/guilds/"+guildID+"/messages/search") || h.discord.all()[4].query.Get("offset") != "25" {
 		t.Errorf("paged search requests %v", got)
 	}
 	// After an hour the cache expires.
 	h.clock.Advance(time.Hour)
-	h.callOK(discordapi.PathSearch, discordapi.SearchRequest{GuildID: guildID, Content: "rig"}, &again)
+	h.callOK("search", map[string]string{"guild_id": guildID, "content": "rig"}, &again)
 	if n := len(h.discord.to(api("/guilds/" + guildID + "/messages/search"))); n != 3 {
 		t.Errorf("search requests after expiry: %d", n)
 	}
@@ -469,8 +459,8 @@ func TestSearchUpsertsAndCaches(t *testing.T) {
 func TestSyncCounts(t *testing.T) {
 	h := newHarness(t, nil)
 	h.start()
-	var resp discordapi.SyncResponse
-	h.callOK(discordapi.PathSync, discordapi.SyncRequest{}, &resp)
+	var resp connector.ReadResult
+	h.callOK("sync", map[string]string{}, &resp)
 	if resp.Containers != 2 { // guild + DM
 		t.Errorf("sync upserted %d", resp.Containers)
 	}
@@ -478,17 +468,17 @@ func TestSyncCounts(t *testing.T) {
 		!strings.Contains(fmt.Sprint(row[2]), aliceUser) {
 		t.Errorf("dm row %v", row)
 	}
-	h.callOK(discordapi.PathSync, discordapi.SyncRequest{GuildID: guildID}, &resp)
+	h.callOK("sync", map[string]string{"guild_id": guildID}, &resp)
 	if resp.Containers != 4 { // guild + DM + two text channels (category skipped)
 		t.Errorf("guild sync upserted %d", resp.Containers)
 	}
 	// Cached lists cost nothing.
-	h.callOK(discordapi.PathSync, discordapi.SyncRequest{GuildID: guildID}, &resp)
+	h.callOK("sync", map[string]string{"guild_id": guildID}, &resp)
 	if got := h.discord.paths(); len(got) != 3 {
 		t.Errorf("upstream requests %v", got)
 	}
 	// A guild the account has not joined is refused without a request.
-	h.callErr(discordapi.PathSync, discordapi.SyncRequest{GuildID: "1199999999999999999"}, http.StatusNotFound)
+	h.callErr("sync", map[string]string{"guild_id": "1199999999999999999"}, http.StatusNotFound)
 	if got := h.discord.paths(); len(got) != 3 {
 		t.Errorf("unjoined guild caused requests %v", got)
 	}
@@ -497,8 +487,8 @@ func TestSyncCounts(t *testing.T) {
 func TestFetchUpsertsMessages(t *testing.T) {
 	h := newHarness(t, nil)
 	h.start()
-	var resp discordapi.MessagesResponse
-	h.callOK(discordapi.PathFetch, discordapi.FetchRequest{ChannelID: dmID}, &resp)
+	var resp connector.ReadResult
+	h.callOK("fetch", map[string]string{"channel_id": dmID}, &resp)
 	if strings.Join(resp.MessageIDs, ",") != msg4 {
 		t.Errorf("ids %v (system message must be skipped)", resp.MessageIDs)
 	}
@@ -519,7 +509,7 @@ func TestFetchUpsertsMessages(t *testing.T) {
 	if row := h.queryRow(`SELECT container_id, is_from_me, body FROM messages WHERE id = ?`, msg4); row[0] != dmID || row[1] != int64(1) || row[2] != "see you" {
 		t.Errorf("message row %v", row)
 	}
-	h.callOK(discordapi.PathFetch, discordapi.FetchRequest{ChannelID: dmID, Before: msg4, Limit: 10}, &resp)
+	h.callOK("fetch", map[string]string{"channel_id": dmID, "before": msg4, "limit": "10"}, &resp)
 	hits := h.discord.all()
 	if len(hits) != 4 {
 		t.Fatalf("second fetch requests %v", h.discord.paths())
@@ -543,8 +533,8 @@ func TestPageLoadBuildNumber(t *testing.T) {
 		io.WriteString(w, `x={releaseChannel:"stable",buildNumber:"700001",versionHash:"0"}`)
 	})
 	h.start()
-	var resp discordapi.SyncResponse
-	h.callOK(discordapi.PathSync, discordapi.SyncRequest{}, &resp)
+	var resp connector.ReadResult
+	h.callOK("sync", map[string]string{}, &resp)
 	want := []string{"/channels/@me", "/assets/web.b2b84438f3c83e84.js", api("/users/@me/guilds"), api("/users/@me/channels")}
 	if got := h.discord.paths(); strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("requests\n got %v\nwant %v", got, want)
@@ -577,7 +567,7 @@ func TestPageLoadBuildNumber(t *testing.T) {
 	// Same identity after a restart; no second page load within 24 h.
 	h.restart()
 	h.clock.Advance(2 * time.Hour)
-	h.callOK(discordapi.PathFetch, discordapi.FetchRequest{ChannelID: dmID}, &discordapi.MessagesResponse{})
+	h.callOK("fetch", map[string]string{"channel_id": dmID}, &connector.ReadResult{})
 	if n := len(h.discord.to("/channels/@me")); n != 1 {
 		t.Errorf("page loaded %d times", n)
 	}
@@ -593,9 +583,9 @@ func TestPageLoadBuildNumber(t *testing.T) {
 	// A failing page keeps the last build number and is not retried that day.
 	h.discord.reply("/channels/@me", http.StatusServiceUnavailable, map[string]any{})
 	h.clock.Advance(25 * time.Hour)
-	h.callOK(discordapi.PathSync, discordapi.SyncRequest{}, &resp)
+	h.callOK("sync", map[string]string{}, &resp)
 	h.clock.Advance(time.Hour)
-	h.callOK(discordapi.PathSearch, discordapi.SearchRequest{GuildID: guildID, Content: "x"}, &discordapi.MessagesResponse{})
+	h.callOK("search", map[string]string{"guild_id": guildID, "content": "x"}, &connector.ReadResult{})
 	if n := len(h.discord.to("/channels/@me")); n != 2 {
 		t.Errorf("page loaded %d times, want 2", n)
 	}
@@ -616,7 +606,7 @@ func TestRateLimitRetriesOnce(t *testing.T) {
 		writeJSON(w, http.StatusOK, dmMessagesBody)
 	})
 	h.start()
-	h.callOK(discordapi.PathFetch, discordapi.FetchRequest{ChannelID: dmID}, &discordapi.MessagesResponse{})
+	h.callOK("fetch", map[string]string{"channel_id": dmID}, &connector.ReadResult{})
 	hits := h.discord.to(path)
 	if len(hits) != 2 {
 		t.Fatalf("%d message requests, want 2", len(hits))
@@ -634,9 +624,9 @@ func TestRateLimitTwiceGivesUp(t *testing.T) {
 	h := newHarness(t, nil)
 	h.discord.reply(path, http.StatusTooManyRequests, map[string]any{"message": "You are being rate limited.", "retry_after": 1.2, "global": false})
 	h.start()
-	e := h.callErr(discordapi.PathFetch, discordapi.FetchRequest{ChannelID: dmID}, http.StatusTooManyRequests)
-	if e.RetryAfterSeconds != 2 {
-		t.Errorf("retry_after_seconds = %d, want 2", e.RetryAfterSeconds)
+	e := h.callErr("fetch", map[string]string{"channel_id": dmID}, http.StatusTooManyRequests)
+	if e.RetryAfter != 2 {
+		t.Errorf("retry_after_seconds = %d, want 2", e.RetryAfter)
 	}
 	if n := len(h.discord.to(path)); n != 2 {
 		t.Errorf("%d message requests, want exactly 2", n)
@@ -679,9 +669,9 @@ func TestCooldown(t *testing.T) {
 				writeJSON(w, tt.status, tt.body)
 			})
 			h.start()
-			e := h.callErr(discordapi.PathFetch, discordapi.FetchRequest{ChannelID: dmID}, http.StatusTooManyRequests)
-			if e.RetryAfterSeconds != int(cooldownLength/time.Second) {
-				t.Errorf("retry_after_seconds = %d, want 6 h", e.RetryAfterSeconds)
+			e := h.callErr("fetch", map[string]string{"channel_id": dmID}, http.StatusTooManyRequests)
+			if e.RetryAfter != int(cooldownLength/time.Second) {
+				t.Errorf("retry_after_seconds = %d, want 6 h", e.RetryAfter)
 			}
 			if n := len(h.discord.to(path)); n != 1 {
 				t.Errorf("%d requests: a cooldown must not retry", n)
@@ -698,9 +688,9 @@ func TestCooldown(t *testing.T) {
 			before := len(h.discord.all())
 			h.restart()
 			h.clock.Advance(time.Hour)
-			e = h.callErr(discordapi.PathSync, discordapi.SyncRequest{}, http.StatusTooManyRequests)
-			if e.RetryAfterSeconds < int((cooldownLength-time.Hour)/time.Second) {
-				t.Errorf("retry_after_seconds = %d after restart", e.RetryAfterSeconds)
+			e = h.callErr("sync", map[string]string{}, http.StatusTooManyRequests)
+			if e.RetryAfter < int((cooldownLength-time.Hour)/time.Second) {
+				t.Errorf("retry_after_seconds = %d after restart", e.RetryAfter)
 			}
 			if len(h.discord.all()) != before {
 				t.Error("request sent during cooldown")
@@ -720,8 +710,8 @@ func TestSearchNotReadyRetries(t *testing.T) {
 		writeJSON(w, http.StatusOK, searchBody)
 	})
 	h.start()
-	var resp discordapi.MessagesResponse
-	h.callOK(discordapi.PathSearch, discordapi.SearchRequest{GuildID: guildID, Content: "rig"}, &resp)
+	var resp connector.ReadResult
+	h.callOK("search", map[string]string{"guild_id": guildID, "content": "rig"}, &resp)
 	hits := h.discord.to(path)
 	if len(hits) != 2 || len(resp.MessageIDs) != 2 {
 		t.Fatalf("%d search requests, %d ids", len(hits), len(resp.MessageIDs))
@@ -735,9 +725,9 @@ func TestSearchNotReadyRetries(t *testing.T) {
 
 	// Still not ready after the retry: 503 with a retry hint, no third try.
 	h.discord.reply(path, http.StatusAccepted, map[string]any{"code": 110000, "retry_after": 0})
-	e := h.callErr(discordapi.PathSearch, discordapi.SearchRequest{GuildID: guildID, Content: "other"}, http.StatusServiceUnavailable)
-	if e.RetryAfterSeconds != 5 {
-		t.Errorf("retry_after_seconds = %d, want the 5 s default", e.RetryAfterSeconds)
+	e := h.callErr("search", map[string]string{"guild_id": guildID, "content": "other"}, http.StatusServiceUnavailable)
+	if e.RetryAfter != 5 {
+		t.Errorf("retry_after_seconds = %d, want the 5 s default", e.RetryAfter)
 	}
 	if n := len(h.discord.to(path)); n != 4 {
 		t.Errorf("%d search requests, want 4", n)
@@ -763,7 +753,7 @@ func TestOwnerStopConditions(t *testing.T) {
 			h := newHarness(t, nil)
 			h.discord.reply(path, tt.status, tt.body)
 			h.start()
-			h.callErr(discordapi.PathFetch, discordapi.FetchRequest{ChannelID: dmID}, http.StatusServiceUnavailable)
+			h.callErr("fetch", map[string]string{"channel_id": dmID}, http.StatusServiceUnavailable)
 			err := h.wait()
 			h.cancel()
 			h.cancel = nil
@@ -785,13 +775,13 @@ func TestDenialCached(t *testing.T) {
 	h := newHarness(t, nil)
 	h.discord.reply(path, http.StatusForbidden, map[string]any{"message": "Missing Access", "code": 50001})
 	h.start()
-	h.callErr(discordapi.PathFetch, discordapi.FetchRequest{ChannelID: otherChan}, http.StatusForbidden)
+	h.callErr("fetch", map[string]string{"channel_id": otherChan}, http.StatusNotFound)
 	before := len(h.discord.all())
-	h.callErr(discordapi.PathFetch, discordapi.FetchRequest{ChannelID: otherChan, Before: msg1}, http.StatusForbidden)
+	h.callErr("fetch", map[string]string{"channel_id": otherChan, "before": msg1}, http.StatusNotFound)
 	h.restart()
 	h.clock.Advance(23 * time.Hour)
-	h.callErr(discordapi.PathFetch, discordapi.FetchRequest{ChannelID: otherChan}, http.StatusForbidden)
-	h.callErr(discordapi.PathSearch, discordapi.SearchRequest{GuildID: guildID, ChannelID: otherChan, Content: "x"}, http.StatusForbidden)
+	h.callErr("fetch", map[string]string{"channel_id": otherChan}, http.StatusNotFound)
+	h.callErr("search", map[string]string{"guild_id": guildID, "channel_id": otherChan, "content": "x"}, http.StatusNotFound)
 	if len(h.discord.all()) != before {
 		t.Errorf("denied channel requested again: %v", h.discord.paths()[before:])
 	}
@@ -800,8 +790,8 @@ func TestDenialCached(t *testing.T) {
 	}
 	// A 404 for an unknown guild channel list is cached the same way.
 	h.discord.reply(api("/guilds/"+guildID+"/channels"), http.StatusNotFound, map[string]any{"message": "Unknown Guild", "code": 10004})
-	h.callErr(discordapi.PathSync, discordapi.SyncRequest{GuildID: guildID}, http.StatusNotFound)
-	h.callErr(discordapi.PathSearch, discordapi.SearchRequest{GuildID: guildID, Content: "x"}, http.StatusNotFound)
+	h.callErr("sync", map[string]string{"guild_id": guildID}, http.StatusNotFound)
+	h.callErr("search", map[string]string{"guild_id": guildID, "content": "x"}, http.StatusNotFound)
 	if n := len(h.discord.to(api("/guilds/" + guildID + "/channels"))); n != 1 {
 		t.Errorf("%d requests to the denied guild", n)
 	}
@@ -812,47 +802,85 @@ func TestValidation(t *testing.T) {
 	h.start()
 	tests := []struct {
 		name string
-		path string
-		body any
+		op   string
+		args map[string]string
 	}{
-		{"fetch letters", discordapi.PathFetch, map[string]any{"channel_id": "abc"}},
-		{"fetch short id", discordapi.PathFetch, map[string]any{"channel_id": "12345678901234"}},
-		{"fetch long id", discordapi.PathFetch, map[string]any{"channel_id": "1234567890123456789012"}},
-		{"fetch path traversal", discordapi.PathFetch, map[string]any{"channel_id": "../../users/@me"}},
-		{"fetch encoded slash", discordapi.PathFetch, map[string]any{"channel_id": "110000000000000%2F"}},
-		{"fetch missing", discordapi.PathFetch, map[string]any{}},
-		{"fetch bad before", discordapi.PathFetch, map[string]any{"channel_id": dmID, "before": "x"}},
-		{"fetch two anchors", discordapi.PathFetch, map[string]any{"channel_id": dmID, "before": msg1, "after": msg2}},
-		{"fetch limit too big", discordapi.PathFetch, map[string]any{"channel_id": dmID, "limit": 101}},
-		{"fetch negative limit", discordapi.PathFetch, map[string]any{"channel_id": dmID, "limit": -1}},
-		{"fetch unknown field", discordapi.PathFetch, map[string]any{"channel_id": dmID, "method": "DELETE"}},
-		{"search missing guild", discordapi.PathSearch, map[string]any{"content": "x"}},
-		{"search bad guild", discordapi.PathSearch, map[string]any{"guild_id": "1; DROP", "content": "x"}},
-		{"search bad author", discordapi.PathSearch, map[string]any{"guild_id": guildID, "author_id": "me"}},
-		{"search bad channel", discordapi.PathSearch, map[string]any{"guild_id": guildID, "channel_id": "#general"}},
-		{"search bad has", discordapi.PathSearch, map[string]any{"guild_id": guildID, "has": "pdf"}},
-		{"search negative offset", discordapi.PathSearch, map[string]any{"guild_id": guildID, "content": "x", "offset": -25}},
-		{"search huge offset", discordapi.PathSearch, map[string]any{"guild_id": guildID, "content": "x", "offset": 10000}},
-		{"search no criteria", discordapi.PathSearch, map[string]any{"guild_id": guildID}},
-		{"search long content", discordapi.PathSearch, map[string]any{"guild_id": guildID, "content": strings.Repeat("a", 513)}},
-		{"sync bad guild", discordapi.PathSync, map[string]any{"guild_id": "x"}},
-		{"not json", discordapi.PathSync, "{"},
+		{"fetch letters", "fetch", map[string]string{"channel_id": "abc"}},
+		{"fetch short id", "fetch", map[string]string{"channel_id": "12345678901234"}},
+		{"fetch long id", "fetch", map[string]string{"channel_id": "1234567890123456789012"}},
+		{"fetch path traversal", "fetch", map[string]string{"channel_id": "../../users/@me"}},
+		{"fetch encoded slash", "fetch", map[string]string{"channel_id": "110000000000000%2F"}},
+		{"fetch missing", "fetch", map[string]string{}},
+		{"fetch bad before", "fetch", map[string]string{"channel_id": dmID, "before": "x"}},
+		{"fetch two anchors", "fetch", map[string]string{"channel_id": dmID, "before": msg1, "after": msg2}},
+		{"fetch limit too big", "fetch", map[string]string{"channel_id": dmID, "limit": "101"}},
+		{"fetch negative limit", "fetch", map[string]string{"channel_id": dmID, "limit": "-1"}},
+		{"fetch unknown field", "fetch", map[string]string{"channel_id": dmID, "method": "DELETE"}},
+		{"search missing guild", "search", map[string]string{"content": "x"}},
+		{"search bad guild", "search", map[string]string{"guild_id": "1; DROP", "content": "x"}},
+		{"search bad author", "search", map[string]string{"guild_id": guildID, "author_id": "me"}},
+		{"search bad channel", "search", map[string]string{"guild_id": guildID, "channel_id": "#general"}},
+		{"search bad has", "search", map[string]string{"guild_id": guildID, "has": "pdf"}},
+		{"search negative offset", "search", map[string]string{"guild_id": guildID, "content": "x", "offset": "-25"}},
+		{"search huge offset", "search", map[string]string{"guild_id": guildID, "content": "x", "offset": "10000"}},
+		{"search no criteria", "search", map[string]string{"guild_id": guildID}},
+		{"search long content", "search", map[string]string{"guild_id": guildID, "content": strings.Repeat("a", 513)}},
+		{"sync bad guild", "sync", map[string]string{"guild_id": "x"}},
+		{"limit not a number", "fetch", map[string]string{"channel_id": dmID, "limit": "ten"}},
+		{"sync unknown field", "sync", map[string]string{"guild_id": guildID, "path": "/users/@me"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h.callErr(tt.path, tt.body, http.StatusBadRequest)
+			h.callErr(tt.op, tt.args, http.StatusBadRequest)
 		})
 	}
 	if hits := h.discord.all(); len(hits) != 0 {
 		t.Errorf("invalid calls reached Discord: %v", h.discord.paths())
 	}
-	resp, err := h.client.Get("http://discord" + discordapi.PathFetch)
+}
+
+// The service has no write ops and no verifier: a well-formed, really signed
+// approval for a discord op is still refused, and nothing goes upstream.
+func TestWritesRefused(t *testing.T) {
+	h := newHarness(t, nil)
+	h.start()
+	ctx := context.Background()
+
+	spec, err := h.client.Spec(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("GET /fetch: %d", resp.StatusCode)
+	if spec.Name != "discord" || len(spec.Ops) != 3 {
+		t.Fatalf("spec %+v", spec)
+	}
+	for _, op := range spec.Ops {
+		if op.Kind != connector.Read {
+			t.Errorf("op %s is %s", op.Name, op.Kind)
+		}
+	}
+
+	_, err = h.client.Prepare(ctx, "fetch", map[string]string{"channel_id": dmID})
+	var e *connector.Error
+	if !errors.As(err, &e) || e.Status != http.StatusNotFound {
+		t.Errorf("prepare: %v", err)
+	}
+
+	rec, err := approval.Encode(approval.Record{
+		V: 1, ID: "p1", Connector: "discord", Op: "fetch", Args: map[string]string{"channel_id": dmID},
+		CreatedAt: noon, ExpiresAt: noon.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk := approvaltest.New(t, "mandate.example", "https://mandate.example")
+	_, err = h.client.Execute(ctx, pk.Approve(rec, noon))
+	if !errors.As(err, &e) || e.Status != http.StatusForbidden {
+		t.Errorf("execute: %v", err)
+	}
+
+	h.callErr("delete", map[string]string{"channel_id": dmID}, http.StatusNotFound)
+	if hits := h.discord.all(); len(hits) != 0 {
+		t.Errorf("refused calls reached Discord: %v", h.discord.paths())
 	}
 }
 
@@ -884,13 +912,13 @@ func TestActiveHoursRefusal(t *testing.T) {
 	h := newHarness(t, nil)
 	h.clock.now = time.Date(2026, 10, 29, 2, 0, 0, 0, newYork)
 	h.start()
-	e := h.callErr(discordapi.PathFetch, discordapi.FetchRequest{ChannelID: dmID}, http.StatusTooManyRequests)
+	e := h.callErr("fetch", map[string]string{"channel_id": dmID}, http.StatusTooManyRequests)
 	// 08:00 local plus the 2 s app-open delay.
-	if want := 6*3600 + 2; e.RetryAfterSeconds != want {
-		t.Errorf("retry_after_seconds = %d, want %d", e.RetryAfterSeconds, want)
+	if want := 6*3600 + 2; e.RetryAfter != want {
+		t.Errorf("retry_after_seconds = %d, want %d", e.RetryAfter, want)
 	}
-	if !strings.Contains(e.Error, "outside active hours") {
-		t.Errorf("error %q", e.Error)
+	if !strings.Contains(e.Message, "outside active hours") {
+		t.Errorf("error %q", e.Message)
 	}
 	if len(h.discord.all()) != 0 || !h.clock.Now().Equal(time.Date(2026, 10, 29, 2, 0, 0, 0, newYork)) {
 		t.Error("refusal waited or sent a request")
@@ -920,15 +948,15 @@ func TestSlotWaitCap(t *testing.T) {
 			}
 			h.start()
 			if tt.served {
-				h.callOK(discordapi.PathFetch, discordapi.FetchRequest{ChannelID: dmID}, &discordapi.MessagesResponse{})
+				h.callOK("fetch", map[string]string{"channel_id": dmID}, &connector.ReadResult{})
 				if hits := h.discord.all(); len(hits) != 1 || !hits[0].at.Equal(noon.Add(89*time.Second)) {
 					t.Errorf("hits %v", h.discord.paths())
 				}
 				return
 			}
-			e := h.callErr(discordapi.PathFetch, discordapi.FetchRequest{ChannelID: dmID}, http.StatusTooManyRequests)
-			if e.RetryAfterSeconds != 91 {
-				t.Errorf("retry_after_seconds = %d, want 91", e.RetryAfterSeconds)
+			e := h.callErr("fetch", map[string]string{"channel_id": dmID}, http.StatusTooManyRequests)
+			if e.RetryAfter != 91 {
+				t.Errorf("retry_after_seconds = %d, want 91", e.RetryAfter)
 			}
 			if len(h.discord.all()) != 0 || !h.clock.Now().Equal(noon) {
 				t.Error("refused call waited or sent a request")
@@ -940,7 +968,7 @@ func TestSlotWaitCap(t *testing.T) {
 func TestStateFileMode(t *testing.T) {
 	h := newHarness(t, nil)
 	h.start()
-	h.callOK(discordapi.PathSync, discordapi.SyncRequest{}, &discordapi.SyncResponse{})
+	h.callOK("sync", map[string]string{}, &connector.ReadResult{})
 	fi, err := os.Stat(h.statePath)
 	if err != nil {
 		t.Fatal(err)
@@ -959,4 +987,10 @@ func TestStateFileMode(t *testing.T) {
 	if bytes.Contains(b, []byte(testToken)) || bytes.Contains(b, []byte("Alice")) {
 		t.Error("state file holds the token or names")
 	}
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
 }

@@ -1,7 +1,6 @@
 package discord
 
 import (
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -89,30 +88,6 @@ func TestReadToken(t *testing.T) {
 		if tt.ok && tok != "abc.def.ghi" {
 			t.Errorf("%s: token %q", tt.name, tok)
 		}
-	}
-}
-
-func TestListenUnix(t *testing.T) {
-	dir := t.TempDir()
-	sock := filepath.Join(dir, "s.sock")
-	ln, err := listenUnix(sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Leave a stale socket behind, as after a crash.
-	ln.(*net.UnixListener).SetUnlinkOnClose(false)
-	ln.Close()
-	ln, err = listenUnix(sock)
-	if err != nil {
-		t.Fatalf("stale socket not replaced: %v", err)
-	}
-	ln.Close()
-	file := filepath.Join(dir, "file")
-	if err := os.WriteFile(file, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := listenUnix(file); err == nil {
-		t.Error("a regular file was replaced by the socket")
 	}
 }
 

@@ -10,10 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
-	"io/fs"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -24,14 +21,13 @@ import (
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 
-	"github.com/adeci/mandate/internal/discordapi"
+	"github.com/adeci/mandate/internal/approval"
+	"github.com/adeci/mandate/internal/connector"
 	"github.com/adeci/mandate/internal/exitcode"
 	"github.com/adeci/mandate/internal/store"
 )
 
 const usage = "usage: mandate discord serve --data PATH --state PATH --token-file PATH --listen PATH [--timezone TZ] [--active-hours HH-HH]"
-
-const maxCallBody = 64 << 10
 
 func Command(ctx context.Context, args []string) error {
 	if len(args) == 0 {
@@ -59,7 +55,7 @@ func serve(ctx context.Context, args []string) error {
 	dataPath := flags.String("data", "", "path to the discord store database (required)")
 	statePath := flags.String("state", "", "path to the private state file (required)")
 	tokenFile := flags.String("token-file", "", "path to a file holding the Discord user token (required)")
-	listen := flags.String("listen", "", "Unix socket to serve the gateway on (required)")
+	listen := flags.String("listen", "", "Unix socket to serve the connector protocol on (required)")
 	timezone := flags.String("timezone", defaultTimezone(), "IANA time zone for X-Discord-Timezone and active hours")
 	hoursFlag := flags.String("active-hours", "08-24", "local hours HH-HH in which requests may be sent")
 	if err := flags.Parse(args); err != nil {
@@ -190,9 +186,9 @@ func run(ctx context.Context, cfg config) error {
 		cfg.log.Warn("in rate-limit cooldown", "until", st.CooldownUntil.Format(time.RFC3339))
 	}
 
-	ln, err := listenUnix(cfg.listen)
+	ln, err := connector.ListenUnix(cfg.listen)
 	if err != nil {
-		return err
+		return fmt.Errorf("listen %s: %w", cfg.listen, err)
 	}
 	workCtx, stopWork := context.WithCancel(context.WithoutCancel(ctx))
 	w := &worker{
@@ -208,7 +204,9 @@ func run(ctx context.Context, cfg config) error {
 		defer close(workerDone)
 		w.loop()
 	}()
-	srv := &http.Server{Handler: w.mux(), ReadHeaderTimeout: 10 * time.Second}
+	// No verifier: every /execute is refused before reaching the worker.
+	cs := &connector.Server{Connector: w, Log: cfg.log}
+	srv := &http.Server{Handler: cs.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ln) }()
 	cfg.log.Info("serving", "socket", cfg.listen, "timezone", cfg.timezone,
@@ -234,41 +232,16 @@ func run(ctx context.Context, cfg config) error {
 	return runErr
 }
 
-// listenUnix listens on path with mode 0660, replacing a stale socket but
-// never another kind of file.
-func listenUnix(path string) (net.Listener, error) {
-	if fi, err := os.Lstat(path); err == nil {
-		if fi.Mode()&fs.ModeSocket == 0 {
-			return nil, fmt.Errorf("--listen %s exists and is not a socket", path)
-		}
-		if err := os.Remove(path); err != nil {
-			return nil, fmt.Errorf("remove stale socket: %w", err)
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
-	}
-	var lc net.ListenConfig
-	ln, err := lc.Listen(context.Background(), "unix", path)
-	if err != nil {
-		return nil, fmt.Errorf("listen: %w", err)
-	}
-	if err := os.Chmod(path, 0o660); err != nil {
-		ln.Close()
-		return nil, fmt.Errorf("chmod socket: %w", err)
-	}
-	return ln, nil
-}
-
 // job is one gateway call, run on the worker goroutine.
 type job struct {
 	ctx      context.Context
 	deadline time.Time // latest acceptable upstream slot
-	run      func(ctx context.Context, dl time.Time) (any, error)
+	run      func(ctx context.Context, dl time.Time) (connector.ReadResult, error)
 	done     chan jobResult
 }
 
 type jobResult struct {
-	v   any
+	v   connector.ReadResult
 	err error
 }
 
@@ -308,71 +281,120 @@ func (w *worker) loop() {
 	}
 }
 
-func (w *worker) mux() *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST "+discordapi.PathSync, func(rw http.ResponseWriter, r *http.Request) {
-		var req discordapi.SyncRequest
-		w.handle(rw, r, &req, func() error { return validateSync(&req) },
-			func(ctx context.Context, dl time.Time) (any, error) { return w.svc.sync(ctx, dl, req) })
-	})
-	mux.HandleFunc("POST "+discordapi.PathSearch, func(rw http.ResponseWriter, r *http.Request) {
-		var req discordapi.SearchRequest
-		w.handle(rw, r, &req, func() error { return validateSearch(&req) },
-			func(ctx context.Context, dl time.Time) (any, error) { return w.svc.search(ctx, dl, req) })
-	})
-	mux.HandleFunc("POST "+discordapi.PathFetch, func(rw http.ResponseWriter, r *http.Request) {
-		var req discordapi.FetchRequest
-		w.handle(rw, r, &req, func() error { return validateFetch(&req) },
-			func(ctx context.Context, dl time.Time) (any, error) { return w.svc.fetch(ctx, dl, req) })
-	})
-	return mux
+var spec = connector.Spec{Name: "discord", Ops: []connector.Op{
+	{
+		Name: "sync", Kind: connector.Read,
+		Summary: "Refresh the list of Discord servers (guilds) and DMs; with guild_id, also that server's channels and threads. " +
+			"Run this first to learn IDs; lists are cached for a day, so repeats are free.",
+		Params: []connector.Param{
+			{Name: "guild_id", Doc: "Server ID whose channels and threads to list. Omit to list only servers and DMs.", Container: true},
+		},
+	},
+	{
+		Name: "search", Kind: connector.Read,
+		Summary: "Search one server's message history the way Discord's search box does, 25 results per page, newest first. " +
+			"Needs at least one of content, author_id, channel_id, or has. Results are cached for an hour.",
+		Params: []connector.Param{
+			{Name: "guild_id", Doc: "Server ID to search (from sync).", Required: true, Container: true},
+			{Name: "content", Doc: "Words to match in message text, at most 512 characters."},
+			{Name: "author_id", Doc: "Only messages by this user ID."},
+			{Name: "channel_id", Doc: "Only messages in this channel or thread ID.", Container: true},
+			{Name: "has", Doc: "Only messages with this attachment kind: link, embed, file, video, image, or sound."},
+			{Name: "offset", Doc: "Skip this many results to page further, in steps of 25 (0 to 9975)."},
+		},
+	},
+	{
+		Name: "fetch", Kind: connector.Read,
+		Summary: "Read recent messages from one channel, thread, or DM, newest first. " +
+			"Anchor with at most one of before, after, or around to page through history.",
+		Params: []connector.Param{
+			{Name: "channel_id", Doc: "Channel, thread, or DM ID (from sync).", Required: true, Container: true},
+			{Name: "before", Doc: "Only messages older than this message ID."},
+			{Name: "after", Doc: "Only messages newer than this message ID."},
+			{Name: "around", Doc: "Messages surrounding this message ID."},
+			{Name: "limit", Doc: "How many messages, 1 to 100 (default 50)."},
+		},
+	},
+}}
+
+func (w *worker) Spec() connector.Spec { return spec }
+
+func (w *worker) Prepare(context.Context, string, map[string]string) (connector.Prepared, error) {
+	return connector.Prepared{}, connector.Invalid("discord has no write ops")
 }
 
-// handle decodes and validates a call, then hands it to the worker, waiting
-// at most maxSlotWait to be picked up.
-func (w *worker) handle(rw http.ResponseWriter, r *http.Request, req any, validate func() error,
-	run func(ctx context.Context, dl time.Time) (any, error),
-) {
-	dec := json.NewDecoder(io.LimitReader(r.Body, maxCallBody))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(req); err != nil {
-		writeError(rw, http.StatusBadRequest, "invalid JSON body", 0)
-		return
+func (w *worker) Execute(context.Context, approval.Record) connector.Result {
+	return connector.Result{Status: connector.Failed, Detail: "discord has no write ops"}
+}
+
+func (w *worker) Read(ctx context.Context, op string, args map[string]string) (json.RawMessage, error) {
+	var run func(ctx context.Context, dl time.Time) (connector.ReadResult, error)
+	switch op {
+	case "sync":
+		req, err := parseSync(args)
+		if err != nil {
+			return nil, toConnectorError(err)
+		}
+		run = func(ctx context.Context, dl time.Time) (connector.ReadResult, error) { return w.svc.sync(ctx, dl, req) }
+	case "search":
+		req, err := parseSearch(args)
+		if err != nil {
+			return nil, toConnectorError(err)
+		}
+		run = func(ctx context.Context, dl time.Time) (connector.ReadResult, error) {
+			return w.svc.search(ctx, dl, req)
+		}
+	case "fetch":
+		req, err := parseFetch(args)
+		if err != nil {
+			return nil, toConnectorError(err)
+		}
+		run = func(ctx context.Context, dl time.Time) (connector.ReadResult, error) {
+			return w.svc.fetch(ctx, dl, req)
+		}
+	default:
+		return nil, connector.ErrUnknownOp
 	}
-	if err := validate(); err != nil {
-		writeError(rw, http.StatusBadRequest, err.Error(), 0)
-		return
+	res, err := w.submit(ctx, op, run)
+	if err != nil {
+		return nil, err
 	}
-	j := &job{ctx: r.Context(), deadline: w.clock.Now().Add(maxSlotWait), run: run, done: make(chan jobResult, 1)}
+	return json.Marshal(res)
+}
+
+// submit hands a call to the worker, waiting at most maxSlotWait for it to be
+// picked up.
+func (w *worker) submit(ctx context.Context, op string, run func(ctx context.Context, dl time.Time) (connector.ReadResult, error)) (connector.ReadResult, error) {
+	j := &job{ctx: ctx, deadline: w.clock.Now().Add(maxSlotWait), run: run, done: make(chan jobResult, 1)}
 	wait := time.NewTimer(maxSlotWait)
 	defer wait.Stop()
 	select {
 	case w.jobs <- j:
 	case <-wait.C:
-		writeError(rw, http.StatusTooManyRequests, "discord service busy with another call", retrySeconds(maxSlotWait))
-		return
+		return connector.ReadResult{}, &connector.Error{
+			Status: http.StatusTooManyRequests, Message: "discord service busy with another call", RetryAfter: retrySeconds(maxSlotWait),
+		}
 	case <-w.ctx.Done():
-		writeError(rw, http.StatusServiceUnavailable, "discord service stopping", 0)
-		return
-	case <-r.Context().Done():
-		return
+		return connector.ReadResult{}, &connector.Error{Status: http.StatusServiceUnavailable, Message: "discord service stopping"}
+	case <-ctx.Done():
+		return connector.ReadResult{}, ctx.Err()
 	}
 	res := <-j.done
 	if res.err != nil {
-		status, retry, msg := errorResponse(res.err)
-		if status >= 500 {
-			w.log.Warn("call failed", "path", r.URL.Path, "status", status, "err", res.err)
+		e := toConnectorError(res.err)
+		if e.Status >= 500 {
+			w.log.Warn("call failed", "op", op, "status", e.Status, "err", res.err)
 		} else {
-			w.log.Info("call refused", "path", r.URL.Path, "status", status, "err", res.err)
+			w.log.Info("call refused", "op", op, "status", e.Status, "err", res.err)
 		}
-		writeError(rw, status, msg, retry)
-		return
+		return connector.ReadResult{}, e
 	}
-	writeJSON(rw, http.StatusOK, res.v)
+	return res.v, nil
 }
 
-// errorResponse maps a call error to its status, retry hint, and message.
-func errorResponse(err error) (status, retryAfter int, msg string) {
+// toConnectorError maps a call error to the refusal relayed to the agent.
+// Denials are always 404, so a 403 never confirms that a channel exists.
+func toConnectorError(err error) *connector.Error {
 	var (
 		paced    *pacedError
 		denied   *deniedError
@@ -382,30 +404,20 @@ func errorResponse(err error) (status, retryAfter int, msg string) {
 	)
 	switch {
 	case errors.As(err, &paced):
-		return http.StatusTooManyRequests, retrySeconds(paced.retryAfter), paced.Error()
+		return &connector.Error{Status: http.StatusTooManyRequests, Message: paced.Error(), RetryAfter: retrySeconds(paced.retryAfter)}
 	case errors.As(err, &denied):
-		return denied.status, 0, denied.Error()
+		return &connector.Error{Status: http.StatusNotFound, Message: denied.Error()}
 	case errors.As(err, &notReady):
-		return http.StatusServiceUnavailable, retrySeconds(notReady.retryAfter), notReady.Error()
+		return &connector.Error{Status: http.StatusServiceUnavailable, Message: notReady.Error(), RetryAfter: retrySeconds(notReady.retryAfter)}
 	case errors.Is(err, exitcode.ErrNeedsOwner):
-		return http.StatusServiceUnavailable, 0, "discord account needs manual action; the service is stopping"
+		return &connector.Error{Status: http.StatusServiceUnavailable, Message: "discord account needs manual action; the service is stopping"}
 	case errors.As(err, &bad):
-		return http.StatusBadRequest, 0, bad.Error()
+		return &connector.Error{Status: http.StatusBadRequest, Message: bad.Error()}
 	case errors.As(err, &up):
-		return http.StatusBadGateway, 0, up.Error()
+		return &connector.Error{Status: http.StatusBadGateway, Message: up.Error()}
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		return http.StatusServiceUnavailable, 0, "call canceled"
+		return &connector.Error{Status: http.StatusServiceUnavailable, Message: "call canceled"}
 	default:
-		return http.StatusInternalServerError, 0, "internal error"
+		return &connector.Error{Status: http.StatusInternalServerError, Message: "internal error"}
 	}
-}
-
-func writeError(rw http.ResponseWriter, status int, msg string, retryAfter int) {
-	writeJSON(rw, status, discordapi.ErrorResponse{Error: msg, RetryAfterSeconds: retryAfter})
-}
-
-func writeJSON(rw http.ResponseWriter, status int, v any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(v)
 }
