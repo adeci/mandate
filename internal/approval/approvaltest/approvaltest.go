@@ -17,10 +17,12 @@ import (
 	"github.com/adeci/mandate/internal/approval"
 )
 
-// Flags for authenticator data: user present, user verified.
+// Flags for authenticator data: user present, user verified, and backup
+// eligible (a synced passkey).
 const (
 	FlagUP = 0x01
 	FlagUV = 0x04
+	FlagBE = 0x08
 )
 
 // Authenticator is one software passkey bound to a relying party.
