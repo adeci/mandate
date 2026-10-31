@@ -17,26 +17,20 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/mdp/qrterminal/v3"
 	"github.com/rs/zerolog"
 	signalLog "go.mau.fi/libsignal/logger"
 	"go.mau.fi/whatsmeow"
 	wastore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
-	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/adeci/mandate/internal/approval"
 	"github.com/adeci/mandate/internal/connector"
-	"github.com/adeci/mandate/internal/exitcode"
 	"github.com/adeci/mandate/internal/store"
 )
 
 const usage = `usage: mandate whatsapp run --data PATH --session PATH [--listen SOCKET]
-                           [--approvers FILE --rp-id ID --origin URL] [--seen PATH]
-       mandate whatsapp pair --session PATH [--phone +E164]`
-
-var errNotPaired = fmt.Errorf(`not paired: run "mandate whatsapp pair": %w`, exitcode.ErrNeedsOwner)
+                           [--approvers FILE --rp-id ID --origin URL] [--seen PATH]`
 
 func Command(ctx context.Context, args []string) error {
 	if len(args) < 1 {
@@ -45,8 +39,6 @@ func Command(ctx context.Context, args []string) error {
 	switch args[0] {
 	case "run":
 		return run(ctx, args[1:])
-	case "pair":
-		return pair(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown subcommand %q\n%s", args[0], usage)
 	}
@@ -95,37 +87,27 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 	defer container.Close()
-	if device.ID == nil {
-		return errNotPaired
+
+	// Shown under Linked devices on the phone.
+	wastore.SetOSInfo("mandate", [3]uint32{0, 1, 0})
+	newClient := func(dev *wastore.Device, onEvent func(any)) waClient {
+		cli := whatsmeow.NewClient(dev, newWALogger("whatsmeow"))
+		cli.BackgroundEventCtx = ctx
+		// Ack only after the handler stored the message; the decrypted-event
+		// buffer lets a redelivered (unacked) message be decrypted again.
+		cli.SynchronousAck = true
+		cli.EnableDecryptedEventBuffer = true
+		cli.InitialAutoReconnect = true
+		in := newIngester(cli, st, log)
+		cli.AddEventHandlerWithSuccessStatus(func(evt any) bool {
+			onEvent(evt)
+			return in.handle(ctx, evt)
+		})
+		return cli
 	}
+	c := newConnector(ctx, st, log, device, container.NewDevice, newClient)
 
-	cli := whatsmeow.NewClient(device, newWALogger("whatsmeow"))
-	cli.BackgroundEventCtx = ctx
-	// Ack only after the handler stored the message; the decrypted-event
-	// buffer lets a redelivered (unacked) message be decrypted again.
-	cli.SynchronousAck = true
-	cli.EnableDecryptedEventBuffer = true
-	cli.InitialAutoReconnect = true
-
-	in := newIngester(cli, st, log)
-	fatal := make(chan error, 1)
-	cli.AddEventHandlerWithSuccessStatus(func(evt any) bool {
-		if err := permanentError(evt); err != nil {
-			select {
-			case fatal <- err:
-			default:
-			}
-			return true
-		}
-		return in.handle(ctx, evt)
-	})
-
-	srv := &connector.Server{
-		Connector: newConnector(cli, device, st, log),
-		Verifier:  verifier,
-		Seen:      seen,
-		Log:       log,
-	}
+	srv := &connector.Server{Connector: c, Verifier: verifier, Seen: seen, Log: log}
 	serveCtx, stopServe := context.WithCancel(ctx)
 	defer stopServe()
 	served := make(chan error, 1)
@@ -134,16 +116,16 @@ func run(ctx context.Context, args []string) error {
 	shutdown := func() error {
 		stopServe()
 		err := <-served
-		cli.Disconnect()
+		c.disconnect()
 		if err != nil {
 			return fmt.Errorf("serve connector: %w", err)
 		}
 		return nil
 	}
 
-	log.Info("connecting", "jid", device.ID.String(), "listen", *listen)
-	if err := cli.ConnectContext(ctx); err != nil {
-		return errors.Join(fmt.Errorf("connect: %w", err), shutdown())
+	log.Info("serving", "listen", *listen)
+	if err := c.connect(); err != nil {
+		return errors.Join(err, shutdown())
 	}
 	select {
 	case <-ctx.Done():
@@ -152,10 +134,8 @@ func run(ctx context.Context, args []string) error {
 		}
 		log.Info("disconnected")
 		return nil
-	case err := <-fatal:
-		return errors.Join(err, shutdown())
 	case err := <-served:
-		cli.Disconnect()
+		c.disconnect()
 		return fmt.Errorf("serve connector: %w", err)
 	}
 }
@@ -183,101 +163,6 @@ func loadVerifier(path, rpID, origin string) (*approval.Verifier, error) {
 		return nil, errors.New("--rp-id and --origin are required when approvers are enrolled")
 	}
 	return &approval.Verifier{RPID: rpID, Origin: origin, Approvers: approvers}, nil
-}
-
-// permanentError maps events after which whatsmeow will not reconnect.
-func permanentError(evt any) error {
-	switch e := evt.(type) {
-	case *events.LoggedOut:
-		return fmt.Errorf("logged out (%s): %w", e.Reason, errNotPaired)
-	case *events.StreamReplaced:
-		return errors.New("session taken over by another client using the same session file")
-	case events.PermanentDisconnect:
-		return fmt.Errorf("permanent disconnect: %s", e.PermanentDisconnectDescription())
-	}
-	return nil
-}
-
-func pair(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("whatsapp pair", flag.ContinueOnError)
-	sessionPath := fs.String("session", "", "whatsmeow session database (required)")
-	phone := fs.String("phone", "", "pair by phone number (+E164) and print a code instead of a QR")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *sessionPath == "" {
-		return errors.New("--session is required")
-	}
-	ctx = withLibraryLogger(ctx)
-
-	container, device, err := openSession(ctx, *sessionPath)
-	if err != nil {
-		return err
-	}
-	defer container.Close()
-	if device.ID != nil {
-		return fmt.Errorf("already paired as %s; remove %s to pair again", device.ID, *sessionPath)
-	}
-
-	// Shown under Linked devices on the phone.
-	wastore.SetOSInfo("mandate", [3]uint32{0, 1, 0})
-	cli := whatsmeow.NewClient(device, newWALogger("whatsmeow"))
-	cli.BackgroundEventCtx = ctx
-	qr, err := cli.GetQRChannel(ctx)
-	if err != nil {
-		return err
-	}
-	if err := cli.ConnectContext(ctx); err != nil {
-		return fmt.Errorf("connect: %w", err)
-	}
-	defer cli.Disconnect()
-
-	codeShown := false
-	for {
-		var item whatsmeow.QRChannelItem
-		var ok bool
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case item, ok = <-qr:
-		}
-		if !ok {
-			return errors.New("pairing aborted")
-		}
-		switch item.Event {
-		case whatsmeow.QRChannelEventCode:
-			if *phone == "" {
-				qrterminal.GenerateHalfBlock(item.Code, qrterminal.L, os.Stdout)
-				fmt.Printf("Scan in WhatsApp: Settings > Linked devices > Link a device (expires in %s)\n\n", item.Timeout)
-				continue
-			}
-			if codeShown {
-				continue
-			}
-			// The websocket is ready once the first QR item arrives.
-			code, err := cli.PairPhone(ctx, *phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
-			if err != nil {
-				return fmt.Errorf("request pairing code: %w", err)
-			}
-			codeShown = true
-			fmt.Printf("Pairing code: %s\nIn WhatsApp: Settings > Linked devices > Link a device > Link with phone number instead\n", code)
-		case whatsmeow.QRChannelEventPasskeyRequest:
-			return errors.New("phone requested passkey pairing, which mandate does not support; retry with QR or --phone")
-		case whatsmeow.QRChannelEventPasskeyResponse:
-			fmt.Printf("Confirm code on phone: %s\n", item.PasskeyConfirmation.Code)
-		case whatsmeow.QRChannelSuccess.Event:
-			// Disconnect before the post-pair login: anything delivered now
-			// (history sync) would be acked without being stored. The run
-			// service receives it instead.
-			cli.Disconnect()
-			fmt.Printf("Paired as %s. Start the run service now to receive history sync.\n", cli.Store.ID)
-			return nil
-		case whatsmeow.QRChannelEventError:
-			return fmt.Errorf("pairing failed: %w", item.Error)
-		default:
-			return fmt.Errorf("pairing failed: %s", item.Event)
-		}
-	}
 }
 
 // The session database is created with mode 0600.

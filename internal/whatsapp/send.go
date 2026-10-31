@@ -1,9 +1,10 @@
 package whatsapp
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"log/slog"
+	"net/http"
 	"slices"
 	"strings"
 	"time"
@@ -19,27 +20,6 @@ import (
 	"github.com/adeci/mandate/internal/store"
 )
 
-// sendClient is the part of *whatsmeow.Client that sends.
-type sendClient interface {
-	IsConnected() bool
-	IsLoggedIn() bool
-	SendMessage(ctx context.Context, to types.JID, msg *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
-}
-
-// waConnector sends approved text messages. Recipients are resolved from
-// local state only: the address book and LID map in the session database and
-// the groups in data.db.
-type waConnector struct {
-	cli sendClient
-	dev *wastore.Device
-	st  *store.Store
-	log *slog.Logger
-}
-
-func newConnector(cli sendClient, dev *wastore.Device, st *store.Store, log *slog.Logger) *waConnector {
-	return &waConnector{cli: cli, dev: dev, st: st, log: log}
-}
-
 func (c *waConnector) Spec() connector.Spec {
 	return connector.Spec{Name: "whatsapp", Ops: []connector.Op{{
 		Name:    "send",
@@ -48,7 +28,7 @@ func (c *waConnector) Spec() connector.Spec {
 		Params: []connector.Param{
 			{
 				Name:      "to",
-				Doc:       "chat JID (…@s.whatsapp.net or …@g.us), phone number with country code, or exact address-book contact or group name",
+				Doc:       "chat JID (…@s.whatsapp.net, …@lid, or …@g.us), phone number with country code, or exact address-book contact or group name",
 				Required:  true,
 				Container: true,
 			},
@@ -58,9 +38,10 @@ func (c *waConnector) Spec() connector.Spec {
 }
 
 type recipient struct {
-	jid   types.JID
-	name  string // address-book or group name; empty for numbers not in the address book
-	group bool
+	jid     types.JID
+	aliases []string // the contact's LID
+	name    string   // address-book or group name; empty for numbers not in the address book
+	group   bool
 }
 
 func (r recipient) field() approval.Field {
@@ -72,6 +53,16 @@ func (r recipient) field() approval.Field {
 	default:
 		return approval.Field{Label: "To", Value: formatPhone(r.jid.User, false) + " (not in your contacts)"}
 	}
+}
+
+// Numbers are masked: the agent may not otherwise see these people, and it
+// can find the JID of the one it means in the chats it can read.
+func (r recipient) candidate() connector.Candidate {
+	label := r.name + " (group)"
+	if !r.group {
+		label = r.name + " (" + formatPhone(r.jid.User, true) + ")"
+	}
+	return connector.Candidate{ID: r.jid.String(), Aliases: r.aliases, Label: label}
 }
 
 func (c *waConnector) Prepare(ctx context.Context, op string, args map[string]string) (connector.Prepared, error) {
@@ -87,7 +78,11 @@ func (c *waConnector) Prepare(ctx context.Context, op string, args map[string]st
 	if strings.TrimSpace(text) == "" {
 		return connector.Prepared{}, connector.Invalid("text is required")
 	}
-	r, err := c.resolve(ctx, args["to"])
+	_, dev, linked := c.current()
+	if !linked {
+		return connector.Prepared{}, &connector.Error{Status: http.StatusServiceUnavailable, Message: "whatsapp is not linked"}
+	}
+	r, err := book{dev: dev, st: c.st}.resolve(ctx, args["to"])
 	if err != nil {
 		return connector.Prepared{}, err
 	}
@@ -95,14 +90,22 @@ func (c *waConnector) Prepare(ctx context.Context, op string, args map[string]st
 		Args:      map[string]string{"to": r.jid.String(), "text": text},
 		Display:   []approval.Field{r.field(), {Label: "Text", Value: text, Param: "text"}},
 		Container: r.jid.String(),
+		Aliases:   r.aliases,
 	}, nil
+}
+
+// book resolves recipients from local state only: the address book and LID
+// map in the session database and the groups in data.db.
+type book struct {
+	dev *wastore.Device
+	st  *store.Store
 }
 
 // Phone numbers are not checked with IsOnWhatsApp: that is a network query
 // WhatsApp rate-limits and watches for number scraping, and Prepare runs for
 // every proposal and again at execution. Sending to a number without WhatsApp
 // fails upstream instead.
-func (c *waConnector) resolve(ctx context.Context, to string) (recipient, error) {
+func (b book) resolve(ctx context.Context, to string) (recipient, error) {
 	to = strings.TrimSpace(to)
 	switch {
 	case to == "":
@@ -112,27 +115,45 @@ func (c *waConnector) resolve(ctx context.Context, to string) (recipient, error)
 		if err != nil {
 			return recipient{}, connector.Invalid("invalid JID %q", to)
 		}
-		return c.byJID(ctx, j.ToNonAD())
+		return b.byJID(ctx, j.ToNonAD())
 	}
 	if digits, ok := phoneDigits(to); ok {
-		return c.byJID(ctx, types.NewJID(digits, types.DefaultUserServer))
+		return b.byJID(ctx, types.NewJID(digits, types.DefaultUserServer))
 	}
-	return c.byName(ctx, to)
+	return b.byName(ctx, to)
 }
 
-func (c *waConnector) byJID(ctx context.Context, j types.JID) (recipient, error) {
+func (b book) byJID(ctx context.Context, j types.JID) (recipient, error) {
 	switch j.Server {
 	case types.DefaultUserServer:
 		if d, ok := phoneDigits(j.User); !ok || d != j.User {
 			return recipient{}, connector.Invalid("invalid user JID %q", j.String())
 		}
-		name, err := c.addressBookName(ctx, j)
+		r := recipient{jid: j}
+		// The gateway refuses the send if the LID is hidden, so a person
+		// hidden by either ID stays unsendable.
+		lid, err := b.dev.LIDs.GetLIDForPN(ctx, j)
 		if err != nil {
+			return recipient{}, fmt.Errorf("look up lid: %w", err)
+		}
+		if !lid.IsEmpty() {
+			r.aliases = []string{lid.ToNonAD().String()}
+		}
+		if r.name, err = b.addressBookName(ctx, j, lid); err != nil {
 			return recipient{}, err
 		}
-		return recipient{jid: j, name: name}, nil
+		return r, nil
+	case types.HiddenUserServer:
+		pn, err := b.dev.LIDs.GetPNForLID(ctx, j)
+		if err != nil {
+			return recipient{}, fmt.Errorf("look up phone number: %w", err)
+		}
+		if pn.IsEmpty() {
+			return recipient{}, connector.Invalid("no phone number is known for %s; use a phone number or name", j.String())
+		}
+		return b.byJID(ctx, pn.ToNonAD())
 	case types.GroupServer:
-		groups, err := c.groups(ctx)
+		groups, err := b.groups(ctx)
 		if err != nil {
 			return recipient{}, err
 		}
@@ -143,7 +164,7 @@ func (c *waConnector) byJID(ctx context.Context, j types.JID) (recipient, error)
 		}
 		return recipient{}, connector.Invalid("unknown group %s", j.String())
 	}
-	return recipient{}, connector.Invalid("cannot send to %s: use a phone number, a name, or a …@s.whatsapp.net or …@g.us JID", j.String())
+	return recipient{}, connector.Invalid("cannot send to %s: use a phone number, a name, or a …@s.whatsapp.net, …@lid, or …@g.us JID", j.String())
 }
 
 // Push names are chosen by the sender and never identify a recipient.
@@ -155,30 +176,23 @@ func addressBookName(ci types.ContactInfo) string {
 }
 
 // Address-book entries may be keyed by phone number or by LID.
-func (c *waConnector) addressBookName(ctx context.Context, pn types.JID) (string, error) {
-	ci, err := c.dev.Contacts.GetContact(ctx, pn)
+func (b book) addressBookName(ctx context.Context, pn, lid types.JID) (string, error) {
+	ci, err := b.dev.Contacts.GetContact(ctx, pn)
 	if err != nil {
 		return "", fmt.Errorf("look up contact: %w", err)
 	}
-	if n := addressBookName(ci); n != "" {
+	if n := addressBookName(ci); n != "" || lid.IsEmpty() {
 		return n, nil
 	}
-	lid, err := c.dev.LIDs.GetLIDForPN(ctx, pn)
-	if err != nil {
-		return "", fmt.Errorf("look up lid: %w", err)
-	}
-	if lid.IsEmpty() {
-		return "", nil
-	}
-	ci, err = c.dev.Contacts.GetContact(ctx, lid)
+	ci, err = b.dev.Contacts.GetContact(ctx, lid)
 	if err != nil {
 		return "", fmt.Errorf("look up contact: %w", err)
 	}
 	return addressBookName(ci), nil
 }
 
-func (c *waConnector) groups(ctx context.Context) ([]recipient, error) {
-	rows, err := c.st.DB().QueryContext(ctx,
+func (b book) groups(ctx context.Context) ([]recipient, error) {
+	rows, err := b.st.DB().QueryContext(ctx,
 		`SELECT id, COALESCE(name, '') FROM containers WHERE is_group = 1`)
 	if err != nil {
 		return nil, fmt.Errorf("list groups: %w", err)
@@ -202,8 +216,8 @@ func (c *waConnector) groups(ctx context.Context) ([]recipient, error) {
 	return out, rows.Err()
 }
 
-func (c *waConnector) byName(ctx context.Context, name string) (recipient, error) {
-	contacts, err := c.dev.Contacts.GetAllContacts(ctx)
+func (b book) byName(ctx context.Context, name string) (recipient, error) {
+	contacts, err := b.dev.Contacts.GetAllContacts(ctx)
 	if err != nil {
 		return recipient{}, fmt.Errorf("list contacts: %w", err)
 	}
@@ -215,7 +229,7 @@ func (c *waConnector) byName(ctx context.Context, name string) (recipient, error
 		}
 		pn := j.ToNonAD()
 		if pn.Server == types.HiddenUserServer {
-			if pn, err = c.dev.LIDs.GetPNForLID(ctx, pn); err != nil {
+			if pn, err = b.dev.LIDs.GetPNForLID(ctx, pn); err != nil {
 				return recipient{}, fmt.Errorf("look up phone number: %w", err)
 			}
 			pn = pn.ToNonAD()
@@ -227,13 +241,13 @@ func (c *waConnector) byName(ctx context.Context, name string) (recipient, error
 	var matches []recipient
 	for pn := range people {
 		// Resolve as byJID does, so preparing the result again shows the same name.
-		r, err := c.byJID(ctx, pn)
+		r, err := b.byJID(ctx, pn)
 		if err != nil {
 			return recipient{}, err
 		}
 		matches = append(matches, r)
 	}
-	groups, err := c.groups(ctx)
+	groups, err := b.groups(ctx)
 	if err != nil {
 		return recipient{}, err
 	}
@@ -249,19 +263,16 @@ func (c *waConnector) byName(ctx context.Context, name string) (recipient, error
 	case 1:
 		return matches[0], nil
 	}
-	// Numbers are masked: the agent may not otherwise see these people, and
-	// it can find the JID of the one it means in the chats it can read.
-	candidates := make([]string, len(matches))
+	candidates := make([]connector.Candidate, len(matches))
 	for i, m := range matches {
-		if m.group {
-			candidates[i] = m.name + " (group)"
-		} else {
-			candidates[i] = m.name + " (" + formatPhone(m.jid.User, true) + ")"
-		}
+		candidates[i] = m.candidate()
 	}
-	slices.Sort(candidates)
-	return recipient{}, connector.Invalid("%q matches %d chats: %s; retry with the chat JID",
-		name, len(matches), strings.Join(candidates, ", "))
+	slices.SortFunc(candidates, func(a, b connector.Candidate) int { return cmp.Compare(a.Label, b.Label) })
+	return recipient{}, &connector.Error{
+		Status:     http.StatusBadRequest,
+		Message:    fmt.Sprintf("several chats match %q; retry with one of the candidates' IDs", name),
+		Candidates: candidates,
+	}
 }
 
 // Execute never retries: once SendMessage is called the message may have
@@ -272,31 +283,34 @@ func (c *waConnector) Execute(ctx context.Context, rec approval.Record) connecto
 		return connector.Result{Status: connector.Failed, Detail: "invalid recipient: " + err.Error()}
 	}
 	text := rec.Args["text"]
-	if !c.cli.IsConnected() || !c.cli.IsLoggedIn() {
+	cli, dev, _ := c.current()
+	if !cli.IsConnected() || !cli.IsLoggedIn() {
 		return connector.Result{Status: connector.Failed, Detail: "whatsapp is not connected"}
 	}
-	resp, err := c.cli.SendMessage(ctx, to, &waE2E.Message{Conversation: proto.String(text)})
+	resp, err := cli.SendMessage(ctx, to, &waE2E.Message{Conversation: proto.String(text)})
 	if err != nil {
 		return connector.Result{Status: connector.Unknown, Detail: err.Error()}
 	}
 	res := connector.Result{Status: connector.Done, Ref: resp.ID}
-	if err := c.record(ctx, to, text, resp); err != nil {
+	if err := (book{dev: dev, st: c.st}).record(ctx, to, text, resp); err != nil {
 		c.log.Error("store sent message", "id", resp.ID, "chat", to.String(), "err", err)
 		res.Detail = "sent, but not stored: " + err.Error()
 	}
 	return res
 }
 
-func (c *waConnector) record(ctx context.Context, to types.JID, text string, resp whatsmeow.SendResponse) error {
+func (b book) record(ctx context.Context, to types.JID, text string, resp whatsmeow.SendResponse) error {
 	ct := store.Container{ID: to.String(), Kind: kindFor(to), IsGroup: to.Server == types.GroupServer}
 	if !ct.IsGroup {
-		name, err := c.addressBookName(ctx, to)
+		lid, err := b.dev.LIDs.GetLIDForPN(ctx, to)
 		if err != nil {
+			return fmt.Errorf("look up lid: %w", err)
+		}
+		if ct.Name, err = b.addressBookName(ctx, to, lid); err != nil {
 			return err
 		}
-		ct.Name = name
 	}
-	if err := c.st.UpsertContainer(ctx, ct); err != nil {
+	if err := b.st.UpsertContainer(ctx, ct); err != nil {
 		return err
 	}
 	at := resp.Timestamp
@@ -306,15 +320,15 @@ func (c *waConnector) record(ctx context.Context, to types.JID, text string, res
 	msg := store.Message{
 		ID:          messageID(to, resp.ID),
 		ContainerID: to.String(),
-		SenderName:  c.dev.PushName,
+		SenderName:  b.dev.PushName,
 		SentAt:      at,
 		IsFromMe:    true,
 		Body:        text,
 	}
-	if own := c.dev.GetJID(); !own.IsEmpty() {
+	if own := b.dev.GetJID(); !own.IsEmpty() {
 		msg.SenderID = own.ToNonAD().String()
 	}
-	return c.st.UpsertMessage(ctx, msg)
+	return b.st.UpsertMessage(ctx, msg)
 }
 
 // phoneDigits accepts an E.164 number or bare digits including the country

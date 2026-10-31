@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,8 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waAdv"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	wastore "go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 
 	"github.com/adeci/mandate/internal/approval"
@@ -43,11 +46,14 @@ type sent struct {
 }
 
 type fakeClient struct {
-	mu        sync.Mutex
-	connected bool
-	loggedIn  bool
-	err       error
-	sent      []sent
+	mu          sync.Mutex
+	connected   bool
+	loggedIn    bool
+	err         error
+	sent        []sent
+	qrs         []chan whatsmeow.QRChannelItem
+	phones      []string
+	disconnects int
 }
 
 func (f *fakeClient) IsConnected() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.connected }
@@ -63,29 +69,108 @@ func (f *fakeClient) SendMessage(_ context.Context, to types.JID, msg *waE2E.Mes
 	return whatsmeow.SendResponse{ID: "3EB0AA", Timestamp: time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC)}, nil
 }
 
+// GetQRChannel opens a QR session whose first code is "qr-<session>-1".
+func (f *fakeClient) GetQRChannel(context.Context) (<-chan whatsmeow.QRChannelItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ch := make(chan whatsmeow.QRChannelItem, 8)
+	ch <- whatsmeow.QRChannelItem{Event: whatsmeow.QRChannelEventCode, Code: fmt.Sprintf("qr-%d-1", len(f.qrs)+1)}
+	f.qrs = append(f.qrs, ch)
+	return ch, nil
+}
+
+func (f *fakeClient) PairPhone(_ context.Context, phone string, _ bool, _ whatsmeow.PairClientType, _ string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.phones = append(f.phones, phone)
+	return "ABCD-EFGH", nil
+}
+
+func (f *fakeClient) ConnectContext(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.connected = true
+	return nil
+}
+
+func (f *fakeClient) Disconnect() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.connected = false
+	f.disconnects++
+}
+
 func (f *fakeClient) calls() []sent {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]sent(nil), f.sent...)
 }
 
-type fixture struct {
-	c   *waConnector
-	cli *fakeClient
-	st  *store.Store
+// qr emits item on the latest QR session; final items close it, as whatsmeow does.
+func (f *fakeClient) qr(item whatsmeow.QRChannelItem) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ch := f.qrs[len(f.qrs)-1]
+	ch <- item
+	if item.Event != whatsmeow.QRChannelEventCode {
+		close(ch)
+	}
 }
 
-// newFixture builds a connector over a real session database and data.db.
-// Every contact also has a push name, which must never be shown as identity.
-func newFixture(t *testing.T) *fixture {
+func (f *fakeClient) sessions() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.qrs)
+}
+
+type fixture struct {
+	c         *waConnector
+	cli       *fakeClient // the first client
+	st        *store.Store
+	container *sqlstore.Container
+
+	mu      sync.Mutex
+	clients []*fakeClient
+}
+
+// newBareFixture opens a real session database and data.db.
+func newBareFixture(t *testing.T) *fixture {
 	t.Helper()
-	ctx := context.Background()
 	dir := t.TempDir()
-	container, dev, err := openSession(ctx, filepath.Join(dir, "session.db"))
+	container, _, err := openSession(context.Background(), filepath.Join(dir, "session.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { container.Close() })
+	st, err := store.Open(context.Background(), filepath.Join(dir, "data.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return &fixture{st: st, container: container}
+}
+
+func (f *fixture) start(dev *wastore.Device) {
+	f.c = newConnector(context.Background(), f.st, slog.New(slog.NewTextHandler(io.Discard, nil)), dev, f.container.NewDevice,
+		func(*wastore.Device, func(any)) waClient {
+			cli := &fakeClient{}
+			f.mu.Lock()
+			f.clients = append(f.clients, cli)
+			f.mu.Unlock()
+			return cli
+		})
+	f.cli = f.client(0)
+}
+
+func (f *fixture) client(i int) *fakeClient {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.clients[i]
+}
+
+// pair stores dev as whatsmeow does on a successful pairing.
+func (f *fixture) pair(t *testing.T, dev *wastore.Device) {
+	t.Helper()
 	dev.ID = &owner
 	dev.PushName = "Owner"
 	// Placeholder pairing data, sized to satisfy the session schema.
@@ -94,9 +179,19 @@ func newFixture(t *testing.T) *fixture {
 		AccountSignatureKey: make([]byte, 32),
 		DeviceSignature:     make([]byte, 64),
 	}
-	if err := container.PutDevice(ctx, dev); err != nil {
+	if err := f.container.PutDevice(context.Background(), dev); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// newFixture builds a linked, connected connector with an address book.
+// Every contact also has a push name, which must never be shown as identity.
+func newFixture(t *testing.T) *fixture {
+	t.Helper()
+	ctx := context.Background()
+	f := newBareFixture(t)
+	dev := f.container.NewDevice()
+	f.pair(t, dev)
 	for _, c := range []struct {
 		jid         types.JID
 		first, full string
@@ -119,29 +214,19 @@ func newFixture(t *testing.T) *fixture {
 	if err := dev.LIDs.PutLIDMapping(ctx, samParkL, samPark); err != nil {
 		t.Fatal(err)
 	}
-
-	st, err := store.Open(ctx, filepath.Join(dir, "data.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
 	for _, g := range []store.Container{
 		{ID: climbing.String(), Kind: "group", IsGroup: true, Name: "Climbing crew"},
 		{ID: samGroup.String(), Kind: "group", IsGroup: true, Name: "Sam"},
 		// DM containers can carry push names; they must not resolve names.
 		{ID: stranger.String(), Kind: "dm", Name: "Mom"},
 	} {
-		if err := st.UpsertContainer(ctx, g); err != nil {
+		if err := f.st.UpsertContainer(ctx, g); err != nil {
 			t.Fatal(err)
 		}
 	}
-
-	cli := &fakeClient{connected: true, loggedIn: true}
-	return &fixture{
-		c:   newConnector(cli, dev, st, slog.New(slog.NewTextHandler(io.Discard, nil))),
-		cli: cli,
-		st:  st,
-	}
+	f.start(dev)
+	f.cli.connected, f.cli.loggedIn = true, true
+	return f
 }
 
 func invalid(err error) bool {
@@ -153,11 +238,12 @@ func TestPrepareResolvesRecipient(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	tests := []struct {
-		name    string
-		to      string
-		wantTo  types.JID
-		want    approval.Field
-		wantErr string
+		name        string
+		to          string
+		wantTo      types.JID
+		wantAliases []string
+		want        approval.Field
+		wantErr     string
 	}{
 		{
 			name: "user JID", to: "15551234567@s.whatsapp.net", wantTo: farid,
@@ -188,7 +274,15 @@ func TestPrepareResolvesRecipient(t *testing.T) {
 			want: approval.Field{Label: "To", Value: "Farid Haddad (+1 555 123 4567)"},
 		},
 		{
-			name: "contact listed under its LID", to: "Sam Park", wantTo: samPark,
+			name: "contact listed under its LID", to: "Sam Park", wantTo: samPark, wantAliases: []string{samParkL.String()},
+			want: approval.Field{Label: "To", Value: "Sam Park (+44 770 090 0123)"},
+		},
+		{
+			name: "number with a LID", to: "+44 7700 900123", wantTo: samPark, wantAliases: []string{samParkL.String()},
+			want: approval.Field{Label: "To", Value: "Sam Park (+44 770 090 0123)"},
+		},
+		{
+			name: "LID JID", to: samParkL.String(), wantTo: samPark, wantAliases: []string{samParkL.String()},
 			want: approval.Field{Label: "To", Value: "Sam Park (+44 770 090 0123)"},
 		},
 		{
@@ -200,14 +294,10 @@ func TestPrepareResolvesRecipient(t *testing.T) {
 			want: approval.Field{Label: "Group", Value: "Climbing crew"},
 		},
 
-		{
-			name: "ambiguous name", to: "sam",
-			wantErr: `"sam" matches 3 chats: Sam (group), Sam Lee (+1 ••• ••• 1111), Sam Park (+44 ••• ••• 0123); retry with the chat JID`,
-		},
 		{name: "unknown name", to: "Nobody", wantErr: `no address-book contact or group is named "Nobody"`},
 		{name: "push name", to: "Mom", wantErr: `no address-book contact or group is named "Mom"`},
 		{name: "unknown group", to: "120363000000000999@g.us", wantErr: "unknown group"},
-		{name: "LID JID", to: samParkL.String(), wantErr: "cannot send to"},
+		{name: "LID without a known number", to: "999888777@lid", wantErr: "no phone number is known"},
 		{name: "malformed user JID", to: "+15551234567@s.whatsapp.net", wantErr: "invalid user JID"},
 		{name: "empty", to: " ", wantErr: "to is required"},
 	}
@@ -228,6 +318,7 @@ func TestPrepareResolvesRecipient(t *testing.T) {
 				Args:      map[string]string{"to": tt.wantTo.String(), "text": "on my way"},
 				Display:   []approval.Field{tt.want, {Label: "Text", Value: "on my way", Param: "text"}},
 				Container: tt.wantTo.String(),
+				Aliases:   tt.wantAliases,
 			}
 			if !reflect.DeepEqual(p, want) {
 				t.Fatalf("prepared\n got %+v\nwant %+v", p, want)
@@ -237,6 +328,31 @@ func TestPrepareResolvesRecipient(t *testing.T) {
 				t.Fatalf("not idempotent: %+v %v", again, err)
 			}
 		})
+	}
+}
+
+// The gateway drops hidden candidates before the agent sees them, so the
+// message itself must not name anyone.
+func TestAmbiguousNameCandidates(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	_, err := f.c.Prepare(context.Background(), "send", map[string]string{"to": "sam", "text": "hi"})
+	var e *connector.Error
+	if !errors.As(err, &e) || e.Status != http.StatusBadRequest {
+		t.Fatalf("err = %v, want a 400 connector.Error", err)
+	}
+	want := []connector.Candidate{
+		{ID: samGroup.String(), Label: "Sam (group)"},
+		{ID: samLee.String(), Label: "Sam Lee (+1 ••• ••• 1111)"},
+		{ID: samPark.String(), Aliases: []string{samParkL.String()}, Label: "Sam Park (+44 ••• ••• 0123)"},
+	}
+	if !reflect.DeepEqual(e.Candidates, want) {
+		t.Fatalf("candidates\n got %+v\nwant %+v", e.Candidates, want)
+	}
+	for _, leak := range []string{"Lee", "Park", "1111", "0123", "@"} {
+		if strings.Contains(e.Message, leak) {
+			t.Errorf("message %q names a candidate (%q)", e.Message, leak)
+		}
 	}
 }
 

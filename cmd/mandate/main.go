@@ -37,7 +37,7 @@ for agents (set MANDATE_URL and MANDATE_TOKEN):
 
 on the host:
   gateway                 serve the gateway
-  whatsapp run|pair       WhatsApp linked device
+  whatsapp run            WhatsApp linked device, linked from the console
   discord serve           Discord reader behind the gateway
   http-proxy              token-holding proxy for HTTP APIs
   approvals               serve the approval pages and proposal API
