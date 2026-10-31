@@ -94,6 +94,35 @@ Exit codes: 0 done, 75 not yet (pending, or Discord resting), 1 no
 (rejected, failed, or `unknown`, which may have gone out and is never
 retried), 2 usage.
 
+## Connectors
+
+Everything that holds a credential is a connector: its own program, serving
+the protocol in package `connector` on a Unix socket. WhatsApp, Discord and
+the HTTP API proxy live in `connectors/`, each its own Go module; yours can
+live anywhere. A connector is a `connector.Main` call:
+
+```go
+func main() {
+	connector.Main(func(ctx context.Context, env *connector.Env, cfg Config) (connector.Connector, error) {
+		token, err := env.Credential("token")
+		...
+	})
+}
+```
+
+```
+mandate-NAME --socket PATH --state DIR [--config FILE]
+             [--approvers FILE --rp-id ID --origin URL]
+mandate-NAME --check-config FILE
+```
+
+`--config` is JSON decoded strictly into `Config`, then checked by its
+`Validate` method if it has one; `--check-config` does only that. Credentials
+are files in `$CREDENTIALS_DIRECTORY`. Secrets belong in `DIR/private`; a
+connector that stores messages writes them to `DIR/data.db` with package
+`store`, and the gateway serves that as its views. Without approvers every
+write is refused.
+
 ## Caveats
 
 Reading Discord with a user token is against Discord's terms. mandate reads

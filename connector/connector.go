@@ -59,7 +59,7 @@ type Param struct {
 	Required bool   `json:"required,omitempty"`
 	// Editable params can be changed by the owner on the approval page.
 	Editable bool `json:"editable,omitempty"`
-	// Container params name a chat/channel/guild; the gateway refuses the op
+	// Container params name a container (chat, channel, ...); the gateway refuses the op
 	// before it reaches the connector if that container is hidden.
 	Container bool `json:"container,omitempty"`
 }
@@ -80,8 +80,8 @@ type Prepared struct {
 	Args      map[string]string `json:"args"`
 	Display   []approval.Field  `json:"display"`
 	Container string            `json:"container,omitempty"`
-	// Aliases are other IDs of the same container, e.g. a WhatsApp contact's
-	// LID; the write is refused if any of them is hidden.
+	// Aliases are other IDs of the same container, e.g. a contact known by
+	// two addresses; the write is refused if any of them is hidden.
 	Aliases []string `json:"aliases,omitempty"`
 }
 
@@ -135,7 +135,7 @@ type HealthState string
 
 const (
 	Healthy HealthState = "ok"
-	// NeedsSetup means the owner must act in the console, e.g. link WhatsApp.
+	// NeedsSetup means the owner must act in the console, e.g. link an account.
 	NeedsSetup HealthState = "setup"
 	// Resting means reads are refused for pacing until Health.Until.
 	Resting HealthState = "resting"

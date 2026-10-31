@@ -615,6 +615,50 @@ func TestSchemaListsReachableConnectors(t *testing.T) {
 	}
 }
 
+func TestOtherProtocolIsDownAndRefused(t *testing.T) {
+	t.Parallel()
+	var called atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /spec", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, connector.Spec{Protocol: 2, Name: "next", Ops: []connector.Op{
+			{Name: "fetch", Kind: connector.Read}, {Name: "send", Kind: connector.Write},
+		}})
+	})
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, connector.Health{State: connector.Healthy})
+	})
+	mux.HandleFunc("POST /", func(w http.ResponseWriter, _ *http.Request) {
+		called.Add(1)
+		writeJSON(w, http.StatusOK, map[string]any{})
+	})
+	r := newRig(t, func(c *Config) { c.Connectors["next"] = serveUnix(t, "next", mux) })
+
+	const want = "speaks protocol 2, this mandate speaks 1"
+	rec := call(r.h, http.MethodGet, "/v1/schema", "")
+	var s struct {
+		Connectors []connectorInfo `json:"connectors"`
+	}
+	mustDo(t, json.Unmarshal(rec.Body.Bytes(), &s))
+	if len(s.Connectors) != 2 || s.Connectors[1].Name != "next" || len(s.Connectors[1].Ops) != 0 ||
+		s.Connectors[1].Health != (connector.Health{State: connector.Broken, Detail: want}) {
+		t.Fatalf("connectors = %+v, want next listed down", s.Connectors)
+	}
+	for name, rec := range map[string]*httptest.ResponseRecorder{
+		"read":    call(r.h, http.MethodPost, "/v1/read/next/fetch", `{"args":{}}`),
+		"propose": call(r.h, http.MethodPost, "/v1/actions", `{"connector":"next","op":"send","args":{}}`),
+	} {
+		if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "connector next "+want) {
+			t.Errorf("%s: %d %s", name, rec.Code, rec.Body)
+		}
+	}
+	if n := called.Load(); n != 0 {
+		t.Errorf("connector speaking another protocol was called %d times", n)
+	}
+	if n := r.console.calls.Load(); n != 0 {
+		t.Errorf("console called %d times", n)
+	}
+}
+
 // fakeHTTP is shaped like the HTTP proxy connector: it has no data source.
 type fakeHTTP struct {
 	calls     atomic.Int32

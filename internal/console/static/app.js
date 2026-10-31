@@ -178,7 +178,7 @@ function linkConnection(panel, args) {
   const step = async () => {
     if (stopped) return;
     try {
-      const s = await call("POST", `/connections/${name}/setup`, args);
+      const s = await call("POST", `/connections/${name}/setup`, { args });
       if (s.done) return finish();
       box.hidden = false;
       qr.hidden = !s.qr_svg;
@@ -199,7 +199,7 @@ function linkConnection(panel, args) {
     }
     setTimeout(step, POLL_MS);
   };
-  for (const el of $$("[data-link], [data-pair]", panel)) el.hidden = true;
+  for (const el of $$("[data-link], [data-setup]", panel)) el.hidden = true;
   return step();
 }
 
@@ -252,8 +252,9 @@ document.addEventListener("DOMContentLoaded", () => {
   for (const panel of $$("[data-connection]")) {
     const link = $("[data-link]", panel);
     if (link) link.addEventListener("click", busy(link, () => linkConnection(panel, {})));
-    const pair = $("[data-pair]", panel);
-    if (pair) pair.addEventListener("submit", busy(pair, () => linkConnection(panel, { phone: pair.elements.phone.value })));
+    for (const form of $$("[data-setup]", panel)) {
+      form.addEventListener("submit", busy(form, () => linkConnection(panel, Object.fromEntries(new FormData(form)))));
+    }
   }
 
   for (const button of $$("[data-copy]")) {

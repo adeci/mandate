@@ -42,7 +42,7 @@ func New(extraSender, extraBody []string) (*Classifier, error) {
 	return c, nil
 }
 
-// source is the gateway source name ("whatsapp", "discord").
+// source is the gateway source name.
 func (c *Classifier) IsAuth(source, sender, body string) bool {
 	for _, re := range c.extraSender {
 		if re.MatchString(sender) {

@@ -33,10 +33,28 @@ func Dial(path string, timeout time.Duration) *Client {
 	}}
 }
 
+// Spec fails with a *ProtocolError for a connector that speaks another
+// protocol version, since nothing else it says can be trusted to mean the
+// same.
 func (c *Client) Spec(ctx context.Context) (Spec, error) {
 	var s Spec
-	err := c.Do(ctx, http.MethodGet, "/spec", nil, &s)
-	return s, err
+	if err := c.Do(ctx, http.MethodGet, "/spec", nil, &s); err != nil {
+		return Spec{}, err
+	}
+	if s.Protocol != ProtocolVersion {
+		return Spec{}, &ProtocolError{Protocol: s.Protocol}
+	}
+	return s, nil
+}
+
+// ProtocolError is a connector speaking a protocol version other than
+// ProtocolVersion.
+type ProtocolError struct {
+	Protocol int
+}
+
+func (e *ProtocolError) Error() string {
+	return fmt.Sprintf("speaks protocol %d, this mandate speaks %d", e.Protocol, ProtocolVersion)
 }
 
 func (c *Client) Health(ctx context.Context) (Health, error) {

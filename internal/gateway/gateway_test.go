@@ -230,6 +230,44 @@ SELECT c.name, count(*) FROM recent r JOIN whatsapp_containers c ON c.id = r.con
 	}
 }
 
+// A connector's data.db appears when it first stores something; until then
+// its source has no views and the gateway serves the others.
+func TestSourceAppearsOnceItsDatabaseExists(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "late", "data.db")
+	h := newHandler(Config{
+		Sources:      map[string]string{"late": path},
+		ExposureFile: filepath.Join(dir, "exposure.toml"),
+		MaxRows:      100, Timeout: 2 * time.Second,
+	}, testToken)
+
+	rec := call(h, http.MethodGet, "/v1/schema", "")
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "late_") {
+		t.Fatalf("schema before the database exists: %d %s", rec.Code, rec.Body)
+	}
+	if rec := call(h, http.MethodPost, "/v1/query", `{"sql":"SELECT 1"}`); rec.Code != http.StatusOK {
+		t.Fatalf("query before the database exists: %d %s", rec.Code, rec.Body)
+	}
+	if rec := call(h, http.MethodPost, "/v1/query", `{"sql":"SELECT * FROM late_messages"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("view before the database exists: %d %s", rec.Code, rec.Body)
+	}
+
+	mustDo(t, os.Mkdir(filepath.Dir(path), 0o750))
+	st, err := store.Open(context.Background(), path)
+	mustDo(t, err)
+	mustDo(t, st.UpsertContainer(context.Background(), store.Container{ID: "c1", Kind: "dm", Name: "Ann"}))
+	mustDo(t, st.UpsertMessage(context.Background(), store.Message{ID: "m1", ContainerID: "c1", SenderID: "u1", Body: "hi", SentAt: time.Now()}))
+	mustDo(t, st.Close())
+
+	if rec := call(h, http.MethodGet, "/v1/schema", ""); !strings.Contains(rec.Body.String(), `"late_messages"`) {
+		t.Fatalf("schema after the database exists: %d %s", rec.Code, rec.Body)
+	}
+	rec = call(h, http.MethodPost, "/v1/query", `{"sql":"SELECT body FROM late_messages"}`)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"hi"`) {
+		t.Fatalf("query after the database exists: %d %s", rec.Code, rec.Body)
+	}
+}
+
 func TestParseExposureStrict(t *testing.T) {
 	sources := []string{"discord", "whatsapp"}
 	for name, conf := range map[string]string{

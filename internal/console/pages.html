@@ -211,15 +211,19 @@
   {{end}}
   {{if eq .Health.State "setup"}}
   <div class="actions">
-    <button type="button" class="primary" data-link>Link by QR</button>
+    <button type="button" class="primary" data-link>Link</button>
   </div>
-  <form class="pair" data-pair>
-    <label for="phone-{{.Name}}">or get a pairing code for</label>
+  {{$conn := .Name}}
+  {{range .Setup}}
+  <form class="setup" data-setup>
+    <label for="setup-{{$conn}}-{{.Name}}">or link with {{.Name}}</label>
     <div class="row">
-      <input id="phone-{{.Name}}" name="phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="+1 555 0100" required>
-      <button type="submit">Pairing code</button>
+      <input id="setup-{{$conn}}-{{.Name}}" name="{{.Name}}" required autocomplete="off">
+      <button type="submit">Link</button>
     </div>
+    {{with .Doc}}<p class="hint">{{.}}</p>{{end}}
   </form>
+  {{end}}
   <div class="linking" hidden>
     <ol class="steps">
       <li data-state="done">open the app</li>

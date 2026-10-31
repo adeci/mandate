@@ -32,7 +32,8 @@ const (
 
 var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
 
-// fake sends "messages" to a fixed contact book and links like WhatsApp.
+// fake sends "messages" to a fixed contact book. Linking shows a QR code, or
+// a code to type with the optional "account" setup input.
 type fake struct {
 	mu       sync.Mutex
 	executed []approval.Record
@@ -53,7 +54,7 @@ func (f *fake) Spec() connector.Spec {
 			{Name: "text", Required: true, Editable: true},
 		}},
 		{Name: "fetch", Kind: connector.Read},
-	}}
+	}, Setup: []connector.Param{{Name: "account", Doc: "link by typing a code for this account"}}}
 }
 
 func (f *fake) Prepare(_ context.Context, _ string, args map[string]string) (connector.Prepared, error) {
@@ -115,8 +116,8 @@ func (f *fake) Setup(_ context.Context, args map[string]string) (connector.Setup
 		f.linked = true
 		return connector.SetupStep{Done: true}, nil
 	}
-	if phone := args["phone"]; phone != "" {
-		return connector.SetupStep{Code: "K7QF-2M9X", Instructions: "type it on " + phone}, nil
+	if account := args["account"]; account != "" {
+		return connector.SetupStep{Code: "K7QF-2M9X", Instructions: "type it on " + account}, nil
 	}
 	return connector.SetupStep{QR: "2@ref" + strings.Repeat("x", f.setupCalls), Instructions: "scan it"}, nil
 }
@@ -180,6 +181,13 @@ func serveSocket(t *testing.T, path string, h http.Handler) func() {
 // start runs a console with one pinned passkey and logs it in.
 func start(t *testing.T) *harness {
 	t.Helper()
+	return startWith(t, nil)
+}
+
+// startWith lets edit add connectors with sockets in dir before the console
+// starts.
+func startWith(t *testing.T, edit func(cfg *Config, dir string)) *harness {
+	t.Helper()
 	sockets := shortDir(t)
 	key := approvaltest.New(t, rpID, origin)
 	verifier := &approval.Verifier{RPID: rpID, Origin: origin, Approvers: []approval.Approver{key.Approver("phone")}}
@@ -202,6 +210,9 @@ func start(t *testing.T) *harness {
 		StateDir:   t.TempDir(),
 		Log:        discard,
 		Now:        clk.now,
+	}
+	if edit != nil {
+		edit(&cfg, sockets)
 	}
 	srv, err := New(context.Background(), cfg)
 	if err != nil {

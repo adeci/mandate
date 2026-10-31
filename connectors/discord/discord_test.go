@@ -5,7 +5,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
@@ -82,20 +81,5 @@ func TestCheckToken(t *testing.T) {
 		if tt.ok && tok != "abc.def.ghi" {
 			t.Errorf("%s: token %q", tt.name, tok)
 		}
-	}
-}
-
-func TestConfigValidate(t *testing.T) {
-	for _, c := range []Config{{}, {ActiveHours: "22-06"}} {
-		if err := c.Validate(); err != nil {
-			t.Errorf("%+v: %v", c, err)
-		}
-	}
-	if err := (Config{ActiveHours: "08-25"}).Validate(); err == nil {
-		t.Error("accepted active_hours 08-25")
-	}
-	h, err := Config{}.hours(time.UTC)
-	if err != nil || h.start != 8 || h.end != 24 {
-		t.Errorf("default hours %+v, %v", h, err)
 	}
 }

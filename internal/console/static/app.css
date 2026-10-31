@@ -199,8 +199,8 @@ button.danger { border: calc(var(--bw) * 3) double var(--fg); font-weight: var(-
 .qr-box svg { width: 100%; height: auto; display: block; }
 .code { font-size: 2rem; line-height: calc(var(--lh) * 2); font-weight: var(--w-bold);
   background: var(--fg); color: var(--bg); padding: 0 1ch; display: inline-block; user-select: all; }
-.pair { margin-bottom: var(--lh); }
-.pair label { font-weight: var(--w-normal); color: var(--fg-alt); }
+.setup { margin-bottom: var(--lh); }
+.setup label { font-weight: var(--w-normal); color: var(--fg-alt); }
 @media (min-width: 800px) {
   .cols > .panel.danger { grid-column: 1 / -1; }
   .linking { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 0 3ch; align-items: start; }

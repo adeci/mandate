@@ -2,6 +2,7 @@ package console
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -22,16 +23,33 @@ const (
 type connView struct {
 	Name   string
 	Health connector.Health
+	// Setup are the inputs the connector takes when linking.
+	Setup []connector.Param
 }
 
-func (s *Server) health(ctx context.Context, c *conn) connector.Health {
+// view asks for the spec first: a connector speaking another protocol is
+// down whatever its health says.
+func (s *Server) view(ctx context.Context, c *conn) connView {
 	ctx, cancel := context.WithTimeout(ctx, healthTimeout)
 	defer cancel()
-	h, err := c.client.Health(ctx)
+	v := connView{Name: c.name}
+	spec, err := c.getSpec(ctx, s.now())
 	if err != nil {
-		return connector.Health{State: connector.Broken, Detail: err.Error()}
+		v.Health = connector.Health{State: connector.Broken, Detail: specProblem(err)}
+		return v
 	}
-	return h
+	v.Setup = spec.Setup
+	if v.Health, err = c.client.Health(ctx); err != nil {
+		v.Health = connector.Health{State: connector.Broken, Detail: err.Error()}
+	}
+	return v
+}
+
+func specProblem(err error) string {
+	if pe, ok := errors.AsType[*connector.ProtocolError](err); ok {
+		return pe.Error()
+	}
+	return err.Error()
 }
 
 func (s *Server) connections(ctx context.Context) []connView {
@@ -42,9 +60,9 @@ func (s *Server) connections(ctx context.Context) []connView {
 	)
 	for _, c := range s.conns {
 		wg.Go(func() {
-			h := s.health(ctx, c)
+			v := s.view(ctx, c)
 			mu.Lock()
-			out = append(out, connView{Name: c.name, Health: h})
+			out = append(out, v)
 			mu.Unlock()
 		})
 	}
@@ -59,12 +77,13 @@ func (s *Server) connectionHealth(w http.ResponseWriter, r *http.Request, _ sess
 		writeErr(w, &connector.Error{Status: http.StatusNotFound, Message: "no such connection"})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.health(r.Context(), c))
+	writeJSON(w, http.StatusOK, s.view(r.Context(), c).Health)
 }
 
+// setupRequest carries the connector's declared setup inputs; empty ones
+// count as not given.
 type setupRequest struct {
-	// Phone asks for a pairing code for this number instead of a QR code.
-	Phone string `json:"phone,omitempty"`
+	Args map[string]string `json:"args,omitempty"`
 }
 
 type setupView struct {
@@ -84,12 +103,27 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request, _ session) {
 	if !decode(w, r, &req) {
 		return
 	}
-	args := map[string]string{}
-	if req.Phone != "" {
-		args["phone"] = req.Phone
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), setupTimeout)
 	defer cancel()
+	spec, err := c.getSpec(ctx, s.now())
+	if pe, ok := errors.AsType[*connector.ProtocolError](err); ok {
+		writeErr(w, &connector.Error{Status: http.StatusBadGateway, Message: c.name + " " + pe.Error()})
+		return
+	}
+	if err != nil {
+		writeErr(w, upstream(err))
+		return
+	}
+	args := map[string]string{}
+	for k, v := range req.Args {
+		if !slices.ContainsFunc(spec.Setup, func(p connector.Param) bool { return p.Name == k }) {
+			writeErr(w, &connector.Error{Status: http.StatusBadRequest, Message: fmt.Sprintf("%s takes no setup input %q", c.name, k)})
+			return
+		}
+		if v != "" {
+			args[k] = v
+		}
+	}
 	step, err := c.client.Setup(ctx, args)
 	if err != nil {
 		writeErr(w, upstream(err))

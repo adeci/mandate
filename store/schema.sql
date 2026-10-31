@@ -1,8 +1,8 @@
 -- Source schema shared by every ingester. Also loaded by the NixOS VM test.
 CREATE TABLE IF NOT EXISTS containers (
     id                TEXT PRIMARY KEY,
-    kind              TEXT NOT NULL,   -- dm, group, guild, channel, thread
-    parent_id         TEXT,            -- discord: channel/thread -> guild
+    kind              TEXT NOT NULL,   -- dm, group, channel, thread, ...
+    parent_id         TEXT,            -- the enclosing container
     name              TEXT,
     is_group          INTEGER NOT NULL DEFAULT 0,
     participants_json TEXT NOT NULL DEFAULT '[]',

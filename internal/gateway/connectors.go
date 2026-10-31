@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	// readTimeout bounds a connector read. Paced reads (Discord) wait up to
+	// readTimeout bounds a connector read. Paced reads may wait up to
 	// 90 s for a slot before answering 429.
 	readTimeout = 120 * time.Second
 	callTimeout = 30 * time.Second
@@ -106,6 +106,13 @@ func (c *connectors) list(ctx context.Context) []connectorInfo {
 	out := []connectorInfo{}
 	for _, name := range slices.Sorted(maps.Keys(c.calls)) {
 		s, err := c.spec(ctx, name)
+		if pe, ok := errors.AsType[*connector.ProtocolError](err); ok {
+			out = append(out, connectorInfo{
+				Spec:   connector.Spec{Name: name, Ops: []connector.Op{}},
+				Health: connector.Health{State: connector.Broken, Detail: pe.Error()},
+			})
+			continue
+		}
 		if err != nil {
 			slog.Warn("connector spec", "connector", name, "err", err)
 			continue
@@ -130,6 +137,10 @@ func (h *handler) lookup(w http.ResponseWriter, r *http.Request, name, opName st
 		return connector.Op{}, false
 	}
 	spec, err := h.connectors.spec(r.Context(), name)
+	if pe, ok := errors.AsType[*connector.ProtocolError](err); ok {
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("connector %s %s; tell the owner", name, pe))
+		return connector.Op{}, false
+	}
 	if err != nil {
 		slog.Error("connector spec", "connector", name, "err", err)
 		writeError(w, http.StatusServiceUnavailable, unavailable("connector "+name))
@@ -430,7 +441,7 @@ func (h *handler) propose(w http.ResponseWriter, r *http.Request) {
 
 // hidden mirrors the containers view's filter (the id or its parent is
 // hidden) against the hide lists directly: a write may target a chat with no
-// stored row yet, such as a new WhatsApp contact. A DM's container is the
+// stored row yet, such as a new contact. A DM's container is the
 // other person, so hidden senders count as hidden targets too. ids are one
 // container's IDs; any of them being hidden hides it.
 func (h *handler) hidden(source string, ids []string) (bool, error) {

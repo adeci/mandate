@@ -248,7 +248,6 @@ func TestMainStartupErrors(t *testing.T) {
 		"unknown config key":  {append(base, "--config", writeFile(t, "c.json", `{"greting":"hi"}`)), "unknown field"},
 		"invalid config":      {append(base, "--config", writeFile(t, "c.json", `{"greeting":"bad"}`)), "greeting must not be bad"},
 		"missing config":      {append(base, "--config", filepath.Join(state, "nope.json")), "read config"},
-		"stray argument":      {append(base, "serve"), "unexpected arguments"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

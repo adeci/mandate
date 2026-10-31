@@ -18,7 +18,7 @@ import (
 )
 
 var viewDocs = map[string]string{
-	"containers": "Chats, or guilds/channels/threads/DMs. kind: dm, group, guild, channel, thread. parent_id links channels and threads to their guild.",
+	"containers": "Containers messages live in. kind: dm, group, channel, thread, or another the connector documents. parent_id is the enclosing container, e.g. a thread's channel.",
 	"messages":   "Messages. seq grows in the order messages are stored, not sent: poll with seq > :cursor for new ones, ORDER BY sent_at for chronology. Times are UTC ISO-8601 text. body is NULL and is_auth = 1 for messages that carry login codes or links.",
 }
 

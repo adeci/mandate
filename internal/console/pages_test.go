@@ -1,10 +1,16 @@
 package console
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/adeci/mandate/connector"
+	"github.com/adeci/mandate/internal/proposal"
 )
 
 func TestVisible(t *testing.T) {
@@ -130,13 +136,18 @@ func TestSecurityHeaders(t *testing.T) {
 func TestSetupFlow(t *testing.T) {
 	h := start(t)
 	_, body := h.page(t, "/connections")
-	if !strings.Contains(body, `data-connection="fake"`) || !strings.Contains(body, "not linked") || !strings.Contains(body, "data-link") {
-		t.Fatalf("connections page:\n%s", body)
+	for _, want := range []string{
+		`data-connection="fake"`, "not linked", "data-link",
+		`<input id="setup-fake-account" name="account"`, "link by typing a code for this account",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("connections page lacks %q:\n%s", want, body)
+		}
 	}
 
-	setup := func(req setupRequest) (int, setupView) {
+	setup := func(args map[string]string) (int, setupView) {
 		t.Helper()
-		status, body := h.post(t, "/connections/fake/setup", req)
+		status, body := h.post(t, "/connections/fake/setup", setupRequest{Args: args})
 		var v setupView
 		if status == http.StatusOK {
 			if err := json.Unmarshal(body, &v); err != nil {
@@ -145,20 +156,24 @@ func TestSetupFlow(t *testing.T) {
 		}
 		return status, v
 	}
-	status, first := setup(setupRequest{})
+	// An empty input counts as not given.
+	status, first := setup(map[string]string{"account": ""})
 	if status != http.StatusOK || !strings.HasPrefix(first.QR, "<svg") || !strings.Contains(first.QR, `<path fill="#000" d="M`) ||
 		first.Instructions != "scan it" || first.Done {
 		t.Fatalf("setup = %d %+v", status, first)
 	}
+	if status, _ := setup(map[string]string{"phone": "+15550100"}); status != http.StatusBadRequest {
+		t.Fatalf("setup with an undeclared input = %d, want 400", status)
+	}
 	// Polls get the rotated code.
-	status, code := setup(setupRequest{Phone: "+15550100"})
+	status, code := setup(map[string]string{"account": "+15550100"})
 	if status != http.StatusOK || code.Code != "K7QF-2M9X" || code.QR != "" || code.Instructions != "type it on +15550100" {
 		t.Fatalf("pairing = %d %+v", status, code)
 	}
-	if _, done := setup(setupRequest{}); !done.Done {
+	if _, done := setup(nil); !done.Done {
 		t.Fatalf("third poll = %+v, want done", done)
 	}
-	if status, _ := setup(setupRequest{}); status != http.StatusConflict {
+	if status, _ := setup(nil); status != http.StatusConflict {
 		t.Fatalf("setup when linked = %d, want the connector's 409", status)
 	}
 	status, raw := h.call(t, "GET", "/connections/fake/health", h.session, nil)
@@ -169,7 +184,51 @@ func TestSetupFlow(t *testing.T) {
 		t.Fatalf("setup unknown = %d", status)
 	}
 	if status, _ := h.post(t, "/connections/fake/setup", map[string]string{"code": "x"}); status != http.StatusBadRequest {
-		t.Fatalf("setup with unknown arg = %d, want 400", status)
+		t.Fatalf("setup with unknown field = %d, want 400", status)
+	}
+}
+
+func TestOtherProtocolIsDown(t *testing.T) {
+	var called atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /spec", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, connector.Spec{
+			Protocol: 2, Name: "next", Ops: []connector.Op{{Name: "send", Kind: connector.Write}},
+			Setup: []connector.Param{{Name: "account"}},
+		})
+	})
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, connector.Health{State: connector.NeedsSetup})
+	})
+	mux.HandleFunc("POST /", func(w http.ResponseWriter, _ *http.Request) {
+		called.Add(1)
+		writeJSON(w, http.StatusOK, map[string]any{})
+	})
+	h := startWith(t, func(cfg *Config, dir string) {
+		sock := filepath.Join(dir, "next.sock")
+		serveSocket(t, sock, mux)
+		cfg.Connectors["next"] = sock
+	})
+
+	const want = "speaks protocol 2, this mandate speaks 1"
+	status, raw := h.call(t, "GET", "/connections/next/health", h.session, nil)
+	var hl connector.Health
+	if err := json.Unmarshal(raw, &hl); err != nil || status != http.StatusOK || hl != (connector.Health{State: connector.Broken, Detail: want}) {
+		t.Fatalf("health = %d %s", status, raw)
+	}
+	_, body := h.page(t, "/connections")
+	if !strings.Contains(body, want) || strings.Contains(body, "setup-next-") {
+		t.Fatalf("connections page:\n%s", body)
+	}
+	status, raw = h.post(t, "/connections/next/setup", setupRequest{Args: map[string]string{"account": "x"}})
+	if status != http.StatusBadGateway || !strings.Contains(string(raw), "next "+want) {
+		t.Fatalf("setup = %d %s", status, raw)
+	}
+	if _, err := h.api.Submit(context.Background(), proposal.Request{Connector: "next", Op: "send"}); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("submit: %v", err)
+	}
+	if n := called.Load(); n != 0 {
+		t.Fatalf("connector speaking another protocol was called %d times", n)
 	}
 }
 

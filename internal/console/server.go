@@ -134,21 +134,31 @@ func (s *Server) Sweep(ctx context.Context, interval time.Duration) {
 
 func (s *Server) url(id string) string { return s.cfg.Origin + "/r/" + id }
 
-func (c *conn) op(ctx context.Context, name string, now time.Time) (connector.Op, error) {
+// getSpec fetches the spec at most every specTTL. A connector answering
+// under another name or protocol is refused and not cached.
+func (c *conn) getSpec(ctx context.Context, now time.Time) (connector.Spec, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.fetched.IsZero() || now.Sub(c.fetched) > specTTL {
 		spec, err := c.client.Spec(ctx)
 		if err != nil {
-			return connector.Op{}, fmt.Errorf("fetch %s spec: %w", c.name, err)
+			return connector.Spec{}, fmt.Errorf("fetch %s spec: %w", c.name, err)
 		}
 		// Connectors check the record's connector against their own name.
 		if spec.Name != c.name {
-			return connector.Op{}, fmt.Errorf("connector configured as %q calls itself %q", c.name, spec.Name)
+			return connector.Spec{}, fmt.Errorf("connector configured as %q calls itself %q", c.name, spec.Name)
 		}
 		c.spec, c.fetched = spec, now
 	}
-	op, ok := c.spec.Op(name)
+	return c.spec, nil
+}
+
+func (c *conn) op(ctx context.Context, name string, now time.Time) (connector.Op, error) {
+	spec, err := c.getSpec(ctx, now)
+	if err != nil {
+		return connector.Op{}, err
+	}
+	op, ok := spec.Op(name)
 	if !ok || op.Kind != connector.Write {
 		return connector.Op{}, &connector.Error{Status: http.StatusNotFound, Message: fmt.Sprintf("%s has no write op %q", c.name, name)}
 	}

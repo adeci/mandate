@@ -198,3 +198,27 @@ func TestPrepareAndReadRelayErrors(t *testing.T) {
 		t.Fatalf("read: %s %v", out, err)
 	}
 }
+
+func TestClientRefusesOtherProtocol(t *testing.T) {
+	t.Parallel()
+	sock := filepath.Join(t.TempDir(), "c.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- connector.ServeUnix(ctx, sock, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Write([]byte(`{"protocol":2,"name":"next","ops":[]}`))
+		}))
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	c := connector.Dial(sock, 5*time.Second)
+	var err error
+	for range 100 {
+		if _, err = c.Spec(context.Background()); errors.As(err, new(*connector.ProtocolError)) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err == nil || err.Error() != "speaks protocol 2, this mandate speaks 1" {
+		t.Fatalf("Spec = %v", err)
+	}
+}
