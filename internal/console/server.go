@@ -1,4 +1,4 @@
-package approvals
+package console
 
 import (
 	"context"
@@ -13,7 +13,6 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
-	"slices"
 	"sync"
 	"time"
 
@@ -29,33 +28,34 @@ const (
 	specTTL        = 5 * time.Minute
 	executeTimeout = 2 * time.Minute
 	maxBody        = 1 << 20
+	historySize    = 50
 )
 
-// Config is everything the approvals unit needs; Command builds it from flags.
+// Config is everything the console needs; Command builds it from flags.
 type Config struct {
-	// RPID is the WebAuthn relying party ID, the page's hostname.
+	// RPID is the WebAuthn relying party ID, the console's hostname.
 	RPID string
-	// Origin is the page's origin as browsers report it, e.g.
-	// https://box.tailnet.ts.net:8781.
+	// Origin is the console's origin as browsers report it, e.g.
+	// https://box.tailnet.ts.net.
 	Origin string
-	// Approvers may be empty: enrollment still works, approving doesn't.
+	// Approvers are the pinned passkeys. Empty means bootstrap: enrolling
+	// works, logging in and approving don't.
 	Approvers []approval.Approver
 	// Connectors maps connector names to their sockets.
 	Connectors map[string]string
 	StateDir   string
-	// Ntfy is optional.
-	Ntfy *Ntfy
-	Log  *slog.Logger
-	Now  func() time.Time
+	Log        *slog.Logger
+	Now        func() time.Time
 }
 
-// Server is the approvals unit: proposal store, approval pages, enrollment.
+// Server is the console: proposal store, web app, enrollment.
 type Server struct {
 	cfg      Config
 	db       *db
 	verifier *approval.Verifier
 	conns    map[string]*conn
 	tmpl     *template.Template
+	logins   *loginChallenges
 
 	enrollMu sync.Mutex
 	enrolls  map[string]*enrollment
@@ -71,8 +71,8 @@ type conn struct {
 	fetched time.Time
 }
 
-// New opens the proposal database in cfg.StateDir and settles proposals left
-// executing by a previous run.
+// New opens the database in cfg.StateDir and settles proposals left executing
+// by a previous run.
 func New(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
@@ -80,7 +80,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	d, err := openDB(ctx, filepath.Join(cfg.StateDir, "approvals.db"), cfg.Log)
+	d, err := openDB(ctx, filepath.Join(cfg.StateDir, "console.db"))
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
@@ -92,17 +92,19 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		},
 		conns:   map[string]*conn{},
 		tmpl:    templates,
+		logins:  newLoginChallenges(),
 		enrolls: map[string]*enrollment{},
 	}
 	for name, sock := range cfg.Connectors {
 		s.conns[name] = &conn{name: name, client: connector.Dial(sock, executeTimeout)}
 	}
-	if err := d.verifyAudit(ctx); err != nil {
-		cfg.Log.Error("audit log failed verification", "err", err)
-	}
-	if err := d.recoverInterrupted(ctx, s.now()); err != nil {
+	ids, err := d.recoverInterrupted(ctx)
+	if err != nil {
 		d.Close()
 		return nil, fmt.Errorf("recover interrupted proposals: %w", err)
+	}
+	for _, id := range ids {
+		cfg.Log.Warn("proposal was interrupted while executing; it may have run", "id", id)
 	}
 	return s, nil
 }
@@ -113,7 +115,8 @@ func (s *Server) Close() error { return s.db.Close() }
 // stored proposal matches one built from the original.
 func (s *Server) now() time.Time { return s.cfg.Now().UTC().Truncate(time.Millisecond) }
 
-// Sweep marks expired proposals every interval until ctx is done.
+// Sweep expires proposals and drops dead challenges and sessions every
+// interval until ctx is done.
 func (s *Server) Sweep(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -122,12 +125,14 @@ func (s *Server) Sweep(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := s.db.expireDue(ctx, s.now()); err != nil && ctx.Err() == nil {
-				s.cfg.Log.Error("expire proposals", "err", err)
+			if err := s.db.sweep(ctx, s.now()); err != nil && ctx.Err() == nil {
+				s.cfg.Log.Error("sweep", "err", err)
 			}
 		}
 	}
 }
+
+func (s *Server) url(id string) string { return s.cfg.Origin + "/r/" + id }
 
 func (c *conn) op(ctx context.Context, name string, now time.Time) (connector.Op, error) {
 	c.mu.Lock()
@@ -180,14 +185,9 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, upstream(err))
 		return
 	}
-	if err := s.db.expireDue(ctx, now); err != nil {
-		writeErr(w, err)
-		return
-	}
-	id := rand.Text()
 	pr := row{
 		Proposal: proposal.Proposal{
-			ID: id, Connector: req.Connector, Op: req.Op, Display: p.Display, Note: req.Note,
+			ID: rand.Text(), Connector: req.Connector, Op: req.Op, Display: p.Display, Note: req.Note,
 			Status: proposal.Pending, CreatedAt: now, ExpiresAt: now.Add(proposalTTL),
 		},
 		Args: p.Args,
@@ -199,47 +199,34 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	s.cfg.Log.Info("proposed", "id", id, "connector", req.Connector, "op", req.Op)
-	msg := "waiting for approval"
-	if sum := summary(p.Display); sum != "" {
-		msg = sum + ": " + msg
-	}
-	s.notify(ctx, req.Connector+" "+req.Op, msg, s.cfg.Origin+"/p/"+id)
+	s.cfg.Log.Info("proposed", "id", pr.ID, "connector", req.Connector, "op", req.Op)
+	pr.URL = s.url(pr.ID)
 	writeJSON(w, http.StatusCreated, pr.Proposal)
 }
 
 func (s *Server) getProposal(w http.ResponseWriter, r *http.Request) {
-	pr, ok := s.load(w, r)
-	if !ok {
+	pr, err := s.load(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, pr.Proposal)
 }
 
-// load expires due proposals and returns the one named in the path.
-func (s *Server) load(w http.ResponseWriter, r *http.Request) (row, bool) {
-	if err := s.db.expireDue(r.Context(), s.now()); err != nil {
-		writeErr(w, err)
-		return row{}, false
+// load expires due proposals and returns one with its URL filled in.
+func (s *Server) load(ctx context.Context, id string) (row, error) {
+	if err := s.db.expireDue(ctx, s.now()); err != nil {
+		return row{}, err
 	}
-	pr, err := s.db.get(r.Context(), r.PathValue("id"))
+	pr, err := s.db.get(ctx, id)
 	if errors.Is(err, errNotFound) {
-		err = &connector.Error{Status: http.StatusNotFound, Message: err.Error()}
+		return row{}, &connector.Error{Status: http.StatusNotFound, Message: err.Error()}
 	}
 	if err != nil {
-		writeErr(w, err)
-		return row{}, false
+		return row{}, err
 	}
-	return pr, true
-}
-
-func (s *Server) notify(ctx context.Context, title, message, click string) {
-	if s.cfg.Ntfy == nil {
-		return
-	}
-	if err := s.cfg.Ntfy.publish(context.WithoutCancel(ctx), title, message, click); err != nil {
-		s.cfg.Log.Warn("ntfy publish failed", "err", err)
-	}
+	pr.URL = s.url(pr.ID)
+	return pr, nil
 }
 
 type challengeRequest struct {
@@ -261,26 +248,47 @@ type requestOptions struct {
 	Timeout          int                    `json:"timeout"`
 }
 
+func (s *Server) requestOptions(challenge []byte) requestOptions {
+	opts := requestOptions{
+		Challenge:        b64(challenge),
+		RPID:             s.cfg.RPID,
+		AllowCredentials: []credentialDescriptor{},
+		UserVerification: "required",
+		Timeout:          int((2 * time.Minute).Milliseconds()),
+	}
+	for _, a := range s.cfg.Approvers {
+		opts.AllowCredentials = append(opts.AllowCredentials, credentialDescriptor{Type: "public-key", ID: a.CredentialID})
+	}
+	return opts
+}
+
+// challengeResponse carries what the passkey will sign: the page shows
+// Preview, rendered from the record's display, before asking for the key.
+type challengeResponse struct {
+	Nonce   string           `json:"nonce"`
+	Options requestOptions   `json:"options"`
+	Display []approval.Field `json:"display"`
+	Preview string           `json:"preview"`
+}
+
 // challenge applies the owner's edits, has the connector prepare the result,
-// and stores the exact record bytes the passkey will sign.
-func (s *Server) challenge(w http.ResponseWriter, r *http.Request) {
+// and stores the exact record bytes the passkey will sign. Each call adds a
+// challenge; earlier ones stay valid until one is used.
+func (s *Server) challenge(w http.ResponseWriter, r *http.Request, sess session) {
 	var req challengeRequest
 	if !decode(w, r, &req) {
 		return
 	}
-	pr, ok := s.load(w, r)
-	if !ok {
+	ctx := r.Context()
+	pr, err := s.load(ctx, r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
 		return
 	}
 	if pr.Status != proposal.Pending {
-		writeErr(w, &connector.Error{Status: http.StatusConflict, Message: "proposal is " + string(pr.Status)})
+		writeErr(w, &connector.Error{Status: http.StatusConflict, Message: "request is " + string(pr.Status)})
 		return
 	}
-	if len(s.cfg.Approvers) == 0 {
-		writeErr(w, &connector.Error{Status: http.StatusServiceUnavailable, Message: "no passkeys are enrolled; approving is disabled"})
-		return
-	}
-	ctx := r.Context()
 	c, ok := s.conns[pr.Connector]
 	if !ok {
 		writeErr(w, &connector.Error{Status: http.StatusBadGateway, Message: fmt.Sprintf("connector %q is no longer configured", pr.Connector)})
@@ -296,18 +304,13 @@ func (s *Server) challenge(w http.ResponseWriter, r *http.Request) {
 		editable[p.Name] = p.Editable
 	}
 	args := maps.Clone(pr.Args)
-	var edited []string
 	for k, v := range req.Edits {
 		if !editable[k] {
 			writeErr(w, connector.Invalid("%s is not editable", k))
 			return
 		}
-		if args[k] != v {
-			args[k] = v
-			edited = append(edited, k)
-		}
+		args[k] = v
 	}
-	slices.Sort(edited)
 	p, err := c.client.Prepare(ctx, pr.Op, args)
 	if err != nil {
 		writeErr(w, upstream(err))
@@ -321,44 +324,58 @@ func (s *Server) challenge(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	nonce := make([]byte, 16)
-	rand.Read(nonce)
-	issuedAt := s.cfg.Now().UTC()
-	if err := s.db.setChallenge(ctx, pr.ID, record, nonce, issuedAt, edited); err != nil {
+	ch := challenge{Nonce: make([]byte, 16), Proposal: pr.ID, Record: record, IssuedAt: s.cfg.Now().UTC(), Session: sess.hash}
+	rand.Read(ch.Nonce)
+	if err := s.db.addChallenge(ctx, ch, s.now()); err != nil {
 		writeErr(w, conflict(err))
 		return
 	}
-	opts := requestOptions{
-		Challenge:        b64(approval.Challenge(record, nonce, issuedAt)),
-		RPID:             s.cfg.RPID,
-		UserVerification: "required",
-		Timeout:          int((2 * time.Minute).Milliseconds()),
+	preview, err := s.renderString("fields", fieldViews(p.Display, nil, nil))
+	if err != nil {
+		writeErr(w, err)
+		return
 	}
-	for _, a := range s.cfg.Approvers {
-		opts.AllowCredentials = append(opts.AllowCredentials, credentialDescriptor{Type: "public-key", ID: a.CredentialID})
-	}
-	writeJSON(w, http.StatusOK, opts)
+	writeJSON(w, http.StatusOK, challengeResponse{
+		Nonce:   b64(ch.Nonce),
+		Options: s.requestOptions(approval.Challenge(record, ch.Nonce, ch.IssuedAt)),
+		Display: p.Display,
+		Preview: preview,
+	})
 }
 
 type approveRequest struct {
+	Nonce     string          `json:"nonce"`
 	Assertion json.RawMessage `json:"assertion"`
 }
 
-func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
+func (s *Server) approve(w http.ResponseWriter, r *http.Request, sess session) {
 	var req approveRequest
 	if !decode(w, r, &req) {
 		return
 	}
-	pr, ok := s.load(w, r)
-	if !ok {
+	nonce, err := base64.RawURLEncoding.DecodeString(req.Nonce)
+	if err != nil {
+		writeErr(w, connector.Invalid("invalid nonce"))
 		return
 	}
-	if pr.Status != proposal.Pending {
-		writeErr(w, &connector.Error{Status: http.StatusConflict, Message: "proposal is " + string(pr.Status)})
+	id := r.PathValue("id")
+	ch, err := s.db.challenge(r.Context(), nonce)
+	if errors.Is(err, errNotFound) || (err == nil && ch.Proposal != id) {
+		writeErr(w, &connector.Error{Status: http.StatusConflict, Message: "this approval was already used or has expired; start again"})
 		return
 	}
-	if pr.Record == nil {
-		writeErr(w, &connector.Error{Status: http.StatusConflict, Message: "no challenge was issued"})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	// The page that asked for the challenge is the one that showed it.
+	if string(ch.Session) != string(sess.hash) {
+		writeErr(w, &connector.Error{Status: http.StatusForbidden, Message: "this approval was started in another session"})
+		return
+	}
+	pr, err := s.load(r.Context(), id)
+	if err != nil {
+		writeErr(w, err)
 		return
 	}
 	c, ok := s.conns[pr.Connector]
@@ -366,35 +383,36 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, &connector.Error{Status: http.StatusBadGateway, Message: fmt.Sprintf("connector %q is no longer configured", pr.Connector)})
 		return
 	}
-	a := approval.Approval{Record: pr.Record, Nonce: pr.Nonce, IssuedAt: pr.IssuedAt, Assertion: req.Assertion}
+	a := approval.Approval{Record: ch.Record, Nonce: ch.Nonce, IssuedAt: ch.IssuedAt, Assertion: req.Assertion}
 	// The connector verifies again; checking here refuses bad approvals
 	// before anything is marked executing.
 	rec, err := s.verifier.Verify(a)
 	if err != nil {
-		s.cfg.Log.Warn("approval refused", "id", pr.ID, "err", err)
+		s.cfg.Log.Warn("approval refused", "id", id, "err", err)
 		writeErr(w, &connector.Error{Status: http.StatusForbidden, Message: err.Error()})
 		return
 	}
-	if rec.ID != pr.ID {
-		writeErr(w, &connector.Error{Status: http.StatusForbidden, Message: "approval is for a different proposal"})
+	if rec.ID != id {
+		writeErr(w, &connector.Error{Status: http.StatusForbidden, Message: "approval is for a different request"})
 		return
 	}
+	approver, _, _ := s.findApprover(assertionRawID(req.Assertion))
 	// From here on the request runs to completion even if the page goes
 	// away: once claimed, the outcome must be recorded.
 	ctx := context.WithoutCancel(r.Context())
-	if err := s.db.claim(ctx, pr.ID, pr.Nonce, rec, s.approverName(req.Assertion), s.now()); err != nil {
+	if err := s.db.claim(ctx, ch, rec, req.Assertion, approver.Name, s.now()); err != nil {
 		writeErr(w, conflict(err))
 		return
 	}
 	res := s.execute(ctx, c, a)
-	s.cfg.Log.Info("executed", "id", pr.ID, "connector", pr.Connector, "op", pr.Op, "status", res.Status, "ref", res.Ref)
-	if err := s.db.finish(ctx, pr.ID, res, s.now()); err != nil {
+	s.cfg.Log.Info("executed", "id", id, "connector", pr.Connector, "op", pr.Op, "status", res.Status, "ref", res.Ref)
+	if err := s.db.finish(ctx, id, res); err != nil {
 		// The proposal stays executing and becomes unknown on restart.
-		s.cfg.Log.Error("store result", "id", pr.ID, "status", res.Status, "err", err)
+		s.cfg.Log.Error("store result", "id", id, "status", res.Status, "err", err)
 		writeErr(w, err)
 		return
 	}
-	out, err := s.db.get(ctx, pr.ID)
+	out, err := s.load(ctx, id)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -428,33 +446,34 @@ func (s *Server) execute(ctx context.Context, c *conn, a approval.Approval) conn
 	}
 }
 
-func (s *Server) reject(w http.ResponseWriter, r *http.Request) {
-	pr, ok := s.load(w, r)
-	if !ok {
+func (s *Server) deny(w http.ResponseWriter, r *http.Request, sess session) {
+	id := r.PathValue("id")
+	err := s.db.reject(r.Context(), id, sess.approver.Name, s.now())
+	switch {
+	case errors.Is(err, errNotFound):
+		s.errorPage(w, http.StatusNotFound, "No such request.")
+		return
+	case errors.Is(err, errNotPending):
+		s.errorPage(w, http.StatusConflict, "This request was already decided.")
+		return
+	case err != nil:
+		s.cfg.Log.Error("deny", "id", id, "err", err)
+		s.errorPage(w, http.StatusInternalServerError, "Couldn't deny the request.")
 		return
 	}
-	if err := s.db.reject(r.Context(), pr.ID, s.now()); err != nil {
-		writeErr(w, conflict(err))
-		return
-	}
-	s.cfg.Log.Info("rejected", "id", pr.ID)
-	http.Redirect(w, r, "/p/"+pr.ID, http.StatusSeeOther)
+	s.cfg.Log.Info("denied", "id", id, "by", sess.approver.Name)
+	http.Redirect(w, r, "/r/"+id, http.StatusSeeOther)
 }
 
-// approverName names the passkey behind an assertion for the audit log.
-func (s *Server) approverName(assertion json.RawMessage) string {
+func assertionRawID(assertion json.RawMessage) []byte {
 	var cred struct {
 		RawID string `json:"rawId"`
 	}
 	if json.Unmarshal(assertion, &cred) != nil {
-		return ""
+		return nil
 	}
-	for _, a := range s.cfg.Approvers {
-		if a.CredentialID == cred.RawID {
-			return a.Name
-		}
-	}
-	return ""
+	id, _ := base64.RawURLEncoding.DecodeString(cred.RawID)
+	return id
 }
 
 func upstream(err error) error {

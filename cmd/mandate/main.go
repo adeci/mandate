@@ -1,5 +1,5 @@
 // Command mandate is a multi-call binary: the agent CLI, the gateway, the
-// approvals unit, and one connector per service.
+// console, and one connector per service.
 package main
 
 import (
@@ -10,8 +10,8 @@ import (
 	"syscall"
 
 	"github.com/adeci/mandate/internal/admin"
-	"github.com/adeci/mandate/internal/approvals"
 	"github.com/adeci/mandate/internal/client"
+	"github.com/adeci/mandate/internal/console"
 	"github.com/adeci/mandate/internal/discord"
 	"github.com/adeci/mandate/internal/exitcode"
 	"github.com/adeci/mandate/internal/gateway"
@@ -40,8 +40,8 @@ on the host:
   whatsapp run            WhatsApp linked device, linked from the console
   discord serve           Discord reader behind the gateway
   http-proxy              token-holding proxy for HTTP APIs
-  approvals               serve the approval pages and proposal API
-  approver enroll --name NAME
+  console                 serve the owner's console and the proposal API
+  passkey add --name NAME
                           print a one-time passkey enrollment link (as root)
   list [--senders] DB     list chat and sender IDs for exposure.toml
 `
@@ -84,10 +84,10 @@ func run() int {
 		err = discord.Command(ctx, args)
 	case "http-proxy":
 		err = httpproxy.Command(ctx, args)
-	case "approvals":
-		err = approvals.Command(ctx, args)
-	case "approver":
-		err = approvals.Enroll(ctx, args)
+	case "console":
+		err = console.Command(ctx, args)
+	case "passkey":
+		err = console.Passkey(ctx, args)
 	case "list":
 		err = admin.List(ctx, args)
 	case "-h", "--help", "help":

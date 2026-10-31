@@ -1,10 +1,10 @@
-// Package approvals is the unit between agents' proposals and the owner's
-// passkey. It stores proposals the gateway submits, pushes a notification,
-// serves the approval page over HTTPS, and hands approved records to
-// connectors, which verify them again before executing. It also runs passkey
-// enrollment, whose output becomes trusted only once the owner adds it to the
-// approvers file.
-package approvals
+// Package console is where the owner approves agents' proposals and links
+// connectors. It stores the proposals the gateway submits, serves a web app
+// behind passkey login, and hands approved records to connectors, which
+// verify them again before executing. Passkeys it enrolls are trusted only
+// once the owner pins them in the NixOS config, so a compromised console
+// can't add its own.
+package console
 
 import (
 	"context"
@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -25,15 +26,10 @@ import (
 	"github.com/adeci/mandate/internal/connector"
 )
 
-const defaultAdminSocket = "/run/mandate-approvals/admin.sock"
+const defaultAdminSocket = "/run/mandate-console/admin.sock"
 
-const usage = "usage: mandate approvals --hostname HOST --tls-cert FILE --tls-key FILE --state DIR " +
-	"--socket PATH [--approvers FILE] [--connector NAME=SOCKET]... [--https-listen ADDR] " +
-	"[--origin-port N] [--admin-socket PATH] [--ntfy-url URL --ntfy-topic TOPIC [--ntfy-token-file FILE]]"
-
-func newFlagSet(name string) *flag.FlagSet {
-	return flag.NewFlagSet(name, flag.ContinueOnError)
-}
+const usage = "usage: mandate console --hostname HOST --tls-cert FILE --tls-key FILE --state DIR " +
+	"--socket PATH [--listen ADDR] [--approvers FILE] [--connector NAME=SOCKET]... [--admin-socket PATH]"
 
 // connectorFlags collects repeated --connector name=socket.
 type connectorFlags map[string]string
@@ -52,23 +48,19 @@ func (c connectorFlags) Set(v string) error {
 	return nil
 }
 
-// Command is `mandate approvals`.
+// Command is `mandate console`.
 func Command(ctx context.Context, args []string) error {
-	flags := newFlagSet("approvals")
-	listen := flags.String("https-listen", ":8781", "address for the approval pages")
-	hostname := flags.String("hostname", "", "the pages' hostname, also the WebAuthn RP ID (required)")
-	originPort := flags.Int("origin-port", 0, "port browsers use to reach the pages, if a proxy changes it (default: the --https-listen port)")
-	certFile := flags.String("tls-cert", "", "TLS certificate (required)")
+	flags := flag.NewFlagSet("console", flag.ContinueOnError)
+	listen := flags.String("listen", ":443", "HTTPS address of the console")
+	hostname := flags.String("hostname", "", "the console's hostname, also the WebAuthn RP ID (required)")
+	certFile := flags.String("tls-cert", "", "TLS certificate chain (required)")
 	keyFile := flags.String("tls-key", "", "TLS key (required)")
 	stateDir := flags.String("state", "", "directory for the database and enrolled.json (required)")
-	approversFile := flags.String("approvers", "", "JSON array of trusted passkeys; missing or empty allows enrollment only")
+	approversFile := flags.String("approvers", "", "JSON array of pinned passkeys; missing or empty allows enrollment only")
 	socket := flags.String("socket", "", "Unix socket for the gateway's proposal API (required)")
-	adminSocket := flags.String("admin-socket", defaultAdminSocket, "root-only Unix socket for mandate approver enroll")
-	ntfyURL := flags.String("ntfy-url", "", "ntfy server URL")
-	ntfyTopic := flags.String("ntfy-topic", "", "ntfy topic")
-	ntfyTokenFile := flags.String("ntfy-token-file", "", "file holding an ntfy access token")
+	adminSocket := flags.String("admin-socket", defaultAdminSocket, "owner-only Unix socket for mandate passkey add")
 	conns := connectorFlags{}
-	flags.Var(conns, "connector", "NAME=SOCKET of a connector with write ops; repeatable")
+	flags.Var(conns, "connector", "NAME=SOCKET of a connector; repeatable")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -78,54 +70,34 @@ func Command(ctx context.Context, args []string) error {
 	if flags.NArg() > 0 {
 		return fmt.Errorf("unexpected arguments %q; %s", flags.Args(), usage)
 	}
-	if (*ntfyURL == "") != (*ntfyTopic == "") {
-		return errors.New("--ntfy-url and --ntfy-topic go together")
-	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("unit", "approvals")
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("unit", "console")
 
 	_, listenPort, err := net.SplitHostPort(*listen)
 	if err != nil {
-		return fmt.Errorf("--https-listen: %w", err)
+		return fmt.Errorf("--listen: %w", err)
 	}
 	port, err := strconv.Atoi(listenPort)
 	if err != nil {
-		return fmt.Errorf("--https-listen: %w", err)
+		return fmt.Errorf("--listen: %w", err)
 	}
-	if *originPort != 0 {
-		port = *originPort
-	}
-
 	approvers, err := loadApprovers(*approversFile)
 	if err != nil {
 		return err
 	}
 	if len(approvers) == 0 {
-		log.Warn("no approvers configured; enrollment only, nothing can be approved")
+		log.Warn("no passkeys pinned; enrollment only, nothing can log in or approve")
 	}
-
-	var ntfy *Ntfy
-	if *ntfyURL != "" {
-		ntfy = &Ntfy{URL: *ntfyURL, Topic: *ntfyTopic, Client: &http.Client{Timeout: 10 * time.Second}}
-		if *ntfyTokenFile != "" {
-			b, err := os.ReadFile(*ntfyTokenFile)
-			if err != nil {
-				return fmt.Errorf("read ntfy token: %w", err)
-			}
-			ntfy.Token = strings.TrimSpace(string(b))
-		}
-	}
-
 	cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
 	if err != nil {
 		return fmt.Errorf("load TLS certificate: %w", err)
 	}
+	origin := originOf(*hostname, port)
 	srv, err := New(ctx, Config{
 		RPID:       *hostname,
-		Origin:     originOf(*hostname, port),
+		Origin:     origin,
 		Approvers:  approvers,
 		Connectors: conns,
 		StateDir:   *stateDir,
-		Ntfy:       ntfy,
 		Log:        log,
 	})
 	if err != nil {
@@ -140,10 +112,8 @@ func Command(ctx context.Context, args []string) error {
 	errc := make(chan error, 3)
 	go func() { errc <- wrap("proposal socket", connector.ServeUnix(ctx, *socket, srv.ProposalHandler())) }()
 	go func() { errc <- wrap("admin socket", serveAdmin(ctx, *adminSocket, srv.AdminHandler())) }()
-	go func() {
-		errc <- wrap("https", serveTLS(ctx, *listen, srv.PageHandler(), cert))
-	}()
-	log.Info("approvals listening", "origin", originOf(*hostname, port), "socket", *socket,
+	go func() { errc <- wrap("https", serveTLS(ctx, *listen, srv.Handler(), cert)) }()
+	log.Info("console listening", "origin", origin, "socket", *socket,
 		"connectors", len(conns), "approvers", len(approvers))
 
 	// Every server returns nil on shutdown; the first to stop takes the rest
@@ -163,8 +133,8 @@ func wrap(what string, err error) error {
 	return nil
 }
 
-// originOf is how browsers spell the page's origin, which omits the default
-// port.
+// originOf is how browsers spell the console's origin, which omits the
+// default port.
 func originOf(host string, port int) string {
 	if port == 443 {
 		return "https://" + host
@@ -187,16 +157,46 @@ func loadApprovers(path string) ([]approval.Approver, error) {
 }
 
 func serveAdmin(ctx context.Context, path string, h http.Handler) error {
-	ln, err := connector.ListenUnix(path)
+	ln, err := listenPrivate(path)
 	if err != nil {
-		return err
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		ln.Close()
 		return err
 	}
 	srv := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
 	return serve(ctx, srv, func() error { return srv.Serve(ln) })
+}
+
+// listenPrivate listens on a 0600 Unix socket at path. It binds inside a
+// fresh 0700 directory and renames the socket into place, so no one else can
+// connect even between bind and chmod.
+func listenPrivate(path string) (net.Listener, error) {
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&fs.ModeSocket == 0 {
+		return nil, fmt.Errorf("%s exists and is not a socket", path)
+	}
+	dir, err := os.MkdirTemp(filepath.Dir(path), ".admin-")
+	if err != nil {
+		return nil, err
+	}
+	tmp := filepath.Join(dir, "sock")
+	defer func() {
+		os.Remove(tmp)
+		os.Remove(dir)
+	}()
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "unix", tmp)
+	if err != nil {
+		return nil, err
+	}
+	// The path changes below; closing must not unlink whatever is at tmp.
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		ln.Close()
+		return nil, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		ln.Close()
+		return nil, err
+	}
+	return ln, nil
 }
 
 func serveTLS(ctx context.Context, addr string, h http.Handler, cert tls.Certificate) error {
@@ -212,8 +212,8 @@ func serveTLS(ctx context.Context, addr string, h http.Handler, cert tls.Certifi
 		// Approving waits for the connector to execute.
 		WriteTimeout: executeTimeout + 30*time.Second,
 		IdleTimeout:  2 * time.Minute,
+		TLSConfig:    &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}},
 	}
-	srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
 	return serve(ctx, srv, func() error { return srv.ServeTLS(ln, "", "") })
 }
 

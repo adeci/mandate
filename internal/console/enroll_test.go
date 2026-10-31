@@ -1,10 +1,9 @@
-package approvals
+package console
 
 import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,8 +16,8 @@ import (
 	"github.com/adeci/mandate/internal/approval/approvaltest"
 )
 
-// startEnroll asks the admin socket for a link and returns its token.
-func (h *harness) startEnroll(t *testing.T, name string) string {
+// adminEnroll asks the admin socket for a link and returns its token.
+func (h *harness) adminEnroll(t *testing.T, name string) string {
 	t.Helper()
 	b, _ := json.Marshal(enrollRequest{Name: name})
 	resp, err := http.Post(h.admin.URL+"/enroll", "application/json", bytes.NewReader(b))
@@ -31,7 +30,7 @@ func (h *harness) startEnroll(t *testing.T, name string) string {
 		t.Fatalf("enroll: %d %v", resp.StatusCode, err)
 	}
 	token, ok := strings.CutPrefix(out.URL, origin+"/enroll/")
-	if !ok || token == "" {
+	if !ok || token == "" || token != out.Token {
 		t.Fatalf("enroll URL = %q", out.URL)
 	}
 	if d := out.ExpiresAt.Sub(h.clock.now()); d > 10*time.Minute || d < 9*time.Minute {
@@ -40,20 +39,9 @@ func (h *harness) startEnroll(t *testing.T, name string) string {
 	return token
 }
 
-func (h *harness) enrollGet(t *testing.T, path string) (int, []byte) {
-	t.Helper()
-	resp, err := http.Get(h.pages.URL + path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, b
-}
-
 func (h *harness) creationOptions(t *testing.T, token string) creationOptions {
 	t.Helper()
-	status, body := h.enrollGet(t, "/enroll/"+token+"/options")
+	status, body := h.call(t, "GET", "/enroll/"+token+"/options", "", nil)
 	if status != http.StatusOK {
 		t.Fatalf("options: %d %s", status, body)
 	}
@@ -64,6 +52,7 @@ func (h *harness) creationOptions(t *testing.T, token string) creationOptions {
 	return o
 }
 
+// register runs the enrollment page's flow without a session.
 func (h *harness) register(t *testing.T, token string, key *approvaltest.Authenticator) (int, []byte) {
 	t.Helper()
 	o := h.creationOptions(t, token)
@@ -71,14 +60,14 @@ func (h *harness) register(t *testing.T, token string, key *approvaltest.Authent
 	if err != nil {
 		t.Fatal(err)
 	}
-	return h.post(t, "/enroll/"+token, key.Register(c))
+	return h.call(t, http.MethodPost, "/enroll/"+token, "", key.Register(c))
 }
 
-func TestEnrollment(t *testing.T) {
+func TestEnrollmentLink(t *testing.T) {
 	h := start(t)
-	token := h.startEnroll(t, "yubikey")
+	token := h.adminEnroll(t, "yubikey")
 
-	if status, body := h.enrollGet(t, "/enroll/"+token); status != http.StatusOK || !bytes.Contains(body, []byte("yubikey")) {
+	if status, body := h.call(t, "GET", "/enroll/"+token, "", nil); status != http.StatusOK || !bytes.Contains(body, []byte("yubikey")) {
 		t.Fatalf("enroll page: %d", status)
 	}
 	o := h.creationOptions(t, token)
@@ -97,31 +86,40 @@ func TestEnrollment(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("register: %d %s", status, body)
 	}
-	var got approval.Approver
+	var got enrolled
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
 	}
-	if want := key.Approver("yubikey"); got != want {
+	want := key.Approver("yubikey")
+	if got.Approver != want || got.Synced || got.Kind != "hardware key" ||
+		got.Nix != `{ name = "yubikey"; credential_id = "`+want.CredentialID+`"; public_key = "`+want.PublicKey+`"; }` {
 		t.Fatalf("enrolled %+v, want %+v", got, want)
 	}
 
-	// The enrolled entry verifies real assertions once it is trusted.
-	v := approval.Verifier{RPID: rpID, Origin: origin, Approvers: []approval.Approver{got}}
+	// The enrolled entry verifies real assertions once it is pinned.
+	v := approval.Verifier{RPID: rpID, Origin: origin, Approvers: []approval.Approver{got.Approver}}
 	rec, _ := approval.Encode(approval.Record{ID: "x", Connector: "fake", Op: "send", ExpiresAt: time.Now().Add(time.Hour)})
 	if _, err := v.Verify(key.Approve(rec, time.Now())); err != nil {
 		t.Fatalf("enrolled key doesn't verify: %v", err)
 	}
 
-	// But enrolling alone trusts nothing.
+	// But enrolling alone trusts nothing: no login, no approval.
+	resp := h.do(t, http.MethodPost, "/login", "", loginRequest{Assertion: h.loginAssertion(t, key)})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("login with enrolled, unpinned key = %d, want 403", resp.StatusCode)
+	}
 	p := h.submit(t, "running late")
-	if status, _ := h.approve(t, p.ID, key.Assert(h.challenge(t, p.ID, nil))); status != http.StatusForbidden {
-		t.Fatalf("approve with freshly enrolled key = %d, want 403", status)
+	nonce, c, _ := h.challenge(t, p.ID, nil)
+	if status, _ := h.approve(t, p.ID, nonce, key.Assert(c)); status != http.StatusForbidden {
+		t.Fatalf("approve with enrolled, unpinned key = %d, want 403", status)
 	}
 
-	if status, _ := h.post(t, "/enroll/"+token, key.Register([]byte("again"))); status != http.StatusNotFound {
+	// The link works once.
+	if status, _ := h.call(t, http.MethodPost, "/enroll/"+token, "", key.Register([]byte("again"))); status != http.StatusNotFound {
 		t.Fatalf("second registration = %d, want 404", status)
 	}
-	if status, _ := h.enrollGet(t, "/enroll/"+token); status != http.StatusNotFound {
+	if status, _ := h.call(t, "GET", "/enroll/"+token, "", nil); status != http.StatusNotFound {
 		t.Fatalf("page after use = %d, want 404", status)
 	}
 
@@ -130,37 +128,31 @@ func TestEnrollment(t *testing.T) {
 		t.Fatal(err)
 	}
 	var saved []approval.Approver
-	if err := json.Unmarshal(b, &saved); err != nil || len(saved) != 1 || saved[0] != got {
+	if err := json.Unmarshal(b, &saved); err != nil || len(saved) != 1 || saved[0] != want {
 		t.Fatalf("enrolled.json = %s (%v)", b, err)
 	}
 	if loaded, err := loadApprovers(filepath.Join(h.cfg.StateDir, "enrolled.json")); err != nil || len(loaded) != 1 {
 		t.Fatalf("enrolled.json isn't a valid approvers file: %v", err)
 	}
 
-	var pushed bool
-	for _, m := range h.ntfy.all() {
-		pushed = pushed || m.msg.Message == "new passkey enrolled: yubikey"
-	}
-	if !pushed {
-		t.Fatalf("no enrollment notification in %+v", h.ntfy.all())
-	}
-	if got := h.kinds(t); slices.Index(got, evEnrolled) < 0 {
-		t.Fatalf("audit = %v, want an enrolled event", got)
+	_, page := h.page(t, "/passkeys")
+	if !strings.Contains(page, "yubikey") || !strings.Contains(page, "not pinned") || !strings.Contains(page, want.CredentialID) {
+		t.Fatalf("passkeys page doesn't list the unpinned key:\n%s", page)
 	}
 }
 
-func TestEnrollmentRefusals(t *testing.T) {
+func TestEnrollmentLinkRefusals(t *testing.T) {
 	t.Run("expired link", func(t *testing.T) {
 		h := start(t)
-		token := h.startEnroll(t, "phone")
+		token := h.adminEnroll(t, "phone")
 		h.clock.advance(10*time.Minute + time.Second)
-		if status, _ := h.enrollGet(t, "/enroll/"+token); status != http.StatusNotFound {
+		if status, _ := h.call(t, "GET", "/enroll/"+token, "", nil); status != http.StatusNotFound {
 			t.Fatalf("page = %d, want 404", status)
 		}
-		if status, _ := h.enrollGet(t, "/enroll/"+token+"/options"); status != http.StatusNotFound {
+		if status, _ := h.call(t, "GET", "/enroll/"+token+"/options", "", nil); status != http.StatusNotFound {
 			t.Fatalf("options = %d, want 404", status)
 		}
-		if status, _ := h.post(t, "/enroll/"+token, approvaltest.New(t, rpID, origin).Register([]byte("x"))); status != http.StatusNotFound {
+		if status, _ := h.call(t, http.MethodPost, "/enroll/"+token, "", approvaltest.New(t, rpID, origin).Register([]byte("x"))); status != http.StatusNotFound {
 			t.Fatalf("register = %d, want 404", status)
 		}
 	})
@@ -183,12 +175,12 @@ func TestEnrollmentRefusals(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			h := start(t)
-			token := h.startEnroll(t, "phone")
+			token := h.adminEnroll(t, "phone")
 			if status, body := h.register(t, token, tt.key(t)); status != http.StatusBadRequest {
 				t.Fatalf("register = %d %s, want 400", status, body)
 			}
 			// A failed attempt spends the link too.
-			if status, _ := h.enrollGet(t, "/enroll/"+token); status != http.StatusNotFound {
+			if status, _ := h.call(t, "GET", "/enroll/"+token, "", nil); status != http.StatusNotFound {
 				t.Fatalf("page after failed attempt = %d, want 404", status)
 			}
 			if _, err := os.Stat(filepath.Join(h.cfg.StateDir, "enrolled.json")); err == nil {
@@ -199,16 +191,16 @@ func TestEnrollmentRefusals(t *testing.T) {
 
 	t.Run("challenge from another link", func(t *testing.T) {
 		h := start(t)
-		first, second := h.startEnroll(t, "a"), h.startEnroll(t, "b")
+		first, second := h.adminEnroll(t, "a"), h.adminEnroll(t, "b")
 		c, _ := base64.RawURLEncoding.DecodeString(h.creationOptions(t, first).Challenge)
-		if status, _ := h.post(t, "/enroll/"+second, approvaltest.New(t, rpID, origin).Register(c)); status != http.StatusBadRequest {
+		if status, _ := h.call(t, http.MethodPost, "/enroll/"+second, "", approvaltest.New(t, rpID, origin).Register(c)); status != http.StatusBadRequest {
 			t.Fatalf("register = %d, want 400", status)
 		}
 	})
 
 	t.Run("bad name", func(t *testing.T) {
 		h := start(t)
-		resp, err := http.Post(h.admin.URL+"/enroll", "application/json", strings.NewReader(`{"name":"<b>x</b>"}`))
+		resp, err := http.Post(h.admin.URL+"/enroll", "application/json", strings.NewReader(`{"name":"\"; x = \"${y}"}`))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -217,4 +209,44 @@ func TestEnrollmentRefusals(t *testing.T) {
 			t.Fatalf("enroll = %d, want 400", resp.StatusCode)
 		}
 	})
+}
+
+func TestAddPasskeyFromConsole(t *testing.T) {
+	h := start(t)
+	if status, _ := h.call(t, http.MethodPost, "/passkeys", "", enrollRequest{Name: "pixel"}); status != http.StatusUnauthorized {
+		t.Fatalf("add without session = %d, want 401", status)
+	}
+	status, body := h.post(t, "/passkeys", enrollRequest{Name: "pixel"})
+	if status != http.StatusOK {
+		t.Fatalf("add = %d %s", status, body)
+	}
+	var res enrollResponse
+	if err := json.Unmarshal(body, &res); err != nil {
+		t.Fatal(err)
+	}
+
+	synced := approvaltest.New(t, rpID, origin)
+	synced.Flags |= approvaltest.FlagBE
+	status, body = h.register(t, res.Token, synced)
+	if status != http.StatusOK {
+		t.Fatalf("register = %d %s", status, body)
+	}
+	var got enrolled
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Synced || got.Kind != "synced passkey" {
+		t.Fatalf("enrolled = %+v, want a synced passkey", got)
+	}
+
+	// Once pinned, the passkeys page labels it from the stored BE flag.
+	h.srv.cfg.Approvers = append(h.srv.cfg.Approvers, got.Approver)
+	_, page := h.page(t, "/passkeys")
+	if !strings.Contains(page, "pixel") || !strings.Contains(page, "synced passkey") {
+		t.Fatalf("passkeys page:\n%s", page)
+	}
+	keys, err := h.srv.db.passkeys(t.Context())
+	if err != nil || len(keys) != 1 || !keys[0].Synced || keys[0].Name != "pixel" {
+		t.Fatalf("stored passkeys = %+v (%v)", keys, err)
+	}
 }

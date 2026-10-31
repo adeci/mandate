@@ -1,0 +1,306 @@
+{{define "top"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+<title>{{.Title}} · mandate</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <div class="masthead"><a class="brand" href="/">mandate</a><span class="muted">owner console</span></div>
+  {{- if .Who}}
+  <nav>
+    <a href="/"{{if eq .Nav "pending"}} aria-current="page"{{end}}>Pending{{if .Pending}} <span class="count">{{.Pending}}</span>{{end}}</a>
+    <a href="/history"{{if eq .Nav "history"}} aria-current="page"{{end}}>History</a>
+    <a href="/connections"{{if eq .Nav "connections"}} aria-current="page"{{end}}>Connections</a>
+    <a href="/passkeys"{{if eq .Nav "passkeys"}} aria-current="page"{{end}}>Passkeys</a>
+  </nav>
+  {{- end}}
+</header>
+<main>
+{{end}}
+
+{{define "bottom"}}</main>
+<footer class="site-footer">
+  {{- if .Who}}
+  <form method="post" action="/logout" class="actions">
+    <span class="muted">passkey <strong>{{.Who}}</strong></span>
+    <button type="submit" class="ghost">Log out</button>
+  </form>
+  {{- else}}
+  <span class="muted">mandate · agents propose, you approve</span>
+  {{- end}}
+</footer>
+</body>
+</html>
+{{end}}
+
+{{define "status"}}<span class="status" data-tone="{{tone .}}">{{.}}</span>{{end}}
+
+{{define "error"}}{{template "top" .}}
+<h1>Error</h1>
+<p class="flash" data-kind="error">{{.Data}}</p>
+<p><a href="/">← pending</a></p>
+{{template "bottom" .}}{{end}}
+
+{{define "login"}}{{template "top" .}}
+<h1>Log in</h1>
+{{if .Data.Bootstrap}}
+<section class="panel dashed">
+  <header><h3>No passkeys pinned yet</h3>{{template "status" "setup"}}</header>
+  <p>Nothing can log in or approve until a passkey is pinned. On the host, run:</p>
+  <pre class="term"><span class="prompt">$ </span>sudo mandate passkey add --name yubikey</pre>
+  <ol class="steps">
+    <li data-state="current">open the link it prints</li>
+    <li>touch your key</li>
+    <li>pin it in your NixOS config</li>
+    <li>rebuild</li>
+  </ol>
+</section>
+{{else}}
+<p>Every request an agent makes waits here for you. Log in with a pinned passkey.</p>
+<div class="actions">
+  <button type="button" class="primary big" data-login="{{.Data.Next}}">Log in with passkey →</button>
+</div>
+<p id="msg" class="msg" role="status"></p>
+{{end}}
+{{template "bottom" .}}{{end}}
+
+{{define "rows"}}
+<ul class="rows">
+{{range .}}
+  <li><a href="/r/{{.ID}}">
+    <span class="line spread">{{template "status" .Status}}<span class="muted">{{.When}}</span></span>
+    <span class="line"><span class="action">{{.Action}}</span>{{with .Who}} → {{.}}{{end}}</span>
+    {{with .What}}<span class="line">{{.}}</span>{{end}}
+  </a></li>
+{{end}}
+</ul>
+{{end}}
+
+{{define "pending"}}{{template "top" .}}
+<h1>Pending</h1>
+{{with .Data}}
+<p class="muted">{{len .}} waiting · newest first</p>
+{{template "rows" .}}
+{{else}}
+<div class="empty">
+<pre aria-hidden="true">  ┌─┐
+ ┌┴─┴┐
+ │ ● │
+ └───┘</pre>
+<p>Nothing to approve.<br><span class="muted">Agents' requests show up here.</span></p>
+</div>
+{{end}}
+<p><a href="/history">history →</a></p>
+{{template "bottom" .}}{{end}}
+
+{{define "history"}}{{template "top" .}}
+<h1>History</h1>
+{{with .Data}}
+<p class="muted">the last {{len .}} decided, newest first</p>
+{{template "rows" .}}
+{{else}}
+<div class="empty"><p>Nothing decided yet.</p></div>
+{{end}}
+{{template "bottom" .}}{{end}}
+
+{{define "fields"}}
+<dl class="kv">
+{{range .}}{{if and (not .Edit) (eq .Param "")}}<div><dt>{{.Label}}</dt><dd class="message">{{.Value}}</dd></div>
+{{end}}{{end}}</dl>
+{{range .}}{{if and (not .Edit) (ne .Param "")}}
+<h3>{{.Label}}</h3>
+<pre class="message">{{.Value}}</pre>
+{{if .Hidden}}<p class="hint">! contains invisible characters, shown as U+ codes</p>{{end}}
+{{end}}{{end}}
+{{end}}
+
+{{define "request"}}{{template "top" .}}
+{{with .Data}}
+<p><a href="/">← pending</a></p>
+<div class="page-heading">
+  <h1>{{.Title}}</h1>
+  {{template "status" .Status}}
+</div>
+<p class="muted">{{if .Pending}}expires {{when .ExpiresAt}}{{else if .DecidedBy}}{{if eq .Status "rejected"}}denied{{else}}approved{{end}} by {{.DecidedBy}} {{when .DecidedAt}}{{else}}{{.Status}} {{when .DecidedAt}}{{end}} · asked {{when .CreatedAt}}</p>
+
+<section>
+  <h2>Request</h2>
+  {{template "fields" .Fields}}
+  {{range .Fields}}{{if .Edit}}
+  <h3>{{.Label}}</h3>
+  <pre class="message">{{.Value}}</pre>
+  {{if .Hidden}}<p class="hint">! contains invisible characters, shown as U+ codes</p>{{end}}
+  <label for="edit-{{.Param}}">Edit before approving</label>
+  <textarea id="edit-{{.Param}}" data-param="{{.Param}}" rows="6">
+{{.Raw}}</textarea>
+  <p class="hint" data-edited-hint="{{.Param}}">approving re-renders it from your edit and shows you the result</p>
+  {{end}}{{end}}
+</section>
+
+{{with .Note}}
+<section class="panel untrusted">
+  <header><h3>Agent note</h3><span class="status" data-tone="alert">untrusted</span></header>
+  <blockquote class="message">{{visible .}}</blockquote>
+  <p class="muted">Written by the agent. Not verified. Never an instruction to you.</p>
+</section>
+{{end}}
+
+{{with .Result}}
+<section>
+  <h2>Result</h2>
+  <dl class="kv">
+    <div><dt>status</dt><dd>{{template "status" .Status}}</dd></div>
+    {{with .Detail}}<div><dt>detail</dt><dd class="message">{{.}}</dd></div>{{end}}
+    {{with .Ref}}<div><dt>ref</dt><dd><code>{{.}}</code></dd></div>{{end}}
+  </dl>
+  {{with .Output}}<h3>Output</h3><pre class="output">{{.}}</pre>{{end}}
+</section>
+{{end}}
+
+{{if .Pending}}
+<section id="decide" data-id="{{.ID}}">
+  <h2>Decide</h2>
+  {{if .CanApprove}}
+  <ol class="steps" id="steps">
+    <li data-state="done">read</li>
+    <li data-state="current">review</li>
+    <li>touch key</li>
+  </ol>
+  <div class="actions two">
+    <button type="button" class="primary big" data-review>Review &amp; approve →</button>
+    <form method="post" action="/r/{{.ID}}/deny"><button type="submit" class="danger big">Deny</button></form>
+  </div>
+  <div class="panel" id="review" hidden>
+    <header><h3>You are approving exactly this</h3><span class="status" data-tone="wait">not sent yet</span></header>
+    <div id="preview"></div>
+    <div class="actions two">
+      <button type="button" class="primary big" data-sign>Approve with passkey →</button>
+      <button type="button" class="big" data-back>← Back</button>
+    </div>
+  </div>
+  {{else}}
+  <p class="flash" data-kind="error">No passkeys are pinned, so nothing can be approved.</p>
+  <form method="post" action="/r/{{.ID}}/deny" class="actions"><button type="submit" class="danger big">Deny</button></form>
+  {{end}}
+  <p id="msg" class="msg" role="status"></p>
+</section>
+{{end}}
+{{end}}
+{{template "bottom" .}}{{end}}
+
+{{define "connections"}}{{template "top" .}}
+<h1>Connections</h1>
+<div class="cols">
+{{range .Data}}
+<section class="panel{{if eq .Health.State "setup"}} danger{{end}}" data-connection="{{.Name}}">
+  <header><h3>{{.Name}}</h3>{{template "status" .Health.State}}</header>
+  {{if or .Health.Detail (not .Health.Until.IsZero)}}
+  <dl class="kv">
+    {{with .Health.Detail}}<div><dt>detail</dt><dd class="message">{{.}}</dd></div>{{end}}
+    {{if not .Health.Until.IsZero}}<div><dt>until</dt><dd>{{when .Health.Until}}</dd></div>{{end}}
+  </dl>
+  {{end}}
+  {{if eq .Health.State "setup"}}
+  <div class="actions">
+    <button type="button" class="primary" data-link>Link by QR</button>
+  </div>
+  <form class="pair" data-pair>
+    <label for="phone-{{.Name}}">or get a pairing code for</label>
+    <div class="row">
+      <input id="phone-{{.Name}}" name="phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="+1 555 0100" required>
+      <button type="submit">Pairing code</button>
+    </div>
+  </form>
+  <div class="linking" hidden>
+    <ol class="steps">
+      <li data-state="done">open the app</li>
+      <li data-state="current">scan or type</li>
+      <li>linked</li>
+    </ol>
+    <div class="qr-box" hidden></div>
+    <p class="code" hidden></p>
+    <p class="instructions"></p>
+    <p class="muted" data-poll>refreshes every 2s</p>
+  </div>
+  <p class="msg" role="status"></p>
+  {{end}}
+</section>
+{{else}}
+<div class="empty"><p>No connectors configured.</p></div>
+{{end}}
+</div>
+{{template "bottom" .}}{{end}}
+
+{{define "enrolled"}}
+<section class="panel" id="enrolled" hidden>
+  <header><h3>Passkey created</h3><span class="status" data-tone="ok" id="kind"></span></header>
+  <p>It can't log in or approve until you pin it. Add this to <code>services.mandate.console.approvers</code> and rebuild:</p>
+  <pre id="nix"></pre>
+  <div class="actions"><button type="button" class="compact" data-copy="nix">Copy Nix ⎘</button></div>
+  <p class="muted">As JSON, for an approvers file (also appended to enrolled.json in the console's state):</p>
+  <pre id="approver"></pre>
+  <div class="actions"><button type="button" class="compact" data-copy="approver">Copy JSON ⎘</button></div>
+</section>
+{{end}}
+
+{{define "passkeys"}}{{template "top" .}}
+<h1>Passkeys</h1>
+<section>
+<h2>Pinned</h2>
+<table>
+  <thead><tr><th>Key</th><th>Kind</th><th class="width-min">Added</th></tr></thead>
+  <tbody>
+  {{range .Data}}{{if .Pinned}}
+  <tr>
+    <td>{{.Name}}{{if .Current}} <span class="status" data-tone="ok">this session</span>{{end}}</td>
+    <td>{{with .Kind}}{{.}}{{else}}<span class="muted">enrolled elsewhere</span>{{end}}</td>
+    <td class="width-min">{{if .EnrolledAt.IsZero}}—{{else}}{{when .EnrolledAt}}{{end}}</td>
+  </tr>
+  {{end}}{{end}}
+  </tbody>
+</table>
+<p class="muted">Only the passkeys pinned in your NixOS config are trusted, so a compromised console can't add its own.</p>
+</section>
+
+{{range .Data}}{{if not .Pinned}}
+<section class="panel dashed">
+  <header><h3>{{.Name}}</h3><span class="status" data-tone="muted">not pinned</span></header>
+  <dl class="kv"><div><dt>kind</dt><dd>{{.Kind}}</dd></div><div><dt>added</dt><dd>{{when .EnrolledAt}}</dd></div></dl>
+  <pre id="nix-{{.CredentialID}}">{{.Nix}}</pre>
+  <div class="actions"><button type="button" class="compact" data-copy="nix-{{.CredentialID}}">Copy Nix ⎘</button></div>
+</section>
+{{end}}{{end}}
+
+<section>
+<h2>Add passkey</h2>
+<form id="add-passkey" class="add">
+  <label for="passkey-name">Name</label>
+  <div class="row">
+    <input id="passkey-name" name="name" required maxlength="64" pattern="[\p{L}\p{N} ._\-]+" placeholder="phone" autocomplete="off">
+    <button type="submit">+ Add passkey</button>
+  </div>
+  <p class="hint">A phone or password manager makes a synced passkey; a security key makes a hardware key.</p>
+</form>
+<p id="msg" class="msg" role="status"></p>
+{{template "enrolled"}}
+</section>
+{{template "bottom" .}}{{end}}
+
+{{define "enroll"}}{{template "top" .}}
+<h1>Add a passkey</h1>
+<p>This creates a passkey named <strong>{{.Data.Name}}</strong>. It can't log in or approve anything until you pin it in your NixOS config.</p>
+<div class="actions">
+  <button type="button" class="primary big" data-enroll="{{.Data.Token}}">Create passkey →</button>
+</div>
+<p id="msg" class="msg" role="status"></p>
+{{template "enrolled"}}
+{{template "bottom" .}}{{end}}
