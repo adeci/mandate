@@ -2,7 +2,7 @@
 
 A connector is a program that holds one login and serves the connector
 protocol on a Unix socket. The gateway and console learn what it can do from
-its spec and never see its credentials.
+its spec.
 
 | Route | |
 |---|---|
@@ -12,11 +12,13 @@ its spec and never see its credentials.
 | `POST /read` | read operations, run without approval |
 | `POST /prepare` | normalize a write and render what the owner will see |
 | `POST /execute` | run a write the owner approved |
+| `GET /forward/…` | relay agents' GETs to an API, for a `Forwarder` |
+| `GET`, `PUT /keys` | the owner's trusted keys, kept in sync by the console |
 
-`connector.Main` serves all of it, including the part that matters most:
-`/execute` verifies the owner's passkey signature over the exact record,
-re-runs `Prepare` and refuses if anything changed, spends the nonce, and only
-then calls your `Execute`. You never handle an unverified write.
+`connector.Main` serves all of it. `/execute` checks the owner's passkey
+signature over the exact record against the connector's own key list, re-runs
+`Prepare` and refuses if anything changed, spends the nonce, and only then
+calls your `Execute`.
 
 ## A webhook connector
 
@@ -97,17 +99,20 @@ func main() {
 
 ## Rules
 
-- **Render `Display` from `Args`**, never from anything a third party chose
+- **Render `Display` from `Args`**, not from anything a third party chose
   (like a sender's display name). The owner approves what `Display` says;
   `Args` is what runs.
 - **`Prepare` must be idempotent**: preparing its own output gives the same
   args and display, which is how the connector detects tampering.
-- **Never retry in `Execute`.** If the request may have reached the service,
+- **Don't retry in `Execute`.** If the request may have reached the service,
   return `Unknown`; the owner decides what happens next.
 - **Name**: `Spec().Name` must match the name you give the connector in Nix.
-- **Reading** is optional. Implement `connector.Reader`; to be queryable with
-  SQL, write messages to `env.DataPath()` with the `store` package, and the
-  gateway serves them through the owner's hide rules and login-code redaction.
+- **Reading** is optional. Implement `connector.Reader` for read ops. Write
+  messages to `env.DataPath()` with the `store` package and agents get
+  `chats`, `messages` and `search` over them, with the owner's hide rules and
+  login-code redaction applied.
+- **Chats**: mark a param `Container` and the gateway refuses the op unless
+  it names a stored, visible chat.
 - **Health and linking** are optional: `connector.Checker` and
   `connector.Setupper`, with linking inputs declared in `Spec.Setup`.
 - **Credentials** come only from `env.Credential`; settings only from the
@@ -127,4 +132,4 @@ services.mandate.connectors.webhook = {
 ```
 
 It runs as its own user (`mandate-webhook`) with only that token, and shows up
-in `mandate guide` and the console on the next deploy.
+in `mandate --help` and the console on the next deploy.

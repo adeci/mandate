@@ -2,28 +2,24 @@
 
 Let agents use your services semi-sanely.
 
-Your agents can read your messages. They can't send one without your thumb.
-
 mandate sits between your AI agents and your accounts, on a NixOS box you own.
 Each account is held by a **connector**: a small program that keeps that one
-login and nothing else. Agents get read-only SQL over what connectors store,
-plus the operations connectors offer, and never see a credential. Chats you
-hide don't exist for them, and messages carrying login codes come back with
-the text removed.
+login. Agents read what connectors store and call the operations they offer,
+without seeing a credential. Chats you hide are left out, and messages
+carrying login codes come back with the text removed.
 
-Anything that writes is a proposal. The agent sends you a link, you open it in
-the **console**, read exactly what will happen, fix the typo if you like, and
-approve it with a passkey. The connector checks your signature itself and acts
-at most once, so even a compromised gateway can't send anything.
+Writes are proposals. The agent tells you one is waiting, you open the
+**console**, check what will happen, edit it if you like, and approve it with
+a passkey. The connector checks your signature itself and acts at most once.
 
-What it won't do: stop an agent from repeating what it read (hide what it
-shouldn't read), or protect your accounts from root on the box.
+mandate can't stop an agent from repeating what it read, so hide what it
+shouldn't read. Root on the box can reach your accounts.
 
 ## Pieces
 
 - **gateway**: what agents talk to, over your tailnet. Holds no credentials.
-- **console**: a web app where you link connectors and approve or deny
-  writes. Passkeys only (a YubiKey, or your phone's).
+- **console**: a web app where you link connectors, manage keys and approve
+  or deny writes.
 - **connectors**: one per service, each its own program, user and sandbox.
   Bundled: `whatsapp`, `discord` (reads only), and `http`, which puts any
   token API behind an allowlist. Writing your own is
@@ -40,10 +36,10 @@ services.mandate = {
 
   console = {
     enable = true;
-    hostname = "mandate.example.com"; # the passkeys' identity; don't change it
+    hostname = "mandate.example.com"; # passkeys are bound to it
     tlsCertFile = "/var/lib/acme/mandate.example.com/fullchain.pem";
     tlsKeyFile = "/var/lib/acme/mandate.example.com/key.pem";
-    approvers = lib.importJSON ./approvers.json;
+    adminPasswordHashFile = "/run/secrets/mandate-admin-password-hash"; # mkpasswd -m bcrypt
   };
 
   connectors = {
@@ -62,18 +58,15 @@ services.mandate = {
 
 The gateway (8780) and console (443) listen on `tailscale0` only; give agents
 a tailnet ACL for 8780 and nothing else. Connector settings are checked when
-the system builds, so a typo fails the build, not the box.
+the system builds.
 
-Your first passkey comes from a one-time link:
+Sign in to the console with the admin password and add a passkey under Keys;
+the first one is trusted right away. Every key after that, and every removal,
+waits until one of your trusted keys approves it, from any device. Approving
+writes always takes a key. Then link your accounts under Connections.
 
-```sh
-sudo mandate passkey add --name yubikey
-```
-
-The console shows the key's JSON; add it to `approvers.json` and redeploy.
-Keys are only ever trusted from your config, so nothing over the network can
-add one. Then sign in, link your accounts under Connections, and add more
-passkeys the same way.
+Lost every key? `sudo mandate-reset-keys` clears the key lists so the
+password can add a first key again.
 
 To hide a chat or person, find its ID and add it to
 `/var/lib/mandate-gateway/exposure.toml`:
@@ -91,16 +84,19 @@ hide_containers = ["15551234567@s.whatsapp.net"]
 
 ```sh
 export MANDATE_URL=http://box:8780 MANDATE_TOKEN_FILE=~/.config/mandate/token
-mandate guide
+mandate --help
+mandate whatsapp chats --search farid
+mandate whatsapp messages 15551234567@s.whatsapp.net
+mandate whatsapp send 15551234567@s.whatsapp.net "running 10 late" --wait 10m
 ```
 
-`mandate guide` prints everything an agent needs, generated from what's
-actually running: the views, a few SQL recipes, each connector's operations
-and health, and how approval works. Paste it into a system prompt.
+Help is generated from what's running. Output is TSV when piped, a table on a
+terminal, JSON with `--json`. Chats are addressed by exact ID; errors say
+which command to run next.
 
 Exit codes: 0 done, 75 not yet (pending, or a connector resting), 1 no
-(rejected, failed, or `unknown`, which may have gone out and is never
-retried), 2 usage.
+(rejected, failed, or `unknown`: it may have gone out and won't be retried),
+2 usage.
 
 ## Connectors
 
@@ -119,17 +115,15 @@ func main() {
 ```
 
 ```
-mandate-NAME --socket PATH --state DIR [--config FILE]
-             [--approvers FILE --rp-id ID --origin URL]
+mandate-NAME --socket PATH --state DIR [--config FILE] [--rp-id ID --origin URL]
 mandate-NAME --check-config FILE
 ```
 
 `--config` is JSON decoded strictly into `Config`, then checked by its
 `Validate` method if it has one; `--check-config` does only that. Credentials
-are files in `$CREDENTIALS_DIRECTORY`. Secrets belong in `DIR/private`; a
-connector that stores messages writes them to `DIR/data.db` with package
-`store`, and the gateway serves that as its views. Without approvers every
-write is refused.
+are files in `$CREDENTIALS_DIRECTORY`. Secrets belong in `DIR/private`,
+including the connector's own copy of your keys; a connector that stores
+messages writes them to `DIR/data.db` with package `store`.
 
 ## Caveats
 
