@@ -1,5 +1,5 @@
-// Command mandate is a multi-call binary: the agent CLI, the gateway, the
-// console, and one connector per service.
+// Command mandate is the agent CLI, the gateway, and the console. Connectors
+// are separate programs; see package connector.
 package main
 
 import (
@@ -12,11 +12,8 @@ import (
 	"github.com/adeci/mandate/internal/admin"
 	"github.com/adeci/mandate/internal/client"
 	"github.com/adeci/mandate/internal/console"
-	"github.com/adeci/mandate/internal/discord"
 	"github.com/adeci/mandate/internal/exitcode"
 	"github.com/adeci/mandate/internal/gateway"
-	"github.com/adeci/mandate/internal/httpproxy"
-	"github.com/adeci/mandate/internal/whatsapp"
 )
 
 const usage = `usage: mandate <command> [args]
@@ -37,9 +34,6 @@ for agents (set MANDATE_URL and MANDATE_TOKEN):
 
 on the host:
   gateway                 serve the gateway
-  whatsapp run            WhatsApp linked device, linked from the console
-  discord serve           Discord reader behind the gateway
-  http-proxy              token-holding proxy for HTTP APIs
   console                 serve the owner's console and the proposal API
   passkey add --name NAME
                           print a one-time passkey enrollment link (as root)
@@ -78,12 +72,6 @@ func run() int {
 		err = client.HTTP(ctx, args)
 	case "gateway":
 		err = gateway.Command(ctx, args)
-	case "whatsapp":
-		err = whatsapp.Command(ctx, args)
-	case "discord":
-		err = discord.Command(ctx, args)
-	case "http-proxy":
-		err = httpproxy.Command(ctx, args)
 	case "console":
 		err = console.Command(ctx, args)
 	case "passkey":
