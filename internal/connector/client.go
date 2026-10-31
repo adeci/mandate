@@ -35,30 +35,31 @@ func Dial(path string, timeout time.Duration) *Client {
 
 func (c *Client) Spec(ctx context.Context) (Spec, error) {
 	var s Spec
-	err := c.do(ctx, http.MethodGet, "/spec", nil, &s)
+	err := c.Do(ctx, http.MethodGet, "/spec", nil, &s)
 	return s, err
 }
 
 func (c *Client) Read(ctx context.Context, op string, args map[string]string) (json.RawMessage, error) {
 	var out json.RawMessage
-	err := c.do(ctx, http.MethodPost, "/read", opRequest{Op: op, Args: args}, &out)
+	err := c.Do(ctx, http.MethodPost, "/read", opRequest{Op: op, Args: args}, &out)
 	return out, err
 }
 
 func (c *Client) Prepare(ctx context.Context, op string, args map[string]string) (Prepared, error) {
 	var p Prepared
-	err := c.do(ctx, http.MethodPost, "/prepare", opRequest{Op: op, Args: args}, &p)
+	err := c.Do(ctx, http.MethodPost, "/prepare", opRequest{Op: op, Args: args}, &p)
 	return p, err
 }
 
 func (c *Client) Execute(ctx context.Context, a approval.Approval) (Result, error) {
 	var r Result
-	err := c.do(ctx, http.MethodPost, "/execute", a, &r)
+	err := c.Do(ctx, http.MethodPost, "/execute", a, &r)
 	return r, err
 }
 
-// do returns *Error for refusals so callers can relay status and message.
-func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+// Do sends a JSON request over the socket. Refusals come back as *Error so
+// callers can relay status and message.
+func (c *Client) Do(ctx context.Context, method, path string, body, out any) error {
 	var rd io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)

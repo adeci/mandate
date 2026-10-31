@@ -43,6 +43,9 @@ type Param struct {
 	Required bool   `json:"required,omitempty"`
 	// Editable params can be changed by the owner on the approval page.
 	Editable bool `json:"editable,omitempty"`
+	// Container params name a chat/channel/guild; the gateway refuses the op
+	// before it reaches the connector if that container is hidden.
+	Container bool `json:"container,omitempty"`
 }
 
 func (s Spec) Op(name string) (Op, bool) {
@@ -80,6 +83,16 @@ type Result struct {
 	Ref string `json:"ref,omitempty"`
 }
 
+// ReadResult is what read ops return. Messages are stored in the connector's
+// data.db first; the gateway answers with these IDs read back through its
+// filtered views, so hidden and OTP rules apply to fetched data too.
+type ReadResult struct {
+	MessageIDs   []string `json:"message_ids,omitempty"`
+	TotalResults int      `json:"total_results,omitempty"`
+	// Containers counts containers upserted by sync-style reads.
+	Containers int `json:"containers,omitempty"`
+}
+
 // Connector is implemented once per service.
 type Connector interface {
 	Spec() Spec
@@ -91,6 +104,7 @@ type Connector interface {
 }
 
 // Reader is implemented by connectors with read ops, e.g. on-demand fetches.
+// It returns an encoded ReadResult.
 type Reader interface {
 	Read(ctx context.Context, op string, args map[string]string) (json.RawMessage, error)
 }
