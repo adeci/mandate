@@ -36,7 +36,7 @@
       packages = forAllSystems (
         pkgs:
         let
-          all = pkgs.callPackage ./nix/package.nix { };
+          all = pkgs.callPackages ./nix/package.nix { };
         in
         all // { default = all.mandate; }
       );

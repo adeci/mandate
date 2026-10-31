@@ -282,7 +282,8 @@ in
 
         users.users =
           lib.mapAttrs' (
-            name: _: lib.nameValuePair "mandate-${name}" (systemUser "mandate-${name}" [ ] // { home = state name; })
+            name: _:
+            lib.nameValuePair "mandate-${name}" (systemUser "mandate-${name}" [ ] // { home = state name; })
           ) connectors
           // {
             # Group membership grants read access to each source's data.db (0640)
@@ -291,11 +292,9 @@ in
               connectorGroups ++ lib.optional cfg.console.enable "mandate-console"
             );
           };
-        users.groups =
-          lib.mapAttrs' (name: _: lib.nameValuePair "mandate-${name}" { }) connectors
-          // {
-            mandate-gateway = { };
-          };
+        users.groups = lib.mapAttrs' (name: _: lib.nameValuePair "mandate-${name}" { }) connectors // {
+          mandate-gateway = { };
+        };
 
         systemd.services =
           lib.mapAttrs' (name: c: lib.nameValuePair "mandate-${name}" (connectorService name c)) connectors
