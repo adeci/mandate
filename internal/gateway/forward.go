@@ -29,7 +29,7 @@ func (h *handler) forward(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		writeError(w, http.StatusMethodNotAllowed, fmt.Sprintf(
-			"/v1/forward only reads (GET, HEAD); a %s needs the owner's approval: propose it with mandate propose %s ...", r.Method, name))
+			"/v1/forward only reads (GET, HEAD); a %s needs the owner's approval: see mandate %s --help for its write ops", r.Method, name))
 		return
 	}
 	spec, ok := h.spec(w, r, name)
@@ -37,7 +37,7 @@ func (h *handler) forward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !spec.Forward {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("connector %s serves no raw reads; see mandate guide for its ops", name))
+		writeError(w, http.StatusNotFound, fmt.Sprintf("connector %s serves no raw reads; see mandate %s --help", name, name))
 		return
 	}
 	if !h.healthy(w, r, name) {

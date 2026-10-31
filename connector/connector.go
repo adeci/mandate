@@ -65,7 +65,7 @@ type Param struct {
 	// Editable params can be changed by the owner on the approval page.
 	Editable bool `json:"editable,omitempty"`
 	// Container params name a container (chat, channel, ...); the gateway refuses the op
-	// before it reaches the connector if that container is hidden.
+	// before it reaches the connector unless the container is stored and not hidden.
 	Container bool `json:"container,omitempty"`
 }
 
@@ -78,16 +78,12 @@ func (s Spec) Op(name string) (Op, bool) {
 	return Op{}, false
 }
 
-// Prepared is a write after normalization: Args with names resolved to IDs,
-// the fields the owner must see, and the container it writes to (for exposure
-// checks).
+// Prepared is a write after normalization: the args to execute, the fields the
+// owner must see, and the container it writes to (for exposure checks).
 type Prepared struct {
 	Args      map[string]string `json:"args"`
 	Display   []approval.Field  `json:"display"`
 	Container string            `json:"container,omitempty"`
-	// Aliases are other IDs of the same container, e.g. a contact known by
-	// two addresses; the write is refused if any of them is hidden.
-	Aliases []string `json:"aliases,omitempty"`
 }
 
 type Status string
@@ -111,8 +107,9 @@ type Result struct {
 }
 
 // ReadResult is what read ops return. Messages are stored in the connector's
-// data.db first; the gateway answers with these IDs read back through its
-// filtered views, so hidden and OTP rules apply to fetched data too.
+// data.db first; the gateway answers with these IDs read back through the
+// same filter as its message verbs, so hidden and OTP rules apply to fetched
+// data too.
 type ReadResult struct {
 	MessageIDs   []string `json:"message_ids,omitempty"`
 	TotalResults int      `json:"total_results,omitempty"`
@@ -181,22 +178,12 @@ type Setupper interface {
 }
 
 // Error is a request the connector refused, with a message meant for the
-// agent (e.g. "ambiguous recipient"). Status is the HTTP status to relay.
+// agent (e.g. "unknown chat"). Status is the HTTP status to relay.
 type Error struct {
 	Status  int    `json:"-"`
 	Message string `json:"error"`
 	// RetryAfter is set when a read is refused for pacing.
 	RetryAfter int `json:"retry_after_seconds,omitempty"`
-	// Candidates are the matches for an ambiguous name. Message must not
-	// name them: the gateway drops hidden ones before the agent sees them.
-	Candidates []Candidate `json:"candidates,omitempty"`
-}
-
-type Candidate struct {
-	// ID is the container the candidate resolves to; Aliases as in Prepared.
-	ID      string   `json:"id"`
-	Aliases []string `json:"aliases,omitempty"`
-	Label   string   `json:"label"`
 }
 
 func (e *Error) Error() string { return e.Message }

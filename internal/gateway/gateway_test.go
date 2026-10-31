@@ -3,9 +3,9 @@ package gateway
 import (
 	"context"
 	"encoding/json"
-	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -31,6 +31,7 @@ func fixture(t *testing.T) map[string]string {
 		{ID: "conv-family", Kind: "group", Name: "Family", IsGroup: true},
 		{ID: "conv-private", Kind: "dm", Name: "Private"},
 		{ID: "conv-bank", Kind: "dm", Name: "72975"},
+		{ID: "+15550002", Kind: "dm", Name: "Hidden Cousin"},
 	} {
 		mustDo(t, wa.UpsertContainer(ctx, c))
 	}
@@ -40,6 +41,7 @@ func fixture(t *testing.T) map[string]string {
 		{ID: "m3", ContainerID: "conv-private", SenderID: "+15550003", Body: "private thing"},
 		{ID: "m4", ContainerID: "conv-bank", SenderID: "72975", Body: "Your code is 482913"},
 		{ID: "m5", ContainerID: "conv-family", SenderID: "+15550001", Body: "Your login code is 482913, don't share"},
+		{ID: "m6", ContainerID: "+15550002", SenderID: "+15559990000", IsFromMe: true, Body: "dinner with you?"},
 	} {
 		m.SentAt = at.Add(time.Duration(i) * time.Minute)
 		mustDo(t, wa.UpsertMessage(ctx, m))
@@ -64,7 +66,6 @@ func fixture(t *testing.T) map[string]string {
 	return map[string]string{
 		"whatsapp": filepath.Join(dir, "whatsapp.db"),
 		"discord":  filepath.Join(dir, "discord.db"),
-		"signal":   filepath.Join(dir, "missing-signal.db"),
 	}
 }
 
@@ -78,178 +79,127 @@ hide_containers = ["g-work"]
 hide_senders = ["u-hidden"]
 `
 
-func openTest(t *testing.T) *queryConn {
+func sourceHandler(t *testing.T) (*handler, string) {
 	t.Helper()
-	sources := fixture(t)
-	pol, err := parseExposure(testExposure, slices.Sorted(maps.Keys(sources)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	q, err := openQueryConn(sources, pol)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { q.close() })
-	return q
+	exposure := filepath.Join(t.TempDir(), "exposure.toml")
+	mustDo(t, os.WriteFile(exposure, []byte(testExposure), 0o600))
+	return newHandler(Config{Sources: fixture(t), ExposureFile: exposure, Timeout: 2 * time.Second}, testToken), exposure
 }
 
-func query(t *testing.T, q *queryConn, sql string, params ...any) (*queryResult, error) {
+func getTable(t *testing.T, h *handler, path string) (int, table, string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	return q.run(ctx, sql, params, 100)
+	rec := call(h, http.MethodGet, path, "")
+	var res table
+	if rec.Code == http.StatusOK {
+		mustDo(t, json.Unmarshal(rec.Body.Bytes(), &res))
+	}
+	return rec.Code, res, rec.Body.String()
 }
 
-func TestExposureFiltering(t *testing.T) {
-	q := openTest(t)
-
-	res, err := query(t, q, `SELECT id, body, is_auth FROM whatsapp_messages ORDER BY seq`)
-	if err != nil {
-		t.Fatal(err)
+func column(t *testing.T, res table, name string) []any {
+	t.Helper()
+	i := slices.Index(res.Columns, name)
+	if i < 0 {
+		t.Fatalf("no column %s in %v", name, res.Columns)
 	}
-	got := map[string][]any{}
+	var out []any
 	for _, r := range res.Rows {
-		got[r[0].(string)] = r[1:]
+		out = append(out, r[i])
 	}
-	if _, ok := got["m2"]; ok {
-		t.Error("message from hidden sender served")
+	return out
+}
+
+func TestVerbsNeverShowHiddenChatsOrLoginCodes(t *testing.T) {
+	t.Parallel()
+	h, _ := sourceHandler(t)
+
+	_, res, _ := getTable(t, h, "/v1/whatsapp/chats")
+	if got := column(t, res, "id"); !slices.Equal(got, []any{"conv-bank", "conv-family"}) && !slices.Equal(got, []any{"conv-family", "conv-bank"}) {
+		t.Errorf("whatsapp chats = %v, want family and bank (hidden chat and hidden sender's DM dropped)", got)
 	}
-	if _, ok := got["m3"]; ok {
-		t.Error("message in hidden container served")
+	_, res, _ = getTable(t, h, "/v1/discord/chats")
+	if got := column(t, res, "id"); len(got) != 2 || slices.Contains(got, "g-work") || slices.Contains(got, "c-general") {
+		t.Errorf("discord chats = %v, want fun and memes (hidden guild hides its channels)", got)
 	}
-	if b := got["m1"]; b == nil || b[0] != "dinner at 7?" || b[1] != int64(0) {
-		t.Errorf("ordinary message = %v, want body and is_auth=0", b)
+
+	_, res, _ = getTable(t, h, "/v1/whatsapp/messages?chat=conv-family")
+	if got := column(t, res, "body"); !slices.Equal(got, []any{nil, "dinner at 7?"}) {
+		t.Errorf("family messages = %v, want the login code blanked and the hidden sender dropped", got)
 	}
-	for _, id := range []string{"m4", "m5"} {
-		if b := got[id]; b == nil || b[0] != nil || b[1] != int64(1) {
-			t.Errorf("auth message %s = %v, want NULL body and is_auth=1", id, b)
+
+	for _, chat := range []string{"conv-private", "+15550002", "c-general", "nope"} {
+		source := "whatsapp"
+		if strings.HasPrefix(chat, "c-") {
+			source = "discord"
+		}
+		code, _, body := getTable(t, h, "/v1/"+source+"/messages?chat="+url.QueryEscape(chat))
+		if code != http.StatusNotFound || !strings.Contains(body, "unknown chat") || !strings.Contains(body, "chats --search") {
+			t.Errorf("messages in %s: %d %s, want 404 unknown chat with a hint", chat, code, body)
+		}
+		if code, _, _ := getTable(t, h, "/v1/"+source+"/search?text=a&chat="+url.QueryEscape(chat)); code != http.StatusNotFound {
+			t.Errorf("search in %s: %d, want 404", chat, code)
 		}
 	}
 
-	res, err = query(t, q, `SELECT id FROM discord_messages`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Rows) != 1 || res.Rows[0][0] != "d2" {
-		t.Errorf("discord messages = %v, want only d2 (hidden guild hides its channels)", res.Rows)
-	}
-	res, err = query(t, q, `SELECT id FROM discord_containers ORDER BY id`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Rows) != 2 || res.Rows[0][0] != "c-memes" || res.Rows[1][0] != "g-fun" {
-		t.Errorf("discord containers = %v, want c-memes and g-fun", res.Rows)
-	}
-}
-
-func TestBotCannotBypassViews(t *testing.T) {
-	q := openTest(t)
-	for _, sql := range []string{
-		`SELECT * FROM src_whatsapp.messages`,
-		`SELECT body FROM src_whatsapp.messages WHERE id = 'm2'`,
-		`SELECT * FROM _hidden`,
-		`SELECT sql FROM sqlite_temp_master`,
-		`SELECT * FROM sqlite_schema`,
-		`SELECT * FROM pragma_table_info('whatsapp_messages')`,
-		`SELECT * FROM pragma_database_list`,
-		`WITH whatsapp_messages AS (SELECT * FROM src_whatsapp.messages) SELECT * FROM whatsapp_messages`,
-		`WITH x AS (SELECT * FROM src_whatsapp.messages) SELECT * FROM x`,
-		`SELECT * FROM whatsapp_messages UNION ALL SELECT seq, id, container_id, NULL, NULL, sender_id, sender_name, sent_at, is_from_me, body, 0, media_type, reply_to_id, edited_at, deleted FROM src_whatsapp.messages`,
-		`SELECT (SELECT body FROM src_whatsapp.messages LIMIT 1)`,
-		`SELECT load_extension('x')`,
+	for text, want := range map[string][]any{
+		"dinner":  {"dinner at 7?"},
+		"482913":  nil,
+		"code":    nil,
+		"gossip":  nil,
+		"private": nil,
 	} {
-		if res, err := query(t, q, sql); err == nil {
-			t.Errorf("%s: allowed, returned %v", sql, res.Rows)
+		_, res, _ := getTable(t, h, "/v1/whatsapp/search?text="+text)
+		if got := column(t, res, "body"); !slices.Equal(got, want) {
+			t.Errorf("search %q = %v, want %v", text, got, want)
 		}
 	}
 }
 
-func TestBotCannotWrite(t *testing.T) {
-	q := openTest(t)
-	for _, sql := range []string{
-		`INSERT INTO _hidden VALUES ('whatsapp', 'sender', 'x')`,
-		`DELETE FROM _hidden`,
-		`DROP VIEW whatsapp_messages`,
-		`CREATE TEMP VIEW leak AS SELECT * FROM src_whatsapp.messages`,
-		`CREATE TEMP TABLE t(x)`,
-		`ATTACH DATABASE 'file:/tmp/x.db' AS x`,
-		`DETACH DATABASE src_whatsapp`,
-		`PRAGMA query_only = 0`,
-		`PRAGMA table_info(whatsapp_messages)`,
-		`SELECT 1; DELETE FROM _hidden`,
-		`BEGIN`,
-		`VACUUM`,
+func TestVerbsPaginate(t *testing.T) {
+	t.Parallel()
+	h, _ := sourceHandler(t)
+	_, res, _ := getTable(t, h, "/v1/whatsapp/messages?chat=conv-family&limit=1")
+	if !res.More || res.NextBefore != 5 || len(res.Rows) != 1 {
+		t.Fatalf("first page: %+v, want one row and next_before 5", res)
+	}
+	_, res, _ = getTable(t, h, "/v1/whatsapp/messages?chat=conv-family&limit=1&before=5")
+	if res.More || len(res.Rows) != 1 || res.Rows[0][0] != float64(1) {
+		t.Errorf("second page: %+v, want seq 1 and no more", res)
+	}
+	_, res, _ = getTable(t, h, "/v1/whatsapp/chats?limit=1")
+	if !res.More || res.NextBefore != 0 || len(res.Rows) != 1 {
+		t.Errorf("chats page: %+v", res)
+	}
+	_, res, _ = getTable(t, h, "/v1/whatsapp/search?text=dinner&since=2026-10-02")
+	if len(res.Rows) != 0 {
+		t.Errorf("search since: %+v", res)
+	}
+	for _, q := range []string{
+		"chats?limit=0", "chats?limit=501", "messages?chat=conv-family&before=x", "messages", "search", "search?text=a&since=yesterday",
 	} {
-		if _, err := query(t, q, sql); err == nil {
-			t.Errorf("%s: allowed", sql)
+		if code, _, body := getTable(t, h, "/v1/whatsapp/"+q); code != http.StatusBadRequest {
+			t.Errorf("%s: %d %s, want 400", q, code, body)
 		}
-	}
-	// The policy survives the attempts.
-	res, err := query(t, q, `SELECT count(*) FROM whatsapp_messages WHERE sender_id = '+15550002'`)
-	if err != nil || res.Rows[0][0] != int64(0) {
-		t.Fatalf("hidden sender visible after write attempts: %v %v", res, err)
-	}
-}
-
-func TestQueryFeatures(t *testing.T) {
-	q := openTest(t)
-
-	res, err := query(t, q, `
-WITH recent AS (SELECT * FROM whatsapp_messages WHERE sent_at >= ?1)
-SELECT c.name, count(*) FROM recent r JOIN whatsapp_containers c ON c.id = r.container_id GROUP BY c.name ORDER BY c.name`,
-		"2026-10-01T00:00:00.000Z")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Rows) != 2 {
-		t.Errorf("grouped rows = %v, want Family and 72975", res.Rows)
-	}
-
-	ctx := context.Background()
-	res, err = q.run(ctx, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 50) SELECT i FROM n`, nil, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Rows) != 10 || !res.Truncated {
-		t.Errorf("row cap: got %d rows truncated=%v, want 10 truncated", len(res.Rows), res.Truncated)
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer cancel()
-	start := time.Now()
-	_, err = q.run(ctx, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT count(*) FROM n`, nil, 10)
-	if err == nil {
-		t.Fatal("runaway query was not interrupted")
-	}
-	if time.Since(start) > 2*time.Second {
-		t.Errorf("interrupt took %v", time.Since(start))
-	}
-
-	if _, err := query(t, q, `SELECT * FROM signal_messages`); err == nil {
-		t.Error("view for missing source exists")
 	}
 }
 
 // A connector's data.db appears when it first stores something; until then
-// its source has no views and the gateway serves the others.
+// its source reads as empty.
 func TestSourceAppearsOnceItsDatabaseExists(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "late", "data.db")
 	h := newHandler(Config{
 		Sources:      map[string]string{"late": path},
 		ExposureFile: filepath.Join(dir, "exposure.toml"),
-		MaxRows:      100, Timeout: 2 * time.Second,
+		Timeout:      2 * time.Second,
 	}, testToken)
 
-	rec := call(h, http.MethodGet, "/v1/schema", "")
-	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "late_") {
-		t.Fatalf("schema before the database exists: %d %s", rec.Code, rec.Body)
+	if code, res, body := getTable(t, h, "/v1/late/chats"); code != http.StatusOK || len(res.Rows) != 0 {
+		t.Fatalf("chats before the database exists: %d %s", code, body)
 	}
-	if rec := call(h, http.MethodPost, "/v1/query", `{"sql":"SELECT 1"}`); rec.Code != http.StatusOK {
-		t.Fatalf("query before the database exists: %d %s", rec.Code, rec.Body)
-	}
-	if rec := call(h, http.MethodPost, "/v1/query", `{"sql":"SELECT * FROM late_messages"}`); rec.Code != http.StatusBadRequest {
-		t.Fatalf("view before the database exists: %d %s", rec.Code, rec.Body)
+	if code, _, _ := getTable(t, h, "/v1/late/messages?chat=c1"); code != http.StatusNotFound {
+		t.Fatalf("messages before the database exists: %d", code)
 	}
 
 	mustDo(t, os.Mkdir(filepath.Dir(path), 0o750))
@@ -259,16 +209,35 @@ func TestSourceAppearsOnceItsDatabaseExists(t *testing.T) {
 	mustDo(t, st.UpsertMessage(context.Background(), store.Message{ID: "m1", ContainerID: "c1", SenderID: "u1", Body: "hi", SentAt: time.Now()}))
 	mustDo(t, st.Close())
 
-	if rec := call(h, http.MethodGet, "/v1/schema", ""); !strings.Contains(rec.Body.String(), `"late_messages"`) {
-		t.Fatalf("schema after the database exists: %d %s", rec.Code, rec.Body)
+	if _, res, body := getTable(t, h, "/v1/late/messages?chat=c1"); len(res.Rows) != 1 {
+		t.Fatalf("messages after the database exists: %s", body)
 	}
-	rec = call(h, http.MethodPost, "/v1/query", `{"sql":"SELECT body FROM late_messages"}`)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"hi"`) {
-		t.Fatalf("query after the database exists: %d %s", rec.Code, rec.Body)
+}
+
+func TestAuthAndBrokenExposure(t *testing.T) {
+	t.Parallel()
+	h, exposure := sourceHandler(t)
+	for _, auth := range []string{"", "Bearer wrong"} {
+		req := httptest.NewRequest(http.MethodGet, "/v1/whatsapp/chats", nil)
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("auth %q: %d", auth, rec.Code)
+		}
+	}
+	// A broken exposure file fails closed instead of serving unfiltered data.
+	time.Sleep(10 * time.Millisecond)
+	mustDo(t, os.WriteFile(exposure, []byte("[whatsap]\nhide_senders = []\n"), 0o600))
+	if code, _, body := getTable(t, h, "/v1/whatsapp/chats"); code != http.StatusServiceUnavailable {
+		t.Errorf("broken exposure: %d %s", code, body)
 	}
 }
 
 func TestParseExposureStrict(t *testing.T) {
+	t.Parallel()
 	sources := []string{"discord", "whatsapp"}
 	for name, conf := range map[string]string{
 		"typo in key":          "[whatsapp]\nhide_sender = [\"+1\"]\n",
@@ -296,10 +265,12 @@ func TestParseExposureStrict(t *testing.T) {
 }
 
 func TestFlagNames(t *testing.T) {
+	t.Parallel()
 	for v, ok := range map[string]bool{
 		"whatsapp=/var/lib/w/data.db": true,
 		"auth=/x.db":                  false,
 		"../x=/x.db":                  false,
+		"proposals=/x.db":             false,
 	} {
 		if err := (sourceFlag{}).Set(v); (err == nil) != ok {
 			t.Errorf("source %q: err = %v, want ok=%v", v, err, ok)
@@ -312,46 +283,6 @@ func TestFlagNames(t *testing.T) {
 		if err := (connectorFlag{}).Set(v); (err == nil) != ok {
 			t.Errorf("connector %q: err = %v, want ok=%v", v, err, ok)
 		}
-	}
-}
-
-func TestHTTP(t *testing.T) {
-	dir := t.TempDir()
-	exposure := filepath.Join(dir, "exposure.toml")
-	mustDo(t, os.WriteFile(exposure, []byte(testExposure), 0o600))
-	h := newHandler(Config{Sources: fixture(t), ExposureFile: exposure, MaxRows: 100, Timeout: 2 * time.Second}, testToken)
-
-	for _, auth := range []string{"", "Bearer wrong"} {
-		req := httptest.NewRequest(http.MethodPost, "/v1/query", strings.NewReader(`{"sql":"SELECT 1"}`))
-		if auth != "" {
-			req.Header.Set("Authorization", auth)
-		}
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("auth %q: %d", auth, rec.Code)
-		}
-	}
-	rec := call(h, http.MethodPost, "/v1/query", `{"sql":"SELECT count(*) FROM whatsapp_messages"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("query: %d %s", rec.Code, rec.Body)
-	}
-	var res queryResult
-	mustDo(t, json.Unmarshal(rec.Body.Bytes(), &res))
-	if len(res.Rows) != 1 || res.Rows[0][0] != float64(3) {
-		t.Errorf("count = %v, want 3", res.Rows)
-	}
-
-	rec = call(h, http.MethodGet, "/v1/schema", "")
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"whatsapp_messages"`) || strings.Contains(rec.Body.String(), "_hidden") {
-		t.Errorf("schema: %d %s", rec.Code, rec.Body)
-	}
-
-	// A broken exposure file fails closed instead of serving unfiltered data.
-	time.Sleep(10 * time.Millisecond)
-	mustDo(t, os.WriteFile(exposure, []byte("[whatsap]\nhide_senders = []\n"), 0o600))
-	if rec := call(h, http.MethodPost, "/v1/query", `{"sql":"SELECT 1"}`); rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("broken exposure: %d %s", rec.Code, rec.Body)
 	}
 }
 
