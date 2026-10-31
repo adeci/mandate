@@ -11,45 +11,47 @@ let
   exe = lib.getExe cfg.package;
   state = name: "/var/lib/mandate-${name}";
   socket = unit: "/run/mandate-${unit}/connector.sock";
-  proposalSocket = "/run/mandate-approvals/proposals.sock";
+  proposalSocket = "/run/mandate-console/proposals.sock";
 
   # %d (the credentials directory) must reach systemd unescaped, so credential
   # paths are appended after escapeSystemdExecArgs, which would turn it into %%d.
   credential = flag: name: " ${flag} %d/${name}";
 
-  # internal/exitcode.NeedsOwner: systemd leaves the unit failed instead of looping.
-  needsOwner = 3;
-
   # Browsers omit the default port from the origin a passkey signs.
   origin =
-    "https://${cfg.approvals.hostname}"
-    + lib.optionalString (cfg.approvals.port != 443) ":${toString cfg.approvals.port}";
-  approvers = pkgs.writeText "mandate-approvers.json" (builtins.toJSON cfg.approvals.approvers);
+    "https://${cfg.console.hostname}"
+    + lib.optionalString (cfg.console.port != 443) ":${toString cfg.console.port}";
+  approvers = pkgs.writeText "mandate-approvers.json" (builtins.toJSON cfg.console.approvers);
 
   # Connectors verify every approval themselves; without these flags they
   # refuse all writes.
   verifyArgs =
     seen:
-    lib.optionals cfg.approvals.enable [
+    lib.optionals cfg.console.enable [
       "--approvers"
       approvers
       "--rp-id"
-      cfg.approvals.hostname
+      cfg.console.hostname
       "--origin"
       origin
       "--seen"
       seen
     ];
 
-  # Enabled sources: unit/user name -> gateway source name, ExecStart args,
-  # the session file whose absence means "not paired yet", and whether the
-  # unit serves a connector socket.
+  # Only the tailnet and localhost may connect.
+  tailnetOnly = {
+    IPAddressAllow = [
+      "localhost"
+      "100.64.0.0/10"
+      "fd7a:115c:a1e0::/48"
+    ];
+    IPAddressDeny = "any";
+  };
+
+  # Enabled sources: unit/user name -> gateway source name and ExecStart args.
   sources = lib.filterAttrs (name: _: cfg.${name}.enable) {
     whatsapp = {
       source = "whatsapp";
-      session = "private/session.db";
-      connector = true;
-      writes = true;
       args = [
         "whatsapp"
         "run"
@@ -64,9 +66,6 @@ let
     };
     discord = {
       source = "discord";
-      session = null;
-      connector = true;
-      writes = false;
       args = [
         "discord"
         "serve"
@@ -88,27 +87,14 @@ let
 
   # Connector name -> the unit serving it.
   connectors =
-    lib.mapAttrs' (
-      unit: src:
-      lib.nameValuePair src.source {
-        inherit unit;
-        inherit (src) writes;
-      }
-    ) (lib.filterAttrs (_: src: src.connector) sources)
-    // lib.optionalAttrs httpProxy {
-      http = {
-        unit = "http-proxy";
-        writes = true;
-      };
-    };
-  writers = lib.filterAttrs (_: c: c.writes) connectors;
-  connectorArgs =
-    cs:
-    lib.concatMap (name: [
-      "--connector"
-      "${name}=${socket cs.${name}.unit}"
-    ]) (lib.attrNames cs);
-  groupsOf = cs: map (c: "mandate-${c.unit}") (lib.attrValues cs);
+    lib.mapAttrs' (unit: src: lib.nameValuePair src.source { inherit unit; }) sources
+    // lib.optionalAttrs httpProxy { http.unit = "http-proxy"; };
+  connectorArgs = lib.concatMap (name: [
+    "--connector"
+    "${name}=${socket connectors.${name}.unit}"
+  ]) (lib.attrNames connectors);
+  connectorGroups = map (c: "mandate-${c.unit}") (lib.attrValues connectors);
+  connectorUnits = map (c: "mandate-${c.unit}.service") (lib.attrValues connectors);
 
   httpConfig = pkgs.writeText "mandate-http.json" (
     builtins.toJSON (
@@ -134,7 +120,6 @@ let
       method = lib.elemAt parts 0;
       path = lib.elemAt parts 1;
     };
-  ruleType = lib.types.strMatching "[A-Z]+ /[^ ]*";
 
   hardening = {
     NoNewPrivileges = true;
@@ -176,43 +161,29 @@ let
     inherit extraGroups;
   };
 
-  sourceService = name: src: {
-    description = "mandate ${name} source";
-    after = [ "network-online.target" ];
-    wants = [ "network-online.target" ];
-    wantedBy = [ "multi-user.target" ];
-    startLimitIntervalSec = 0;
-    # Not started until paired: run `mandate <name> pair` as mandate-<name> first.
-    unitConfig = lib.optionalAttrs (src.session != null) {
-      ConditionPathExists = "${state name}/${src.session}";
-    };
-    serviceConfig =
-      hardening
-      // {
-        User = "mandate-${name}";
-        Group = "mandate-${name}";
-        StateDirectory = "mandate-${name}";
-        StateDirectoryMode = "0750";
-        WorkingDirectory = state name;
-        ExecStart =
-          utils.escapeSystemdExecArgs ([ exe ] ++ src.args)
-          + lib.optionalString (name == "discord") (credential "--token-file" "token");
+  # A unit that serves a connector socket as its own user.
+  connectorService =
+    unit: description: extra:
+    lib.recursiveUpdate {
+      inherit description;
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      wantedBy = [ "multi-user.target" ];
+      startLimitIntervalSec = 0;
+      serviceConfig = hardening // {
+        User = "mandate-${unit}";
+        Group = "mandate-${unit}";
+        StateDirectory = "mandate-${unit}";
+        RuntimeDirectory = "mandate-${unit}";
+        RuntimeDirectoryMode = "0750";
         Restart = "always";
         RestartSec = "30s";
-        RestartPreventExitStatus = needsOwner;
-      }
-      // lib.optionalAttrs src.connector {
-        RuntimeDirectory = "mandate-${name}";
-        RuntimeDirectoryMode = "0750";
-      }
-      // lib.optionalAttrs (name == "discord") {
-        LoadCredential = [ "token:${cfg.discord.tokenFile}" ];
       };
-  };
+    } extra;
 in
 {
   options.services.mandate = {
-    enable = lib.mkEnableOption "the mandate gateway (and the sources enabled below)";
+    enable = lib.mkEnableOption "the mandate gateway (and the connectors enabled below)";
 
     package = lib.mkOption {
       type = lib.types.package;
@@ -239,30 +210,30 @@ in
     openFirewallOn = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = "tailscale0";
-      description = "Interface to open the gateway and approval ports on; null leaves the firewall alone.";
+      description = "Interface to open the gateway and console ports on; null leaves the firewall alone.";
     };
 
-    approvals = {
-      enable = lib.mkEnableOption "writes: agents propose, you approve each one with a passkey";
+    console = {
+      enable = lib.mkEnableOption "the console, where you link accounts and approve each write with a passkey";
 
       hostname = lib.mkOption {
         type = lib.types.str;
-        example = "box.example.ts.net";
+        example = "mandate.example.com";
         description = ''
-          Hostname of the approval page, which is also the passkey relying
-          party: changing it invalidates every enrolled passkey.
+          Hostname of the console, which is also the passkey relying party:
+          changing it invalidates every enrolled passkey.
         '';
       };
 
       port = lib.mkOption {
         type = lib.types.port;
-        default = 8781;
-        description = "Approval page port (HTTPS).";
+        default = 443;
+        description = "Console port (HTTPS).";
       };
 
       tlsCertFile = lib.mkOption {
         type = lib.types.externalPath;
-        description = "TLS certificate for the hostname. Loaded via LoadCredential; restart mandate-approvals after renewing.";
+        description = "TLS certificate for the hostname. Loaded via LoadCredential; restart mandate-console after renewing.";
       };
 
       tlsKeyFile = lib.mkOption {
@@ -283,34 +254,16 @@ in
         default = [ ];
         example = lib.literalExpression "lib.importJSON ./approvers.json";
         description = ''
-          Passkeys that may approve writes, as printed by
-          `mandate approver enroll`. Empty means nothing can be approved.
+          Passkeys that may sign in and approve writes, as shown by the
+          console after adding one. Keys are trusted only from here, so a
+          compromised console can't add its own.
         '';
-      };
-
-      ntfy = {
-        url = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-          example = "https://ntfy.example.com";
-          description = "ntfy server for approval pushes; null disables them.";
-        };
-        topic = lib.mkOption {
-          type = lib.types.str;
-          default = "mandate";
-          description = "ntfy topic.";
-        };
-        tokenFile = lib.mkOption {
-          type = lib.types.nullOr lib.types.externalPath;
-          default = null;
-          description = "ntfy access token that may publish to the topic.";
-        };
       };
     };
 
-    whatsapp.enable = lib.mkEnableOption "the WhatsApp source (linked device)";
+    whatsapp.enable = lib.mkEnableOption "the WhatsApp connector (linked from the console)";
     discord = {
-      enable = lib.mkEnableOption "the Discord source (on-demand reads with a user token)";
+      enable = lib.mkEnableOption "the Discord connector (on-demand reads with a user token)";
       tokenFile = lib.mkOption {
         type = lib.types.externalPath;
         example = "/run/secrets/discord-token";
@@ -339,13 +292,13 @@ in
               default = "Bearer ";
             };
             reads = lib.mkOption {
-              type = lib.types.listOf ruleType;
+              type = lib.types.listOf (lib.types.strMatching "(GET|HEAD) /[^ ]*");
               default = [ ];
               example = [ "GET /repos/*/*/issues" ];
-              description = "Requests agents may make directly. `*` matches one path segment, a trailing `**` the rest.";
+              description = "GET or HEAD requests agents may make directly. `*` matches one path segment, a trailing `**` the rest.";
             };
             writes = lib.mkOption {
-              type = lib.types.listOf ruleType;
+              type = lib.types.listOf (lib.types.strMatching "[A-Z]+ /[^ ]*");
               default = [ ];
               example = [ "POST /repos/*/*/issues" ];
               description = "Requests agents may propose; each one waits for your approval.";
@@ -369,12 +322,26 @@ in
       users.groups = lib.mapAttrs' (name: _: lib.nameValuePair "mandate-${name}" { }) sources;
 
       systemd.services = lib.mapAttrs' (
-        name: src: lib.nameValuePair "mandate-${name}" (sourceService name src)
+        name: src:
+        lib.nameValuePair "mandate-${name}" (
+          connectorService name "mandate ${name} connector" {
+            serviceConfig = {
+              StateDirectoryMode = "0750";
+              WorkingDirectory = state name;
+              ExecStart =
+                utils.escapeSystemdExecArgs ([ exe ] ++ src.args)
+                + lib.optionalString (name == "discord") (credential "--token-file" "token");
+            }
+            // lib.optionalAttrs (name == "discord") {
+              LoadCredential = [ "token:${cfg.discord.tokenFile}" ];
+            };
+          }
+        )
       ) sources;
 
-      # `pair` runs before StateDirectory exists. Session state (incl. SQLite
-      # -wal/-shm files, which ignore file modes) lives in private/, which the
-      # gateway cannot traverse.
+      # data.db is readable by the gateway's group. Session state, including
+      # SQLite -wal/-shm files that ignore file modes, lives in private/,
+      # which only the connector's user can traverse.
       systemd.tmpfiles.rules = lib.concatLists (
         lib.mapAttrsToList (name: _: [
           "d ${state name} 0750 mandate-${name} mandate-${name} -"
@@ -387,129 +354,116 @@ in
       # Group membership grants read access to each source's data.db (0640)
       # and connector sockets (0660).
       users.users.mandate-gateway = systemUser "mandate-gateway" (
-        map (name: "mandate-${name}") (lib.attrNames sources)
-        ++ groupsOf (lib.filterAttrs (_: c: c.unit == "http-proxy") connectors)
-        ++ lib.optional cfg.approvals.enable "mandate-approvals"
+        connectorGroups ++ lib.optional cfg.console.enable "mandate-console"
       );
       users.groups.mandate-gateway = { };
 
       systemd.services.mandate-gateway = {
         description = "mandate gateway";
-        after = [ "network.target" ] ++ map (c: "mandate-${c.unit}.service") (lib.attrValues connectors);
+        after = [ "network.target" ] ++ connectorUnits;
         wantedBy = [ "multi-user.target" ];
-        serviceConfig = hardening // {
-          User = "mandate-gateway";
-          Group = "mandate-gateway";
-          StateDirectory = "mandate-gateway";
-          StateDirectoryMode = "0750";
-          LoadCredential = [ "token:${cfg.tokenFile}" ];
-          # Only the tailnet and localhost may connect; no egress at all.
-          IPAddressAllow = [
-            "localhost"
-            "100.64.0.0/10"
-            "fd7a:115c:a1e0::/48"
-          ];
-          IPAddressDeny = "any";
-          ExecStart =
-            utils.escapeSystemdExecArgs (
-              [
-                exe
-                "gateway"
-                "--listen"
-                ":${toString cfg.port}"
-                "--exposure"
-                "${state "gateway"}/exposure.toml"
-              ]
-              ++ lib.concatLists (
-                lib.mapAttrsToList (name: src: [
-                  "--source"
-                  "${src.source}=${state name}/data.db"
-                ]) sources
+        serviceConfig =
+          hardening
+          // tailnetOnly
+          // {
+            User = "mandate-gateway";
+            Group = "mandate-gateway";
+            StateDirectory = "mandate-gateway";
+            StateDirectoryMode = "0750";
+            LoadCredential = [ "token:${cfg.tokenFile}" ];
+            ExecStart =
+              utils.escapeSystemdExecArgs (
+                [
+                  exe
+                  "gateway"
+                  "--listen"
+                  ":${toString cfg.port}"
+                  "--exposure"
+                  "${state "gateway"}/exposure.toml"
+                ]
+                ++ lib.concatLists (
+                  lib.mapAttrsToList (name: src: [
+                    "--source"
+                    "${src.source}=${state name}/data.db"
+                  ]) sources
+                )
+                ++ connectorArgs
+                ++ lib.optionals cfg.console.enable [
+                  "--console-socket"
+                  proposalSocket
+                  "--console-url"
+                  origin
+                ]
+                ++ lib.optionals httpProxy [
+                  "--http-proxy-socket"
+                  (socket "http-proxy")
+                ]
               )
-              ++ connectorArgs connectors
-              ++ lib.optionals cfg.approvals.enable [
-                "--approvals-socket"
-                proposalSocket
-              ]
-              ++ lib.optionals httpProxy [
-                "--http-proxy-socket"
-                (socket "http-proxy")
-              ]
-            )
-            + credential "--token-file" "token";
-          Restart = "always";
-          RestartSec = "5s";
-        };
+              + credential "--token-file" "token";
+            Restart = "always";
+            RestartSec = "5s";
+          };
       };
 
       networking.firewall.interfaces = lib.mkIf (cfg.openFirewallOn != null) {
         ${cfg.openFirewallOn}.allowedTCPPorts = [
           cfg.port
         ]
-        ++ lib.optional cfg.approvals.enable cfg.approvals.port;
+        ++ lib.optional cfg.console.enable cfg.console.port;
       };
     })
 
-    (lib.mkIf (cfg.enable && cfg.approvals.enable) {
-      users.users.mandate-approvals = systemUser "mandate-approvals" (groupsOf writers);
-      users.groups.mandate-approvals = { };
+    (lib.mkIf (cfg.enable && cfg.console.enable) {
+      users.users.mandate-console = systemUser "mandate-console" connectorGroups;
+      users.groups.mandate-console = { };
 
-      systemd.services.mandate-approvals = {
-        description = "mandate approvals";
-        after = [
-          "network-online.target"
-        ]
-        ++ map (c: "mandate-${c.unit}.service") (lib.attrValues writers);
-        wants = [ "network-online.target" ];
+      systemd.services.mandate-console = {
+        description = "mandate console";
+        after = [ "network.target" ] ++ connectorUnits;
         wantedBy = [ "multi-user.target" ];
-        serviceConfig = hardening // {
-          User = "mandate-approvals";
-          Group = "mandate-approvals";
-          # Proposals and the audit log are this unit's alone; the gateway
-          # only reaches the proposal socket.
-          StateDirectory = "mandate-approvals";
-          StateDirectoryMode = "0700";
-          RuntimeDirectory = "mandate-approvals";
-          RuntimeDirectoryMode = "0750";
-          LoadCredential = [
-            "tls-cert:${cfg.approvals.tlsCertFile}"
-            "tls-key:${cfg.approvals.tlsKeyFile}"
-          ]
-          ++ lib.optional (cfg.approvals.ntfy.tokenFile != null) "ntfy-token:${cfg.approvals.ntfy.tokenFile}";
-          ExecStart =
-            utils.escapeSystemdExecArgs (
-              [
-                exe
-                "approvals"
-                "--hostname"
-                cfg.approvals.hostname
-                "--https-listen"
-                ":${toString cfg.approvals.port}"
-                "--state"
-                (state "approvals")
-                "--approvers"
-                approvers
-                "--socket"
-                proposalSocket
-                "--admin-socket"
-                "/run/mandate-approvals/admin.sock"
-              ]
-              ++ connectorArgs writers
-              ++ lib.optionals (cfg.approvals.ntfy.url != null) [
-                "--ntfy-url"
-                cfg.approvals.ntfy.url
-                "--ntfy-topic"
-                cfg.approvals.ntfy.topic
-              ]
-            )
-            + credential "--tls-cert" "tls-cert"
-            + credential "--tls-key" "tls-key"
-            + lib.optionalString (cfg.approvals.ntfy.tokenFile != null) (
-              credential "--ntfy-token-file" "ntfy-token"
-            );
-          Restart = "always";
-          RestartSec = "5s";
-        };
+        serviceConfig =
+          hardening
+          // tailnetOnly
+          // {
+            User = "mandate-console";
+            Group = "mandate-console";
+            # Sessions and decided proposals are the console's alone; the
+            # gateway only reaches the proposal socket.
+            StateDirectory = "mandate-console";
+            StateDirectoryMode = "0700";
+            RuntimeDirectory = "mandate-console";
+            RuntimeDirectoryMode = "0750";
+            AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
+            CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
+            LoadCredential = [
+              "tls-cert:${cfg.console.tlsCertFile}"
+              "tls-key:${cfg.console.tlsKeyFile}"
+            ];
+            ExecStart =
+              utils.escapeSystemdExecArgs (
+                [
+                  exe
+                  "console"
+                  "--hostname"
+                  cfg.console.hostname
+                  "--listen"
+                  ":${toString cfg.console.port}"
+                  "--state"
+                  (state "console")
+                  "--approvers"
+                  approvers
+                  "--socket"
+                  proposalSocket
+                  "--admin-socket"
+                  "/run/mandate-console/admin.sock"
+                ]
+                ++ connectorArgs
+              )
+              + credential "--tls-cert" "tls-cert"
+              + credential "--tls-key" "tls-key";
+            Restart = "always";
+            RestartSec = "5s";
+          };
       };
     })
 
@@ -517,18 +471,9 @@ in
       users.users.mandate-http-proxy = systemUser "mandate-http-proxy" [ ];
       users.groups.mandate-http-proxy = { };
 
-      systemd.services.mandate-http-proxy = {
-        description = "mandate HTTP API proxy";
-        after = [ "network-online.target" ];
-        wants = [ "network-online.target" ];
-        wantedBy = [ "multi-user.target" ];
-        serviceConfig = hardening // {
-          User = "mandate-http-proxy";
-          Group = "mandate-http-proxy";
-          StateDirectory = "mandate-http-proxy";
+      systemd.services.mandate-http-proxy = connectorService "http-proxy" "mandate HTTP API proxy" {
+        serviceConfig = {
           StateDirectoryMode = "0700";
-          RuntimeDirectory = "mandate-http-proxy";
-          RuntimeDirectoryMode = "0750";
           LoadCredential = lib.mapAttrsToList (name: s: "${name}:${s.tokenFile}") cfg.http.services;
           # Reads token files from $CREDENTIALS_DIRECTORY.
           ExecStart = utils.escapeSystemdExecArgs (
@@ -542,8 +487,6 @@ in
             ]
             ++ verifyArgs "${state "http-proxy"}/seen.json"
           );
-          Restart = "always";
-          RestartSec = "5s";
         };
       };
     })
