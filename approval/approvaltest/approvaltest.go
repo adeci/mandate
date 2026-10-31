@@ -1,5 +1,6 @@
 // Package approvaltest is a software passkey that produces real WebAuthn
-// assertions, so tests exercise the same verifier production uses.
+// registrations and assertions, so tests exercise the same verifiers
+// production uses.
 package approvaltest
 
 import (
@@ -9,6 +10,8 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -28,8 +31,9 @@ const (
 type Authenticator struct {
 	RPID   string
 	Origin string
-	// Flags are set in every assertion; tests clear FlagUV to simulate an
-	// authenticator that skipped user verification.
+	// Flags are set in every registration and assertion; tests clear FlagUV
+	// to simulate an authenticator that skipped user verification, or set
+	// FlagBE for a synced passkey.
 	Flags byte
 
 	key *ecdsa.PrivateKey
@@ -49,13 +53,47 @@ func New(t testing.TB, rpID, origin string) *Authenticator {
 	return &Authenticator{RPID: rpID, Origin: origin, Flags: FlagUP | FlagUV, key: key, id: id}
 }
 
-// Approver is this passkey as it would be enrolled.
-func (a *Authenticator) Approver(name string) approval.Approver {
-	return approval.Approver{
+// Key is this passkey as registration reports it.
+func (a *Authenticator) Key(name string) approval.Key {
+	return approval.Key{
 		Name:         name,
 		CredentialID: base64.RawURLEncoding.EncodeToString(a.id),
 		PublicKey:    base64.RawURLEncoding.EncodeToString(a.coseKey()),
+		Synced:       a.Flags&FlagBE != 0,
 	}
+}
+
+// Sign approves key change bytes.
+func (a *Authenticator) Sign(change []byte) approval.SignedChange {
+	return approval.SignedChange{
+		Change:    change,
+		Signer:    base64.RawURLEncoding.EncodeToString(a.id),
+		Assertion: a.Assert(approval.KeyChallenge(change)),
+	}
+}
+
+// Keys returns a key log in a temporary directory that trusts keys, named
+// key1, key2, and so on: the first added unsigned, the rest signed by it.
+func Keys(t testing.TB, keys ...*Authenticator) *approval.Keys {
+	t.Helper()
+	k, err := approval.OpenKeys(filepath.Join(t.TempDir(), "keys.json"), keys[0].RPID, keys[0].Origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, a := range keys {
+		change, err := k.Next(approval.OpAdd, a.Key("key"+strconv.Itoa(i+1)), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		sc := approval.SignedChange{Change: change}
+		if i > 0 {
+			sc = keys[0].Sign(change)
+		}
+		if err := k.Apply(sc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return k
 }
 
 // coseKey is the public key in canonical CTAP2 CBOR, so it encodes the same

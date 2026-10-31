@@ -106,7 +106,7 @@ func start(t *testing.T, h http.HandlerFunc) *harness {
 	}
 	srv := &connector.Server{
 		Connector: p,
-		Verifier:  &approval.Verifier{RPID: rpID, Origin: origin, Approvers: []approval.Approver{key.Approver("phone")}},
+		Keys:      approvaltest.Keys(t, key),
 		Seen:      seen,
 		Log:       log,
 	}

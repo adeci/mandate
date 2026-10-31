@@ -35,8 +35,13 @@ func TestProtectedRoutesNeedSession(t *testing.T) {
 		{"GET", "/connections", nil},
 		{"GET", "/connections/fake/health", nil},
 		{"POST", "/connections/fake/setup", setupRequest{}},
-		{"GET", "/passkeys", nil},
-		{"POST", "/passkeys", enrollRequest{Name: "mallory"}},
+		{"GET", "/keys", nil},
+		{"POST", "/keys/options", registerRequest{Name: "mallory"}},
+		{"POST", "/keys", json.RawMessage(`{}`)},
+		{"POST", "/keys/remove", nil},
+		{"POST", "/keys/changes/x/challenge", nil},
+		{"POST", "/keys/changes/x/approve", keyApproveRequest{}},
+		{"POST", "/keys/changes/x/discard", nil},
 		{"GET", "/session", nil},
 		{"POST", "/logout", nil},
 	}
@@ -71,11 +76,11 @@ func TestProtectedRoutesNeedSession(t *testing.T) {
 	if h.fake.linked || h.fake.setupCalls != 0 {
 		t.Fatal("unauthenticated setup reached the connector")
 	}
-	h.srv.enrollMu.Lock()
-	n := len(h.srv.enrolls)
-	h.srv.enrollMu.Unlock()
+	h.srv.regMu.Lock()
+	n := len(h.srv.regs)
+	h.srv.regMu.Unlock()
 	if n != 0 {
-		t.Fatalf("%d enrollments started without a session", n)
+		t.Fatalf("%d key registrations started without a session", n)
 	}
 
 	for _, path := range []string{"/login", "/static/app.js"} {
@@ -137,7 +142,8 @@ func TestLoginRefused(t *testing.T) {
 	noUV := approvaltest.New(t, rpID, origin)
 	noUV.Flags = approvaltest.FlagUP
 	phishing := approvaltest.New(t, rpID, "https://evil.example")
-	h.srv.cfg.Approvers = append(h.srv.cfg.Approvers, noUV.Approver("no-uv"), phishing.Approver("phished"))
+	h.trust(t, noUV, "no-uv")
+	h.trust(t, phishing, "phished")
 
 	replayed := h.loginAssertion(t, h.key)
 	if status, _ := h.call(t, http.MethodPost, "/login", "", loginRequest{Assertion: replayed}); status != http.StatusOK {

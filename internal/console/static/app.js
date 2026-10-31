@@ -77,6 +77,11 @@ async function login(button) {
   location.assign(res.next);
 }
 
+async function passwordLogin(form) {
+  const res = await call("POST", "/login", { password: form.elements.password.value, next: form.dataset.next });
+  location.assign(res.next);
+}
+
 function steps(current) {
   const items = $$("#steps li");
   items.forEach((li, i) => {
@@ -126,8 +131,8 @@ async function sign() {
   location.reload();
 }
 
-async function enroll(token) {
-  const o = await call("GET", `/enroll/${token}/options`);
+async function addKey(form) {
+  const o = await call("POST", "/keys/options", { name: form.elements.name.value });
   say("Touch your key…");
   const cred = await navigator.credentials.create({
     publicKey: {
@@ -138,7 +143,7 @@ async function enroll(token) {
     },
   });
   const r = cred.response;
-  const res = await call("POST", `/enroll/${token}`, {
+  await call("POST", "/keys", {
     id: cred.id,
     rawId: toB64(cred.rawId),
     type: cred.type,
@@ -148,17 +153,17 @@ async function enroll(token) {
       transports: r.getTransports ? r.getTransports() : [],
     },
   });
-  say("");
-  $("#kind").textContent = res.kind;
-  $("#nix").textContent = res.nix;
-  $("#approver").textContent = JSON.stringify(res.approver, null, 2);
-  $("#enrolled").hidden = false;
+  location.reload();
 }
 
-async function addPasskey(form) {
-  const res = await call("POST", "/passkeys", { name: form.elements.name.value });
-  await enroll(res.token);
-  form.hidden = true;
+async function approveKey(panel) {
+  const id = panel.dataset.change;
+  const msg = $(".msg", panel);
+  const res = await call("POST", `/keys/changes/${id}/challenge`);
+  say("Waiting for your passkey…", false, msg);
+  const assertion = await getAssertion(res.options);
+  await call("POST", `/keys/changes/${id}/approve`, { change: res.change, assertion });
+  location.reload();
 }
 
 const POLL_MS = 2000;
@@ -211,7 +216,8 @@ function busy(el, action) {
     try {
       await action();
     } catch (e) {
-      say(e.message || String(e), true, el.closest("[data-connection]") ? $(".msg", el.closest("[data-connection]")) : $("#msg"));
+      const box = el.closest("[data-connection], [data-change]");
+      say(e.message || String(e), true, box ? $(".msg", box) : $("#msg"));
     } finally {
       el.disabled = false;
     }
@@ -220,9 +226,11 @@ function busy(el, action) {
 
 document.addEventListener("DOMContentLoaded", () => {
   const loginButton = $("[data-login]");
-  if (loginButton) {
-    resumeSession(loginButton.dataset.login);
-    loginButton.addEventListener("click", busy(loginButton, () => login(loginButton)));
+  if (loginButton) loginButton.addEventListener("click", busy(loginButton, () => login(loginButton)));
+  const passwordForm = $("#password-login");
+  if (passwordForm) {
+    resumeSession(passwordForm.dataset.next);
+    passwordForm.addEventListener("submit", busy(passwordForm, () => passwordLogin(passwordForm)));
   }
 
   const reviewButton = $("[data-review]");
@@ -240,14 +248,12 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  for (const button of $$("[data-enroll]")) {
-    button.addEventListener("click", busy(button, async () => {
-      await enroll(button.dataset.enroll);
-      button.closest(".actions").hidden = true;
-    }));
+  const add = $("#add-key");
+  if (add) add.addEventListener("submit", busy(add, () => addKey(add)));
+  for (const panel of $$("[data-change]")) {
+    const button = $("[data-approve-key]", panel);
+    button.addEventListener("click", busy(button, () => approveKey(panel)));
   }
-  const add = $("#add-passkey");
-  if (add) add.addEventListener("submit", busy(add, () => addPasskey(add)));
 
   for (const panel of $$("[data-connection]")) {
     const link = $("[data-link]", panel);
@@ -255,14 +261,5 @@ document.addEventListener("DOMContentLoaded", () => {
     for (const form of $$("[data-setup]", panel)) {
       form.addEventListener("submit", busy(form, () => linkConnection(panel, Object.fromEntries(new FormData(form)))));
     }
-  }
-
-  for (const button of $$("[data-copy]")) {
-    button.addEventListener("click", async () => {
-      const label = button.textContent;
-      await navigator.clipboard.writeText(document.getElementById(button.dataset.copy).textContent);
-      button.textContent = "Copied ■";
-      setTimeout(() => (button.textContent = label), 1500);
-    });
   }
 });

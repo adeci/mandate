@@ -21,8 +21,6 @@ const hostUsage = `
 on the host:
   gateway                 serve the gateway
   console                 serve the owner's console and the proposal API
-  passkey add --name NAME
-                          print a one-time passkey enrollment link (as root)
   list [--senders] DB     list chat and sender IDs for exposure.toml
 `
 
@@ -48,8 +46,6 @@ func run() int {
 		err = gateway.Command(ctx, args)
 	case "console":
 		err = console.Command(ctx, args)
-	case "passkey":
-		err = console.Passkey(ctx, args)
 	case "list":
 		err = admin.List(ctx, args)
 	case "-h", "--help", "help":

@@ -20,7 +20,7 @@
     <a href="/"{{if eq .Nav "pending"}} aria-current="page"{{end}}>Pending{{if .Pending}} <span class="count">{{.Pending}}</span>{{end}}</a>
     <a href="/history"{{if eq .Nav "history"}} aria-current="page"{{end}}>History</a>
     <a href="/connections"{{if eq .Nav "connections"}} aria-current="page"{{end}}>Connections</a>
-    <a href="/passkeys"{{if eq .Nav "passkeys"}} aria-current="page"{{end}}>Passkeys</a>
+    <a href="/keys"{{if eq .Nav "keys"}} aria-current="page"{{end}}>Keys</a>
   </nav>
   {{- end}}
 </header>
@@ -31,8 +31,8 @@
 <footer class="site-footer">
   {{- if .Who}}
   <form method="post" action="/logout" class="actions">
-    <span class="muted">passkey <strong>{{.Who}}</strong></span>
-    <button type="submit" class="ghost">Log out</button>
+    <span class="muted">signed in with <strong>{{.Who}}</strong></span>
+    <button type="submit" class="ghost">Sign out</button>
   </form>
   {{- else}}
   <span class="muted">mandate · agents propose, you approve</span>
@@ -51,26 +51,23 @@
 {{template "bottom" .}}{{end}}
 
 {{define "login"}}{{template "top" .}}
-<h1>Log in</h1>
-{{if .Data.Bootstrap}}
-<section class="panel dashed">
-  <header><h3>No passkeys pinned yet</h3>{{template "status" "setup"}}</header>
-  <p>Nothing can log in or approve until a passkey is pinned. On the host, run:</p>
-  <pre class="term"><span class="prompt">$ </span>sudo mandate passkey add --name yubikey</pre>
-  <ol class="steps">
-    <li data-state="current">open the link it prints</li>
-    <li>touch your key</li>
-    <li>pin it in your NixOS config</li>
-    <li>rebuild</li>
-  </ol>
-</section>
-{{else}}
-<p>Every request an agent makes waits here for you. Log in with a pinned passkey.</p>
+<h1>Sign in</h1>
+{{if .Data.Passkeys}}
 <div class="actions">
-  <button type="button" class="primary big" data-login="{{.Data.Next}}">Log in with passkey →</button>
+  <button type="button" class="primary big" data-login="{{.Data.Next}}">Sign in with a passkey →</button>
 </div>
-<p id="msg" class="msg" role="status"></p>
+<p class="muted">or with the admin password</p>
+{{else}}
+<p class="muted">No passkeys yet. Sign in with the admin password, then add one under Keys.</p>
 {{end}}
+<form id="password-login" data-next="{{.Data.Next}}">
+  <label for="password">Password</label>
+  <div class="row">
+    <input id="password" name="password" type="password" required autocomplete="current-password">
+    <button type="submit">Sign in</button>
+  </div>
+</form>
+<p id="msg" class="msg" role="status"></p>
 {{template "bottom" .}}{{end}}
 
 {{define "rows"}}
@@ -188,7 +185,7 @@
     </div>
   </div>
   {{else}}
-  <p class="flash" data-kind="error">No passkeys are pinned, so nothing can be approved.</p>
+  <p class="flash" data-kind="error">No passkeys yet. Add one under <a href="/keys">Keys</a> to approve.</p>
   <form method="post" action="/r/{{.ID}}/deny" class="actions"><button type="submit" class="danger big">Deny</button></form>
   {{end}}
   <p id="msg" class="msg" role="status"></p>
@@ -209,6 +206,7 @@
     {{if not .Health.Until.IsZero}}<div><dt>until</dt><dd>{{when .Health.Until}}</dd></div>{{end}}
   </dl>
   {{end}}
+  {{with .Keys}}<p class="flash" data-kind="error">Keys out of sync: {{.}}</p>{{end}}
   {{if eq .Health.State "setup"}}
   <div class="actions">
     <button type="button" class="primary" data-link>Link</button>
@@ -244,67 +242,68 @@
 </div>
 {{template "bottom" .}}{{end}}
 
-{{define "enrolled"}}
-<section class="panel" id="enrolled" hidden>
-  <header><h3>Passkey created</h3><span class="status" data-tone="ok" id="kind"></span></header>
-  <p>It can't log in or approve until you pin it. Add this to <code>services.mandate.console.approvers</code> and rebuild:</p>
-  <pre id="nix"></pre>
-  <div class="actions"><button type="button" class="compact" data-copy="nix">Copy Nix ⎘</button></div>
-  <p class="muted">As JSON, for an approvers file (also appended to enrolled.json in the console's state):</p>
-  <pre id="approver"></pre>
-  <div class="actions"><button type="button" class="compact" data-copy="approver">Copy JSON ⎘</button></div>
+{{define "keys"}}{{template "top" .}}
+<h1>Keys</h1>
+{{with .Data.Problems}}
+<section class="panel danger">
+  <header><h3>Connectors out of sync</h3><span class="status" data-tone="alert">warning</span></header>
+  <dl class="kv">
+    {{range .}}<div><dt>{{.Name}}</dt><dd class="message">{{.Problem}}</dd></div>{{end}}
+  </dl>
+  <p class="muted">They refuse approvals from keys they don't have.</p>
 </section>
 {{end}}
 
-{{define "passkeys"}}{{template "top" .}}
-<h1>Passkeys</h1>
 <section>
-<h2>Pinned</h2>
+<h2>Trusted</h2>
+{{with .Data.Keys}}
+{{$removable := gt (len .) 1}}
 <table>
-  <thead><tr><th>Key</th><th>Kind</th><th class="width-min">Added</th></tr></thead>
+  <thead><tr><th>Key</th><th class="width-min">Added</th>{{if $removable}}<th class="width-min"></th>{{end}}</tr></thead>
   <tbody>
-  {{range .Data}}{{if .Pinned}}
+  {{range .}}
   <tr>
-    <td>{{.Name}}{{if .Current}} <span class="status" data-tone="ok">this session</span>{{end}}</td>
-    <td>{{with .Kind}}{{.}}{{else}}<span class="muted">enrolled elsewhere</span>{{end}}</td>
-    <td class="width-min">{{if .EnrolledAt.IsZero}}—{{else}}{{when .EnrolledAt}}{{end}}</td>
+    <td>{{.Name}}{{if .Current}} <span class="status" data-tone="ok">this session</span>{{end}}<br><span class="muted">{{.Kind}}</span></td>
+    <td class="width-min">{{when .Added}}</td>
+    {{- if $removable}}
+    <td class="width-min"><form method="post" action="/keys/remove"><input type="hidden" name="credential_id" value="{{.CredentialID}}"><button type="submit" class="compact">Remove</button></form></td>
+    {{- end}}
   </tr>
-  {{end}}{{end}}
+  {{end}}
   </tbody>
 </table>
-<p class="muted">Only the passkeys pinned in your NixOS config are trusted, so a compromised console can't add its own.</p>
+{{else}}
+<div class="empty"><p>No keys yet.<br><span class="muted">The first key you add is trusted at once.</span></p></div>
+{{end}}
 </section>
 
-{{range .Data}}{{if not .Pinned}}
-<section class="panel dashed">
-  <header><h3>{{.Name}}</h3><span class="status" data-tone="muted">not pinned</span></header>
-  <dl class="kv"><div><dt>kind</dt><dd>{{.Kind}}</dd></div><div><dt>added</dt><dd>{{when .EnrolledAt}}</dd></div></dl>
-  <pre id="nix-{{.CredentialID}}">{{.Nix}}</pre>
-  <div class="actions"><button type="button" class="compact" data-copy="nix-{{.CredentialID}}">Copy Nix ⎘</button></div>
+{{with .Data.Changes}}
+<section>
+<h2>Waiting</h2>
+{{range .}}
+<section class="panel dashed" data-change="{{.ID}}">
+  <header><h3>{{if eq .Op "add"}}Add{{else}}Remove{{end}} {{.Name}}</h3><span class="status" data-tone="wait">{{.Left}}</span></header>
+  <p class="muted">{{.Kind}} · approve with any trusted key, from any device</p>
+  <div class="actions two">
+    <button type="button" class="primary" data-approve-key>Approve with passkey →</button>
+    <form method="post" action="/keys/changes/{{.ID}}/discard"><button type="submit">Discard</button></form>
+  </div>
+  <p class="msg" role="status"></p>
 </section>
-{{end}}{{end}}
+{{end}}
+</section>
+{{end}}
 
 <section>
-<h2>Add passkey</h2>
-<form id="add-passkey" class="add">
-  <label for="passkey-name">Name</label>
+<h2>Add key</h2>
+<form id="add-key" class="add">
+  <label for="key-name">Name</label>
   <div class="row">
-    <input id="passkey-name" name="name" required maxlength="64" pattern="[\p{L}\p{N} ._\-]+" placeholder="phone" autocomplete="off">
-    <button type="submit">+ Add passkey</button>
+    <input id="key-name" name="name" required maxlength="64" pattern="[\p{L}\p{N} ._\-]+" placeholder="phone" autocomplete="off">
+    <button type="submit">+ Add key</button>
   </div>
-  <p class="hint">A phone or password manager makes a synced passkey; a security key makes a hardware key.</p>
+  {{if .Data.Keys}}<p class="hint">It waits until a trusted key approves it.</p>{{end}}
 </form>
 <p id="msg" class="msg" role="status"></p>
-{{template "enrolled"}}
 </section>
-{{template "bottom" .}}{{end}}
-
-{{define "enroll"}}{{template "top" .}}
-<h1>Add a passkey</h1>
-<p>This creates a passkey named <strong>{{.Data.Name}}</strong>. It can't log in or approve anything until you pin it in your NixOS config.</p>
-<div class="actions">
-  <button type="button" class="primary big" data-enroll="{{.Data.Token}}">Create passkey →</button>
-</div>
-<p id="msg" class="msg" role="status"></p>
-{{template "enrolled"}}
 {{template "bottom" .}}{{end}}

@@ -97,6 +97,20 @@ func (c *Client) Execute(ctx context.Context, a approval.Approval) (Result, erro
 	return r, err
 }
 
+func (c *Client) Keys(ctx context.Context) (KeysHead, error) {
+	var h KeysHead
+	err := c.Do(ctx, http.MethodGet, "/keys", nil, &h)
+	return h, err
+}
+
+// PutKeys offers log; the connector refuses it with a 409 *Error unless it
+// extends the log it holds.
+func (c *Client) PutKeys(ctx context.Context, log []approval.SignedChange) (KeysHead, error) {
+	var h KeysHead
+	err := c.Do(ctx, http.MethodPut, "/keys", log, &h)
+	return h, err
+}
+
 // Do sends a JSON request over the socket; refusals come back as *Error.
 func (c *Client) Do(ctx context.Context, method, path string, body, out any) error {
 	var rd io.Reader

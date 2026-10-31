@@ -80,10 +80,8 @@ code, kbd, samp, pre { font-family: inherit; font-size: 1em; }
 code { font-weight: var(--w-medium); }
 :not(pre) > code { background: var(--bg-alt); outline: var(--bw) solid var(--bg-alt); overflow-wrap: anywhere; }
 pre { padding: var(--lh) 2ch; background: var(--bg-alt); overflow-x: auto; }
-pre.term .prompt { color: var(--fg-alt); user-select: none; }
 .message { white-space: pre-wrap; overflow-wrap: anywhere; }
 pre.message, pre.output { white-space: pre-wrap; overflow-wrap: anywhere; }
-#nix, #approver, [id^="nix-"] { white-space: pre-wrap; overflow-wrap: anywhere; margin-bottom: calc(var(--lh) / 2); }
 
 /* A character that renders as nothing, shown by its code point. */
 .cp { background: var(--fg); color: var(--bg); font-weight: var(--w-bold); font-style: normal; }

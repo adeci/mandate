@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/adeci/mandate/approval"
 	"github.com/adeci/mandate/approval/approvaltest"
 	"github.com/adeci/mandate/connector"
@@ -35,6 +37,7 @@ var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
 // fake sends "messages" to a fixed contact book. Linking shows a QR code, or
 // a code to type with the optional "account" setup input.
 type fake struct {
+	name     string
 	mu       sync.Mutex
 	executed []approval.Record
 	// abort drops the connection after "sending", like a network failure
@@ -48,7 +51,7 @@ type fake struct {
 var contacts = map[string]string{"Farid": "id-farid", "Mallory": "id-mallory"}
 
 func (f *fake) Spec() connector.Spec {
-	return connector.Spec{Name: "fake", Ops: []connector.Op{
+	return connector.Spec{Name: f.name, Ops: []connector.Op{
 		{Name: "send", Kind: connector.Write, Params: []connector.Param{
 			{Name: "to", Required: true, Container: true},
 			{Name: "text", Required: true, Editable: true},
@@ -136,17 +139,20 @@ func (c *clock) now() time.Time          { return time.Now().Add(time.Duration(c
 func (c *clock) advance(d time.Duration) { c.off.Add(int64(d)) }
 
 type harness struct {
-	srv           *Server
-	cfg           Config
-	pages         *httptest.Server
-	admin         *httptest.Server
-	api           *proposal.Client
-	fake          *fake
-	key           *approvaltest.Authenticator
-	clock         *clock
-	session       string
+	srv     *Server
+	cfg     Config
+	pages   *httptest.Server
+	api     *proposal.Client
+	fake    *fake
+	key     *approvaltest.Authenticator
+	clock   *clock
+	session string
+	// connKeys is the fake connector's key log.
+	connKeys      *approval.Keys
 	stopConnector func()
 }
+
+const password = "correct horse"
 
 // shortDir keeps Unix socket paths under the 108-byte limit.
 func shortDir(t *testing.T) string {
@@ -178,7 +184,28 @@ func serveSocket(t *testing.T, path string, h http.Handler) func() {
 	return stop
 }
 
-// start runs a console with one pinned passkey and logs it in.
+func emptyKeys(t *testing.T) *approval.Keys {
+	t.Helper()
+	k, err := approval.OpenKeys(filepath.Join(t.TempDir(), "keys.json"), rpID, origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
+// serveFake runs a fake connector called name that trusts keys.
+func serveFake(t *testing.T, sock, name string, keys *approval.Keys) (*fake, func()) {
+	t.Helper()
+	seen, err := approval.OpenSeen(filepath.Join(t.TempDir(), "seen.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &fake{name: name}
+	return f, serveSocket(t, sock, (&connector.Server{Connector: f, Keys: keys, Seen: seen, Log: discard}).Handler())
+}
+
+// start runs a console whose first key, "phone", was added with the
+// password, and signs in with that key.
 func start(t *testing.T) *harness {
 	t.Helper()
 	return startWith(t, nil)
@@ -188,28 +215,35 @@ func start(t *testing.T) *harness {
 // starts.
 func startWith(t *testing.T, edit func(cfg *Config, dir string)) *harness {
 	t.Helper()
+	h := bare(t, edit)
+	if !h.addKey(t, h.session, h.key, "phone") {
+		t.Fatal("first key is not trusted")
+	}
+	h.session = h.login(t, h.key)
+	return h
+}
+
+// bare runs a console with no keys, signed in with the password.
+func bare(t *testing.T, edit func(cfg *Config, dir string)) *harness {
+	t.Helper()
 	sockets := shortDir(t)
-	key := approvaltest.New(t, rpID, origin)
-	verifier := &approval.Verifier{RPID: rpID, Origin: origin, Approvers: []approval.Approver{key.Approver("phone")}}
-	seen, err := approval.OpenSeen(filepath.Join(t.TempDir(), "seen.json"))
+	connKeys := emptyKeys(t)
+	connSock := filepath.Join(sockets, "fake.sock")
+	f, stopConnector := serveFake(t, connSock, "fake", connKeys)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fake{}
-	connSock := filepath.Join(sockets, "fake.sock")
-	stopConnector := serveSocket(t, connSock, (&connector.Server{
-		Connector: f, Verifier: verifier, Seen: seen, Log: discard,
-	}).Handler())
 
 	clk := &clock{}
 	cfg := Config{
-		RPID:       rpID,
-		Origin:     origin,
-		Approvers:  []approval.Approver{key.Approver("phone")},
-		Connectors: map[string]string{"fake": connSock},
-		StateDir:   t.TempDir(),
-		Log:        discard,
-		Now:        clk.now,
+		RPID:         rpID,
+		Origin:       origin,
+		PasswordHash: hash,
+		Connectors:   map[string]string{"fake": connSock},
+		StateDir:     t.TempDir(),
+		Log:          discard,
+		Now:          clk.now,
 	}
 	if edit != nil {
 		edit(&cfg, sockets)
@@ -224,21 +258,24 @@ func startWith(t *testing.T, edit func(cfg *Config, dir string)) *harness {
 	serveSocket(t, apiSock, srv.ProposalHandler())
 	pages := httptest.NewServer(srv.Handler())
 	t.Cleanup(pages.Close)
-	admin := httptest.NewServer(srv.AdminHandler())
-	t.Cleanup(admin.Close)
 
 	h := &harness{
-		srv: srv, cfg: cfg, pages: pages, admin: admin, api: proposal.Dial(apiSock),
-		fake: f, key: key, clock: clk, stopConnector: stopConnector,
+		srv: srv, cfg: cfg, pages: pages, api: proposal.Dial(apiSock),
+		fake: f, key: approvaltest.New(t, rpID, origin), clock: clk, connKeys: connKeys, stopConnector: stopConnector,
 	}
-	h.session = h.login(t, key)
+	h.session = h.passwordLogin(t)
 	return h
 }
 
 func (h *harness) submit(t *testing.T, text string) proposal.Proposal {
 	t.Helper()
+	return h.submitTo(t, "fake", text)
+}
+
+func (h *harness) submitTo(t *testing.T, conn, text string) proposal.Proposal {
+	t.Helper()
 	p, err := h.api.Submit(context.Background(), proposal.Request{
-		Connector: "fake", Op: "send", Args: map[string]string{"to": "Farid", "text": text}, Note: "she asked",
+		Connector: conn, Op: "send", Args: map[string]string{"to": "Farid", "text": text}, Note: "she asked",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -349,7 +386,7 @@ func (h *harness) challenge(t *testing.T, id string, edits map[string]string) (s
 	}
 	opts := res.Options
 	if opts.RPID != rpID || opts.UserVerification != "required" || len(opts.AllowCredentials) != 1 ||
-		opts.AllowCredentials[0].ID != h.key.Approver("").CredentialID {
+		opts.AllowCredentials[0].ID != h.key.Key("").CredentialID {
 		t.Fatalf("request options = %+v", opts)
 	}
 	c, err := base64.RawURLEncoding.DecodeString(opts.Challenge)
@@ -418,10 +455,7 @@ func TestApproveExecutesOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	pf.IssuedAt, pf.Assertion = time.Unix(0, issued).UTC(), json.RawMessage(signed)
-	v := approval.Verifier{
-		RPID: rpID, Origin: origin, Approvers: h.cfg.Approvers,
-		Now: func() time.Time { return pf.IssuedAt },
-	}
+	v := approval.Verifier{Keys: h.srv.keys, Now: func() time.Time { return pf.IssuedAt }}
 	rec, err := v.Verify(pf)
 	if err != nil {
 		t.Fatalf("stored proof doesn't verify: %v", err)
@@ -549,8 +583,8 @@ func TestApprovalRefused(t *testing.T) {
 	noUV := approvaltest.New(t, rpID, origin)
 	noUV.Flags = approvaltest.FlagUP
 	phishing := approvaltest.New(t, rpID, "https://evil.example")
-	h.srv.cfg.Approvers = append(h.srv.cfg.Approvers, noUV.Approver("no-uv"), phishing.Approver("phished"))
-	h.srv.verifier.Approvers = h.srv.cfg.Approvers
+	h.trust(t, noUV, "no-uv")
+	h.trust(t, phishing, "phished")
 
 	for name, assertion := range map[string]json.RawMessage{
 		"unknown passkey":     stranger.Assert(c),
@@ -588,23 +622,6 @@ func TestApprovalRefused(t *testing.T) {
 	// Refusals spent nothing: the owner can still approve.
 	if status, _ := h.approve(t, p.ID, nonce, h.key.Assert(c)); status != http.StatusOK {
 		t.Fatalf("approve after refusals = %d", status)
-	}
-}
-
-func TestBootstrapCannotApprove(t *testing.T) {
-	h := start(t)
-	p := h.submit(t, "running late")
-	h.srv.cfg.Approvers, h.srv.verifier.Approvers = nil, nil
-	// The session's passkey is no longer pinned, so it is gone too.
-	if status, _ := h.post(t, "/r/"+p.ID+"/challenge", challengeRequest{}); status != http.StatusUnauthorized {
-		t.Fatalf("challenge = %d, want 401", status)
-	}
-	if status, _ := h.call(t, http.MethodPost, "/login/options", "", nil); status != http.StatusServiceUnavailable {
-		t.Fatalf("login options = %d, want 503", status)
-	}
-	status, body := h.call(t, http.MethodGet, "/login", "", nil)
-	if status != http.StatusOK || !strings.Contains(string(body), "passkey add") {
-		t.Fatalf("bootstrap page = %d:\n%s", status, body)
 	}
 }
 
@@ -781,33 +798,5 @@ func TestSubmit(t *testing.T) {
 	}
 	if _, err := h.api.Get(context.Background(), "nope"); err == nil {
 		t.Fatal("get unknown proposal succeeded")
-	}
-}
-
-func TestAdminSocketIsPrivate(t *testing.T) {
-	path := filepath.Join(shortDir(t), "admin.sock")
-	for range 2 { // the second run replaces the stale socket
-		ln, err := listenPrivate(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		fi, err := os.Stat(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if fi.Mode()&os.ModeSocket == 0 || fi.Mode().Perm() != 0o600 {
-			t.Fatalf("admin socket mode = %v", fi.Mode())
-		}
-		ln.Close()
-	}
-	entries, _ := os.ReadDir(filepath.Dir(path))
-	if len(entries) != 1 {
-		t.Fatalf("left behind %v", entries)
-	}
-	if err := os.WriteFile(path+".file", nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := listenPrivate(path + ".file"); err == nil {
-		t.Fatal("replaced a regular file")
 	}
 }

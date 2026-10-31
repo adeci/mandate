@@ -4,7 +4,6 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/adeci/mandate/approval"
 	"github.com/adeci/mandate/connector"
@@ -28,9 +28,17 @@ const (
 	loginTTL      = 5 * time.Minute
 )
 
+// session is a signed-in browser; key is zero for a password session.
 type session struct {
-	hash     []byte
-	approver approval.Approver
+	hash []byte
+	key  approval.Key
+}
+
+func (s session) who() string {
+	if s.key.Name == "" {
+		return "password"
+	}
+	return s.key.Name
 }
 
 func tokenHash(token string) []byte {
@@ -38,7 +46,7 @@ func tokenHash(token string) []byte {
 	return h[:]
 }
 
-// A session ends early once its passkey is no longer pinned.
+// A passkey session ends once its key is no longer trusted.
 func (s *Server) session(r *http.Request) (session, bool) {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil || c.Value == "" {
@@ -52,15 +60,14 @@ func (s *Server) session(r *http.Request) (session, bool) {
 		}
 		return session{}, false
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(id)
-	if err != nil {
-		return session{}, false
+	if id == "" {
+		return session{hash: hash}, true
 	}
-	a, _, ok := s.findApprover(raw)
+	k, ok := s.keys.Find(id)
 	if !ok {
 		return session{}, false
 	}
-	return session{hash: hash, approver: a}, true
+	return session{hash: hash, key: k}, true
 }
 
 func (s *Server) page(h func(http.ResponseWriter, *http.Request, session)) http.HandlerFunc {
@@ -78,26 +85,11 @@ func (s *Server) api(h func(http.ResponseWriter, *http.Request, session)) http.H
 	return func(w http.ResponseWriter, r *http.Request) {
 		sess, ok := s.session(r)
 		if !ok {
-			connector.WriteError(w, &connector.Error{Status: http.StatusUnauthorized, Message: "log in with your passkey first"})
+			connector.WriteError(w, &connector.Error{Status: http.StatusUnauthorized, Message: "sign in first"})
 			return
 		}
 		h(w, r, sess)
 	}
-}
-
-func (s *Server) findApprover(rawID []byte) (approval.Approver, []byte, bool) {
-	for _, a := range s.cfg.Approvers {
-		id, err := base64.RawURLEncoding.DecodeString(a.CredentialID)
-		if err != nil || len(rawID) == 0 || subtle.ConstantTimeCompare(id, rawID) != 1 {
-			continue
-		}
-		key, err := base64.RawURLEncoding.DecodeString(a.PublicKey)
-		if err != nil {
-			return approval.Approver{}, nil, false
-		}
-		return a, key, true
-	}
-	return approval.Approver{}, nil, false
 }
 
 // loginChallenges issues login challenges without storing them: each is a
@@ -165,15 +157,16 @@ func (l *loginChallenges) spend(c []byte, now time.Time) error {
 }
 
 func (s *Server) loginOptions(w http.ResponseWriter, _ *http.Request) {
-	if len(s.cfg.Approvers) == 0 {
-		connector.WriteError(w, &connector.Error{Status: http.StatusServiceUnavailable, Message: "no passkeys are pinned yet"})
+	if len(s.keys.Trusted()) == 0 {
+		connector.WriteError(w, &connector.Error{Status: http.StatusServiceUnavailable, Message: "no passkeys yet; sign in with the password"})
 		return
 	}
 	connector.WriteJSON(w, http.StatusOK, s.requestOptions(s.logins.issue(s.now())))
 }
 
 type loginRequest struct {
-	Assertion json.RawMessage `json:"assertion"`
+	Assertion json.RawMessage `json:"assertion,omitempty"`
+	Password  string          `json:"password,omitempty"`
 	Next      string          `json:"next"`
 }
 
@@ -186,15 +179,23 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if !connector.DecodeJSON(w, r, &req, maxBody) {
 		return
 	}
-	a, err := s.verifyLogin(req.Assertion)
+	var (
+		k   approval.Key
+		err error
+	)
+	if req.Assertion != nil {
+		k, err = s.verifyLogin(req.Assertion)
+	} else {
+		err = s.checkPassword(req.Password)
+	}
 	if err != nil {
 		s.cfg.Log.Warn("login refused", "err", err)
-		connector.WriteError(w, &connector.Error{Status: http.StatusForbidden, Message: err.Error()})
+		connector.WriteError(w, err)
 		return
 	}
 	token := rand.Text() + rand.Text()
 	now := s.now()
-	if err := s.db.createSession(r.Context(), tokenHash(token), a.CredentialID, now, now.Add(sessionTTL)); err != nil {
+	if err := s.db.createSession(r.Context(), tokenHash(token), k.CredentialID, now, now.Add(sessionTTL)); err != nil {
 		connector.WriteError(w, err)
 		return
 	}
@@ -207,34 +208,75 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
-	s.cfg.Log.Info("logged in", "passkey", a.Name)
+	s.cfg.Log.Info("logged in", "with", session{key: k}.who())
 	connector.WriteJSON(w, http.StatusOK, loginResponse{Next: localPath(req.Next)})
 }
 
-func (s *Server) verifyLogin(assertion json.RawMessage) (approval.Approver, error) {
+func (s *Server) verifyLogin(assertion json.RawMessage) (approval.Key, error) {
 	parsed, err := protocol.ParseCredentialRequestResponseBytes(assertion)
 	if err != nil {
-		return approval.Approver{}, fmt.Errorf("parse assertion: %w", webauthnErr(err))
+		return approval.Key{}, connector.Invalid("parse assertion: %v", webauthnErr(err))
 	}
-	a, key, ok := s.findApprover(parsed.RawID)
+	k, ok := s.keys.Find(b64(parsed.RawID))
 	if !ok {
-		return approval.Approver{}, approval.ErrUnknown
+		return approval.Key{}, forbidden(approval.ErrUnknown)
 	}
 	challenge := parsed.Response.CollectedClientData.Challenge
 	c, err := base64.RawURLEncoding.DecodeString(challenge)
 	if err != nil {
-		return approval.Approver{}, errors.New("not a login challenge")
+		return approval.Key{}, forbidden(errors.New("not a login challenge"))
 	}
 	now := s.now()
 	if err := s.logins.check(c, now); err != nil {
-		return approval.Approver{}, err
+		return approval.Key{}, forbidden(err)
+	}
+	key, err := base64.RawURLEncoding.DecodeString(k.PublicKey)
+	if err != nil {
+		return approval.Key{}, err
 	}
 	err = parsed.Verify(challenge, s.cfg.RPID, "", []string{s.cfg.Origin}, nil, nil,
 		protocol.TopOriginExplicitVerificationMode, false, true, true, key, protocol.SignaturePolicy{})
 	if err != nil {
-		return approval.Approver{}, fmt.Errorf("%w (%s): %w", approval.ErrSignature, a.Name, webauthnErr(err))
+		return approval.Key{}, forbidden(fmt.Errorf("%w (%s): %w", approval.ErrSignature, k.Name, webauthnErr(err)))
 	}
-	return a, s.logins.spend(c, now)
+	if err := s.logins.spend(c, now); err != nil {
+		return approval.Key{}, forbidden(err)
+	}
+	return k, nil
+}
+
+// Password attempts after freeTries failures in a row wait 1s, 2s, 4s...
+// up to about 17 minutes. Attempts run one at a time.
+const freeTries = 5
+
+type throttle struct {
+	mu       sync.Mutex
+	failures int
+	until    time.Time
+}
+
+func (s *Server) checkPassword(password string) error {
+	t := &s.password
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := s.now()
+	if now.Before(t.until) {
+		wait := t.until.Sub(now).Round(time.Second)
+		return &connector.Error{Status: http.StatusTooManyRequests, Message: fmt.Sprintf("too many attempts; try again in %s", max(wait, time.Second))}
+	}
+	if bcrypt.CompareHashAndPassword(s.cfg.PasswordHash, []byte(password)) != nil {
+		t.failures++
+		if t.failures >= freeTries {
+			t.until = now.Add(time.Second << min(t.failures-freeTries, 10))
+		}
+		return forbidden(errors.New("wrong password"))
+	}
+	t.failures = 0
+	return nil
+}
+
+func forbidden(err error) *connector.Error {
+	return &connector.Error{Status: http.StatusForbidden, Message: err.Error()}
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request, sess session) {

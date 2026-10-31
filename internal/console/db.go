@@ -20,9 +20,11 @@ import (
 var schema string
 
 var (
-	errNotFound   = errors.New("no such request")
-	errNotPending = errors.New("request is no longer pending")
-	errTooMany    = errors.New("too many pending requests")
+	errNotFound    = errors.New("no such request")
+	errNotPending  = errors.New("request is no longer pending")
+	errTooMany     = errors.New("too many pending requests")
+	errNoKeyChange = errors.New("no such key change, or it expired")
+	errKeyPending  = errors.New("a change to this key is already waiting")
 )
 
 type row struct {
@@ -42,10 +44,13 @@ type challenge struct {
 	Session  []byte
 }
 
-type passkey struct {
-	approval.Approver
-	Synced     bool
-	EnrolledAt time.Time
+// keyChange is a key change waiting for approval.
+type keyChange struct {
+	ID        string
+	Op        string
+	Key       approval.Key
+	CreatedAt time.Time
+	ExpiresAt time.Time
 }
 
 type db struct {
@@ -301,8 +306,8 @@ func (d *db) expireDue(ctx context.Context, now time.Time) error {
 	return err
 }
 
-// sweep expires proposals and deletes challenges too old to verify and
-// sessions past their lifetime.
+// sweep expires proposals and deletes challenges too old to verify, and
+// sessions and key changes past their lifetime.
 func (d *db) sweep(ctx context.Context, now time.Time) error {
 	if err := d.expireDue(ctx, now); err != nil {
 		return err
@@ -312,6 +317,9 @@ func (d *db) sweep(ctx context.Context, now time.Time) error {
 		   OR proposal NOT IN (SELECT id FROM proposals WHERE status = 'pending')`,
 		now.Add(-approval.MaxAge-time.Minute).UnixNano())
 	if err != nil {
+		return err
+	}
+	if _, err = d.sql.ExecContext(ctx, `DELETE FROM key_changes WHERE expires_at <= ?`, ms(now)); err != nil {
 		return err
 	}
 	_, err = d.sql.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at <= ?`, ms(now))
@@ -365,33 +373,73 @@ func (d *db) deleteSession(ctx context.Context, hash []byte) error {
 	return err
 }
 
-func (d *db) addPasskey(ctx context.Context, p passkey) error {
-	_, err := d.sql.ExecContext(ctx, `
-		INSERT INTO passkeys (credential_id, name, public_key, synced, enrolled_at) VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT (credential_id) DO UPDATE SET name = excluded.name, public_key = excluded.public_key,
-		    synced = excluded.synced, enrolled_at = excluded.enrolled_at`,
-		p.CredentialID, p.Name, p.PublicKey, p.Synced, ms(p.EnrolledAt))
-	return err
+// addKeyChange stores c unless limit changes are waiting or one already
+// names its key.
+func (d *db) addKeyChange(ctx context.Context, c keyChange, limit int) error {
+	return d.tx(ctx, func(tx *sql.Tx) error {
+		var n int
+		err := tx.QueryRowContext(ctx, `SELECT count(*) FROM key_changes WHERE expires_at > ?`, ms(c.CreatedAt)).Scan(&n)
+		if err != nil {
+			return err
+		}
+		if n >= limit {
+			return errTooMany
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM key_changes WHERE expires_at <= ?`, ms(c.CreatedAt)); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO key_changes (id, op, name, credential_id, public_key, synced, created_at, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (credential_id) DO NOTHING`,
+			c.ID, c.Op, c.Key.Name, c.Key.CredentialID, c.Key.PublicKey, c.Key.Synced, ms(c.CreatedAt), ms(c.ExpiresAt))
+		if err != nil {
+			return err
+		}
+		return oneRow(res, errKeyPending)
+	})
 }
 
-func (d *db) passkeys(ctx context.Context) ([]passkey, error) {
+func (d *db) keyChanges(ctx context.Context, now time.Time) ([]keyChange, error) {
+	return d.queryKeyChanges(ctx, `WHERE expires_at > ? ORDER BY created_at`, ms(now))
+}
+
+func (d *db) keyChange(ctx context.Context, id string, now time.Time) (keyChange, error) {
+	cs, err := d.queryKeyChanges(ctx, `WHERE id = ? AND expires_at > ?`, id, ms(now))
+	if err != nil {
+		return keyChange{}, err
+	}
+	if len(cs) == 0 {
+		return keyChange{}, errNoKeyChange
+	}
+	return cs[0], nil
+}
+
+func (d *db) deleteKeyChange(ctx context.Context, id string) error {
+	res, err := d.sql.ExecContext(ctx, `DELETE FROM key_changes WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	return oneRow(res, errNoKeyChange)
+}
+
+func (d *db) queryKeyChanges(ctx context.Context, where string, args ...any) ([]keyChange, error) {
 	rs, err := d.sql.QueryContext(ctx,
-		`SELECT credential_id, name, public_key, synced, enrolled_at FROM passkeys ORDER BY enrolled_at`)
+		`SELECT id, op, name, credential_id, public_key, synced, created_at, expires_at FROM key_changes `+where, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rs.Close()
-	var out []passkey
+	var out []keyChange
 	for rs.Next() {
 		var (
-			p  passkey
-			at int64
+			c                keyChange
+			created, expires int64
 		)
-		if err := rs.Scan(&p.CredentialID, &p.Name, &p.PublicKey, &p.Synced, &at); err != nil {
+		if err := rs.Scan(&c.ID, &c.Op, &c.Key.Name, &c.Key.CredentialID, &c.Key.PublicKey, &c.Key.Synced, &created, &expires); err != nil {
 			return nil, err
 		}
-		p.EnrolledAt = fromMS(at)
-		out = append(out, p)
+		c.CreatedAt, c.ExpiresAt = fromMS(created), fromMS(expires)
+		out = append(out, c)
 	}
 	return out, rs.Err()
 }

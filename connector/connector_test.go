@@ -85,7 +85,7 @@ func start(t *testing.T) *harness {
 	f := &fake{contacts: map[string]string{"Farid": "id-farid", "Mallory": "id-mallory"}}
 	srv := &connector.Server{
 		Connector: f,
-		Verifier:  &approval.Verifier{RPID: rpID, Origin: origin, Approvers: []approval.Approver{key.Approver("phone")}},
+		Keys:      approvaltest.Keys(t, key),
 		Seen:      seen,
 		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}

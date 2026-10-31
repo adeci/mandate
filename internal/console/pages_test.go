@@ -91,7 +91,7 @@ func TestListPages(t *testing.T) {
 func TestSecurityHeaders(t *testing.T) {
 	h := start(t)
 	p := h.submit(t, "hi")
-	for _, path := range []string{"/", "/r/" + p.ID, "/r/nope", "/login", "/enroll/nope", "/static/app.js", "/connections", "/passkeys"} {
+	for _, path := range []string{"/", "/r/" + p.ID, "/r/nope", "/login", "/static/app.js", "/connections", "/keys"} {
 		resp := h.do(t, "GET", path, h.session, nil)
 		resp.Body.Close()
 		got := resp.Header.Get("Content-Security-Policy")
@@ -107,7 +107,7 @@ func TestSecurityHeaders(t *testing.T) {
 			t.Errorf("%s: headers = %v", path, resp.Header)
 		}
 	}
-	for _, path := range []string{"/", "/r/" + p.ID, "/login", "/connections", "/passkeys", "/history"} {
+	for _, path := range []string{"/", "/r/" + p.ID, "/login", "/connections", "/keys", "/history"} {
 		_, body := h.page(t, path)
 		if strings.Count(body, "<script") != strings.Count(body, `<script src="/static/app.js"`) ||
 			strings.Contains(body, "style=") || strings.Contains(body, "<style") {

@@ -36,17 +36,21 @@ CREATE INDEX IF NOT EXISTS challenges_by_proposal ON challenges (proposal);
 
 CREATE TABLE IF NOT EXISTS sessions (
     hash          BLOB PRIMARY KEY, -- sha256 of the cookie's token
-    credential_id TEXT NOT NULL,
+    credential_id TEXT NOT NULL,     -- '' for a password session
     created_at    INTEGER NOT NULL,
     expires_at    INTEGER NOT NULL
 ) STRICT;
 
--- Passkeys enrolled here. Listing one grants nothing; only the pinned
--- approvers file does.
-CREATE TABLE IF NOT EXISTS passkeys (
-    credential_id TEXT PRIMARY KEY,
+DROP TABLE IF EXISTS passkeys;
+
+-- Key changes waiting for a trusted key to approve them.
+CREATE TABLE IF NOT EXISTS key_changes (
+    id            TEXT PRIMARY KEY,
+    op            TEXT NOT NULL,     -- add | remove
     name          TEXT NOT NULL,
+    credential_id TEXT NOT NULL UNIQUE,
     public_key    TEXT NOT NULL,
-    synced        INTEGER NOT NULL, -- the BE flag: the key may be copied to other devices
-    enrolled_at   INTEGER NOT NULL
+    synced        INTEGER NOT NULL,
+    created_at    INTEGER NOT NULL,
+    expires_at    INTEGER NOT NULL
 ) STRICT;

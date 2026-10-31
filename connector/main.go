@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -56,15 +55,15 @@ func (e *Env) Fail(err error) { e.fail(err) }
 
 // Main runs a connector program:
 //
-//	NAME --socket PATH --state DIR [--config FILE]
-//	     [--approvers FILE --rp-id ID --origin URL]
+//	NAME --socket PATH --state DIR [--config FILE] [--rp-id ID --origin URL]
 //	NAME --check-config FILE
 //
 // It decodes --config strictly into C (no file decodes "{}"), runs its
 // Validate method if it has one, then calls start and serves the protocol
 // until SIGINT or SIGTERM. --check-config only decodes and validates.
-// Without approvers the Server has no Verifier and refuses every write. If
-// the Connector is an io.Closer, it is closed after serving stops.
+// Trusted keys live in DIR/private/keys.json and change through PUT /keys.
+// Without --rp-id and --origin there are none and writes are refused. If the
+// Connector is an io.Closer, it is closed after serving stops.
 func Main[C any](start func(ctx context.Context, env *Env, cfg C) (Connector, error)) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -85,7 +84,6 @@ func run[C any](ctx context.Context, name string, args []string, credDir string,
 	stateDir := flags.String("state", "", "state directory (required)")
 	configPath := flags.String("config", "", "JSON settings")
 	checkPath := flags.String("check-config", "", "only validate this settings file, then exit")
-	approversPath := flags.String("approvers", "", "enrolled passkeys (JSON); missing or empty refuses all writes")
 	rpID := flags.String("rp-id", "", "WebAuthn relying party ID of the console")
 	origin := flags.String("origin", "", "origin of the console, e.g. https://mandate.example.com")
 	if err := flags.Parse(args); err != nil {
@@ -101,11 +99,10 @@ func run[C any](ctx context.Context, name string, args []string, credDir string,
 	if *socket == "" || *stateDir == "" {
 		return errors.New("--socket and --state are required")
 	}
-	cfg, err := loadConfig[C](*configPath)
-	if err != nil {
-		return err
+	if (*rpID == "") != (*origin == "") {
+		return errors.New("--rp-id and --origin go together")
 	}
-	verifier, err := loadVerifier(*approversPath, *rpID, *origin)
+	cfg, err := loadConfig[C](*configPath)
 	if err != nil {
 		return err
 	}
@@ -117,11 +114,16 @@ func run[C any](ctx context.Context, name string, args []string, credDir string,
 	if err := os.Chmod(env.PrivateDir(), 0o700); err != nil {
 		return err
 	}
-	srv := &Server{Verifier: verifier, Log: env.Log}
-	if verifier == nil {
-		env.Log.Warn("no approvers; writes are refused")
-	} else if srv.Seen, err = approval.OpenSeen(filepath.Join(env.PrivateDir(), "seen.json")); err != nil {
-		return fmt.Errorf("open seen log: %w", err)
+	srv := &Server{Log: env.Log}
+	if *rpID == "" {
+		env.Log.Warn("no --rp-id and --origin; writes are refused")
+	} else {
+		if srv.Keys, err = approval.OpenKeys(filepath.Join(env.PrivateDir(), "keys.json"), *rpID, *origin); err != nil {
+			return fmt.Errorf("open key log: %w", err)
+		}
+		if srv.Seen, err = approval.OpenSeen(filepath.Join(env.PrivateDir(), "seen.json")); err != nil {
+			return fmt.Errorf("open seen log: %w", err)
+		}
 	}
 
 	ctx, env.fail = context.WithCancelCause(ctx)
@@ -165,30 +167,4 @@ func loadConfig[C any](path string) (C, error) {
 		}
 	}
 	return cfg, nil
-}
-
-// loadVerifier returns nil unless approvers are enrolled. The console writes
-// the file on first enrollment, so a missing or empty one is not an error.
-func loadVerifier(path, rpID, origin string) (*approval.Verifier, error) {
-	if path == "" {
-		return nil, nil
-	}
-	fi, err := os.Stat(path)
-	if errors.Is(err, fs.ErrNotExist) || (err == nil && fi.Size() == 0) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read approvers: %w", err)
-	}
-	approvers, err := approval.LoadApprovers(path)
-	if err != nil {
-		return nil, err
-	}
-	if len(approvers) == 0 {
-		return nil, nil
-	}
-	if rpID == "" || origin == "" {
-		return nil, errors.New("--rp-id and --origin are required when approvers are enrolled")
-	}
-	return &approval.Verifier{RPID: rpID, Origin: origin, Approvers: approvers}, nil
 }

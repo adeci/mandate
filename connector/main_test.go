@@ -2,7 +2,6 @@ package connector
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -125,15 +124,6 @@ func writeFile(t *testing.T, name, content string) string {
 	return path
 }
 
-func approvers(t *testing.T, key *approvaltest.Authenticator) string {
-	t.Helper()
-	b, err := json.Marshal([]approval.Approver{key.Approver("phone")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return writeFile(t, "approvers.json", string(b))
-}
-
 func runOnce(args []string) error {
 	return run(context.Background(), "mandate-echo", args, "", func(context.Context, *Env, testConfig) (Connector, error) {
 		return nil, errors.New("start must not run")
@@ -153,7 +143,7 @@ func approve(t *testing.T, key *approvaltest.Authenticator) approval.Approval {
 	return key.Approve(b, time.Now())
 }
 
-func TestMainServesWithConfigApproversAndCredentials(t *testing.T) {
+func TestMainServesWithConfigKeysAndCredentials(t *testing.T) {
 	t.Parallel()
 	state := t.TempDir()
 	creds := t.TempDir()
@@ -161,9 +151,8 @@ func TestMainServesWithConfigApproversAndCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := approvaltest.New(t, testRPID, testOrigin)
-	l := launch(t, state, creds,
-		"--config", writeFile(t, "config.json", `{"greeting":"hello"}`),
-		"--approvers", approvers(t, key), "--rp-id", testRPID, "--origin", testOrigin)
+	args := []string{"--config", writeFile(t, "config.json", `{"greeting":"hello"}`), "--rp-id", testRPID, "--origin", testOrigin}
+	l := launch(t, state, creds, args...)
 
 	if l.echo.cfg.Greeting != "hello" {
 		t.Errorf("config = %+v", l.echo.cfg)
@@ -188,6 +177,10 @@ func TestMainServesWithConfigApproversAndCredentials(t *testing.T) {
 	if err != nil || spec.Protocol != ProtocolVersion {
 		t.Fatalf("spec = %+v, %v", spec, err)
 	}
+	log := approvaltest.Keys(t, key).Log()
+	if _, err := l.client.PutKeys(context.Background(), log); err != nil {
+		t.Fatalf("put keys: %v", err)
+	}
 	a := approve(t, key)
 	if res, err := l.client.Execute(context.Background(), a); err != nil || res.Status != Done {
 		t.Fatalf("execute: %+v %v", res, err)
@@ -201,16 +194,26 @@ func TestMainServesWithConfigApproversAndCredentials(t *testing.T) {
 	if l.echo.sent != 1 || !l.echo.closed {
 		t.Fatalf("sent %d, closed %v", l.echo.sent, l.echo.closed)
 	}
+
+	// The keys survive a restart, and only an extension replaces them.
+	l = launch(t, state, creds, args...)
+	if h, err := l.client.Keys(context.Background()); err != nil || h.Length != len(log) {
+		t.Fatalf("keys after restart = %+v, %v", h, err)
+	}
+	divergent := approvaltest.Keys(t, approvaltest.New(t, testRPID, testOrigin)).Log()
+	if _, err := l.client.PutKeys(context.Background(), divergent); err == nil {
+		t.Fatal("accepted a divergent key log")
+	} else if e, ok := errors.AsType[*Error](err); !ok || e.Status != http.StatusConflict {
+		t.Fatalf("put divergent keys: %v", err)
+	}
 }
 
-func TestMainWithoutApproversRefusesWrites(t *testing.T) {
+func TestMainWithoutKeysRefusesWrites(t *testing.T) {
 	t.Parallel()
 	key := approvaltest.New(t, testRPID, testOrigin)
 	for name, args := range map[string][]string{
-		"no flag":      nil,
-		"missing file": {"--approvers", filepath.Join(t.TempDir(), "approvers.json")},
-		"empty file":   {"--approvers", writeFile(t, "approvers.json", "")},
-		"empty list":   {"--approvers", writeFile(t, "approvers.json", "[]")},
+		"no rp-id or origin": nil,
+		"empty key log":      {"--rp-id", testRPID, "--origin", testOrigin},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -223,7 +226,7 @@ func TestMainWithoutApproversRefusesWrites(t *testing.T) {
 				t.Errorf("Credential without a credentials dir: %v", err)
 			}
 			if l.echo.sent != 0 {
-				t.Fatal("write ran without approvers")
+				t.Fatal("write ran without trusted keys")
 			}
 		})
 	}
@@ -231,22 +234,27 @@ func TestMainWithoutApproversRefusesWrites(t *testing.T) {
 
 func TestMainStartupErrors(t *testing.T) {
 	t.Parallel()
-	key := approvaltest.New(t, testRPID, testOrigin)
-	enrolled := approvers(t, key)
 	state := t.TempDir()
+	broken := t.TempDir()
+	if err := os.Mkdir(filepath.Join(broken, "private"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(broken, "private", "keys.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	sock := filepath.Join(t.TempDir(), "c.sock")
 	base := []string{"--socket", sock, "--state", state}
 	for name, tc := range map[string]struct {
 		args []string
 		want string
 	}{
-		"no socket":           {[]string{"--state", state}, "--socket and --state are required"},
-		"no state":            {[]string{"--socket", sock}, "--socket and --state are required"},
-		"approvers no rp-id":  {append(base, "--approvers", enrolled, "--origin", testOrigin), "--rp-id and --origin are required"},
-		"approvers no origin": {append(base, "--approvers", enrolled, "--rp-id", testRPID), "--rp-id and --origin are required"},
-		"broken approvers":    {append(base, "--approvers", writeFile(t, "a.json", "{")), "parse approvers"},
-		"invalid config":      {append(base, "--config", writeFile(t, "c.json", `{"greeting":"bad"}`)), "greeting must not be bad"},
-		"missing config":      {append(base, "--config", filepath.Join(state, "nope.json")), "read config"},
+		"no socket":      {[]string{"--state", state}, "--socket and --state are required"},
+		"no state":       {[]string{"--socket", sock}, "--socket and --state are required"},
+		"rp-id alone":    {append(base, "--rp-id", testRPID), "--rp-id and --origin go together"},
+		"origin alone":   {append(base, "--origin", testOrigin), "--rp-id and --origin go together"},
+		"broken key log": {[]string{"--socket", sock, "--state", broken, "--rp-id", testRPID, "--origin", testOrigin}, "open key log"},
+		"invalid config": {append(base, "--config", writeFile(t, "c.json", `{"greeting":"bad"}`)), "greeting must not be bad"},
+		"missing config": {append(base, "--config", filepath.Join(state, "nope.json")), "read config"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -278,7 +286,6 @@ func TestCheckConfigTouchesNothing(t *testing.T) {
 			err := runOnce([]string{
 				"--check-config", writeFile(t, "c.json", tc.config),
 				"--socket", sock, "--state", state,
-				"--approvers", filepath.Join(state, "broken"),
 			})
 			if tc.want == "" && err != nil || tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
 				t.Fatalf("err = %v, want %q", err, tc.want)

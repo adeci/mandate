@@ -358,7 +358,7 @@ func TestApprovedSendRunsOnce(t *testing.T) {
 	}
 	srv := &connector.Server{
 		Connector: f.c,
-		Verifier:  &approval.Verifier{RPID: rpID, Origin: origin, Approvers: []approval.Approver{key.Approver("phone")}},
+		Keys:      approvaltest.Keys(t, key),
 		Seen:      seen,
 		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}

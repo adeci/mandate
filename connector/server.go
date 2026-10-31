@@ -19,11 +19,11 @@ import (
 
 const maxBody = 1 << 20
 
-// Server serves a Connector. Writes run only with an approval the server
-// verifies itself, so nothing that can reach the socket can make it act alone.
+// Server serves a Connector. Writes run only with an approval it verifies
+// itself against Keys; with nil Keys every write is refused.
 type Server struct {
 	Connector Connector
-	Verifier  *approval.Verifier
+	Keys      *approval.Keys
 	Seen      *approval.Seen
 	Log       *slog.Logger
 }
@@ -36,6 +36,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /read", s.read)
 	mux.HandleFunc("POST /prepare", s.prepare)
 	mux.HandleFunc("POST /execute", s.execute)
+	mux.HandleFunc("GET /keys", s.keysHead)
+	mux.HandleFunc("PUT /keys", s.putKeys)
 	f, ok := s.Connector.(Forwarder)
 	if !ok {
 		return mux
@@ -190,11 +192,7 @@ func (s *Server) execute(w http.ResponseWriter, r *http.Request) {
 	if !DecodeJSON(w, r, &a, maxBody) {
 		return
 	}
-	if s.Verifier == nil {
-		WriteError(w, &Error{Status: http.StatusForbidden, Message: "this connector has no approvers, so it refuses writes"})
-		return
-	}
-	rec, err := s.Verifier.Verify(a)
+	rec, err := (&approval.Verifier{Keys: s.Keys}).Verify(a)
 	if err != nil {
 		s.Log.Warn("approval rejected", "err", err)
 		WriteError(w, &Error{Status: http.StatusForbidden, Message: err.Error()})
@@ -228,4 +226,43 @@ func (s *Server) execute(w http.ResponseWriter, r *http.Request) {
 	res := s.Connector.Execute(r.Context(), rec)
 	s.Log.Info("executed", "id", rec.ID, "op", rec.Op, "status", res.Status, "ref", res.Ref)
 	WriteJSON(w, http.StatusOK, res)
+}
+
+// KeysHead is how far a key log goes; the console pushes its log to a
+// connector whose head differs from its own.
+type KeysHead struct {
+	Length int    `json:"length"`
+	Head   string `json:"head"`
+}
+
+var errNoKeyLog = &Error{Status: http.StatusServiceUnavailable, Message: "connector started without --rp-id and --origin; it has no keys"}
+
+func (s *Server) keysHead(w http.ResponseWriter, _ *http.Request) {
+	if s.Keys == nil {
+		WriteError(w, errNoKeyLog)
+		return
+	}
+	n, head := s.Keys.Head()
+	WriteJSON(w, http.StatusOK, KeysHead{Length: n, Head: head})
+}
+
+// putKeys takes the console's whole log and keeps it only if it extends the
+// one held here.
+func (s *Server) putKeys(w http.ResponseWriter, r *http.Request) {
+	if s.Keys == nil {
+		WriteError(w, errNoKeyLog)
+		return
+	}
+	var log []approval.SignedChange
+	if !DecodeJSON(w, r, &log, maxBody) {
+		return
+	}
+	if err := s.Keys.Extend(log); err != nil {
+		s.Log.Warn("key log refused", "err", err)
+		WriteError(w, &Error{Status: http.StatusConflict, Message: "key log refused: " + err.Error()})
+		return
+	}
+	n, head := s.Keys.Head()
+	s.Log.Info("key log updated", "length", n, "head", head)
+	WriteJSON(w, http.StatusOK, KeysHead{Length: n, Head: head})
 }

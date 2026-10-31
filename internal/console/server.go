@@ -37,25 +37,26 @@ type Config struct {
 	// Origin is the console's origin as browsers report it, e.g.
 	// https://box.tailnet.ts.net.
 	Origin string
-	// Approvers are the pinned passkeys. Empty means bootstrap: enrolling
-	// works, logging in and approving don't.
-	Approvers  []approval.Approver
-	Connectors map[string]string
-	StateDir   string
-	Log        *slog.Logger
-	Now        func() time.Time
+	// PasswordHash is the bcrypt hash of the admin password.
+	PasswordHash []byte
+	Connectors   map[string]string
+	StateDir     string
+	Log          *slog.Logger
+	Now          func() time.Time
 }
 
 type Server struct {
 	cfg      Config
 	db       *db
+	keys     *approval.Keys
 	verifier *approval.Verifier
 	conns    map[string]*conn
 	tmpl     *template.Template
 	logins   *loginChallenges
+	password throttle
 
-	enrollMu sync.Mutex
-	enrolls  map[string]*enrollment
+	regMu sync.Mutex
+	regs  map[string]registration
 }
 
 type conn struct {
@@ -65,10 +66,13 @@ type conn struct {
 	mu      sync.Mutex
 	spec    connector.Spec
 	fetched time.Time
+	// keysProblem is why the connector's key log differs from ours, if it
+	// does.
+	keysProblem string
 }
 
-// New opens the database in cfg.StateDir and settles proposals left executing
-// by a previous run.
+// New opens the database and key log in cfg.StateDir and settles proposals
+// left executing by a previous run.
 func New(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
@@ -76,20 +80,23 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	keys, err := approval.OpenKeys(filepath.Join(cfg.StateDir, "keys.json"), cfg.RPID, cfg.Origin)
+	if err != nil {
+		return nil, fmt.Errorf("open key log: %w", err)
+	}
 	d, err := openDB(ctx, filepath.Join(cfg.StateDir, "console.db"))
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 	s := &Server{
-		cfg: cfg,
-		db:  d,
-		verifier: &approval.Verifier{
-			RPID: cfg.RPID, Origin: cfg.Origin, Approvers: cfg.Approvers, Now: cfg.Now,
-		},
-		conns:   map[string]*conn{},
-		tmpl:    templates,
-		logins:  newLoginChallenges(),
-		enrolls: map[string]*enrollment{},
+		cfg:      cfg,
+		db:       d,
+		keys:     keys,
+		verifier: &approval.Verifier{Keys: keys, Now: cfg.Now},
+		conns:    map[string]*conn{},
+		tmpl:     templates,
+		logins:   newLoginChallenges(),
+		regs:     map[string]registration{},
 	}
 	for name, sock := range cfg.Connectors {
 		s.conns[name] = &conn{name: name, client: connector.Dial(sock, executeTimeout)}
@@ -111,7 +118,10 @@ func (s *Server) Close() error { return s.db.Close() }
 // stored proposal matches one built from the original.
 func (s *Server) now() time.Time { return s.cfg.Now().UTC().Truncate(time.Millisecond) }
 
+// Sweep pushes the key log to connectors that lack it, now and every
+// interval, and cleans up expired state.
 func (s *Server) Sweep(ctx context.Context, interval time.Duration) {
+	s.syncKeys(ctx)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -122,6 +132,7 @@ func (s *Server) Sweep(ctx context.Context, interval time.Duration) {
 			if err := s.db.sweep(ctx, s.now()); err != nil && ctx.Err() == nil {
 				s.cfg.Log.Error("sweep", "err", err)
 			}
+			s.syncKeys(ctx)
 		}
 	}
 }
@@ -260,8 +271,8 @@ func (s *Server) requestOptions(challenge []byte) requestOptions {
 		UserVerification: "required",
 		Timeout:          int((2 * time.Minute).Milliseconds()),
 	}
-	for _, a := range s.cfg.Approvers {
-		opts.AllowCredentials = append(opts.AllowCredentials, credentialDescriptor{Type: "public-key", ID: a.CredentialID})
+	for _, k := range s.keys.Trusted() {
+		opts.AllowCredentials = append(opts.AllowCredentials, credentialDescriptor{Type: "public-key", ID: k.CredentialID})
 	}
 	return opts
 }
@@ -400,7 +411,7 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request, sess session) {
 		connector.WriteError(w, &connector.Error{Status: http.StatusForbidden, Message: "approval is for a different request"})
 		return
 	}
-	approver, _, _ := s.findApprover(assertionRawID(req.Assertion))
+	approver, _ := s.keys.Find(b64(assertionRawID(req.Assertion)))
 	// From here on the request runs to completion even if the page goes
 	// away: once claimed, the outcome must be recorded.
 	ctx := context.WithoutCancel(r.Context())
@@ -452,7 +463,7 @@ func (s *Server) execute(ctx context.Context, c *conn, a approval.Approval) conn
 
 func (s *Server) deny(w http.ResponseWriter, r *http.Request, sess session) {
 	id := r.PathValue("id")
-	err := s.db.reject(r.Context(), id, sess.approver.Name, s.now())
+	err := s.db.reject(r.Context(), id, sess.who(), s.now())
 	switch {
 	case errors.Is(err, errNotFound):
 		s.errorPage(w, http.StatusNotFound, "No such request.")
@@ -465,7 +476,7 @@ func (s *Server) deny(w http.ResponseWriter, r *http.Request, sess session) {
 		s.errorPage(w, http.StatusInternalServerError, "Couldn't deny the request.")
 		return
 	}
-	s.cfg.Log.Info("denied", "id", id, "by", sess.approver.Name)
+	s.cfg.Log.Info("denied", "id", id, "by", sess.who())
 	http.Redirect(w, r, "/r/"+id, http.StatusSeeOther)
 }
 

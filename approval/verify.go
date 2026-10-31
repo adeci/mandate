@@ -2,13 +2,11 @@ package approval
 
 import (
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
@@ -22,16 +20,15 @@ const (
 )
 
 // Challenge binds an approval to exact record bytes, a single-use nonce, and
-// the time it was issued. Fields are length-prefixed so no two inputs hash
-// alike.
+// the time it was issued.
 func Challenge(record, nonce []byte, issuedAt time.Time) []byte {
+	return hashParts([]byte("mandate-approval-v1"), record, nonce, []byte(issuedAt.UTC().Format(time.RFC3339Nano)))
+}
+
+// hashParts length-prefixes each part so no two inputs hash alike.
+func hashParts(parts ...[]byte) []byte {
 	h := sha256.New()
-	for _, part := range [][]byte{
-		[]byte("mandate-approval-v1"),
-		record,
-		nonce,
-		[]byte(issuedAt.UTC().Format(time.RFC3339Nano)),
-	} {
+	for _, part := range parts {
 		var n [8]byte
 		binary.BigEndian.PutUint64(n[:], uint64(len(part)))
 		h.Write(n[:])
@@ -50,34 +47,6 @@ type Approval struct {
 	Assertion json.RawMessage `json:"assertion"`
 }
 
-// Approver is an enrolled passkey. Both fields are base64url without padding;
-// PublicKey is the COSE key from registration.
-type Approver struct {
-	Name         string `json:"name"`
-	CredentialID string `json:"credential_id"`
-	PublicKey    string `json:"public_key"`
-}
-
-func LoadApprovers(path string) ([]Approver, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var as []Approver
-	if err := json.Unmarshal(b, &as); err != nil {
-		return nil, fmt.Errorf("parse approvers %s: %w", path, err)
-	}
-	for _, a := range as {
-		if _, err := base64.RawURLEncoding.DecodeString(a.CredentialID); err != nil {
-			return nil, fmt.Errorf("approver %q: credential_id: %w", a.Name, err)
-		}
-		if _, err := base64.RawURLEncoding.DecodeString(a.PublicKey); err != nil {
-			return nil, fmt.Errorf("approver %q: public_key: %w", a.Name, err)
-		}
-	}
-	return as, nil
-}
-
 var (
 	ErrStale     = errors.New("approval is outside its time window")
 	ErrUnknown   = errors.New("approval is from an unknown passkey")
@@ -85,16 +54,19 @@ var (
 	ErrExpired   = errors.New("proposal has expired")
 )
 
+// Verifier checks approvals against the keys Keys trusts at the moment of
+// each call.
 type Verifier struct {
-	RPID      string
-	Origin    string
-	Approvers []Approver
-	Now       func() time.Time
+	Keys *Keys
+	Now  func() time.Time
 }
 
 // Verify checks the assertion and returns the approved record. It does not
 // check nonce reuse; callers record nonces with Seen.
 func (v *Verifier) Verify(a Approval) (Record, error) {
+	if v.Keys == nil || v.Keys.empty() {
+		return Record{}, ErrNoKeys
+	}
 	now := time.Now()
 	if v.Now != nil {
 		now = v.Now()
@@ -110,15 +82,12 @@ func (v *Verifier) Verify(a Approval) (Record, error) {
 	if err != nil {
 		return Record{}, fmt.Errorf("parse assertion: %w", err)
 	}
-	approver, key, ok := v.find(parsed.RawID)
+	key, ok := v.Keys.Find(base64.RawURLEncoding.EncodeToString(parsed.RawID))
 	if !ok {
 		return Record{}, ErrUnknown
 	}
-	challenge := base64.RawURLEncoding.EncodeToString(Challenge(a.Record, a.Nonce, a.IssuedAt))
-	err = parsed.Verify(challenge, v.RPID, "", []string{v.Origin}, nil, nil,
-		protocol.TopOriginExplicitVerificationMode, false, true, true, key, protocol.SignaturePolicy{})
-	if err != nil {
-		return Record{}, fmt.Errorf("%w (%s): %w", ErrSignature, approver.Name, err)
+	if err := verifyAssertion(parsed, Challenge(a.Record, a.Nonce, a.IssuedAt), v.Keys.rpID, v.Keys.origin, key); err != nil {
+		return Record{}, err
 	}
 
 	rec, err := Decode(a.Record)
@@ -129,19 +98,4 @@ func (v *Verifier) Verify(a Approval) (Record, error) {
 		return Record{}, ErrExpired
 	}
 	return rec, nil
-}
-
-func (v *Verifier) find(rawID []byte) (Approver, []byte, bool) {
-	for _, a := range v.Approvers {
-		id, err := base64.RawURLEncoding.DecodeString(a.CredentialID)
-		if err != nil || len(id) != len(rawID) || subtle.ConstantTimeCompare(id, rawID) != 1 {
-			continue
-		}
-		key, err := base64.RawURLEncoding.DecodeString(a.PublicKey)
-		if err != nil {
-			return Approver{}, nil, false
-		}
-		return a, key, true
-	}
-	return Approver{}, nil, false
 }

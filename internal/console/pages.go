@@ -36,8 +36,8 @@ var templates = template.Must(template.New("").Funcs(template.FuncMap{
 const csp = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; " +
 	"object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 
-// Handler serves the console over HTTPS. Everything but login, enrollment
-// links, and static files needs a session.
+// Handler serves the console over HTTPS. Everything but login and static
+// files needs a session.
 func (s *Server) Handler() http.Handler {
 	static, _ := fs.Sub(staticFS, "static")
 	files := http.FileServerFS(static)
@@ -45,9 +45,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /login", s.loginPage)
 	mux.HandleFunc("POST /login/options", s.loginOptions)
 	mux.HandleFunc("POST /login", s.login)
-	mux.HandleFunc("GET /enroll/{token}", s.enrollPage)
-	mux.HandleFunc("GET /enroll/{token}/options", s.enrollOptions)
-	mux.HandleFunc("POST /enroll/{token}", s.finishEnroll)
 	mux.Handle("GET /static/", http.StripPrefix("/static/", files))
 	mux.Handle("GET /manifest.webmanifest", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/manifest+json")
@@ -63,8 +60,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /connections", s.page(s.connectionsPage))
 	mux.HandleFunc("GET /connections/{name}/health", s.api(s.connectionHealth))
 	mux.HandleFunc("POST /connections/{name}/setup", s.api(s.setup))
-	mux.HandleFunc("GET /passkeys", s.page(s.passkeysPage))
-	mux.HandleFunc("POST /passkeys", s.api(s.sessionEnroll))
+	mux.HandleFunc("GET /keys", s.page(s.keysPage))
+	mux.HandleFunc("POST /keys/options", s.api(s.registerOptions))
+	mux.HandleFunc("POST /keys", s.api(s.addKey))
+	mux.HandleFunc("POST /keys/remove", s.api(s.removeKey))
+	mux.HandleFunc("POST /keys/changes/{id}/challenge", s.api(s.keyChallenge))
+	mux.HandleFunc("POST /keys/changes/{id}/approve", s.api(s.approveKeyChange))
+	mux.HandleFunc("POST /keys/changes/{id}/discard", s.api(s.discardKeyChange))
 	mux.HandleFunc("GET /session", s.api(func(w http.ResponseWriter, _ *http.Request, _ session) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -122,7 +124,7 @@ func (s *Server) owner(w http.ResponseWriter, r *http.Request, sess session, nam
 	if err != nil {
 		s.cfg.Log.Error("count pending", "err", err)
 	}
-	s.render(w, http.StatusOK, name, page{Title: title, Nav: nav, Pending: n, Who: sess.approver.Name, Data: data})
+	s.render(w, http.StatusOK, name, page{Title: title, Nav: nav, Pending: n, Who: sess.who(), Data: data})
 }
 
 func (s *Server) errorPage(w http.ResponseWriter, status int, msg string) {
@@ -130,8 +132,8 @@ func (s *Server) errorPage(w http.ResponseWriter, status int, msg string) {
 }
 
 type loginView struct {
-	Bootstrap bool
-	Next      string
+	Passkeys bool
+	Next     string
 }
 
 func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
@@ -140,7 +142,7 @@ func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, next, http.StatusSeeOther)
 		return
 	}
-	s.render(w, http.StatusOK, "login", page{Title: "Log in", Data: loginView{Bootstrap: len(s.cfg.Approvers) == 0, Next: next}})
+	s.render(w, http.StatusOK, "login", page{Title: "Sign in", Data: loginView{Passkeys: len(s.keys.Trusted()) > 0, Next: next}})
 }
 
 type listItem struct {
@@ -265,7 +267,7 @@ func (s *Server) requestPage(w http.ResponseWriter, r *http.Request, sess sessio
 		Proposal:   pr.Proposal,
 		Title:      pr.Connector + " " + pr.Op,
 		Pending:    pr.Status == proposal.Pending,
-		CanApprove: pr.Status == proposal.Pending && len(s.cfg.Approvers) > 0,
+		CanApprove: pr.Status == proposal.Pending && len(s.keys.Trusted()) > 0,
 		DecidedAt:  pr.DecidedAt,
 		DecidedBy:  pr.DecidedBy,
 	}
@@ -286,56 +288,6 @@ func (s *Server) requestPage(w http.ResponseWriter, r *http.Request, sess sessio
 
 func (s *Server) connectionsPage(w http.ResponseWriter, r *http.Request, sess session) {
 	s.owner(w, r, sess, "connections", "Connections", "connections", s.connections(r.Context()))
-}
-
-type passkeyView struct {
-	Name, CredentialID string
-	Kind               string
-	EnrolledAt         time.Time
-	Pinned, Current    bool
-	Nix                string
-}
-
-func (s *Server) passkeysPage(w http.ResponseWriter, r *http.Request, sess session) {
-	known, err := s.db.passkeys(r.Context())
-	if err != nil {
-		s.cfg.Log.Error("list passkeys", "err", err)
-		s.errorPage(w, http.StatusInternalServerError, "Couldn't load passkeys.")
-		return
-	}
-	byID := map[string]passkey{}
-	for _, p := range known {
-		byID[p.CredentialID] = p
-	}
-	var out []passkeyView
-	pinned := map[string]bool{}
-	for _, a := range s.cfg.Approvers {
-		pinned[a.CredentialID] = true
-		v := passkeyView{Name: a.Name, CredentialID: a.CredentialID, Pinned: true, Current: a.CredentialID == sess.approver.CredentialID}
-		if p, ok := byID[a.CredentialID]; ok {
-			v.Kind, v.EnrolledAt = kind(p.Synced), p.EnrolledAt
-		}
-		out = append(out, v)
-	}
-	for _, p := range known {
-		if !pinned[p.CredentialID] {
-			out = append(out, passkeyView{
-				Name: p.Name, CredentialID: p.CredentialID, Kind: kind(p.Synced),
-				EnrolledAt: p.EnrolledAt, Nix: nixEntry(p.Approver),
-			})
-		}
-	}
-	s.owner(w, r, sess, "passkeys", "Passkeys", "passkeys", out)
-}
-
-func (s *Server) enrollPage(w http.ResponseWriter, r *http.Request) {
-	token := r.PathValue("token")
-	e, ok := s.liveEnrollment(token, false)
-	if !ok {
-		s.errorPage(w, http.StatusNotFound, errEnrollGone.Message)
-		return
-	}
-	s.render(w, http.StatusOK, "enroll", page{Title: "Add a passkey", Data: map[string]string{"Token": token, "Name": e.name}})
 }
 
 // hidden reports runes that render as nothing or reorder text around them:

@@ -25,6 +25,8 @@ type connView struct {
 	Health connector.Health
 	// Setup are the inputs the connector takes when linking.
 	Setup []connector.Param
+	// Keys is why the connector's key log differs from the console's.
+	Keys string
 }
 
 // view asks for the spec first: a connector speaking another protocol is
@@ -42,6 +44,7 @@ func (s *Server) view(ctx context.Context, c *conn) connView {
 	if v.Health, err = c.client.Health(ctx); err != nil {
 		v.Health = connector.Health{State: connector.Broken, Detail: err.Error()}
 	}
+	v.Keys = s.syncConn(ctx, c)
 	return v
 }
 

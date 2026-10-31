@@ -31,15 +31,15 @@ func record(t *testing.T) []byte {
 	return b
 }
 
-func verifier(approvers ...approval.Approver) *approval.Verifier {
-	return &approval.Verifier{RPID: rpID, Origin: origin, Approvers: approvers, Now: func() time.Time { return now }}
+func verifier(t *testing.T, keys ...*approvaltest.Authenticator) *approval.Verifier {
+	return &approval.Verifier{Keys: approvaltest.Keys(t, keys...), Now: func() time.Time { return now }}
 }
 
 func TestVerifyAcceptsGenuineApproval(t *testing.T) {
 	t.Parallel()
 	key := approvaltest.New(t, rpID, origin)
 	rec := record(t)
-	got, err := verifier(key.Approver("phone")).Verify(key.Approve(rec, now.Add(-time.Minute)))
+	got, err := verifier(t, key).Verify(key.Approve(rec, now.Add(-time.Minute)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestVerifyRejects(t *testing.T) {
 	wrongRP := approvaltest.New(t, "evil.example", origin)
 	noUV := approvaltest.New(t, rpID, origin)
 	noUV.Flags = approvaltest.FlagUP
-	v := verifier(key.Approver("phone"), wrongOrigin.Approver("o"), wrongRP.Approver("r"), noUV.Approver("u"))
+	v := verifier(t, key, wrongOrigin, wrongRP, noUV)
 	rec := record(t)
 
 	swapped := key.Approve(rec, now)
@@ -84,6 +84,21 @@ func TestVerifyRejects(t *testing.T) {
 				t.Fatalf("err = %v, want %v", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestVerifyUsesLiveKeys(t *testing.T) {
+	t.Parallel()
+	key := approvaltest.New(t, rpID, origin)
+	k, _ := openKeys(t)
+	v := &approval.Verifier{Keys: k, Now: func() time.Time { return now }}
+	a := key.Approve(record(t), now)
+	if _, err := v.Verify(a); !errors.Is(err, approval.ErrNoKeys) {
+		t.Fatalf("with no keys: %v", err)
+	}
+	mustApply(t, k, approval.SignedChange{Change: change(t, k, approval.OpAdd, key.Key("phone"))})
+	if _, err := v.Verify(a); err != nil {
+		t.Fatalf("after trusting the key: %v", err)
 	}
 }
 

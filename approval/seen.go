@@ -69,7 +69,13 @@ func (s *Seen) save() error {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".seen-*")
+	return writeAtomic(s.path, b)
+}
+
+// writeAtomic replaces path with b, mode 0600, so a crash leaves the old or
+// the new contents and never a mix.
+func writeAtomic(path string, b []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
 	if err != nil {
 		return err
 	}
@@ -85,5 +91,5 @@ func (s *Seen) save() error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), s.path)
+	return os.Rename(tmp.Name(), path)
 }
