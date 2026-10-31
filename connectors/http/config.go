@@ -10,13 +10,12 @@ import (
 	"strings"
 )
 
-// Config is the connector's --config: the APIs it lends tokens for, by name.
-// Each service's token is the credential of the same name.
+// Config is the connector's --config. Each service's token is the credential
+// of the same name.
 type Config struct {
 	Services map[string]Service `json:"services"`
 }
 
-// Service is one upstream API.
 type Service struct {
 	BaseURL string `json:"base_url"`
 	Token   Token  `json:"token"`
@@ -50,8 +49,6 @@ func (r *Rule) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (r Rule) String() string { return r.Method + " " + r.Path }
-
 func (c Config) Validate() error {
 	if len(c.Services) == 0 {
 		return errors.New("no services")
@@ -73,13 +70,12 @@ var reservedHeaders = map[string]bool{
 	"Host": true, "Te": true, "Transfer-Encoding": true, "Upgrade": true,
 }
 
-// service is a validated Service.
 type service struct {
 	name   string
 	base   *url.URL
 	header string
 	prefix string
-	// value is the header value, prefix and token.
+	// value is prefix + token.
 	value  string
 	reads  []pattern
 	writes []pattern

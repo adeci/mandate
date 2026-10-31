@@ -32,7 +32,6 @@ const (
 	redacted    = "[redacted]"
 )
 
-// Proxy serves reads and approved writes for the configured services.
 type Proxy struct {
 	services map[string]*service
 	names    []string
@@ -43,7 +42,6 @@ type Proxy struct {
 	log     *slog.Logger
 }
 
-// New reads each service's token with credential, by service name.
 func New(cfg Config, credential func(name string) ([]byte, error), log *slog.Logger) (*Proxy, error) {
 	p := &Proxy{
 		services: map[string]*service{},
@@ -121,7 +119,6 @@ func (p *Proxy) scrub(b []byte) []byte {
 
 func (p *Proxy) scrubString(s string) string { return string(p.scrub([]byte(s))) }
 
-// target is the upstream URL for a normalized path below the service's base.
 func (s *service) target(path string, segs []string, rawQuery string) string {
 	u := *s.base
 	u.Path = s.base.Path + "/" + strings.Join(segs, "/")
@@ -139,8 +136,6 @@ func passHeader(k string) bool {
 		strings.HasPrefix(k, "X-Ratelimit-") || strings.HasPrefix(k, "Ratelimit-") || k == "Ratelimit"
 }
 
-// Forward serves the allowlisted reads, with the service's token added and
-// scrubbed from what comes back.
 func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, rest string) {
 	name, path, _ := strings.Cut(rest, "/")
 	svc, ok := p.services[name]
