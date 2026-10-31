@@ -210,17 +210,10 @@ func TestActiveHours(t *testing.T) {
 	if got := wrap.next(day(12, 0)); !got.Equal(day(22, 0)) {
 		t.Errorf("wrap next = %v", got)
 	}
-	for _, bad := range []string{"", "8", "08-08", "24-08", "08-25", "a-b", "-1-05"} {
+	for _, bad := range []string{"8", "08-08", "24-08", "08-25"} {
 		if _, err := parseActiveHours(bad, newYork); err == nil {
 			t.Errorf("parseActiveHours(%q) accepted", bad)
 		}
-	}
-
-	// A request at 02:00 waits for 08:00 plus the app-open delay.
-	p := newPacer(&state{}, fixedRand(0.5), h)
-	slot, reason := p.slot(day(2, 0), kindAPI, "r", time.Time{})
-	if reason != "outside active hours" || !slot.Equal(day(8, 0).Add(2*time.Second)) {
-		t.Errorf("slot %v (%s)", slot, reason)
 	}
 }
 

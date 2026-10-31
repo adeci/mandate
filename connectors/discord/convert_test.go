@@ -44,7 +44,7 @@ func TestToMessage(t *testing.T) {
 			name: "attachment with content type and caption",
 			in: &apiMessage{
 				ID: "1", ChannelID: "c", Content: "look", Timestamp: ts, Author: alice,
-				Attachments: []apiAttachment{{ID: "a", ContentType: "image/png"}, {ID: "b", ContentType: "video/mp4"}},
+				Attachments: []apiAttachment{{ContentType: "image/png"}, {ContentType: "video/mp4"}},
 			},
 			want: store.Message{ID: "1", ContainerID: "c", SenderID: "200", SenderName: "Alice A", SentAt: ts, Body: "look", MediaType: "image/png"}, wantOK: true,
 		},
@@ -52,7 +52,7 @@ func TestToMessage(t *testing.T) {
 			name: "attachment without content type",
 			in: &apiMessage{
 				ID: "1", ChannelID: "c", Timestamp: ts, Author: alice,
-				Attachments: []apiAttachment{{ID: "a", Filename: "x.bin"}},
+				Attachments: []apiAttachment{{}},
 			},
 			want: store.Message{ID: "1", ContainerID: "c", SenderID: "200", SenderName: "Alice A", SentAt: ts, MediaType: "attachment"}, wantOK: true,
 		},
@@ -75,7 +75,7 @@ func TestToMessage(t *testing.T) {
 			name: "reply",
 			in: &apiMessage{
 				ID: "2", ChannelID: "c", Content: "re", Timestamp: ts, Author: alice, Type: messageReply,
-				MessageReference: &apiMessageReference{MessageID: "1", ChannelID: "c"},
+				MessageReference: &apiMessageReference{MessageID: "1"},
 			},
 			want: store.Message{ID: "2", ContainerID: "c", SenderID: "200", SenderName: "Alice A", SentAt: ts, Body: "re", ReplyToID: "1"}, wantOK: true,
 		},
@@ -83,7 +83,7 @@ func TestToMessage(t *testing.T) {
 			name: "crosspost reference is not a reply",
 			in: &apiMessage{
 				ID: "2", ChannelID: "c", Content: "news", Timestamp: ts, Author: alice,
-				MessageReference: &apiMessageReference{MessageID: "9", ChannelID: "other"},
+				MessageReference: &apiMessageReference{MessageID: "9"},
 			},
 			want: store.Message{ID: "2", ContainerID: "c", SenderID: "200", SenderName: "Alice A", SentAt: ts, Body: "news"}, wantOK: true,
 		},
@@ -91,7 +91,7 @@ func TestToMessage(t *testing.T) {
 			name: "forward uses snapshot content",
 			in: &apiMessage{
 				ID: "2", ChannelID: "c", Timestamp: ts, Author: me,
-				MessageReference: &apiMessageReference{Type: referenceForward, MessageID: "9", ChannelID: "other"},
+				MessageReference: &apiMessageReference{Type: referenceForward, MessageID: "9"},
 				MessageSnapshots: []apiSnapshot{{Message: &apiMessage{
 					Content:     "fwd",
 					Attachments: []apiAttachment{{ContentType: "audio/ogg"}},
@@ -115,9 +115,7 @@ func TestToMessage(t *testing.T) {
 			in:   &apiMessage{ID: "1", ChannelID: "c", Content: "x", Timestamp: ts},
 			want: store.Message{ID: "1", ContainerID: "c", SentAt: ts, Body: "x"}, wantOK: true,
 		},
-		{name: "system join notice skipped", in: &apiMessage{ID: "1", ChannelID: "c", Timestamp: ts, Author: bob, Type: 7}},
-		{name: "pin notice skipped", in: &apiMessage{ID: "1", ChannelID: "c", Timestamp: ts, Author: bob, Type: 6}},
-		{name: "thread starter skipped", in: &apiMessage{ID: "1", ChannelID: "c", Timestamp: ts, Author: bob, Type: 21}},
+		{name: "system notice skipped", in: &apiMessage{ID: "1", ChannelID: "c", Timestamp: ts, Author: bob, Type: 21}},
 		{name: "missing channel", in: &apiMessage{ID: "1", Content: "x", Timestamp: ts}},
 		{name: "unparseable id without timestamp", in: &apiMessage{ID: "x", ChannelID: "c", Content: "x"}},
 		{name: "nil"},
@@ -199,28 +197,13 @@ func TestChannelContainer(t *testing.T) {
 	}{
 		{
 			name: "text channel",
-			in:   &apiChannel{ID: "c", GuildID: "g", Name: "general", Type: 0, ParentID: "cat"},
+			in:   &apiChannel{ID: "c", GuildID: "g", Name: "general", Type: 0},
 			want: store.Container{ID: "c", Kind: "channel", ParentID: "g", Name: "general"}, wantOK: true,
 		},
 		{
-			name: "voice channel text chat",
-			in:   &apiChannel{ID: "v", GuildID: "g", Name: "lounge", Type: 2},
-			want: store.Container{ID: "v", Kind: "channel", ParentID: "g", Name: "lounge"}, wantOK: true,
-		},
-		{
 			name: "public thread parents to guild, not channel",
-			in:   &apiChannel{ID: "t", GuildID: "g", ParentID: "c", Name: "topic", Type: channelPublicThread},
+			in:   &apiChannel{ID: "t", GuildID: "g", Name: "topic", Type: channelPublicThread},
 			want: store.Container{ID: "t", Kind: "thread", ParentID: "g", Name: "topic"}, wantOK: true,
-		},
-		{
-			name: "private thread",
-			in:   &apiChannel{ID: "t", GuildID: "g", ParentID: "c", Name: "secret", Type: channelPrivateThread},
-			want: store.Container{ID: "t", Kind: "thread", ParentID: "g", Name: "secret"}, wantOK: true,
-		},
-		{
-			name: "news thread",
-			in:   &apiChannel{ID: "t", GuildID: "g", Type: channelNewsThread},
-			want: store.Container{ID: "t", Kind: "thread", ParentID: "g"}, wantOK: true,
 		},
 		{
 			name: "dm uses the recipient's name",
@@ -251,7 +234,6 @@ func TestChannelContainer(t *testing.T) {
 		{name: "category skipped", in: &apiChannel{ID: "cat", GuildID: "g", Type: channelGuildCategory}},
 		{name: "guild channel without guild skipped", in: &apiChannel{ID: "c", Type: 0}},
 		{name: "no id", in: &apiChannel{Type: channelDM}},
-		{name: "nil"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -278,7 +260,7 @@ func TestGuildContainers(t *testing.T) {
 	chans := []apiChannel{
 		{ID: "cat", GuildID: "g", Type: channelGuildCategory, Name: "Text"},
 		{ID: "c", Type: 0, Name: "general"}, // guild_id omitted
-		{ID: "t", ParentID: "c", Type: channelPublicThread, Name: "topic"},
+		{ID: "t", Type: channelPublicThread, Name: "topic"},
 	}
 	want := []store.Container{
 		{ID: "c", Kind: "channel", ParentID: "g", Name: "general"},

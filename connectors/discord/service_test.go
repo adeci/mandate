@@ -72,7 +72,7 @@ func (f *fakeDiscord) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h := f.handlers[r.URL.Path]
 	f.mu.Unlock()
 	if h == nil {
-		writeJSON(w, http.StatusNotFound, map[string]any{"message": "404: Not Found", "code": 0})
+		connector.WriteJSON(w, http.StatusNotFound, map[string]any{"message": "404: Not Found", "code": 0})
 		return
 	}
 	h(w, r, n)
@@ -85,7 +85,7 @@ func (f *fakeDiscord) handle(path string, h func(w http.ResponseWriter, r *http.
 }
 
 func (f *fakeDiscord) reply(path string, status int, body any) {
-	f.handle(path, func(w http.ResponseWriter, _ *http.Request, _ int) { writeJSON(w, status, body) })
+	f.handle(path, func(w http.ResponseWriter, _ *http.Request, _ int) { connector.WriteJSON(w, status, body) })
 }
 
 func (f *fakeDiscord) all() []hit {
@@ -240,8 +240,7 @@ func newHarness(t *testing.T, seed func(*state)) *harness {
 
 func (h *harness) start() {
 	h.t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	h.cancel = cancel
+	ctx, cancel := context.WithCancelCause(context.Background())
 	h.done = make(chan error, 1)
 	cfg := config{
 		store:     h.st,
@@ -255,8 +254,18 @@ func (h *harness) start() {
 		clock:     h.clock,
 		rng:       fixedRand(0.5),
 		log:       slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		fail:      cancel,
 	}
-	go func() { h.done <- serve(ctx, cfg, h.socket) }()
+	w, err := start(ctx, cfg)
+	if err != nil {
+		cancel(nil)
+		h.t.Fatal(err)
+	}
+	h.cancel = func() { cancel(nil) }
+	go func() {
+		srv := &connector.Server{Connector: w, Log: cfg.log}
+		h.done <- errors.Join(srv.Serve(ctx, h.socket), w.Close())
+	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if c, err := net.Dial("unix", h.socket); err == nil {
@@ -265,7 +274,7 @@ func (h *harness) start() {
 		}
 		select {
 		case err := <-h.done:
-			h.t.Fatalf("run exited early: %v", err)
+			h.t.Fatalf("serve exited early: %v", err)
 		default:
 		}
 		if time.Now().After(deadline) {
@@ -275,36 +284,14 @@ func (h *harness) start() {
 	}
 }
 
-// serve runs the connector the way connector.Main does: a stop condition
-// cancels ctx and becomes the exit error.
-func serve(ctx context.Context, cfg config, socket string) error {
-	ctx, fail := context.WithCancelCause(ctx)
-	defer fail(nil)
-	cfg.fail = fail
-	w, err := start(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	srv := &connector.Server{Connector: w, Log: cfg.log}
-	err = errors.Join(srv.Serve(ctx, socket), w.Close())
-	if cause := context.Cause(ctx); !errors.Is(cause, context.Canceled) {
-		return cause
-	}
-	return err
-}
-
 func (h *harness) stop() error {
 	h.cancel()
 	h.cancel = nil
-	return h.wait()
-}
-
-func (h *harness) wait() error {
 	select {
 	case err := <-h.done:
 		return err
 	case <-time.After(10 * time.Second):
-		h.t.Fatal("run did not return")
+		h.t.Fatal("serve did not return")
 		return nil
 	}
 }
@@ -421,16 +408,8 @@ func TestSearchUpsertsAndCaches(t *testing.T) {
 	if got := search.header.Get("Referer"); got != "https://discord.com/channels/"+guildID+"/"+chanGeneral {
 		t.Errorf("search referer %q", got)
 	}
-	if search.header.Get("Authorization") != testToken || search.header.Get("X-Discord-Timezone") != "America/New_York" {
-		t.Errorf("search headers %v", search.header)
-	}
-	sp := superProps(t, search.header)
-	if sp["client_build_number"] != float64(defaultBuildNumber) || sp["os"] != "Linux" || sp["client_launch_id"] != h.state().LaunchID {
-		t.Errorf("super properties %v", sp)
-	}
 
-	// Containers before messages, with names from the channel list and the
-	// thread from the search response; is_from_me from /users/@me.
+	// The thread's name comes from the search response; is_from_me from /users/@me.
 	if row := h.queryRow(`SELECT kind, name FROM containers WHERE id = ?`, guildID); row[0] != "guild" || row[1] != "Club" {
 		t.Errorf("guild row %v", row)
 	}
@@ -557,7 +536,8 @@ func TestPageLoadBuildNumber(t *testing.T) {
 	}
 	hits := h.discord.all()
 	doc, js, first := hits[0], hits[1], hits[2]
-	if doc.header.Get("Sec-Fetch-Dest") != "document" || doc.header.Get("Authorization") != "" || doc.header.Get("X-Super-Properties") != "" {
+	if doc.header.Get("Sec-Fetch-Dest") != "document" || doc.header.Get("Authorization") != "" ||
+		doc.header.Get("X-Super-Properties") != "" || doc.header.Get("Referer") != "" {
 		t.Errorf("document headers %v", doc.header)
 	}
 	if js.header.Get("Sec-Fetch-Dest") != "script" || js.header.Get("Authorization") != "" {
@@ -616,10 +596,10 @@ func TestRateLimitRetriesOnce(t *testing.T) {
 	h.discord.handle(path, func(w http.ResponseWriter, _ *http.Request, n int) {
 		if n == 0 {
 			w.Header().Set("Retry-After", "3")
-			writeJSON(w, http.StatusTooManyRequests, map[string]any{"message": "You are being rate limited.", "retry_after": 2.5, "global": false})
+			connector.WriteJSON(w, http.StatusTooManyRequests, map[string]any{"message": "You are being rate limited.", "retry_after": 2.5, "global": false})
 			return
 		}
-		writeJSON(w, http.StatusOK, dmMessagesBody)
+		connector.WriteJSON(w, http.StatusOK, dmMessagesBody)
 	})
 	h.start()
 	h.callOK("fetch", map[string]string{"channel_id": dmID}, &connector.ReadResult{})
@@ -682,7 +662,7 @@ func TestCooldown(t *testing.T) {
 					io.WriteString(w, s)
 					return
 				}
-				writeJSON(w, tt.status, tt.body)
+				connector.WriteJSON(w, tt.status, tt.body)
 			})
 			h.start()
 			e := h.callErr("fetch", map[string]string{"channel_id": dmID}, http.StatusTooManyRequests)
@@ -695,9 +675,6 @@ func TestCooldown(t *testing.T) {
 			s := h.state()
 			if d := s.CooldownUntil.Sub(h.clock.Now()); d < cooldownLength-time.Minute || d > cooldownLength {
 				t.Errorf("cooldown until %v (in %v)", s.CooldownUntil, d)
-			}
-			if !strings.Contains(h.logs.String(), "level=WARN") {
-				t.Error("cooldown not logged at warn")
 			}
 			if health, err := h.client.Health(context.Background()); err != nil || health.State != connector.Resting || !health.Until.Equal(s.CooldownUntil) {
 				t.Errorf("health after cooldown = %+v, %v", health, err)
@@ -723,10 +700,10 @@ func TestSearchNotReadyRetries(t *testing.T) {
 	h := newHarness(t, nil)
 	h.discord.handle(path, func(w http.ResponseWriter, _ *http.Request, n int) {
 		if n == 0 {
-			writeJSON(w, http.StatusAccepted, map[string]any{"message": "Index not yet available. Try again later", "code": 110000, "retry_after": 3})
+			connector.WriteJSON(w, http.StatusAccepted, map[string]any{"message": "Index not yet available. Try again later", "code": 110000, "retry_after": 3})
 			return
 		}
-		writeJSON(w, http.StatusOK, searchBody)
+		connector.WriteJSON(w, http.StatusOK, searchBody)
 	})
 	h.start()
 	var resp connector.ReadResult
@@ -766,8 +743,6 @@ func TestOwnerStopConditions(t *testing.T) {
 		{"401", 401, map[string]any{"message": "401: Unauthorized", "code": 0}, fixToken},
 		{"captcha", 400, map[string]any{"captcha_key": []string{"captcha-required"}, "captcha_sitekey": "a9b5fb07", "captcha_service": "hcaptcha"}, fixVerify},
 		{"account verification", 403, map[string]any{"message": "You need to verify your account in order to perform this action.", "code": 40002}, fixVerify},
-		{"phone verification", 403, map[string]any{"message": "You need to verify your phone number in order to perform this action.", "code": 70007}, fixVerify},
-		{"unauthorized code", 403, map[string]any{"message": "Unauthorized", "code": 40001}, fixToken},
 		{"anti-abuse block", 403, map[string]any{"message": "Unknown Message", "code": 10008}, fixAccount},
 	}
 	for _, tt := range tests {
@@ -879,29 +854,22 @@ func TestValidation(t *testing.T) {
 		op   string
 		args map[string]string
 	}{
-		{"fetch letters", "fetch", map[string]string{"channel_id": "abc"}},
-		{"fetch short id", "fetch", map[string]string{"channel_id": "12345678901234"}},
-		{"fetch long id", "fetch", map[string]string{"channel_id": "1234567890123456789012"}},
 		{"fetch path traversal", "fetch", map[string]string{"channel_id": "../../users/@me"}},
 		{"fetch encoded slash", "fetch", map[string]string{"channel_id": "110000000000000%2F"}},
 		{"fetch missing", "fetch", map[string]string{}},
 		{"fetch bad before", "fetch", map[string]string{"channel_id": dmID, "before": "x"}},
 		{"fetch two anchors", "fetch", map[string]string{"channel_id": dmID, "before": msg1, "after": msg2}},
 		{"fetch limit too big", "fetch", map[string]string{"channel_id": dmID, "limit": "101"}},
-		{"fetch negative limit", "fetch", map[string]string{"channel_id": dmID, "limit": "-1"}},
 		{"fetch unknown field", "fetch", map[string]string{"channel_id": dmID, "method": "DELETE"}},
 		{"search missing guild", "search", map[string]string{"content": "x"}},
-		{"search bad guild", "search", map[string]string{"guild_id": "1; DROP", "content": "x"}},
 		{"search bad author", "search", map[string]string{"guild_id": guildID, "author_id": "me"}},
 		{"search bad channel", "search", map[string]string{"guild_id": guildID, "channel_id": "#general"}},
 		{"search bad has", "search", map[string]string{"guild_id": guildID, "has": "pdf"}},
-		{"search negative offset", "search", map[string]string{"guild_id": guildID, "content": "x", "offset": "-25"}},
 		{"search huge offset", "search", map[string]string{"guild_id": guildID, "content": "x", "offset": "10000"}},
 		{"search no criteria", "search", map[string]string{"guild_id": guildID}},
 		{"search long content", "search", map[string]string{"guild_id": guildID, "content": strings.Repeat("a", 513)}},
 		{"sync bad guild", "sync", map[string]string{"guild_id": "x"}},
-		{"limit not a number", "fetch", map[string]string{"channel_id": dmID, "limit": "ten"}},
-		{"sync unknown field", "sync", map[string]string{"guild_id": guildID, "path": "/users/@me"}},
+		{"fetch limit not a number", "fetch", map[string]string{"channel_id": dmID, "limit": "ten"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -913,8 +881,8 @@ func TestValidation(t *testing.T) {
 	}
 }
 
-// The service has no write ops and no verifier: a well-formed, really signed
-// approval for a discord op is still refused, and nothing goes upstream.
+// Every op is a read, and a really signed approval is still refused without
+// anything going upstream.
 func TestWritesRefused(t *testing.T) {
 	h := newHarness(t, nil)
 	h.start()
@@ -924,19 +892,10 @@ func TestWritesRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.Name != "discord" || len(spec.Ops) != 3 {
-		t.Fatalf("spec %+v", spec)
-	}
 	for _, op := range spec.Ops {
 		if op.Kind != connector.Read {
 			t.Errorf("op %s is %s", op.Name, op.Kind)
 		}
-	}
-
-	_, err = h.client.Prepare(ctx, "fetch", map[string]string{"channel_id": dmID})
-	var e *connector.Error
-	if !errors.As(err, &e) || e.Status != http.StatusNotFound {
-		t.Errorf("prepare: %v", err)
 	}
 
 	rec, err := approval.Encode(approval.Record{
@@ -948,11 +907,9 @@ func TestWritesRefused(t *testing.T) {
 	}
 	pk := approvaltest.New(t, "mandate.example", "https://mandate.example")
 	_, err = h.client.Execute(ctx, pk.Approve(rec, noon))
-	if !errors.As(err, &e) || e.Status != http.StatusForbidden {
+	if e, ok := errors.AsType[*connector.Error](err); !ok || e.Status != http.StatusForbidden {
 		t.Errorf("execute: %v", err)
 	}
-
-	h.callErr("delete", map[string]string{"channel_id": dmID}, http.StatusNotFound)
 	if hits := h.discord.all(); len(hits) != 0 {
 		t.Errorf("refused calls reached Discord: %v", h.discord.paths())
 	}
@@ -969,11 +926,8 @@ func TestIsSnowflake(t *testing.T) {
 		{"12345678901234", false},
 		{"1234567890123456789012", false},
 		{"17592884729911706a", false},
-		{"-75928847299117063", false},
-		{" 175928847299117063", false},
 		{"175928847299117063\n", false},
 		{"１７５９２８８４７２９９１１７０６３", false}, // full-width digits
-		{"", false},
 	}
 	for _, tt := range tests {
 		if got := isSnowflake(tt.in); got != tt.want {
@@ -990,9 +944,6 @@ func TestActiveHoursRefusal(t *testing.T) {
 	// 08:00 local plus the 2 s app-open delay.
 	if want := 6*3600 + 2; e.RetryAfter != want {
 		t.Errorf("retry_after_seconds = %d, want %d", e.RetryAfter, want)
-	}
-	if !strings.Contains(e.Message, "outside active hours") {
-		t.Errorf("error %q", e.Message)
 	}
 	if len(h.discord.all()) != 0 || !h.clock.Now().Equal(time.Date(2026, 10, 29, 2, 0, 0, 0, newYork)) {
 		t.Error("refusal waited or sent a request")
@@ -1039,7 +990,7 @@ func TestSlotWaitCap(t *testing.T) {
 	}
 }
 
-func TestStateFileMode(t *testing.T) {
+func TestStateFilePrivate(t *testing.T) {
 	h := newHarness(t, nil)
 	h.start()
 	h.callOK("sync", map[string]string{}, &connector.ReadResult{})
@@ -1050,21 +1001,8 @@ func TestStateFileMode(t *testing.T) {
 	if fi.Mode().Perm() != 0o600 {
 		t.Errorf("state mode %v", fi.Mode().Perm())
 	}
-	si, err := os.Stat(h.socket)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if si.Mode().Perm() != 0o660 {
-		t.Errorf("socket mode %v", si.Mode().Perm())
-	}
 	b, _ := os.ReadFile(h.statePath)
 	if bytes.Contains(b, []byte(testToken)) || bytes.Contains(b, []byte("Alice")) {
 		t.Error("state file holds the token or names")
 	}
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
 }

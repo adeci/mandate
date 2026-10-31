@@ -39,8 +39,6 @@ func badRequest(format string, args ...any) error {
 	return &badRequestError{msg: fmt.Sprintf(format, args...)}
 }
 
-// syncRequest refreshes the guild list and DM channels; with GuildID set it
-// also refreshes that guild's channels and threads.
 type syncRequest struct {
 	GuildID string
 }
@@ -102,7 +100,7 @@ func parseSync(m map[string]string) (syncRequest, error) {
 	if err := a.done(); err != nil {
 		return r, err
 	}
-	return r, validateSync(&r)
+	return r, checkID("guild_id", r.GuildID, false)
 }
 
 func parseSearch(m map[string]string) (searchRequest, error) {
@@ -150,10 +148,6 @@ func checkID(field, v string, required bool) error {
 		return badRequest("%s must be a Discord snowflake (15-21 digits)", field)
 	}
 	return nil
-}
-
-func validateSync(r *syncRequest) error {
-	return checkID("guild_id", r.GuildID, false)
 }
 
 func validateSearch(r *searchRequest) error {

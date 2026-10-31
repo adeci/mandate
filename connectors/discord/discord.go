@@ -28,7 +28,6 @@ import (
 	"github.com/adeci/mandate/store"
 )
 
-// Config is the connector's --config.
 type Config struct {
 	// ActiveHours are the local hours HH-HH in which requests may be sent.
 	ActiveHours string `json:"active_hours"`
@@ -232,9 +231,9 @@ type worker struct {
 	clock   clock
 	ctx     context.Context // canceled when the service stops
 	jobs    chan *job
-	fail    func(error)   // for stop conditions a restart may clear
-	stopped error         // set after a stop condition; later calls fail fast
-	done    chan struct{} // closed when the loop returns
+	fail    func(error) // for stop conditions a restart may clear
+	stopped error       // set after a stop condition; later calls fail fast
+	done    chan struct{}
 	log     *slog.Logger
 
 	// What Health reads; the pacer and state belong to the worker goroutine.
@@ -407,7 +406,6 @@ func (w *worker) submit(ctx context.Context, op string, run func(ctx context.Con
 	return res.v, nil
 }
 
-// toConnectorError maps a call error to the refusal relayed to the agent.
 // Denials are always 404, so a 403 never confirms that a channel exists.
 func toConnectorError(err error) *connector.Error {
 	var (

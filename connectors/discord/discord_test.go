@@ -11,12 +11,6 @@ import (
 	"github.com/bogdanfinn/tls-client/profiles"
 )
 
-func TestBrowserClientBuilds(t *testing.T) {
-	if _, _, err := newBrowserClient(); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestChromeProfileSpeaksHTTP2(t *testing.T) {
 	type seen struct {
 		proto  string

@@ -231,8 +231,8 @@ func (p *pacer) record(at time.Time) {
 	p.roll()
 }
 
-// updateBucket applies X-RateLimit-* headers observed at now for route.
-// major separates buckets per top-level resource.
+// updateBucket applies X-RateLimit-* headers. A shared bucket is still
+// tracked per major resource, as Discord does.
 func (p *pacer) updateBucket(now time.Time, route, bucket, remaining, resetAfter string) {
 	if remaining == "" {
 		return

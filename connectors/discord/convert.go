@@ -65,7 +65,6 @@ type apiChannel struct {
 	ID         string    `json:"id"`
 	Type       int       `json:"type"`
 	GuildID    string    `json:"guild_id"`
-	ParentID   string    `json:"parent_id"`
 	Name       string    `json:"name"`
 	Position   int       `json:"position"`
 	Recipients []apiUser `json:"recipients"`
@@ -76,15 +75,12 @@ func (c *apiChannel) isThread() bool {
 }
 
 type apiAttachment struct {
-	ID          string `json:"id"`
-	Filename    string `json:"filename"`
 	ContentType string `json:"content_type"`
 }
 
 type apiMessageReference struct {
 	Type      int    `json:"type"`
 	MessageID string `json:"message_id"`
-	ChannelID string `json:"channel_id"`
 }
 
 type apiSnapshot struct {

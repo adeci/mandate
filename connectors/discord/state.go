@@ -75,17 +75,13 @@ func loadState(path string) (*state, error) {
 	return &s, nil
 }
 
-func (s *state) ensureIdentity() bool {
-	changed := false
+func (s *state) ensureIdentity() {
 	if s.LaunchID == "" {
 		s.LaunchID = newUUID()
-		changed = true
 	}
 	if s.LaunchSignature == "" {
 		s.LaunchSignature = newLaunchSignature()
-		changed = true
 	}
-	return changed
 }
 
 func (s *state) prune(now time.Time) {
