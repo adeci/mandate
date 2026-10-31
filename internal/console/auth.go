@@ -38,8 +38,7 @@ func tokenHash(token string) []byte {
 	return h[:]
 }
 
-// session returns the request's live session. A session ends early once its
-// passkey is no longer pinned.
+// A session ends early once its passkey is no longer pinned.
 func (s *Server) session(r *http.Request) (session, bool) {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil || c.Value == "" {
@@ -64,7 +63,6 @@ func (s *Server) session(r *http.Request) (session, bool) {
 	return session{hash: hash, approver: a}, true
 }
 
-// page serves h to logged-in owners and sends everyone else to log in.
 func (s *Server) page(h func(http.ResponseWriter, *http.Request, session)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sess, ok := s.session(r)
@@ -76,7 +74,6 @@ func (s *Server) page(h func(http.ResponseWriter, *http.Request, session)) http.
 	}
 }
 
-// api serves h to logged-in owners and refuses everyone else.
 func (s *Server) api(h func(http.ResponseWriter, *http.Request, session)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sess, ok := s.session(r)
@@ -131,7 +128,6 @@ func (l *loginChallenges) issue(now time.Time) []byte {
 	return m.Sum(c)
 }
 
-// check reports whether c was issued here within loginTTL and not used yet.
 func (l *loginChallenges) check(c []byte, now time.Time) error {
 	if len(c) != loginChallengeSize {
 		return errors.New("not a login challenge")

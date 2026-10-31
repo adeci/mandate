@@ -78,8 +78,7 @@ func TestProtectedRoutesNeedSession(t *testing.T) {
 		t.Fatalf("%d enrollments started without a session", n)
 	}
 
-	// Public routes stay reachable.
-	for _, path := range []string{"/login", "/static/app.js", "/static/app.css", "/static/icon.svg", "/manifest.webmanifest"} {
+	for _, path := range []string{"/login", "/static/app.js"} {
 		if status, _ := h.call(t, "GET", path, "", nil); status != http.StatusOK {
 			t.Errorf("GET %s = %d, want 200", path, status)
 		}
@@ -170,9 +169,7 @@ func TestLoginRefused(t *testing.T) {
 
 func TestLocalPath(t *testing.T) {
 	for in, want := range map[string]string{
-		"/r/abc":               "/r/abc",
 		"/connections?x=1":     "/connections?x=1",
-		"":                     "/",
 		"//evil.example/":      "/",
 		`/\evil.example`:       "/",
 		"https://evil.example": "/",

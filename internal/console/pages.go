@@ -117,7 +117,6 @@ func (s *Server) renderString(name string, data any) (string, error) {
 	return buf.String(), err
 }
 
-// owner renders a logged-in page with the nav and the pending count.
 func (s *Server) owner(w http.ResponseWriter, r *http.Request, sess session, name, title, nav string, data any) {
 	n, err := s.db.pendingCount(r.Context())
 	if err != nil {
@@ -222,8 +221,7 @@ type fieldView struct {
 	Value        template.HTML
 	Raw          string
 	Edit         bool
-	// Hidden is set when the value has characters that render as nothing.
-	Hidden bool
+	Hidden       bool
 }
 
 // fieldViews renders display fields; params named in editable become

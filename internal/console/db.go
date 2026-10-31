@@ -42,13 +42,6 @@ type challenge struct {
 	Session  []byte
 }
 
-// proof is what an approved proposal keeps: enough to re-verify the
-// signature against the pinned key later.
-type proof struct {
-	Approval approval.Approval
-	Approver string
-}
-
 type passkey struct {
 	approval.Approver
 	Synced     bool
@@ -197,7 +190,6 @@ func (d *db) query(ctx context.Context, where string, args ...any) ([]row, error
 	return out, rs.Err()
 }
 
-// addChallenge stores a challenge for a proposal that is still pending.
 func (d *db) addChallenge(ctx context.Context, c challenge, now time.Time) error {
 	res, err := d.sql.ExecContext(ctx, `
 		INSERT INTO challenges (nonce, proposal, record, issued_at, session)
@@ -259,7 +251,6 @@ func (d *db) claim(ctx context.Context, c challenge, rec approval.Record, assert
 	})
 }
 
-// finish stores the result of an executing proposal.
 func (d *db) finish(ctx context.Context, id string, res connector.Result) error {
 	b, err := json.Marshal(res)
 	if err != nil {
@@ -303,7 +294,6 @@ func (d *db) reject(ctx context.Context, id, by string, now time.Time) error {
 	})
 }
 
-// expireDue marks pending proposals past their expiry as expired.
 func (d *db) expireDue(ctx context.Context, now time.Time) error {
 	_, err := d.sql.ExecContext(ctx, `
 		UPDATE proposals SET status = 'expired', decided_at = expires_at
@@ -353,31 +343,6 @@ func (d *db) recoverInterrupted(ctx context.Context) ([]string, error) {
 	return ids, rs.Err()
 }
 
-func (d *db) proof(ctx context.Context, id string) (proof, error) {
-	var (
-		p         proof
-		issued    sql.NullInt64
-		assertion sql.NullString
-		approver  sql.NullString
-	)
-	err := d.sql.QueryRowContext(ctx,
-		`SELECT record, nonce, issued_at, assertion, decided_by FROM proposals WHERE id = ?`, id).
-		Scan(&p.Approval.Record, &p.Approval.Nonce, &issued, &assertion, &approver)
-	if errors.Is(err, sql.ErrNoRows) {
-		return proof{}, errNotFound
-	}
-	if err != nil {
-		return proof{}, err
-	}
-	if !assertion.Valid {
-		return proof{}, errors.New("request was not approved")
-	}
-	p.Approval.IssuedAt = time.Unix(0, issued.Int64).UTC()
-	p.Approval.Assertion = json.RawMessage(assertion.String)
-	p.Approver = approver.String
-	return p, nil
-}
-
 func (d *db) createSession(ctx context.Context, hash []byte, credentialID string, now, expires time.Time) error {
 	_, err := d.sql.ExecContext(ctx,
 		`INSERT INTO sessions (hash, credential_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
@@ -385,7 +350,6 @@ func (d *db) createSession(ctx context.Context, hash []byte, credentialID string
 	return err
 }
 
-// session returns the credential a live session belongs to.
 func (d *db) session(ctx context.Context, hash []byte, now time.Time) (string, error) {
 	var id string
 	err := d.sql.QueryRowContext(ctx,

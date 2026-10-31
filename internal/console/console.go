@@ -31,7 +31,6 @@ const defaultAdminSocket = "/run/mandate-console/admin.sock"
 const usage = "usage: mandate console --hostname HOST --tls-cert FILE --tls-key FILE --state DIR " +
 	"--socket PATH [--listen ADDR] [--approvers FILE] [--connector NAME=SOCKET]... [--admin-socket PATH]"
 
-// connectorFlags collects repeated --connector name=socket.
 type connectorFlags map[string]string
 
 func (c connectorFlags) String() string { return fmt.Sprint(map[string]string(c)) }
@@ -48,7 +47,6 @@ func (c connectorFlags) Set(v string) error {
 	return nil
 }
 
-// Command is `mandate console`.
 func Command(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("console", flag.ContinueOnError)
 	listen := flags.String("listen", ":443", "HTTPS address of the console")

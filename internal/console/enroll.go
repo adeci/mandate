@@ -183,7 +183,6 @@ func (s *Server) enrollOptions(w http.ResponseWriter, r *http.Request) {
 	connector.WriteJSON(w, http.StatusOK, opts)
 }
 
-// enrolled is what the page shows after a registration.
 type enrolled struct {
 	Approver approval.Approver `json:"approver"`
 	Synced   bool              `json:"synced"`
@@ -298,8 +297,6 @@ func appendEnrolled(path string, a approval.Approver) error {
 
 const passkeyUsage = "usage: mandate passkey add --name NAME [--admin-socket PATH]"
 
-// Passkey is `mandate passkey add`: it asks the running console for a
-// one-time enrollment link.
 func Passkey(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] != "add" {
 		return errors.New(passkeyUsage)

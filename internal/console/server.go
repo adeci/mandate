@@ -31,7 +31,6 @@ const (
 	historySize    = 50
 )
 
-// Config is everything the console needs; Command builds it from flags.
 type Config struct {
 	// RPID is the WebAuthn relying party ID, the console's hostname.
 	RPID string
@@ -40,15 +39,13 @@ type Config struct {
 	Origin string
 	// Approvers are the pinned passkeys. Empty means bootstrap: enrolling
 	// works, logging in and approving don't.
-	Approvers []approval.Approver
-	// Connectors maps connector names to their sockets.
+	Approvers  []approval.Approver
 	Connectors map[string]string
 	StateDir   string
 	Log        *slog.Logger
 	Now        func() time.Time
 }
 
-// Server is the console: proposal store, web app, enrollment.
 type Server struct {
 	cfg      Config
 	db       *db
@@ -61,7 +58,6 @@ type Server struct {
 	enrolls  map[string]*enrollment
 }
 
-// conn is a connector and its cached spec.
 type conn struct {
 	name   string
 	client *connector.Client
@@ -115,8 +111,6 @@ func (s *Server) Close() error { return s.db.Close() }
 // stored proposal matches one built from the original.
 func (s *Server) now() time.Time { return s.cfg.Now().UTC().Truncate(time.Millisecond) }
 
-// Sweep expires proposals and drops dead challenges and sessions every
-// interval until ctx is done.
 func (s *Server) Sweep(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -134,8 +128,8 @@ func (s *Server) Sweep(ctx context.Context, interval time.Duration) {
 
 func (s *Server) url(id string) string { return s.cfg.Origin + "/r/" + id }
 
-// getSpec fetches the spec at most every specTTL. A connector answering
-// under another name or protocol is refused and not cached.
+// getSpec caches the spec for specTTL. A connector answering under another
+// name or protocol is refused and not cached.
 func (c *conn) getSpec(ctx context.Context, now time.Time) (connector.Spec, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
