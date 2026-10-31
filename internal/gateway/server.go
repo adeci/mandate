@@ -39,7 +39,7 @@ type Config struct {
 	// name may not touch containers at all.
 	Connectors map[string]string
 	// Empty disables /v1/actions.
-	ApprovalsSocket string
+	ConsoleSocket string
 	// ConsoleURL is where the owner fixes connectors; it goes into errors
 	// that ask the agent to fetch them.
 	ConsoleURL string
@@ -98,7 +98,7 @@ func Command(ctx context.Context, args []string) error {
 	fs.IntVar(&cfg.MaxRows, "max-rows", 5000, "maximum rows per query")
 	fs.DurationVar(&cfg.Timeout, "timeout", 5*time.Second, "maximum query execution time")
 	fs.Var(connectorFlag(cfg.Connectors), "connector", "connector socket as name=path (repeatable; a source of the same name filters it)")
-	fs.StringVar(&cfg.ApprovalsSocket, "approvals-socket", "", "approvals unit socket (enables /v1/actions)")
+	fs.StringVar(&cfg.ConsoleSocket, "console-socket", "", "console proposal socket (enables /v1/actions)")
 	fs.StringVar(&cfg.HTTPProxySocket, "http-proxy-socket", "", "HTTP proxy socket (enables /v1/http)")
 	fs.StringVar(&cfg.ConsoleURL, "console-url", "", "console base URL, shown to agents when a connector needs the owner")
 	if err := fs.Parse(args); err != nil {
@@ -137,7 +137,7 @@ func Serve(ctx context.Context, cfg Config) error {
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	slog.Info("gateway listening", "addr", ln.Addr().String(), "sources", cfg.Sources, "connectors", cfg.Connectors,
-		"approvals", cfg.ApprovalsSocket != "", "http_proxy", cfg.HTTPProxySocket != "")
+		"console", cfg.ConsoleSocket != "", "http_proxy", cfg.HTTPProxySocket != "")
 	select {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -154,7 +154,7 @@ type handler struct {
 	policy     *policyLoader
 	mux        *http.ServeMux
 	connectors *connectors
-	approvals  *proposal.Client // nil when disabled
+	console    *proposal.Client // nil when disabled
 }
 
 func newHandler(cfg Config, token string) *handler {
@@ -165,8 +165,8 @@ func newHandler(cfg Config, token string) *handler {
 		mux:        http.NewServeMux(),
 		connectors: newConnectors(cfg.Connectors),
 	}
-	if cfg.ApprovalsSocket != "" {
-		h.approvals = proposal.Dial(cfg.ApprovalsSocket)
+	if cfg.ConsoleSocket != "" {
+		h.console = proposal.Dial(cfg.ConsoleSocket)
 	}
 	h.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
 	h.mux.HandleFunc("GET /v1/schema", h.authed(h.schema))

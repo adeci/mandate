@@ -79,7 +79,7 @@ func (c *connectors) spec(ctx context.Context, name string) (connector.Spec, err
 	if err != nil {
 		return connector.Spec{}, err
 	}
-	// Approvals routes by the gateway's name and connectors check the record
+	// The console routes by the gateway's name and connectors check the record
 	// against their own, so a mismatch would only fail at execution.
 	if s.Name != name {
 		return connector.Spec{}, fmt.Errorf("socket for %s serves connector %q", name, s.Name)
@@ -211,7 +211,7 @@ func checkArgs(op connector.Op, args map[string]string) error {
 	return nil
 }
 
-// relay passes a connector's or approvals' refusal through with its status
+// relay passes a connector's or the console's refusal through with its status
 // and message; anything else means the peer is unreachable.
 func relay(w http.ResponseWriter, who string, err error) {
 	if e, ok := errors.AsType[*connector.Error](err); ok {
@@ -380,7 +380,7 @@ func (h *handler) answer(w http.ResponseWriter, r *http.Request, source string, 
 
 func (h *handler) propose(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	if h.approvals == nil {
+	if h.console == nil {
 		writeError(w, http.StatusNotFound, "proposals are not enabled on this gateway")
 		return
 	}
@@ -416,12 +416,12 @@ func (h *handler) propose(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	p, err := h.approvals.Submit(r.Context(), proposal.Request{
+	p, err := h.console.Submit(r.Context(), proposal.Request{
 		Connector: req.Connector, Op: req.Op, Args: prepared.Args, Note: req.Note,
 	})
 	if err != nil {
 		slog.Info("propose", append(attrs, "err", err.Error())...)
-		relay(w, "approvals", err)
+		relay(w, "console", err)
 		return
 	}
 	slog.Info("propose", append(attrs, "id", p.ID, "duration_ms", time.Since(start).Milliseconds())...)
@@ -488,7 +488,7 @@ var proposalID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 // console until the proposal is settled or the wait is over, so an agent can
 // block in one call instead of spending a turn per poll.
 func (h *handler) status(w http.ResponseWriter, r *http.Request) {
-	if h.approvals == nil {
+	if h.console == nil {
 		writeError(w, http.StatusNotFound, "proposals are not enabled on this gateway")
 		return
 	}
@@ -508,9 +508,9 @@ func (h *handler) status(w http.ResponseWriter, r *http.Request) {
 	}
 	deadline := time.Now().Add(wait)
 	for {
-		p, err := h.approvals.Get(r.Context(), id)
+		p, err := h.console.Get(r.Context(), id)
 		if err != nil {
-			relay(w, "approvals", err)
+			relay(w, "console", err)
 			return
 		}
 		if settled(p.Status) || !time.Now().Before(deadline) {

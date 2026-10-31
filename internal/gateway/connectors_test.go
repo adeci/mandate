@@ -81,7 +81,7 @@ func (f *fakeDiscord) Execute(context.Context, approval.Record) connector.Result
 	return connector.Result{Status: connector.Failed}
 }
 
-type fakeApprovals struct {
+type fakeConsole struct {
 	calls     atomic.Int32
 	mu        sync.Mutex
 	submitted []proposal.Request
@@ -89,19 +89,19 @@ type fakeApprovals struct {
 	gets      int
 }
 
-func (a *fakeApprovals) set(p proposal.Proposal) {
+func (a *fakeConsole) set(p proposal.Proposal) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.proposals[p.ID] = p
 }
 
-func (a *fakeApprovals) getCount() int {
+func (a *fakeConsole) getCount() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.gets
 }
 
-func (a *fakeApprovals) handler() http.Handler {
+func (a *fakeConsole) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /proposals", func(w http.ResponseWriter, r *http.Request) {
 		a.calls.Add(1)
@@ -133,9 +133,9 @@ func (a *fakeApprovals) handler() http.Handler {
 }
 
 type rig struct {
-	h         *handler
-	discord   *fakeDiscord
-	approvals *fakeApprovals
+	h       *handler
+	discord *fakeDiscord
+	console *fakeConsole
 }
 
 func newRig(t *testing.T, edit func(*Config)) *rig {
@@ -152,17 +152,17 @@ func newRig(t *testing.T, edit func(*Config)) *rig {
 			return connector.Prepared{Args: args, Container: args["to"]}, nil
 		},
 	}
-	a := &fakeApprovals{proposals: map[string]proposal.Proposal{}}
+	a := &fakeConsole{proposals: map[string]proposal.Proposal{}}
 	srv := &connector.Server{Connector: d, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	cfg := Config{
 		Sources: fixture(t), ExposureFile: exposure, MaxRows: 100, Timeout: 2 * time.Second,
-		Connectors:      map[string]string{"discord": serveUnix(t, "discord", srv.Handler())},
-		ApprovalsSocket: serveUnix(t, "approvals", a.handler()),
+		Connectors:    map[string]string{"discord": serveUnix(t, "discord", srv.Handler())},
+		ConsoleSocket: serveUnix(t, "console", a.handler()),
 	}
 	if edit != nil {
 		edit(&cfg)
 	}
-	return &rig{h: newHandler(cfg, testToken), discord: d, approvals: a}
+	return &rig{h: newHandler(cfg, testToken), discord: d, console: a}
 }
 
 func call(h *handler, method, path, body string) *httptest.ResponseRecorder {
@@ -303,8 +303,8 @@ func TestProposeRefusesHiddenTargetWithoutSubmitting(t *testing.T) {
 			t.Errorf("%s: %d %s, want 404 unknown or hidden", name, rec.Code, rec.Body)
 		}
 	}
-	if n := r.approvals.calls.Load(); n != 0 {
-		t.Fatalf("hidden targets reached approvals %d times", n)
+	if n := r.console.calls.Load(); n != 0 {
+		t.Fatalf("hidden targets reached the console %d times", n)
 	}
 }
 
@@ -338,9 +338,9 @@ func TestProposeSubmitsPreparedArgs(t *testing.T) {
 		{Connector: "discord", Op: "send", Args: map[string]string{"to": "c-memes", "text": "hi"}, Note: "asked by Alex"},
 		{Connector: "discord", Op: "send", Args: map[string]string{"to": "dm-7", "text": "hi"}, Note: "asked by Alex"},
 	}
-	r.approvals.mu.Lock()
-	got := r.approvals.submitted
-	r.approvals.mu.Unlock()
+	r.console.mu.Lock()
+	got := r.console.submitted
+	r.console.mu.Unlock()
 	if len(got) != len(want) {
 		t.Fatalf("submitted %+v", got)
 	}
@@ -354,8 +354,8 @@ func TestProposeSubmitsPreparedArgs(t *testing.T) {
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `\"#memes\" matches 2 channels: #memes (Fun), #memes (Work)`) {
 		t.Errorf("ambiguous: %d %s", rec.Code, rec.Body)
 	}
-	if n := r.approvals.calls.Load(); n != 2 {
-		t.Errorf("approvals calls = %d, want 2 (ambiguous prepare must not submit)", n)
+	if n := r.console.calls.Load(); n != 2 {
+		t.Errorf("console calls = %d, want 2 (ambiguous prepare must not submit)", n)
 	}
 
 	for name, body := range map[string]string{
@@ -385,8 +385,8 @@ func TestProposeRefusesHiddenAlias(t *testing.T) {
 			t.Errorf("alias %s: %d %s, want 404", alias, rec.Code, rec.Body)
 		}
 	}
-	if n := r.approvals.calls.Load(); n != 0 {
-		t.Fatalf("hidden aliases reached approvals %d times", n)
+	if n := r.console.calls.Load(); n != 0 {
+		t.Fatalf("hidden aliases reached the console %d times", n)
 	}
 	rec := call(r.h, http.MethodPost, "/v1/actions", `{"connector":"discord","op":"send","args":{"to":"u2","text":"hi"}}`)
 	if rec.Code != http.StatusAccepted {
@@ -436,8 +436,8 @@ func TestAmbiguousNameHidesHiddenCandidates(t *testing.T) {
 	if rec.Code != unknown.Code || rec.Body.String() != unknown.Body.String() {
 		t.Errorf("all-hidden candidates: %d %s\nwant exactly the unknown-target answer: %d %s", rec.Code, rec.Body, unknown.Code, unknown.Body)
 	}
-	if n := r.approvals.calls.Load(); n != 0 {
-		t.Errorf("ambiguous names reached approvals %d times", n)
+	if n := r.console.calls.Load(); n != 0 {
+		t.Errorf("ambiguous names reached the console %d times", n)
 	}
 }
 
@@ -475,8 +475,8 @@ func TestUnhealthyConnectorIsNotCalled(t *testing.T) {
 	if n, m := r.discord.reads.Load(), r.discord.prepares.Load(); n+m != 0 {
 		t.Errorf("unhealthy connector called: %d reads, %d prepares", n, m)
 	}
-	if n := r.approvals.calls.Load(); n != 0 {
-		t.Errorf("approvals called %d times", n)
+	if n := r.console.calls.Load(); n != 0 {
+		t.Errorf("console called %d times", n)
 	}
 }
 
@@ -490,7 +490,7 @@ func TestStatusPassThrough(t *testing.T) {
 		CreatedAt: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC),
 		ExpiresAt: time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC),
 	}
-	r.approvals.set(want)
+	r.console.set(want)
 
 	rec := call(r.h, http.MethodGet, "/v1/actions/p7", "")
 	if rec.Code != http.StatusOK {
@@ -517,18 +517,18 @@ func TestStatusLongPollReturnsOnDecision(t *testing.T) {
 	t.Parallel()
 	r := newRig(t, nil)
 	pending := proposal.Proposal{ID: "p1", Connector: "discord", Op: "send", Status: proposal.Pending}
-	r.approvals.set(pending)
+	r.console.set(pending)
 	go func() {
-		for r.approvals.getCount() < 2 {
+		for r.console.getCount() < 2 {
 			time.Sleep(10 * time.Millisecond)
 		}
 		pending.Status = proposal.Executing
-		r.approvals.set(pending)
-		for r.approvals.getCount() < 3 {
+		r.console.set(pending)
+		for r.console.getCount() < 3 {
 			time.Sleep(10 * time.Millisecond)
 		}
 		pending.Status = proposal.Rejected
-		r.approvals.set(pending)
+		r.console.set(pending)
 	}()
 	start := time.Now()
 	rec := call(r.h, http.MethodGet, "/v1/actions/p1?wait=30", "")
@@ -543,7 +543,7 @@ func TestStatusLongPollReturnsOnDecision(t *testing.T) {
 func TestStatusLongPollTimesOutPending(t *testing.T) {
 	t.Parallel()
 	r := newRig(t, nil)
-	r.approvals.set(proposal.Proposal{ID: "p1", Status: proposal.Pending})
+	r.console.set(proposal.Proposal{ID: "p1", Status: proposal.Pending})
 	start := time.Now()
 	rec := call(r.h, http.MethodGet, "/v1/actions/p1?wait=1", "")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"status":"pending"`) {
@@ -552,7 +552,7 @@ func TestStatusLongPollTimesOutPending(t *testing.T) {
 	if d := time.Since(start); d < time.Second || d > 5*time.Second {
 		t.Errorf("wait=1 answered after %v", d)
 	}
-	if n := r.approvals.getCount(); n < 2 {
+	if n := r.console.getCount(); n < 2 {
 		t.Errorf("console asked %d times, want a re-check before giving up", n)
 	}
 
@@ -565,7 +565,7 @@ func TestStatusLongPollTimesOutPending(t *testing.T) {
 func TestStatusLongPollStopsWhenAgentLeaves(t *testing.T) {
 	t.Parallel()
 	r := newRig(t, nil)
-	r.approvals.set(proposal.Proposal{ID: "p1", Status: proposal.Pending})
+	r.console.set(proposal.Proposal{ID: "p1", Status: proposal.Pending})
 	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 	defer cancel()
 	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/v1/actions/p1?wait=900", nil)
@@ -577,9 +577,9 @@ func TestStatusLongPollStopsWhenAgentLeaves(t *testing.T) {
 	}
 }
 
-func TestActionsDisabledWithoutApprovals(t *testing.T) {
+func TestActionsDisabledWithoutConsole(t *testing.T) {
 	t.Parallel()
-	r := newRig(t, func(c *Config) { c.ApprovalsSocket = "" })
+	r := newRig(t, func(c *Config) { c.ConsoleSocket = "" })
 	for _, rec := range []*httptest.ResponseRecorder{
 		call(r.h, http.MethodPost, "/v1/actions", `{"connector":"discord","op":"send","args":{"to":"c-memes","text":"hi"}}`),
 		call(r.h, http.MethodGet, "/v1/actions/p1", ""),
@@ -589,7 +589,7 @@ func TestActionsDisabledWithoutApprovals(t *testing.T) {
 		}
 	}
 	if n := r.discord.prepares.Load(); n != 0 {
-		t.Errorf("prepared %d times without approvals", n)
+		t.Errorf("prepared %d times without the console", n)
 	}
 }
 
@@ -659,9 +659,9 @@ func TestSourcelessConnectorNeverTargetsContainers(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("propose: %d %s", rec.Code, rec.Body)
 	}
-	r.approvals.mu.Lock()
-	got := r.approvals.submitted
-	r.approvals.mu.Unlock()
+	r.console.mu.Lock()
+	got := r.console.submitted
+	r.console.mu.Unlock()
 	if len(got) != 1 || got[0].Connector != "http" || got[0].Args["path"] != "/repos/a/b/issues" {
 		t.Fatalf("submitted %+v", got)
 	}
@@ -684,8 +684,8 @@ func TestSourcelessConnectorNeverTargetsContainers(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Errorf("prepared container without source: %d %s, want 403", rec.Code, rec.Body)
 	}
-	if n := r.approvals.calls.Load(); n != 1 {
-		t.Errorf("approvals calls = %d, want 1", n)
+	if n := r.console.calls.Load(); n != 1 {
+		t.Errorf("console calls = %d, want 1", n)
 	}
 }
 
