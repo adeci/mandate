@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/adeci/mandate/internal/approval"
+	"github.com/adeci/mandate/approval"
 )
 
 // Client talks to a connector over its Unix socket.

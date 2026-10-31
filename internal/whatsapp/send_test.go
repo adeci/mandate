@@ -23,10 +23,10 @@ import (
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 
-	"github.com/adeci/mandate/internal/approval"
-	"github.com/adeci/mandate/internal/approval/approvaltest"
-	"github.com/adeci/mandate/internal/connector"
-	"github.com/adeci/mandate/internal/store"
+	"github.com/adeci/mandate/approval"
+	"github.com/adeci/mandate/approval/approvaltest"
+	"github.com/adeci/mandate/connector"
+	"github.com/adeci/mandate/store"
 )
 
 var (

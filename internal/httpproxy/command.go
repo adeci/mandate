@@ -8,8 +8,8 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/adeci/mandate/internal/approval"
-	"github.com/adeci/mandate/internal/connector"
+	"github.com/adeci/mandate/approval"
+	"github.com/adeci/mandate/connector"
 )
 
 const usage = "usage: mandate http-proxy --config FILE --listen SOCKET [--credentials-dir DIR] [--approvers FILE --rp-id ID --origin URL --seen FILE]"

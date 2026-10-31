@@ -11,8 +11,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/adeci/mandate/internal/approval"
-	"github.com/adeci/mandate/internal/connector"
+	"github.com/adeci/mandate/approval"
+	"github.com/adeci/mandate/connector"
 )
 
 type Status string

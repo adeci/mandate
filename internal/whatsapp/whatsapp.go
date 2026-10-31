@@ -24,9 +24,9 @@ import (
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
-	"github.com/adeci/mandate/internal/approval"
-	"github.com/adeci/mandate/internal/connector"
-	"github.com/adeci/mandate/internal/store"
+	"github.com/adeci/mandate/approval"
+	"github.com/adeci/mandate/connector"
+	"github.com/adeci/mandate/store"
 )
 
 const usage = `usage: mandate whatsapp run --data PATH --session PATH [--listen SOCKET]

@@ -14,7 +14,7 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"github.com/adeci/mandate/internal/approval"
+	"github.com/adeci/mandate/approval"
 )
 
 // Flags for authenticator data: user present, user verified, and backup

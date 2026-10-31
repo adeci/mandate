@@ -15,9 +15,9 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/adeci/mandate/internal/approval"
-	"github.com/adeci/mandate/internal/connector"
-	"github.com/adeci/mandate/internal/store"
+	"github.com/adeci/mandate/approval"
+	"github.com/adeci/mandate/connector"
+	"github.com/adeci/mandate/store"
 )
 
 func (c *waConnector) Spec() connector.Spec {

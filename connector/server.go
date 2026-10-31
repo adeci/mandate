@@ -14,7 +14,7 @@ import (
 	"slices"
 	"time"
 
-	"github.com/adeci/mandate/internal/approval"
+	"github.com/adeci/mandate/approval"
 )
 
 const maxBody = 1 << 20
@@ -90,7 +90,9 @@ func ListenUnix(path string) (net.Listener, error) {
 }
 
 func (s *Server) spec(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.Connector.Spec())
+	spec := s.Connector.Spec()
+	spec.Protocol = ProtocolVersion
+	writeJSON(w, http.StatusOK, spec)
 }
 
 type opRequest struct {
@@ -172,7 +174,7 @@ func (s *Server) execute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.Verifier == nil {
-		writeErr(w, &Error{Status: http.StatusForbidden, Message: "this connector has no write ops"})
+		writeErr(w, &Error{Status: http.StatusForbidden, Message: "this connector has no approvers, so it refuses writes"})
 		return
 	}
 	rec, err := s.Verifier.Verify(a)

@@ -22,8 +22,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/adeci/mandate/internal/approval"
-	"github.com/adeci/mandate/internal/connector"
+	"github.com/adeci/mandate/approval"
+	"github.com/adeci/mandate/connector"
 )
 
 const defaultAdminSocket = "/run/mandate-console/admin.sock"

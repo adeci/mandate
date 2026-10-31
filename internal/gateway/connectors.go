@@ -20,7 +20,7 @@ import (
 
 	"github.com/ncruces/go-sqlite3"
 
-	"github.com/adeci/mandate/internal/connector"
+	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/internal/proposal"
 )
 

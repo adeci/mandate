@@ -10,7 +10,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 
-	"github.com/adeci/mandate/internal/store"
+	"github.com/adeci/mandate/store"
 )
 
 type pnResolver func(types.JID) types.JID

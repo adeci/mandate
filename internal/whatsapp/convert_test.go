@@ -15,7 +15,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/adeci/mandate/internal/store"
+	"github.com/adeci/mandate/store"
 )
 
 var (

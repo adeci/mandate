@@ -11,7 +11,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 
-	"github.com/adeci/mandate/internal/store"
+	"github.com/adeci/mandate/store"
 )
 
 const queryTimeout = 30 * time.Second

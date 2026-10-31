@@ -17,7 +17,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/adeci/mandate/internal/connector"
+	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/internal/exitcode"
 )
 

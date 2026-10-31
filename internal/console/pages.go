@@ -14,8 +14,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/adeci/mandate/internal/approval"
-	"github.com/adeci/mandate/internal/connector"
+	"github.com/adeci/mandate/approval"
+	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/internal/proposal"
 )
 

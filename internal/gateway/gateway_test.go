@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adeci/mandate/internal/store"
+	"github.com/adeci/mandate/store"
 )
 
 func fixture(t *testing.T) map[string]string {

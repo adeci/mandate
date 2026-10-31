@@ -15,8 +15,8 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 
-	"github.com/adeci/mandate/internal/connector"
-	"github.com/adeci/mandate/internal/store"
+	"github.com/adeci/mandate/connector"
+	"github.com/adeci/mandate/store"
 )
 
 const (

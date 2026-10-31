@@ -1,6 +1,6 @@
 // Package connector is the protocol between mandate's gateway and console
-// and the per-service connectors that hold sessions. A connector serves it on
-// a Unix socket:
+// and the connectors that hold sessions, and the SDK to write one. A
+// connector serves the protocol on a Unix socket:
 //
 //	GET  /spec     ops the connector offers
 //	GET  /health   whether it is working or needs the owner
@@ -8,6 +8,8 @@
 //	POST /read     run a read op (no approval; results land in the connector's data.db)
 //	POST /prepare  validate and normalize a write, render what the owner will see
 //	POST /execute  run an approved write, verifying the approval itself
+//
+// A connector program is usually just a call to Main.
 package connector
 
 import (
@@ -17,7 +19,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/adeci/mandate/internal/approval"
+	"github.com/adeci/mandate/approval"
 )
 
 // Kind separates ops agents may run directly from ops that need approval.
@@ -28,9 +30,17 @@ const (
 	Write Kind = "write"
 )
 
+// ProtocolVersion is the protocol this package speaks. Server stamps it on
+// every Spec; the gateway and console refuse a connector that speaks another.
+const ProtocolVersion = 1
+
 type Spec struct {
-	Name string `json:"name"`
-	Ops  []Op   `json:"ops"`
+	Protocol int    `json:"protocol"`
+	Name     string `json:"name"`
+	Ops      []Op   `json:"ops"`
+	// Setup are the inputs the console offers the owner when linking the
+	// connector, all optional, e.g. a phone number for a pairing code.
+	Setup []Param `json:"setup,omitempty"`
 	// Doc is markdown for agents beyond the ops, e.g. which API paths the
 	// http connector allows.
 	Doc string `json:"doc,omitempty"`

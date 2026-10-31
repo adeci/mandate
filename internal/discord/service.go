@@ -13,8 +13,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/adeci/mandate/internal/connector"
-	"github.com/adeci/mandate/internal/store"
+	"github.com/adeci/mandate/connector"
+	"github.com/adeci/mandate/store"
 )
 
 const (

@@ -11,7 +11,7 @@ import (
 
 	"rsc.io/qr"
 
-	"github.com/adeci/mandate/internal/connector"
+	"github.com/adeci/mandate/connector"
 )
 
 const (

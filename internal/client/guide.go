@@ -6,7 +6,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/adeci/mandate/internal/connector"
+	"github.com/adeci/mandate/connector"
 )
 
 func (c *client) guide(ctx context.Context, args []string) error {

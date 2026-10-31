@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adeci/mandate/internal/approval"
-	"github.com/adeci/mandate/internal/approval/approvaltest"
+	"github.com/adeci/mandate/approval"
+	"github.com/adeci/mandate/approval/approvaltest"
 )
 
 // adminEnroll asks the admin socket for a link and returns its token.

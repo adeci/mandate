@@ -16,10 +16,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adeci/mandate/internal/approval"
-	"github.com/adeci/mandate/internal/connector"
+	"github.com/adeci/mandate/approval"
+	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/internal/proposal"
-	"github.com/adeci/mandate/internal/store"
+	"github.com/adeci/mandate/store"
 )
 
 var testToken = strings.Repeat("t", 40)

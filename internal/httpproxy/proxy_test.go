@@ -18,9 +18,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adeci/mandate/internal/approval"
-	"github.com/adeci/mandate/internal/approval/approvaltest"
-	"github.com/adeci/mandate/internal/connector"
+	"github.com/adeci/mandate/approval"
+	"github.com/adeci/mandate/approval/approvaltest"
+	"github.com/adeci/mandate/connector"
 )
 
 const (
