@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -179,6 +180,42 @@ func TestVerbsPaginate(t *testing.T) {
 	} {
 		if code, _, body := getTable(t, h, "/v1/whatsapp/"+q); code != http.StatusBadRequest {
 			t.Errorf("%s: %d %s, want 400", q, code, body)
+		}
+	}
+}
+
+// History sync stores older messages after newer ones.
+func TestVerbsOrderBySentTimeAcrossIngestOrder(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.db")
+	st, err := store.Open(context.Background(), path)
+	mustDo(t, err)
+	mustDo(t, st.UpsertContainer(context.Background(), store.Container{ID: "c1", Kind: "dm"}))
+	day := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+	for _, m := range []struct {
+		id string
+		at time.Duration
+	}{{"evening", 18*time.Hour + 40*time.Minute}, {"morning", 9*time.Hour + 12*time.Minute}, {"noon-a", 12 * time.Hour}, {"noon-b", 12 * time.Hour}} {
+		mustDo(t, st.UpsertMessage(context.Background(), store.Message{ID: m.id, ContainerID: "c1", SenderID: "u1", Body: "x " + m.id, SentAt: day.Add(m.at)}))
+	}
+	mustDo(t, st.Close())
+	h := newHandler(Config{Sources: map[string]string{"wa": path}, ExposureFile: filepath.Join(dir, "exposure.toml"), Timeout: 2 * time.Second}, testToken)
+
+	for _, verb := range []string{"messages?chat=c1", "search?text=x"} {
+		var got []any
+		next := "&limit=2"
+		for range 2 {
+			_, res, _ := getTable(t, h, "/v1/wa/"+verb+next)
+			got = append(got, column(t, res, "body")...)
+			if !res.More {
+				break
+			}
+			next = "&limit=2&before=" + strconv.FormatInt(res.NextBefore, 10)
+		}
+		want := []any{"x evening", "x noon-b", "x noon-a", "x morning"}
+		if !slices.Equal(got, want) {
+			t.Errorf("%s pages = %v, want %v", verb, got, want)
 		}
 	}
 }

@@ -182,21 +182,24 @@ ORDER BY updated_at DESC, id LIMIT ?4`, search, limit+1)
 	return page(&table{Columns: chatColumns}, rows, limit, -1), nil
 }
 
+// before is the seq of the last message seen; the page continues after it in
+// (sent_at, seq) order, since seq follows ingestion, not sending.
 func (s *source) messages(chat string, before, limit int64) (*table, error) {
 	rows, err := s.query(`SELECT seq, sent_at, sender, body FROM msgs
-WHERE container_id = ?3 AND (?4 = 0 OR seq < ?4)
-ORDER BY seq DESC LIMIT ?5`, chat, before, limit+1)
+WHERE container_id = ?3 AND (?4 = 0 OR (sent_at, seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?4))
+ORDER BY sent_at DESC, seq DESC LIMIT ?5`, chat, before, limit+1)
 	if err != nil {
 		return nil, err
 	}
 	return page(&table{Columns: messageColumns}, rows, limit, 0), nil
 }
 
-// Matches the filtered body, where login codes are blank.
+// Matches the filtered body, where login codes are blank. before as in messages.
 func (s *source) search(text, chat, since string, before, limit int64) (*table, error) {
 	rows, err := s.query(`SELECT seq, sent_at, container_id, sender, body FROM msgs
-WHERE instr(lower(body), lower(?3)) AND (?4 = '' OR container_id = ?4) AND sent_at >= ?5 AND (?6 = 0 OR seq < ?6)
-ORDER BY seq DESC LIMIT ?7`, text, chat, since, before, limit+1)
+WHERE instr(lower(body), lower(?3)) AND (?4 = '' OR container_id = ?4) AND sent_at >= ?5
+  AND (?6 = 0 OR (sent_at, seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?6))
+ORDER BY sent_at DESC, seq DESC LIMIT ?7`, text, chat, since, before, limit+1)
 	if err != nil {
 		return nil, err
 	}
