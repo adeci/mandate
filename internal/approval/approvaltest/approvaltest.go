@@ -50,7 +50,21 @@ func New(t testing.TB, rpID, origin string) *Authenticator {
 
 // Approver is this passkey as it would be enrolled.
 func (a *Authenticator) Approver(name string) approval.Approver {
-	pub, err := cbor.Marshal(map[int]any{
+	return approval.Approver{
+		Name:         name,
+		CredentialID: base64.RawURLEncoding.EncodeToString(a.id),
+		PublicKey:    base64.RawURLEncoding.EncodeToString(a.coseKey()),
+	}
+}
+
+// coseKey is the public key in canonical CTAP2 CBOR, so it encodes the same
+// way every time.
+func (a *Authenticator) coseKey() []byte {
+	enc, err := cbor.CTAP2EncOptions().EncMode()
+	if err != nil {
+		panic(err)
+	}
+	pub, err := enc.Marshal(map[int]any{
 		1:  2,  // kty: EC2
 		3:  -7, // alg: ES256
 		-1: 1,  // crv: P-256
@@ -60,11 +74,54 @@ func (a *Authenticator) Approver(name string) approval.Approver {
 	if err != nil {
 		panic(err)
 	}
-	return approval.Approver{
-		Name:         name,
-		CredentialID: base64.RawURLEncoding.EncodeToString(a.id),
-		PublicKey:    base64.RawURLEncoding.EncodeToString(pub),
+	return pub
+}
+
+// Register answers navigator.credentials.create for challenge with
+// attestation "none" and returns the PublicKeyCredential JSON.
+func (a *Authenticator) Register(challenge []byte) json.RawMessage {
+	clientData, err := json.Marshal(map[string]any{
+		"type":        "webauthn.create",
+		"challenge":   base64.RawURLEncoding.EncodeToString(challenge),
+		"origin":      a.Origin,
+		"crossOrigin": false,
+	})
+	if err != nil {
+		panic(err)
 	}
+	const flagAT = 0x40 // attested credential data included
+	rpHash := sha256.Sum256([]byte(a.RPID))
+	authData := append(rpHash[:], a.Flags|flagAT, 0, 0, 0, 0)
+	authData = append(authData, make([]byte, 16)...) // AAGUID
+	authData = append(authData, byte(len(a.id)>>8), byte(len(a.id)))
+	authData = append(authData, a.id...)
+	authData = append(authData, a.coseKey()...)
+	enc, err := cbor.CTAP2EncOptions().EncMode()
+	if err != nil {
+		panic(err)
+	}
+	att, err := enc.Marshal(map[string]any{
+		"fmt":      "none",
+		"attStmt":  map[string]any{},
+		"authData": authData,
+	})
+	if err != nil {
+		panic(err)
+	}
+	b64 := base64.RawURLEncoding.EncodeToString
+	out, err := json.Marshal(map[string]any{
+		"id":    b64(a.id),
+		"rawId": b64(a.id),
+		"type":  "public-key",
+		"response": map[string]string{
+			"clientDataJSON":    b64(clientData),
+			"attestationObject": b64(att),
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return out
 }
 
 // Assert signs challenge the way navigator.credentials.get does and returns
