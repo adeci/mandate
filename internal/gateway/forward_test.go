@@ -61,6 +61,8 @@ func TestForwardRelaysOnlyAllowedParts(t *testing.T) {
 	t.Parallel()
 	r, f := forwardRig(t, func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/vnd.github+json")
+		w.Header().Set("Link", `<https://api.github.com/x?page=2>; rel="next"`)
+		w.Header().Set("X-Ratelimit-Remaining", "42")
 		w.Header().Set("Set-Cookie", "session=upstream")
 		w.WriteHeader(http.StatusNotFound)
 		w.Write([]byte(`{"message":"Not Found"}`))
@@ -74,7 +76,8 @@ func TestForwardRelaysOnlyAllowedParts(t *testing.T) {
 	r.h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound || rec.Body.String() != `{"message":"Not Found"}` ||
-		rec.Header().Get("Content-Type") != "application/vnd.github+json" || rec.Header().Get("Set-Cookie") != "" {
+		rec.Header().Get("Content-Type") != "application/vnd.github+json" || rec.Header().Get("Set-Cookie") != "" ||
+		rec.Header().Get("Link") == "" || rec.Header().Get("X-Ratelimit-Remaining") != "42" {
 		t.Errorf("response: %d %v %s", rec.Code, rec.Header(), rec.Body)
 	}
 	got := f.got.Load()

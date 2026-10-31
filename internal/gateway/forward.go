@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 )
@@ -13,10 +14,11 @@ const maxForwardResponse = 10 << 20
 
 // Headers that pass between agent and connector on a raw read; the rest stay
 // behind, above all the agent's Authorization, which carries the gateway
-// token.
+// token. Link and the rate-limit headers let agents page and pace themselves.
 var (
-	forwardRequestHeaders  = []string{"Accept"}
-	forwardResponseHeaders = []string{"Content-Type"}
+	forwardRequestHeaders   = []string{"Accept", "If-None-Match", "If-Modified-Since"}
+	forwardResponseHeaders  = []string{"Content-Type", "Link", "Etag", "Last-Modified", "Retry-After", "Location"}
+	forwardResponsePrefixes = []string{"X-Ratelimit-", "Ratelimit"}
 )
 
 // forward relays a raw read to a connector that declares Forward. Anything
@@ -73,8 +75,10 @@ func (h *handler) forward(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, fmt.Sprintf("response exceeds %d MB", maxForwardResponse>>20))
 		return
 	}
-	for _, k := range forwardResponseHeaders {
-		if v := resp.Header.Values(k); len(v) > 0 {
+	for k, v := range resp.Header {
+		if slices.Contains(forwardResponseHeaders, k) || slices.ContainsFunc(forwardResponsePrefixes, func(p string) bool {
+			return strings.HasPrefix(k, p)
+		}) {
 			w.Header()[k] = v
 		}
 	}

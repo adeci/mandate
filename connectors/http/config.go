@@ -23,7 +23,8 @@ type Service struct {
 	Writes  []Rule `json:"writes"`
 }
 
-// Token says how the token is sent: Header: Prefix+token.
+// Token says how the token is sent, as Header: Prefix+token. Omitted, it is
+// Authorization: Bearer.
 type Token struct {
 	Header string `json:"header"`
 	Prefix string `json:"prefix"`
@@ -95,6 +96,9 @@ func compile(name string, s Service) (*service, error) {
 		return nil, fail("base_url: %v", err)
 	}
 	t := s.Token
+	if t == (Token{}) {
+		t = Token{Header: "Authorization", Prefix: "Bearer "}
+	}
 	if !isToken(t.Header) {
 		return nil, fail("token.header %q is not a valid header name", t.Header)
 	}

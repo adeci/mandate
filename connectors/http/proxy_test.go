@@ -89,7 +89,6 @@ func start(t *testing.T, h http.HandlerFunc) *harness {
 	up := newUpstream(t, h)
 	dir := t.TempDir()
 	cfg, err := parse([]byte(`{"services":{"github":{"base_url":"` + up.URL + `",
-		"token":{"header":"Authorization","prefix":"Bearer "},
 		"reads":["GET /repos/*/*/issues"],
 		"writes":["POST /repos/*/*/issues"]}}}`))
 	if err != nil {
