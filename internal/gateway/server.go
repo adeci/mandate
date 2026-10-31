@@ -1,5 +1,5 @@
-// Package gateway serves read-only SQL over filtered views of the source
-// databases.
+// Package gateway is the agent API: read-only SQL over filtered views of the
+// source databases, connector reads, write proposals, and an HTTP passthrough.
 package gateway
 
 import (
@@ -16,6 +16,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/adeci/mandate/internal/proposal"
 )
 
 const (
@@ -30,10 +32,15 @@ type Config struct {
 	Sources      map[string]string // source name -> data.db path
 	MaxRows      int
 	Timeout      time.Duration
-	// Empty disables the /v1/discord/* endpoints.
-	DiscordSocket string
+	// Connector name (equal to its source name) -> socket.
+	Connectors map[string]string
+	// Empty disables /v1/actions.
+	ApprovalsSocket string
+	// Empty disables /v1/http.
+	HTTPProxySocket string
 }
 
+// sourceFlag parses name=path for a known source; connectors share the names.
 type sourceFlag map[string]string
 
 func (s sourceFlag) String() string { return fmt.Sprint(map[string]string(s)) }
@@ -55,7 +62,7 @@ func (s sourceFlag) Set(v string) error {
 }
 
 func Command(ctx context.Context, args []string) error {
-	cfg := Config{Sources: map[string]string{}}
+	cfg := Config{Sources: map[string]string{}, Connectors: map[string]string{}}
 	fs := flag.NewFlagSet("gateway", flag.ContinueOnError)
 	fs.StringVar(&cfg.Listen, "listen", "127.0.0.1:8780", "listen address")
 	fs.StringVar(&cfg.TokenFile, "token-file", "", "file containing the bearer token (required)")
@@ -63,7 +70,9 @@ func Command(ctx context.Context, args []string) error {
 	fs.Var(sourceFlag(cfg.Sources), "source", "source database as name=path (repeatable; names: sms, whatsapp, discord)")
 	fs.IntVar(&cfg.MaxRows, "max-rows", 5000, "maximum rows per query")
 	fs.DurationVar(&cfg.Timeout, "timeout", 5*time.Second, "maximum query execution time")
-	fs.StringVar(&cfg.DiscordSocket, "discord-socket", "", "Discord service Unix socket (enables /v1/discord/*)")
+	fs.Var(sourceFlag(cfg.Connectors), "connector", "connector socket as name=path (repeatable; name is its source)")
+	fs.StringVar(&cfg.ApprovalsSocket, "approvals-socket", "", "approvals unit socket (enables /v1/actions)")
+	fs.StringVar(&cfg.HTTPProxySocket, "http-proxy-socket", "", "HTTP proxy socket (enables /v1/http)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -93,12 +102,13 @@ func Serve(ctx context.Context, cfg Config) error {
 		Handler:           h,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      discordCallTimeout + 10*time.Second,
+		WriteTimeout:      readTimeout + 10*time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
-	slog.Info("gateway listening", "addr", ln.Addr().String(), "sources", cfg.Sources)
+	slog.Info("gateway listening", "addr", ln.Addr().String(), "sources", cfg.Sources, "connectors", cfg.Connectors,
+		"approvals", cfg.ApprovalsSocket != "", "http_proxy", cfg.HTTPProxySocket != "")
 	select {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -110,27 +120,36 @@ func Serve(ctx context.Context, cfg Config) error {
 }
 
 type handler struct {
-	cfg       Config
-	tokenHash [32]byte
-	policy    *policyLoader
-	mux       *http.ServeMux
+	cfg        Config
+	tokenHash  [32]byte
+	policy     *policyLoader
+	mux        *http.ServeMux
+	connectors *connectors
+	approvals  *proposal.Client // nil when disabled
 }
 
 func newHandler(cfg Config, token string) *handler {
 	h := &handler{
-		cfg:       cfg,
-		tokenHash: sha256.Sum256([]byte(token)),
-		policy:    &policyLoader{path: cfg.ExposureFile},
-		mux:       http.NewServeMux(),
+		cfg:        cfg,
+		tokenHash:  sha256.Sum256([]byte(token)),
+		policy:     &policyLoader{path: cfg.ExposureFile},
+		mux:        http.NewServeMux(),
+		connectors: newConnectors(cfg.Connectors),
+	}
+	if cfg.ApprovalsSocket != "" {
+		h.approvals = proposal.Dial(cfg.ApprovalsSocket)
 	}
 	h.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
 	h.mux.HandleFunc("GET /v1/schema", h.authed(h.schema))
 	h.mux.HandleFunc("POST /v1/query", h.authed(h.query))
-	if cfg.DiscordSocket != "" {
-		newDiscordProxy(h, cfg.DiscordSocket).register(h.mux)
+	h.mux.HandleFunc("POST /v1/read/{connector}/{op}", h.authed(h.read))
+	h.mux.HandleFunc("POST /v1/actions", h.authed(h.propose))
+	h.mux.HandleFunc("GET /v1/actions/{id}", h.authed(h.action))
+	if cfg.HTTPProxySocket != "" {
+		h.mux.HandleFunc("/v1/http/{service}/{path...}", h.authed(newHTTPProxy(cfg.HTTPProxySocket).forward))
 	} else {
-		h.mux.HandleFunc("POST /v1/discord/", h.authed(func(w http.ResponseWriter, _ *http.Request) {
-			writeError(w, http.StatusNotFound, "discord is not enabled on this gateway")
+		h.mux.HandleFunc("/v1/http/", h.authed(func(w http.ResponseWriter, _ *http.Request) {
+			writeError(w, http.StatusNotFound, "the HTTP proxy is not enabled on this gateway")
 		}))
 	}
 	return h
@@ -173,9 +192,20 @@ func (h *handler) schema(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "describe failed")
 		return
 	}
+	usage := map[string]string{
+		"query": `POST /v1/query {"sql": "SELECT ...", "params": [...]}: one read-only SELECT over the listed views; positional params bind to ?1, ?2, ...`,
+		"read":  `POST /v1/read/{connector}/{op} {"args": {...}}: run a connector read op; fetched messages come back as rows of <connector>_messages`,
+	}
+	if h.approvals != nil {
+		usage["actions"] = `POST /v1/actions {"connector", "op", "args", "note"}: propose a write op for the owner to approve; poll GET /v1/actions/{id} for its status`
+	}
+	if h.cfg.HTTPProxySocket != "" {
+		usage["http"] = `ANY /v1/http/{service}/{path}: call an HTTP API through the proxy, which adds credentials`
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"views": views,
-		"usage": "POST /v1/query with JSON {\"sql\": \"SELECT ...\", \"params\": [...]}. One read-only SELECT over the listed views; positional params bind to ?1, ?2, ...",
+		"views":      views,
+		"connectors": h.connectors.specs(r.Context()),
+		"usage":      usage,
 		"limits": map[string]any{
 			"max_rows":   h.cfg.MaxRows,
 			"timeout_ms": h.cfg.Timeout.Milliseconds(),
@@ -222,6 +252,21 @@ func (h *handler) query(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("query", append(attrs, "rows", len(res.Rows), "truncated", res.Truncated)...)
 	writeJSON(w, http.StatusOK, res)
+}
+
+func decodeStrict(w http.ResponseWriter, r *http.Request, v any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBytes))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request too large")
+		} else {
+			writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
+		}
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

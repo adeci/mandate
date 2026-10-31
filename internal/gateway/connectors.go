@@ -1,0 +1,374 @@
+package gateway
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"maps"
+	"net/http"
+	"os"
+	"regexp"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/ncruces/go-sqlite3"
+
+	"github.com/adeci/mandate/internal/connector"
+	"github.com/adeci/mandate/internal/proposal"
+)
+
+const (
+	// readTimeout bounds a connector read. Paced reads (Discord) wait up to
+	// 90 s for a slot before answering 429.
+	readTimeout = 120 * time.Second
+	callTimeout = 30 * time.Second
+	specTimeout = 3 * time.Second
+	specTTL     = 30 * time.Second
+)
+
+type connectors struct {
+	// calls serves spec and prepare; reads get their own longer timeout.
+	calls, reads map[string]*connector.Client
+
+	mu    sync.Mutex
+	cache map[string]cachedSpec
+}
+
+type cachedSpec struct {
+	spec connector.Spec
+	at   time.Time
+}
+
+func newConnectors(sockets map[string]string) *connectors {
+	c := &connectors{
+		calls: map[string]*connector.Client{},
+		reads: map[string]*connector.Client{},
+		cache: map[string]cachedSpec{},
+	}
+	for name, socket := range sockets {
+		c.calls[name] = connector.Dial(socket, callTimeout)
+		c.reads[name] = connector.Dial(socket, readTimeout)
+	}
+	return c
+}
+
+// spec fetches lazily and caches only successes, so a connector that comes
+// back up is listed again on the next call.
+func (c *connectors) spec(ctx context.Context, name string) (connector.Spec, error) {
+	c.mu.Lock()
+	cached, ok := c.cache[name]
+	c.mu.Unlock()
+	if ok && time.Since(cached.at) < specTTL {
+		return cached.spec, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, specTimeout)
+	defer cancel()
+	s, err := c.calls[name].Spec(ctx)
+	if err != nil {
+		return connector.Spec{}, err
+	}
+	// Approvals routes by the gateway's name and connectors check the record
+	// against their own, so a mismatch would only fail at execution.
+	if s.Name != name {
+		return connector.Spec{}, fmt.Errorf("socket for %s serves connector %q", name, s.Name)
+	}
+	c.mu.Lock()
+	c.cache[name] = cachedSpec{spec: s, at: time.Now()}
+	c.mu.Unlock()
+	return s, nil
+}
+
+// specs lists the connectors that answer, by name.
+func (c *connectors) specs(ctx context.Context) []connector.Spec {
+	out := []connector.Spec{}
+	for _, name := range slices.Sorted(maps.Keys(c.calls)) {
+		s, err := c.spec(ctx, name)
+		if err != nil {
+			slog.Warn("connector spec", "connector", name, "err", err)
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// lookup resolves connector and op and checks args against the op's params.
+func (h *handler) lookup(w http.ResponseWriter, r *http.Request, name, opName string, kind connector.Kind, args map[string]string) (connector.Op, bool) {
+	if _, ok := h.connectors.calls[name]; !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("no connector %q", name))
+		return connector.Op{}, false
+	}
+	spec, err := h.connectors.spec(r.Context(), name)
+	if err != nil {
+		slog.Error("connector spec", "connector", name, "err", err)
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("connector %s is unavailable", name))
+		return connector.Op{}, false
+	}
+	op, ok := spec.Op(opName)
+	if !ok || op.Kind != kind {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("connector %s has no %s op %q", name, kind, opName))
+		return connector.Op{}, false
+	}
+	if err := checkArgs(op, args); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return connector.Op{}, false
+	}
+	return op, true
+}
+
+func checkArgs(op connector.Op, args map[string]string) error {
+	declared := map[string]bool{}
+	for _, p := range op.Params {
+		declared[p.Name] = true
+		if p.Required && args[p.Name] == "" {
+			return fmt.Errorf("%s: missing required param %q", op.Name, p.Name)
+		}
+	}
+	for _, k := range slices.Sorted(maps.Keys(args)) {
+		if !declared[k] {
+			return fmt.Errorf("%s: unknown param %q", op.Name, k)
+		}
+	}
+	return nil
+}
+
+// relay passes a connector's or approvals' refusal through with its status
+// and message; anything else means the peer is unreachable.
+func relay(w http.ResponseWriter, who string, err error) {
+	if e, ok := errors.AsType[*connector.Error](err); ok {
+		writeJSON(w, e.Status, e)
+		return
+	}
+	slog.Error("call failed", "peer", who, "err", err)
+	writeError(w, http.StatusServiceUnavailable, who+" is unavailable")
+}
+
+type readRequest struct {
+	Args map[string]string `json:"args"`
+}
+
+func (h *handler) read(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	name, opName := r.PathValue("connector"), r.PathValue("op")
+	var req readRequest
+	if !decodeStrict(w, r, &req) {
+		return
+	}
+	op, ok := h.lookup(w, r, name, opName, connector.Read, req.Args)
+	if !ok {
+		return
+	}
+	var ids []string
+	for _, p := range op.Params {
+		if id := req.Args[p.Name]; p.Container && id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if !h.visible(r.Context(), w, name, ids) {
+		return
+	}
+
+	raw, err := h.connectors.reads[name].Read(r.Context(), opName, req.Args)
+	attrs := []any{"remote", r.RemoteAddr, "connector", name, "op", opName, "duration_ms", time.Since(start).Milliseconds()}
+	if err != nil {
+		slog.Info("read", append(attrs, "err", err.Error())...)
+		relay(w, "connector "+name, err)
+		return
+	}
+	var res connector.ReadResult
+	if err := json.Unmarshal(raw, &res); err != nil {
+		slog.Error("decode read result", "connector", name, "err", err)
+		writeError(w, http.StatusBadGateway, "connector returned an invalid read result")
+		return
+	}
+	slog.Info("read", append(attrs, "messages", len(res.MessageIDs), "containers", res.Containers)...)
+	if len(res.MessageIDs) == 0 {
+		writeJSON(w, http.StatusOK, map[string]int{"containers": res.Containers, "total_results": res.TotalResults})
+		return
+	}
+	h.answer(w, r, name, res)
+}
+
+// visible answers 404 unless every id is in the source's containers view.
+// Unknown and hidden look the same to the client.
+func (h *handler) visible(ctx context.Context, w http.ResponseWriter, source string, ids []string) bool {
+	if len(ids) == 0 {
+		return true
+	}
+	q, err := h.open()
+	if err != nil {
+		slog.Error("open query connection", "err", err)
+		writeError(w, http.StatusServiceUnavailable, "gateway unavailable")
+		return false
+	}
+	defer q.close()
+	view := source + "_containers"
+	for _, id := range ids {
+		res, err := q.run(ctx, `SELECT 1 FROM `+sqlite3.QuoteIdentifier(view)+` WHERE id = ?1`, []any{id}, 1)
+		if err == nil && len(res.Rows) == 1 {
+			continue
+		}
+		writeError(w, http.StatusNotFound,
+			fmt.Sprintf("%s container %s is unknown or hidden; check %s (a sync read op may add it)", source, id, view))
+		return false
+	}
+	return true
+}
+
+// answer reads the connector's message IDs back through the filtered view, so
+// hidden senders and containers drop out and auth messages lose their body,
+// as with /v1/query. Rows keep the connector's order.
+func (h *handler) answer(w http.ResponseWriter, r *http.Request, source string, rr connector.ReadResult) {
+	q, err := h.open()
+	if err != nil {
+		slog.Error("open query connection", "err", err)
+		writeError(w, http.StatusServiceUnavailable, "gateway unavailable")
+		return
+	}
+	defer q.close()
+
+	params := make([]any, len(rr.MessageIDs))
+	order := make(map[string]int, len(rr.MessageIDs))
+	for i, id := range rr.MessageIDs {
+		params[i] = id
+		order[id] = i
+	}
+	sql := `SELECT * FROM ` + sqlite3.QuoteIdentifier(source+"_messages") +
+		` WHERE id IN (?` + strings.Repeat(",?", len(params)-1) + `)`
+	ctx, cancel := context.WithTimeout(r.Context(), h.cfg.Timeout)
+	defer cancel()
+	res, err := q.run(ctx, sql, params, len(params))
+	if err != nil {
+		slog.Error("read back messages", "source", source, "err", err)
+		writeError(w, http.StatusInternalServerError, "read back messages")
+		return
+	}
+	idCol := slices.Index(res.Columns, "id")
+	if idCol < 0 {
+		writeError(w, http.StatusInternalServerError, "view has no id column")
+		return
+	}
+	slices.SortFunc(res.Rows, func(a, b []any) int {
+		return order[a[idCol].(string)] - order[b[idCol].(string)]
+	})
+	writeJSON(w, http.StatusOK, struct {
+		*queryResult
+		TotalResults int `json:"total_results,omitempty"`
+	}{res, rr.TotalResults})
+}
+
+func (h *handler) propose(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	if h.approvals == nil {
+		writeError(w, http.StatusNotFound, "proposals are not enabled on this gateway")
+		return
+	}
+	var req proposal.Request
+	if !decodeStrict(w, r, &req) {
+		return
+	}
+	if _, ok := h.lookup(w, r, req.Connector, req.Op, connector.Write, req.Args); !ok {
+		return
+	}
+	attrs := []any{"remote", r.RemoteAddr, "connector", req.Connector, "op", req.Op}
+	prepared, err := h.connectors.calls[req.Connector].Prepare(r.Context(), req.Op, req.Args)
+	if err != nil {
+		slog.Info("propose", append(attrs, "err", err.Error())...)
+		relay(w, "connector "+req.Connector, err)
+		return
+	}
+	if prepared.Container != "" {
+		hidden, err := h.writeHidden(req.Connector, prepared.Container)
+		if err != nil {
+			slog.Error("exposure check", "connector", req.Connector, "err", err)
+			writeError(w, http.StatusServiceUnavailable, "gateway unavailable")
+			return
+		}
+		if hidden {
+			slog.Info("propose", append(attrs, "refused", "hidden container")...)
+			writeError(w, http.StatusNotFound, fmt.Sprintf("%s target is unknown or hidden", req.Connector))
+			return
+		}
+	}
+	p, err := h.approvals.Submit(r.Context(), proposal.Request{
+		Connector: req.Connector, Op: req.Op, Args: prepared.Args, Note: req.Note,
+	})
+	if err != nil {
+		slog.Info("propose", append(attrs, "err", err.Error())...)
+		relay(w, "approvals", err)
+		return
+	}
+	slog.Info("propose", append(attrs, "id", p.ID, "duration_ms", time.Since(start).Milliseconds())...)
+	writeJSON(w, http.StatusAccepted, p)
+}
+
+// writeHidden mirrors the containers view's filter (the id or its parent is
+// hidden) against the hide lists directly: a write may target a chat with no
+// stored row yet, such as a new WhatsApp contact. A DM's container is the
+// other person, so hidden senders count as hidden targets too.
+func (h *handler) writeHidden(source, id string) (bool, error) {
+	pol, err := h.policy.get()
+	if err != nil {
+		return false, err
+	}
+	exp := pol.exposure.source(source)
+	if slices.Contains(exp.HideContainers, id) || slices.Contains(exp.HideSenders, id) {
+		return true, nil
+	}
+	path, ok := h.cfg.Sources[source]
+	if !ok {
+		return false, nil
+	}
+	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	conn, err := sqlite3.OpenFlags(path, sqlite3.OPEN_READONLY)
+	if err != nil {
+		return false, fmt.Errorf("open %s: %w", source, err)
+	}
+	defer conn.Close()
+	if err := conn.BusyTimeout(time.Second); err != nil {
+		return false, err
+	}
+	stmt, _, err := conn.Prepare(`SELECT parent_id FROM containers WHERE id = ?1`)
+	if err != nil {
+		return false, fmt.Errorf("look up %s container: %w", source, err)
+	}
+	defer stmt.Close()
+	if err := stmt.BindText(1, id); err != nil {
+		return false, err
+	}
+	var parent string
+	if stmt.Step() {
+		parent = stmt.ColumnText(0)
+	}
+	if err := stmt.Err(); err != nil {
+		return false, fmt.Errorf("look up %s container: %w", source, err)
+	}
+	return parent != "" && slices.Contains(exp.HideContainers, parent), nil
+}
+
+var proposalID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+func (h *handler) action(w http.ResponseWriter, r *http.Request) {
+	if h.approvals == nil {
+		writeError(w, http.StatusNotFound, "proposals are not enabled on this gateway")
+		return
+	}
+	id := r.PathValue("id")
+	if !proposalID.MatchString(id) {
+		writeError(w, http.StatusBadRequest, "invalid proposal id")
+		return
+	}
+	p, err := h.approvals.Get(r.Context(), id)
+	if err != nil {
+		relay(w, "approvals", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}

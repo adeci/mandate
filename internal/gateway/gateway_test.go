@@ -73,6 +73,7 @@ hide_senders = ["+15550002"]
 
 [discord]
 hide_containers = ["g-work"]
+hide_senders = ["u-hidden"]
 `
 
 func openTest(t *testing.T) *queryConn {
