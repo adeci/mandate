@@ -16,6 +16,7 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode"
 
 	"github.com/adeci/mandate/internal/exitcode"
 )
@@ -362,16 +363,39 @@ func (c *client) table(raw []byte) error {
 // escapeTSV keeps a value on one line and in one cell; help documents it.
 var escapeTSV = strings.NewReplacer(`\`, `\\`, "\t", `\t`, "\n", `\n`, "\r", `\r`)
 
+// sanitize writes control characters other than tab and newline as \xHH
+// or \uHHHH, so a message can't send escape sequences to the terminal.
+func sanitize(s string) string {
+	if !strings.ContainsFunc(s, control) {
+		return s
+	}
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case !control(r):
+			b.WriteRune(r)
+		case r < 0x80:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		default:
+			fmt.Fprintf(&b, `\u%04x`, r)
+		}
+	}
+	return b.String()
+}
+
+// control is true for C0 and C1 controls and DEL, except tab and newline.
+func control(r rune) bool {
+	return unicode.IsControl(r) && r != '\t' && r != '\n'
+}
+
 func cell(v any) string {
 	switch v := v.(type) {
 	case nil:
 		return ""
 	case float64:
 		return strconv.FormatFloat(v, 'f', -1, 64)
-	case string:
-		return escapeTSV.Replace(v)
 	default:
-		return fmt.Sprint(v)
+		return sanitize(escapeTSV.Replace(fmt.Sprint(v)))
 	}
 }
 

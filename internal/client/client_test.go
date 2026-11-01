@@ -155,6 +155,28 @@ func TestSendPrintsProposal(t *testing.T) {
 	}
 }
 
+func TestOutputEscapesControlCharacters(t *testing.T) {
+	t.Parallel()
+	// An OSC title change, a C1 CSI and DEL from a third party.
+	srv, _ := gateway(t, http.StatusOK, `{"columns":["sender","body"],"rows":[["~Mom\u001b]0;pwned\u0007","a\u009b2Jb\u007f"]]}`)
+	c, out, _ := testClient(t, srv.URL, false)
+	if err := c.connector(t.Context(), "whatsapp", []string{"messages", "123@g.us"}); err != nil {
+		t.Fatal(err)
+	}
+	if want := "sender\tbody\n~Mom\\x1b]0;pwned\\x07\ta\\u009b2Jb\\x7f\n"; out.String() != want {
+		t.Errorf("TSV %q, want %q", out, want)
+	}
+
+	srv, _ = gateway(t, http.StatusAccepted, `{"id":"p1","status":"pending","display":[{"label":"To","value":"~Mom\u001b[2K (+1 555)"},{"label":"Text","value":"hi\nthere"}]}`)
+	c, out, _ = testClient(t, srv.URL, false)
+	if err := c.connector(t.Context(), "whatsapp", []string{"send", "1@s.whatsapp.net", "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if want := "  To: ~Mom\\x1b[2K (+1 555)\n  Text: hi\n    there\n"; !strings.Contains(out.String(), want) {
+		t.Errorf("proposal %q, want it to contain %q", out, want)
+	}
+}
+
 // actions fakes the gateway's proposal endpoints: POST answers pending, and
 // GET answers pending until decided after `after` GETs. A pending long-poll
 // times out after 1 s whatever its wait.
