@@ -94,6 +94,28 @@ func (s *Store) DB() *sql.DB { return s.db }
 
 // Empty Name/ParentID and nil Participants do not overwrite existing values.
 func (s *Store) UpsertContainer(ctx context.Context, c Container) error {
+	return upsertContainer(ctx, s.db, c)
+}
+
+// UpsertContainers stores cs in one transaction, as UpsertContainer would.
+func (s *Store) UpsertContainers(ctx context.Context, cs []Container) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // a no-op after Commit
+	for _, c := range cs {
+		if err := upsertContainer(ctx, tx, c); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func upsertContainer(ctx context.Context, db interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, c Container,
+) error {
 	if c.ID == "" || c.Kind == "" {
 		return errors.New("store: container id and kind are required")
 	}
@@ -109,7 +131,7 @@ func (s *Store) UpsertContainer(ctx context.Context, c Container) error {
 	if !c.LastMessageAt.IsZero() {
 		lastMessageAt = formatTime(c.LastMessageAt)
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := db.ExecContext(ctx, `
 INSERT INTO containers (id, kind, parent_id, name, is_group, participants_json, updated_at, last_message_at)
 VALUES (?1, ?2, NULLIF(?3, ''), NULLIF(?4, ''), ?5, COALESCE(?6, '[]'), ?7, ?8)
 ON CONFLICT(id) DO UPDATE SET

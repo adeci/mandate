@@ -133,6 +133,21 @@ func TestUpsertContainerKeepsKnownFields(t *testing.T) {
 	}
 }
 
+func TestUpsertContainersIsAtomic(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := t.Context()
+	must(t, s.UpsertContainers(ctx, []Container{{ID: "g", Kind: "guild", Name: "Club"}, {ID: "ch", Kind: "channel", ParentID: "g"}}))
+	if err := s.UpsertContainers(ctx, []Container{{ID: "ch2", Kind: "channel"}, {ID: "bad"}}); err == nil {
+		t.Fatal("accepted a container without kind")
+	}
+	var n int
+	must(t, s.DB().QueryRowContext(ctx, `SELECT count(*) FROM containers`).Scan(&n))
+	if n != 2 {
+		t.Fatalf("%d containers, want the first batch only", n)
+	}
+}
+
 func TestValidation(t *testing.T) {
 	t.Parallel()
 	s := open(t)

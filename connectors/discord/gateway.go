@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"compress/zlib"
 	"context"
 	"encoding/base64"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -628,7 +630,8 @@ func (c *conn) dispatch(ctx context.Context, p payload, bo *backoff) error {
 			User             struct {
 				ID string `json:"id"`
 			} `json:"user"`
-			UserSettingsProto string `json:"user_settings_proto"`
+			UserSettingsProto string    `json:"user_settings_proto"`
+			Guilds            []gwGuild `json:"guilds"`
 		}
 		if err := json.Unmarshal(p.D, &r); err != nil || r.SessionID == "" {
 			return errors.New("READY without a session")
@@ -637,7 +640,17 @@ func (c *conn) dispatch(ctx context.Context, p payload, bo *backoff) error {
 		s.status = ""
 		c.established(bo)
 		g.log.Info("discord gateway connected")
-		return c.afterReady(settingsStatus(r.UserSettingsProto, g.clock.Now()))
+		if err := c.afterReady(settingsStatus(r.UserSettingsProto, g.clock.Now())); err != nil {
+			return err
+		}
+		// Every guild with its channels, so live messages land in named,
+		// dated chats without a sync.
+		var cs []store.Container
+		for i := range r.Guilds {
+			cs = append(cs, r.Guilds[i].containers()...)
+		}
+		g.storeContainers(ctx, cs)
+		return nil
 	case "RESUMED":
 		c.established(bo)
 		g.log.Info("discord gateway resumed")
@@ -656,8 +669,13 @@ func (c *conn) dispatch(ctx context.Context, p payload, bo *backoff) error {
 				g.log.Error("store deleted message", "id", m.ID, "err", err)
 			}
 		}
-	case "CHANNEL_CREATE", "CHANNEL_UPDATE":
-		g.storeDM(ctx, p.D)
+	case "CHANNEL_CREATE", "CHANNEL_UPDATE", "THREAD_CREATE", "THREAD_UPDATE":
+		g.storeChannel(ctx, p.D)
+	case "GUILD_CREATE", "GUILD_UPDATE":
+		var gg gwGuild
+		if json.Unmarshal(p.D, &gg) == nil {
+			g.storeContainers(ctx, gg.containers())
+		}
 	}
 	return nil
 }
@@ -678,17 +696,64 @@ func (c *conn) settingsUpdate(d json.RawMessage) error {
 	return nil
 }
 
-// storeDM keeps DMs and group DMs current; guild channels come from sync.
-func (g *gateway) storeDM(ctx context.Context, d json.RawMessage) {
+// storeChannel keeps a DM, channel or thread current; categories are skipped
+// as sync skips them.
+func (g *gateway) storeChannel(ctx context.Context, d json.RawMessage) {
 	var ch apiChannel
-	if json.Unmarshal(d, &ch) != nil || (ch.Type != channelDM && ch.Type != channelGroupDM) || !isSnowflake(ch.ID) {
+	if json.Unmarshal(d, &ch) != nil || !isSnowflake(ch.ID) {
 		return
 	}
 	if cc, ok := channelContainer(&ch); ok {
-		if err := g.store.UpsertContainer(ctx, cc); err != nil {
-			g.log.Error("store chat", "id", ch.ID, "err", err)
+		g.storeContainers(ctx, []store.Container{cc})
+	}
+}
+
+func (g *gateway) storeContainers(ctx context.Context, cs []store.Container) {
+	if len(cs) == 0 {
+		return
+	}
+	if err := g.store.UpsertContainers(ctx, cs); err != nil {
+		g.log.Error("store chats", "count", len(cs), "err", err)
+	}
+}
+
+// gwGuild is a guild in READY, GUILD_CREATE or GUILD_UPDATE. The user
+// gateway puts the name under properties; a partial guild carries only what
+// changed since the versions the client sent, which are none.
+type gwGuild struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Properties struct {
+		Name string `json:"name"`
+	} `json:"properties"`
+	Unavailable    bool         `json:"unavailable"`
+	DataMode       string       `json:"data_mode"`
+	Channels       []apiChannel `json:"channels"`
+	Threads        []apiChannel `json:"threads"`
+	PartialUpdates struct {
+		Channels []apiChannel `json:"channels"`
+	} `json:"partial_updates"`
+}
+
+// containers are the guild and its channels and threads, as sync stores them.
+func (gg *gwGuild) containers() []store.Container {
+	if !isSnowflake(gg.ID) {
+		return nil
+	}
+	var out []store.Container
+	if c, ok := guildContainer(&apiGuild{ID: gg.ID, Name: cmp.Or(gg.Properties.Name, gg.Name), Unavailable: gg.Unavailable}); ok {
+		out = append(out, c)
+	}
+	chans := gg.Channels
+	if gg.DataMode == "partial" {
+		chans = gg.PartialUpdates.Channels
+	}
+	for _, c := range guildChannelContainers(gg.ID, slices.Concat(chans, gg.Threads)) {
+		if isSnowflake(c.ID) {
+			out = append(out, c)
 		}
 	}
+	return out
 }
 
 // afterReady sends what an idle tab sends once its session is up: no voice,
