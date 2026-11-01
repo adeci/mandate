@@ -166,7 +166,10 @@ func main() {
   it names a stored, visible chat.
 - **Health and linking** are optional: `connector.Checker`,
   `connector.Setupper` with its inputs declared in `Spec.Setup`, and
-  `connector.Unlinker`, which lets the owner unlink and relink.
+  `connector.Unlinker`, which lets the owner unlink and relink. The console
+  calls `Setup` every 2s until it is done; a step can show a QR code or a
+  code, and `Confirm` asks a yes-or-no question, such as whether the code
+  matches another device. The answer comes as the `confirm` arg alone.
 - **Secrets** such as API tokens come from the owner through `Setup`: mark
   the input `Secret` and keep it with `env.Secret`. Settings come only from
   the typed config, which `Main` decodes strictly and the build checks with

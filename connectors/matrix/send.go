@@ -114,7 +114,7 @@ func (c *mxConnector) Execute(ctx context.Context, rec approval.Record) connecto
 		return connector.Result{Status: connector.Failed, Detail: "look up room encryption: " + err.Error()}
 	}
 	if encrypted {
-		if payload, err = a.encrypt(ctx, room, payload); err != nil {
+		if payload, err = a.encrypt(ctx, room, event.EventMessage, payload); err != nil {
 			return connector.Result{Status: connector.Failed, Detail: "encrypt: " + err.Error()}
 		}
 		evtType = event.EventEncrypted
@@ -146,8 +146,8 @@ func (c *mxConnector) Execute(ctx context.Context, rec approval.Record) connecto
 
 // encrypt shares a new group session with the room's members first if the
 // current one is missing or used up.
-func (a *account) encrypt(ctx context.Context, room id.RoomID, content any) (*event.EncryptedEventContent, error) {
-	enc, err := a.mach.EncryptMegolmEvent(ctx, room, event.EventMessage, content)
+func (a *account) encrypt(ctx context.Context, room id.RoomID, t event.Type, content any) (*event.EncryptedEventContent, error) {
+	enc, err := a.mach.EncryptMegolmEvent(ctx, room, t, content)
 	if !errors.Is(err, crypto.ErrNoGroupSession) && !errors.Is(err, crypto.ErrSessionExpired) && !errors.Is(err, crypto.ErrSessionNotShared) {
 		return enc, err
 	}
@@ -158,5 +158,5 @@ func (a *account) encrypt(ctx context.Context, room id.RoomID, content any) (*ev
 	if err := a.mach.ShareGroupSession(ctx, room, users); err != nil {
 		return nil, fmt.Errorf("share room key: %w", err)
 	}
-	return a.mach.EncryptMegolmEvent(ctx, room, event.EventMessage, content)
+	return a.mach.EncryptMegolmEvent(ctx, room, t, content)
 }

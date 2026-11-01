@@ -112,7 +112,8 @@ func (f *fake) Health(context.Context) connector.Health {
 	return connector.Health{State: connector.Healthy}
 }
 
-// Setup hands out a fresh QR code per poll and links on the third.
+// Setup hands out a fresh QR code per poll and links on the third. The
+// account "compare" asks whether two codes match instead.
 func (f *fake) Setup(_ context.Context, args map[string]string) (connector.SetupStep, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -122,6 +123,12 @@ func (f *fake) Setup(_ context.Context, args map[string]string) (connector.Setup
 	if args["token"] != "" {
 		f.linked = true
 		return connector.SetupStep{Done: true}, nil
+	}
+	if answer, ok := args[connector.SetupConfirm]; ok {
+		return connector.SetupStep{Instructions: "answered " + answer}, nil
+	}
+	if args["account"] == "compare" {
+		return connector.SetupStep{Code: "🐶 🔑", Instructions: "Dog, Key", Confirm: "Same emoji?"}, nil
 	}
 	f.setupCalls++
 	if f.setupCalls == 3 {

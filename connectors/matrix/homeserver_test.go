@@ -7,6 +7,7 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -315,9 +316,15 @@ func (h *homeserver) sendToDevice(w http.ResponseWriter, r *http.Request, from d
 	defer h.mu.Unlock()
 	for _, devices := range req.Messages {
 		for dev, content := range devices {
-			h.inbox[dev] = append(h.inbox[dev], map[string]any{
-				"type": r.PathValue("type"), "sender": from.user, "content": content,
-			})
+			targets := []id.DeviceID{dev}
+			if dev == "*" {
+				targets = slices.Collect(maps.Keys(h.deviceKeys))
+			}
+			for _, t := range targets {
+				h.inbox[t] = append(h.inbox[t], map[string]any{
+					"type": r.PathValue("type"), "sender": from.user, "content": content,
+				})
+			}
 		}
 	}
 	h.notify()

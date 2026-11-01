@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/crypto/backup"
@@ -27,7 +28,8 @@ var setupParams = []connector.Param{
 	{Name: "homeserver", Doc: "Homeserver URL, e.g. https://matrix.org; empty uses your user ID's server"},
 	{Name: "user_id", Doc: "Your Matrix ID, e.g. @alice:matrix.org", Required: true},
 	{Name: "password", Doc: "Your account password; used once to log in, not stored", Required: true, Secret: true},
-	{Name: "recovery_key", Doc: "Your recovery key (Element: Settings → Encryption), to read encrypted chats", Required: true, Secret: true},
+	{Name: "recovery_key", Secret: true, Doc: "Only if you have no other device signed in: your recovery key (Element: Settings → Encryption). " +
+		"Without it, you verify mandate from Element on another device."},
 }
 
 type linkInput struct {
@@ -60,13 +62,24 @@ func parseSetup(args map[string]string) (linkInput, error) {
 	if in.password == "" {
 		return linkInput{}, connector.Invalid("password is required")
 	}
-	if utils.DecodeBase58RecoveryKey(in.recoveryKey) == nil {
+	if in.recoveryKey != "" && utils.DecodeBase58RecoveryKey(in.recoveryKey) == nil {
 		return linkInput{}, connector.Invalid("that is not a recovery key; it looks like EsTc 1234 …, 48 characters in groups of four")
 	}
 	return in, nil
 }
 
+// Setup links with the recovery key at once, or else starts verifying the new
+// device from another one, which later calls follow.
 func (c *mxConnector) Setup(ctx context.Context, args map[string]string) (connector.SetupStep, error) {
+	if answer, ok := args[connector.SetupConfirm]; ok {
+		if len(args) != 1 {
+			return connector.SetupStep{}, connector.Invalid("confirm comes alone")
+		}
+		return c.answer(ctx, answer)
+	}
+	if step, err, ok := c.verifyingStep(); ok {
+		return step, err
+	}
 	in, err := parseSetup(args)
 	if err != nil {
 		return connector.SetupStep{}, err
@@ -76,78 +89,76 @@ func (c *mxConnector) Setup(ctx context.Context, args map[string]string) (connec
 	}
 	defer c.setup.Unlock()
 	c.mu.Lock()
-	linked := c.acct != nil
+	linked := c.acct != nil || c.verifying != nil
 	c.mu.Unlock()
 	if linked {
 		return connector.SetupStep{}, &connector.Error{Status: http.StatusConflict, Message: "already linked"}
 	}
-	a, err := c.link(ctx, in)
+	sess, err := c.login(ctx, in)
 	if err != nil {
 		return connector.SetupStep{}, err
 	}
-	c.mu.Lock()
-	c.acct, c.loggedOut = a, false
-	c.mu.Unlock()
-	c.run(a)
-	c.log.Info("linked", "user", a.sess.UserID, "device", a.sess.DeviceID)
-	return connector.SetupStep{Done: true}, nil
+	a, err := c.openNew(ctx, sess)
+	if err == nil && in.recoveryKey != "" {
+		if err = a.recover(ctx, in.recoveryKey); err == nil {
+			err = c.commit(a)
+		}
+		if err == nil {
+			return connector.SetupStep{Done: true}, nil
+		}
+	}
+	if err == nil {
+		var step connector.SetupStep
+		if step, err = c.startVerifying(ctx, a); err == nil {
+			return step, nil
+		}
+	}
+	c.abandon(a, sess)
+	return connector.SetupStep{}, err
 }
 
-// link logs in as a new device, cross-signs it with the keys in secret
-// storage, and restores the key backup. If any step fails, the device is
-// logged out again.
-func (c *mxConnector) link(ctx context.Context, in linkInput) (*account, error) {
+// login logs in as a new device.
+func (c *mxConnector) login(ctx context.Context, in linkInput) (session, error) {
 	hs, err := c.homeserver(ctx, in)
 	if err != nil {
-		return nil, err
+		return session{}, err
 	}
 	cli, err := newClient(hs, "", "", c.http, c.zl)
 	if err != nil {
-		return nil, connector.Invalid("invalid homeserver URL: %v", err)
+		return session{}, connector.Invalid("invalid homeserver URL: %v", err)
 	}
 	flows, err := cli.GetLoginFlows(ctx)
 	if err != nil {
-		return nil, upstream("reach the homeserver at "+hs, err)
+		return session{}, upstream("reach the homeserver at "+hs, err)
 	}
 	if !flows.HasFlow(mautrix.AuthTypePassword) {
-		return nil, connector.Invalid("this homeserver does not offer password login")
+		return session{}, connector.Invalid("this homeserver does not offer password login")
 	}
 	resp, err := cli.Login(ctx, &mautrix.ReqLogin{
 		Type:                     mautrix.AuthTypePassword,
 		Identifier:               mautrix.UserIdentifier{Type: mautrix.IdentifierTypeUser, User: in.user.String()},
 		Password:                 in.password,
 		InitialDeviceDisplayName: deviceName,
-		StoreCredentials:         true,
 	})
 	switch {
 	case errors.Is(err, mautrix.MForbidden):
-		return nil, connector.Invalid("wrong user ID or password")
+		return session{}, connector.Invalid("wrong user ID or password")
 	case errors.Is(err, mautrix.MUserDeactivated):
-		return nil, connector.Invalid("this account is deactivated")
+		return session{}, connector.Invalid("this account is deactivated")
 	case errors.Is(err, mautrix.MLimitExceeded):
-		return nil, &connector.Error{Status: http.StatusTooManyRequests, Message: "too many login attempts; try again later"}
+		return session{}, &connector.Error{Status: http.StatusTooManyRequests, Message: "too many login attempts; try again later"}
 	case err != nil:
-		return nil, upstream("log in", err)
+		return session{}, upstream("log in", err)
 	}
-	sess := session{
+	return session{
 		Homeserver: hs, UserID: resp.UserID, DeviceID: resp.DeviceID, AccessToken: resp.AccessToken,
 		PickleKey: []byte(rand.Text()),
-	}
-
-	a, err := c.setUp(ctx, sess, in.recoveryKey)
-	if err != nil {
-		if _, lerr := cli.Logout(context.WithoutCancel(ctx)); lerr != nil {
-			c.log.Warn("log out the half-linked device", "device", sess.DeviceID, "err", lerr)
-		}
-		if ferr := c.forget(); ferr != nil {
-			c.log.Error("forget the half-linked device", "err", ferr)
-		}
-		return nil, err
-	}
-	return a, nil
+	}, nil
 }
 
-func (c *mxConnector) setUp(ctx context.Context, sess session, recoveryKey string) (*account, error) {
+// openNew opens fresh crypto state for the logged-in device and uploads its
+// keys.
+func (c *mxConnector) openNew(ctx context.Context, sess session) (*account, error) {
 	// Left over from a link that crashed halfway.
 	if err := removeCryptoDB(c.cryptoPath()); err != nil {
 		return nil, err
@@ -157,22 +168,44 @@ func (c *mxConnector) setUp(ctx context.Context, sess session, recoveryKey strin
 		return nil, err
 	}
 	if err := a.mach.ShareKeys(ctx, -1); err != nil {
-		a.close()
-		return nil, upstream("upload device keys", err)
+		return a, upstream("upload device keys", err)
 	}
-	if err := a.recover(ctx, recoveryKey); err != nil {
-		a.close()
-		return nil, err
-	}
-	b, err := json.Marshal(sess)
+	return a, nil
+}
+
+// commit stores the session and starts syncing a as the linked account.
+func (c *mxConnector) commit(a *account) error {
+	b, err := json.Marshal(a.sess)
 	if err == nil {
 		err = c.session.Store(b)
 	}
 	if err != nil {
-		a.close()
-		return nil, fmt.Errorf("store session: %w", err)
+		return fmt.Errorf("store session: %w", err)
 	}
-	return a, nil
+	c.mu.Lock()
+	c.acct, c.loggedOut = a, false
+	c.mu.Unlock()
+	c.run(a)
+	c.log.Info("linked", "user", a.sess.UserID, "device", a.sess.DeviceID, "backup", !a.sess.NoBackup)
+	return nil
+}
+
+// abandon logs out a device that did not get linked, best effort, and
+// deletes its local state. a may be nil.
+func (c *mxConnector) abandon(a *account, sess session) {
+	if a != nil {
+		a.close()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if cli, err := newClient(sess.Homeserver, sess.UserID, sess.AccessToken, c.http, c.zl); err == nil {
+		if _, err := cli.Logout(ctx); err != nil {
+			c.log.Warn("log out the device that was not linked", "device", sess.DeviceID, "err", err)
+		}
+	}
+	if err := c.forget(); err != nil {
+		c.log.Error("forget the device that was not linked", "err", err)
+	}
 }
 
 var errWrongRecoveryKey = connector.Invalid("wrong recovery key")
@@ -258,6 +291,7 @@ func loopback(host string) bool {
 func (c *mxConnector) Unlink(ctx context.Context) error {
 	c.setup.Lock()
 	defer c.setup.Unlock()
+	c.endVerifying(verifyFailure{msg: "unlinked", cancel: event.VerificationCancelCodeUser})
 	c.mu.Lock()
 	a := c.acct
 	c.acct, c.loggedOut = nil, false

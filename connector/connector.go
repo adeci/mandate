@@ -171,11 +171,19 @@ type Checker interface {
 type SetupStep struct {
 	// QR is text to render as a QR code for the owner to scan.
 	QR string `json:"qr,omitempty"`
-	// Code is a code the owner types on another device.
+	// Code is a code the owner types on, or compares with, another device.
 	Code         string `json:"code,omitempty"`
 	Instructions string `json:"instructions,omitempty"`
-	Done         bool   `json:"done,omitempty"`
+	// Confirm asks the owner a yes-or-no question, e.g. whether Code matches
+	// what another device shows. The console answers by calling Setup with
+	// only the SetupConfirm arg, "yes" or "no".
+	Confirm string `json:"confirm,omitempty"`
+	Done    bool   `json:"done,omitempty"`
 }
+
+// SetupConfirm is the setup arg that answers SetupStep.Confirm. Connectors
+// need not declare it.
+const SetupConfirm = "confirm"
 
 // Setupper is implemented by connectors the owner links from the console.
 // Setup starts or continues linking; it must refuse while already linked.

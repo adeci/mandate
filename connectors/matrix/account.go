@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
@@ -29,6 +30,9 @@ type session struct {
 	DeviceID    id.DeviceID `json:"device_id"`
 	AccessToken string      `json:"access_token"`
 	PickleKey   []byte      `json:"pickle_key"`
+	// NoBackup is set when the device was linked without the key backup, so
+	// messages from before it cannot be decrypted.
+	NoBackup bool `json:"no_backup,omitempty"`
 }
 
 func loadSession(s connector.Secret) (*session, error) {
@@ -113,6 +117,7 @@ func (a *account) load(ctx context.Context, zl zerolog.Logger) error {
 	}
 	a.cli.StateStore = a.state
 	a.mach = crypto.NewOlmMachine(a.cli, &zl, a.crypto, a.state)
+	a.cli.Crypto = olmCrypto{a}
 	a.mach.SessionReceived = func(_ context.Context, _ id.RoomID, sid id.SessionID, _ uint32) {
 		a.mu.Lock()
 		if a.pending[sid] != nil {
@@ -124,6 +129,39 @@ func (a *account) load(ctx context.Context, zl zerolog.Logger) error {
 		return fmt.Errorf("load olm account: %w", err)
 	}
 	return nil
+}
+
+// olmCrypto is the mautrix.CryptoHelper that verificationhelper requires.
+// Sends encrypt explicitly, so SendMessageEvent never encrypts through it.
+type olmCrypto struct{ a *account }
+
+func (o olmCrypto) Encrypt(ctx context.Context, room id.RoomID, t event.Type, content any) (*event.EncryptedEventContent, error) {
+	return o.a.encrypt(ctx, room, t, content)
+}
+
+func (o olmCrypto) Decrypt(ctx context.Context, evt *event.Event) (*event.Event, error) {
+	return o.a.mach.DecryptMegolmEvent(ctx, evt)
+}
+
+func (o olmCrypto) WaitForSession(ctx context.Context, room id.RoomID, key id.SenderKey, sid id.SessionID, d time.Duration) bool {
+	return o.a.mach.WaitForSession(ctx, room, key, sid, d)
+}
+
+func (olmCrypto) RequestSession(context.Context, id.RoomID, id.SenderKey, id.SessionID, id.UserID, id.DeviceID) {
+}
+
+func (olmCrypto) Init(context.Context) error { return nil }
+
+// toDevice hands a sync's to-device messages to the machine (keys, secrets)
+// and the rest to the client's syncer (verification).
+func (a *account) toDevice(ctx context.Context, resp *mautrix.RespSync, since string) {
+	a.mach.ProcessSyncResponse(ctx, resp, since)
+	syncer := a.cli.Syncer.(mautrix.DispatchableSyncer)
+	for _, evt := range resp.ToDevice.Events {
+		if evt.Type != event.ToDeviceEncrypted {
+			syncer.Dispatch(ctx, evt)
+		}
+	}
 }
 
 // openCryptoDB opens the database holding the device's keys, created with

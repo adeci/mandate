@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix/event"
 
 	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/store"
@@ -51,18 +52,22 @@ type mxConnector struct {
 	log     *slog.Logger
 	zl      zerolog.Logger
 	http    *http.Client
+	// How long the owner has to verify, and the other device to share the
+	// key backup key.
+	verifyTimeout, backupWait time.Duration
 
 	setup sync.Mutex // held while linking, unlinking, or forgetting a logged-out device
 
 	mu        sync.Mutex
-	acct      *account // nil until linked
-	loggedOut bool     // the homeserver ended the session
+	acct      *account   // nil until linked
+	verifying *verifying // a link waiting for verification from another device
+	loggedOut bool       // the homeserver ended the session
 }
 
 func newConnector(ctx context.Context, st *store.Store, env *connector.Env, zl zerolog.Logger, hc *http.Client) *mxConnector {
 	return &mxConnector{
 		ctx: ctx, st: st, dir: env.PrivateDir(), session: env.Secret("session.json"),
-		log: env.Log, zl: zl, http: hc,
+		log: env.Log, zl: zl, http: hc, verifyTimeout: verifyTimeout, backupWait: backupWait,
 	}
 }
 
@@ -133,9 +138,12 @@ func (a *account) release() { a.ops.RUnlock() }
 
 func (c *mxConnector) Health(context.Context) connector.Health {
 	c.mu.Lock()
-	a, out := c.acct, c.loggedOut
+	a, v, out := c.acct, c.verifying, c.loggedOut
+	verifying := v != nil && !v.ended
 	c.mu.Unlock()
 	switch {
+	case a == nil && verifying:
+		return connector.Health{State: connector.NeedsSetup, Detail: "linking: waiting for verification from another device"}
 	case a == nil && out:
 		return connector.Health{State: connector.NeedsSetup, Detail: "logged out by the homeserver; link again"}
 	case a == nil:
@@ -143,14 +151,21 @@ func (c *mxConnector) Health(context.Context) connector.Health {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.syncErr != "" {
+	switch {
+	case a.syncErr != "":
 		return connector.Health{State: connector.Broken, Detail: a.syncErr}
+	case a.sess.NoBackup:
+		return connector.Health{State: connector.Healthy, Detail: noBackupDetail}
 	}
 	return connector.Health{State: connector.Healthy}
 }
 
+const noBackupDetail = "linked without the key backup, so encrypted messages from before linking stay unreadable; " +
+	"relink with the recovery key to read them"
+
 // Close stops syncing once serving has stopped, then closes the databases.
 func (c *mxConnector) Close() error {
+	c.endVerifying(verifyFailure{msg: "mandate-matrix stopped", cancel: event.VerificationCancelCodeUser})
 	c.mu.Lock()
 	a := c.acct
 	c.acct = nil

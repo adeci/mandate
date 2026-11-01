@@ -262,9 +262,9 @@
   <form data-setup>
     {{range .Setup}}
     <div class="setup">
-      <label for="setup-{{$conn}}-{{.Name}}">{{.Name}}</label>
+      <label for="setup-{{$conn}}-{{.Name}}">{{.Name}}{{if not .Required}} <span class="muted">optional</span>{{end}}</label>
       <div class="row">
-        <input id="setup-{{$conn}}-{{.Name}}" name="{{.Name}}"{{if .Secret}} type="password"{{end}} required autocomplete="off">
+        <input id="setup-{{$conn}}-{{.Name}}" name="{{.Name}}"{{if .Secret}} type="password"{{end}}{{if .Required}} required{{end}} autocomplete="off">
       </div>
       {{with .Doc}}<p class="hint">{{.}}</p>{{end}}
     </div>
@@ -290,12 +290,19 @@
   <div class="linking" hidden>
     <ol class="steps">
       <li data-state="done">open the app</li>
-      <li data-state="current">scan or type</li>
+      <li data-state="current">scan, type or compare</li>
       <li>linked</li>
     </ol>
     <div class="qr-box" hidden></div>
     <p class="code" hidden></p>
     <p class="instructions"></p>
+    <div class="confirm" hidden>
+      <p class="question"></p>
+      <div class="actions">
+        <button type="button" class="primary" data-answer="yes">They match</button>
+        <button type="button" data-answer="no">They don't match</button>
+      </div>
+    </div>
     <p class="muted">refreshes every 2s</p>
   </div>
   <p class="msg" role="status"></p>

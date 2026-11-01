@@ -345,7 +345,12 @@ function linkConnection(panel, args) {
   const box = $(".linking", panel);
   const qr = $(".qr-box", panel);
   const code = $(".code", panel);
+  const confirm = $(".confirm", box);
   let stopped = false;
+  let inFlight = false;
+  let timer = 0;
+  // The owner's answer to the step's question, sent instead of args once.
+  let answer = null;
 
   const finish = () => {
     stopped = true;
@@ -353,8 +358,11 @@ function linkConnection(panel, args) {
   };
   const step = async () => {
     if (stopped || !panel.isConnected) return;
+    inFlight = true;
     try {
-      const s = await call("POST", `/connections/${name}/setup`, { args });
+      const sent = answer;
+      const s = await call("POST", `/connections/${name}/setup`, { args: sent ? { confirm: sent } : args });
+      if (answer === sent) answer = null;
       if (s.done) return finish();
       box.hidden = false;
       qr.hidden = !s.qr_svg;
@@ -363,6 +371,8 @@ function linkConnection(panel, args) {
       code.hidden = !s.code;
       code.textContent = s.code || "";
       $(".instructions", box).textContent = s.instructions || "";
+      confirm.hidden = !s.confirm || answer !== null;
+      $(".question", confirm).textContent = s.confirm || "";
       say("", false, msg);
     } catch (e) {
       // Linking may finish between polls; the connector then refuses setup.
@@ -373,9 +383,20 @@ function linkConnection(panel, args) {
       controls.hidden = false;
       say(e.message, true, msg);
       return;
+    } finally {
+      inFlight = false;
     }
-    setTimeout(step, POLL_MS);
+    timer = setTimeout(step, POLL_MS);
   };
+  for (const button of $$("[data-answer]", confirm)) {
+    button.onclick = () => {
+      answer = button.dataset.answer;
+      confirm.hidden = true;
+      if (inFlight) return;
+      clearTimeout(timer);
+      step();
+    };
+  }
   controls.hidden = true;
   say("", false, msg);
   return step();

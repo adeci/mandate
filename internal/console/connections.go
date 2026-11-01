@@ -97,7 +97,8 @@ func (s *Server) connectionHealth(w http.ResponseWriter, r *http.Request, _ sess
 }
 
 // setupRequest carries the connector's declared setup inputs; empty ones
-// count as not given.
+// count as not given. An answer to a step's question comes alone, as
+// connector.SetupConfirm.
 type setupRequest struct {
 	Args map[string]string `json:"args,omitempty"`
 }
@@ -106,6 +107,7 @@ type setupView struct {
 	QR           string `json:"qr_svg,omitempty"`
 	Code         string `json:"code,omitempty"`
 	Instructions string `json:"instructions,omitempty"`
+	Confirm      string `json:"confirm,omitempty"`
 	Done         bool   `json:"done,omitempty"`
 }
 
@@ -127,7 +129,12 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request, _ session) {
 	}
 	args := map[string]string{}
 	for k, v := range req.Args {
-		if !slices.ContainsFunc(spec.Setup, func(p connector.Param) bool { return p.Name == k }) {
+		if k == connector.SetupConfirm {
+			if len(req.Args) != 1 || v != "yes" && v != "no" {
+				connector.WriteError(w, &connector.Error{Status: http.StatusBadRequest, Message: "confirm is yes or no, given alone"})
+				return
+			}
+		} else if !slices.ContainsFunc(spec.Setup, func(p connector.Param) bool { return p.Name == k }) {
 			connector.WriteError(w, &connector.Error{Status: http.StatusBadRequest, Message: fmt.Sprintf("%s takes no setup input %q", c.name, k)})
 			return
 		}
@@ -140,7 +147,7 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request, _ session) {
 		connector.WriteError(w, upstream(err))
 		return
 	}
-	v := setupView{Code: step.Code, Instructions: step.Instructions, Done: step.Done}
+	v := setupView{Code: step.Code, Instructions: step.Instructions, Confirm: step.Confirm, Done: step.Done}
 	if step.QR != "" {
 		if v.QR, err = qrSVG(step.QR); err != nil {
 			connector.WriteError(w, fmt.Errorf("render QR code: %w", err))

@@ -161,6 +161,36 @@ func TestSecurityHeaders(t *testing.T) {
 	}
 }
 
+func TestSetupConfirm(t *testing.T) {
+	h := start(t)
+	if _, body := h.page(t, "/connections"); !strings.Contains(body, `data-answer="yes">They match</button>`) ||
+		!strings.Contains(body, `data-answer="no">They don't match</button>`) {
+		t.Fatalf("connections page lacks the confirm buttons:\n%s", body)
+	}
+	setup := func(args map[string]string) (int, setupView) {
+		t.Helper()
+		status, body := h.post(t, "/connections/fake/setup", setupRequest{Args: args})
+		var v setupView
+		if status == http.StatusOK {
+			if err := json.Unmarshal(body, &v); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return status, v
+	}
+	if status, v := setup(map[string]string{"account": "compare"}); status != http.StatusOK || v.Code != "🐶 🔑" || v.Confirm != "Same emoji?" {
+		t.Fatalf("compare = %d %+v", status, v)
+	}
+	if status, v := setup(map[string]string{"confirm": "yes"}); status != http.StatusOK || v.Instructions != "answered yes" {
+		t.Fatalf("answer = %d %+v", status, v)
+	}
+	for _, args := range []map[string]string{{"confirm": "maybe"}, {"confirm": "no", "account": "compare"}} {
+		if status, _ := setup(args); status != http.StatusBadRequest {
+			t.Fatalf("setup %v = %d, want 400", args, status)
+		}
+	}
+}
+
 func TestSetupFlow(t *testing.T) {
 	h := start(t)
 	if _, body := h.page(t, "/connections"); !strings.Contains(body, `name="account"`) || !strings.Contains(body, `name="token" type="password"`) {
