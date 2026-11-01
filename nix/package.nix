@@ -86,13 +86,24 @@ in
   mandate-http = connector "http" "HTTP API connector for mandate";
   mandate-fastmail = connector "fastmail" "Fastmail connector for mandate";
   mandate-gmessages = connector "gmessages" "Google Messages connector for mandate";
-  # libsignal-ffi must be the version mautrix-signal's libsignalgo is built for.
-  mandate-signal = connectorWith {
-    buildInputs = [
-      libsignal-ffi
-      zlib
-    ];
-  } "signal" "Signal connector for mandate";
+  # libsignalgo is written against one libsignal-ffi version; the build stops
+  # if nixpkgs has another.
+  mandate-signal =
+    (connectorWith {
+      buildInputs = [
+        libsignal-ffi
+        zlib
+      ];
+    } "signal" "Signal connector for mandate").overrideAttrs
+      {
+        postConfigure = ''
+          want=$(sed -n 's/^const Version = "v\(.*\)"$/\1/p' vendor/go.mau.fi/mautrix-signal/pkg/libsignalgo/signalversion/version.go)
+          if [ "$want" != "${libsignal-ffi.version}" ]; then
+            echo "libsignalgo needs libsignal-ffi '$want', nixpkgs has ${libsignal-ffi.version}" >&2
+            exit 1
+          fi
+        '';
+      };
 
   # mautrix's pure-Go olm is behind the goolm tag. GOFLAGS rather than tags,
   # so the checks' go test and golangci-lint build it too.
