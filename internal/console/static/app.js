@@ -193,6 +193,7 @@ const POLL_MS = 2000;
 function linkConnection(panel, args) {
   const name = panel.dataset.connection;
   const msg = $(".msg", panel);
+  const controls = $("[data-link-controls]", panel);
   const box = $(".linking", panel);
   const qr = $(".qr-box", panel);
   const code = $(".code", panel);
@@ -220,14 +221,54 @@ function linkConnection(panel, args) {
       const h = await call("GET", `/connections/${name}/health`).catch(() => null);
       if (h && h.state === "ok") return finish();
       stopped = true;
-      $("[data-poll]", box).textContent = "stopped";
+      box.hidden = true;
+      controls.hidden = false;
       say(e.message, true, msg);
       return;
     }
     setTimeout(step, POLL_MS);
   };
-  for (const el of $$("[data-link], [data-setup]", panel)) el.hidden = true;
+  controls.hidden = true;
+  say("", false, msg);
   return step();
+}
+
+const CONFIRM_MS = 4000;
+
+// The first click arms the button for a few seconds; a second click runs the
+// action.
+function confirmFirst(button, label, action) {
+  const text = button.textContent;
+  let timer = 0;
+  const disarm = () => {
+    clearTimeout(timer);
+    timer = 0;
+    button.textContent = text;
+    button.classList.remove("danger");
+  };
+  return busy(button, async () => {
+    if (!timer) {
+      button.textContent = label;
+      button.classList.add("danger");
+      timer = setTimeout(disarm, CONFIRM_MS);
+      return;
+    }
+    disarm();
+    await action();
+  });
+}
+
+async function unlinkConnection(panel) {
+  await call("POST", `/connections/${panel.dataset.connection}/unlink`);
+}
+
+async function relink(panel) {
+  await unlinkConnection(panel);
+  $("[data-linked]", panel).hidden = true;
+  if ($("[data-link]", panel)) return linkConnection(panel, {});
+  const controls = $("[data-link-controls]", panel);
+  controls.hidden = false;
+  $("input", controls).focus();
 }
 
 function busy(el, action) {
@@ -307,6 +348,18 @@ document.addEventListener("DOMContentLoaded", () => {
     if (link) link.addEventListener("click", busy(link, () => linkConnection(panel, {})));
     for (const form of $$("[data-setup]", panel)) {
       form.addEventListener("submit", busy(form, () => linkConnection(panel, Object.fromEntries(new FormData(form)))));
+    }
+    const unlink = $("[data-unlink]", panel);
+    if (unlink) {
+      unlink.addEventListener(
+        "click",
+        confirmFirst(unlink, "Confirm unlink", async () => {
+          await unlinkConnection(panel);
+          location.reload();
+        }),
+      );
+      const again = $("[data-relink]", panel);
+      again.addEventListener("click", confirmFirst(again, "Confirm relink", () => relink(panel)));
     }
   }
 });

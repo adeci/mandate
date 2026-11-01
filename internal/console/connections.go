@@ -24,8 +24,11 @@ const (
 type connView struct {
 	Name   string
 	Health connector.Health
-	// Setup are the inputs the connector takes when linking.
-	Setup []connector.Param
+	// Setup are the inputs the connector takes when linking. With Required
+	// set it links only with them, all given at once.
+	Setup    []connector.Param
+	Required bool
+	Unlink   bool
 	// Keys is why the connector's key log differs from the console's.
 	Keys string
 }
@@ -41,7 +44,8 @@ func (s *Server) view(ctx context.Context, c *conn) connView {
 		v.Health = connector.Health{State: connector.Broken, Detail: problem(err)}
 		return v
 	}
-	v.Setup = spec.Setup
+	v.Setup, v.Unlink = spec.Setup, spec.Unlink
+	v.Required = slices.ContainsFunc(spec.Setup, func(p connector.Param) bool { return p.Required })
 	if v.Health, err = c.client.Health(ctx); err != nil {
 		v.Health = connector.Health{State: connector.Broken, Detail: problem(err)}
 	}
@@ -117,13 +121,8 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request, _ session) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), setupTimeout)
 	defer cancel()
-	spec, err := c.getSpec(ctx, s.now())
-	if pe, ok := errors.AsType[*connector.ProtocolError](err); ok {
-		connector.WriteError(w, &connector.Error{Status: http.StatusBadGateway, Message: c.name + " " + pe.Error()})
-		return
-	}
-	if err != nil {
-		connector.WriteError(w, upstream(err))
+	spec, ok := s.linkSpec(ctx, w, c)
+	if !ok {
 		return
 	}
 	args := map[string]string{}
@@ -149,6 +148,38 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request, _ session) {
 		}
 	}
 	connector.WriteJSON(w, http.StatusOK, v)
+}
+
+func (s *Server) unlink(w http.ResponseWriter, r *http.Request, _ session) {
+	c, ok := s.conns[r.PathValue("name")]
+	if !ok {
+		connector.WriteError(w, &connector.Error{Status: http.StatusNotFound, Message: "no such connection"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), setupTimeout)
+	defer cancel()
+	if _, ok := s.linkSpec(ctx, w, c); !ok {
+		return
+	}
+	if err := c.client.Unlink(ctx); err != nil {
+		connector.WriteError(w, upstream(err))
+		return
+	}
+	connector.WriteJSON(w, http.StatusOK, struct{}{})
+}
+
+// linkSpec writes the error when c can't be asked to link or unlink.
+func (s *Server) linkSpec(ctx context.Context, w http.ResponseWriter, c *conn) (connector.Spec, bool) {
+	spec, err := c.getSpec(ctx, s.now())
+	if pe, ok := errors.AsType[*connector.ProtocolError](err); ok {
+		connector.WriteError(w, &connector.Error{Status: http.StatusBadGateway, Message: c.name + " " + pe.Error()})
+		return spec, false
+	}
+	if err != nil {
+		connector.WriteError(w, upstream(err))
+		return spec, false
+	}
+	return spec, true
 }
 
 // qrSVG draws text as a QR code with a 4-module quiet zone, black on white

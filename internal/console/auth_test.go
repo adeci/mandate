@@ -34,6 +34,7 @@ func TestProtectedRoutesNeedSession(t *testing.T) {
 		{"GET", "/connections", nil},
 		{"GET", "/connections/fake/health", nil},
 		{"POST", "/connections/fake/setup", setupRequest{}},
+		{"POST", "/connections/fake/unlink", nil},
 		{"GET", "/keys", nil},
 		{"POST", "/keys/options", registerRequest{Name: "mallory"}},
 		{"POST", "/keys", json.RawMessage(`{}`)},
@@ -72,8 +73,8 @@ func TestProtectedRoutesNeedSession(t *testing.T) {
 	if got := h.get(t, p.ID); got.Status != proposal.Pending {
 		t.Fatalf("status = %s after unauthenticated requests", got.Status)
 	}
-	if h.fake.linked || h.fake.setupCalls != 0 {
-		t.Fatal("unauthenticated setup reached the connector")
+	if h.fake.linked || h.fake.setupCalls != 0 || h.fake.unlinks != 0 {
+		t.Fatal("unauthenticated setup or unlink reached the connector")
 	}
 	h.srv.regMu.Lock()
 	n := len(h.srv.regs)

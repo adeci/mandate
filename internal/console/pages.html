@@ -242,21 +242,45 @@
   </dl>
   {{end}}
   {{with .Keys}}<p class="flash" data-kind="error">Keys out of sync: {{.}}</p>{{end}}
-  {{if eq .Health.State "setup"}}
+  {{$setup := eq .Health.State "setup"}}
+  {{if or $setup .Unlink}}
+  {{if not $setup}}
+  <div class="actions" data-linked>
+    <button type="button" data-relink>Relink</button>
+    <button type="button" data-unlink>Unlink</button>
+  </div>
+  {{end}}
+  <div data-link-controls{{if not $setup}} hidden{{end}}>
+  {{$conn := .Name}}
+  {{if .Required}}
+  <form data-setup>
+    {{range .Setup}}
+    <div class="setup">
+      <label for="setup-{{$conn}}-{{.Name}}">{{.Name}}</label>
+      <div class="row">
+        <input id="setup-{{$conn}}-{{.Name}}" name="{{.Name}}"{{if .Secret}} type="password"{{end}} required autocomplete="off">
+      </div>
+      {{with .Doc}}<p class="hint">{{.}}</p>{{end}}
+    </div>
+    {{end}}
+    <div class="actions"><button type="submit" class="primary">Link</button></div>
+  </form>
+  {{else}}
   <div class="actions">
     <button type="button" class="primary" data-link>Link</button>
   </div>
-  {{$conn := .Name}}
   {{range .Setup}}
   <form class="setup" data-setup>
     <label for="setup-{{$conn}}-{{.Name}}">or link with {{.Name}}</label>
     <div class="row">
-      <input id="setup-{{$conn}}-{{.Name}}" name="{{.Name}}" required autocomplete="off">
+      <input id="setup-{{$conn}}-{{.Name}}" name="{{.Name}}"{{if .Secret}} type="password"{{end}} required autocomplete="off">
       <button type="submit">Link</button>
     </div>
     {{with .Doc}}<p class="hint">{{.}}</p>{{end}}
   </form>
   {{end}}
+  {{end}}
+  </div>
   <div class="linking" hidden>
     <ol class="steps">
       <li data-state="done">open the app</li>
@@ -266,7 +290,7 @@
     <div class="qr-box" hidden></div>
     <p class="code" hidden></p>
     <p class="instructions"></p>
-    <p class="muted" data-poll>refreshes every 2s</p>
+    <p class="muted">refreshes every 2s</p>
   </div>
   <p class="msg" role="status"></p>
   {{end}}

@@ -163,8 +163,8 @@ func TestSecurityHeaders(t *testing.T) {
 
 func TestSetupFlow(t *testing.T) {
 	h := start(t)
-	if _, body := h.page(t, "/connections"); !strings.Contains(body, `name="account"`) {
-		t.Fatalf("connections page lacks the setup input:\n%s", body)
+	if _, body := h.page(t, "/connections"); !strings.Contains(body, `name="account"`) || !strings.Contains(body, `name="token" type="password"`) {
+		t.Fatalf("connections page lacks the setup inputs:\n%s", body)
 	}
 
 	setup := func(args map[string]string) (int, setupView) {
@@ -198,6 +198,33 @@ func TestSetupFlow(t *testing.T) {
 	}
 	if status, _ := h.post(t, "/connections/nope/setup", setupRequest{}); status != http.StatusNotFound {
 		t.Fatalf("setup unknown = %d", status)
+	}
+
+	health := func() connector.HealthState {
+		t.Helper()
+		_, raw := h.call(t, "GET", "/connections/fake/health", h.session, nil)
+		var hl connector.Health
+		if err := json.Unmarshal(raw, &hl); err != nil {
+			t.Fatal(err)
+		}
+		return hl.State
+	}
+	if status, _ := h.post(t, "/connections/fake/unlink", nil); status != http.StatusOK || health() != connector.NeedsSetup {
+		t.Fatalf("unlink = %d, health %s", status, health())
+	}
+	if status, v := setup(nil); status != http.StatusOK || v.QR == "" {
+		t.Fatalf("relink = %d %+v", status, v)
+	}
+	h.post(t, "/connections/fake/unlink", nil)
+	const token = "tok-4711-secret"
+	if _, v := setup(map[string]string{"token": token}); !v.Done || health() != connector.Healthy {
+		t.Fatalf("link with token = %+v", v)
+	}
+	if _, body := h.page(t, "/connections"); strings.Contains(body, token) {
+		t.Fatal("connections page shows the token")
+	}
+	if status, _ := h.post(t, "/connections/nope/unlink", nil); status != http.StatusNotFound {
+		t.Fatalf("unlink unknown = %d", status)
 	}
 }
 

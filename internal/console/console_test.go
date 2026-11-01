@@ -35,7 +35,8 @@ const (
 var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 // fake sends "messages" to a fixed contact book. Linking shows a QR code, or
-// a code to type with the optional "account" setup input.
+// a code to type with the optional "account" setup input; a "token" links
+// at once.
 type fake struct {
 	name     string
 	mu       sync.Mutex
@@ -46,6 +47,7 @@ type fake struct {
 
 	linked     bool
 	setupCalls int
+	unlinks    int
 }
 
 var contacts = map[string]string{"Farid": "id-farid", "Mallory": "id-mallory"}
@@ -57,7 +59,10 @@ func (f *fake) Spec() connector.Spec {
 			{Name: "text", Required: true, Editable: true},
 		}},
 		{Name: "fetch", Kind: connector.Read},
-	}, Setup: []connector.Param{{Name: "account", Doc: "link by typing a code for this account"}}}
+	}, Setup: []connector.Param{
+		{Name: "account", Doc: "link by typing a code for this account"},
+		{Name: "token", Secret: true},
+	}}
 }
 
 func (f *fake) Prepare(_ context.Context, _ string, args map[string]string) (connector.Prepared, error) {
@@ -114,6 +119,10 @@ func (f *fake) Setup(_ context.Context, args map[string]string) (connector.Setup
 	if f.linked {
 		return connector.SetupStep{}, &connector.Error{Status: http.StatusConflict, Message: "already linked"}
 	}
+	if args["token"] != "" {
+		f.linked = true
+		return connector.SetupStep{Done: true}, nil
+	}
 	f.setupCalls++
 	if f.setupCalls == 3 {
 		f.linked = true
@@ -123,6 +132,14 @@ func (f *fake) Setup(_ context.Context, args map[string]string) (connector.Setup
 		return connector.SetupStep{Code: "K7QF-2M9X", Instructions: "type it on " + account}, nil
 	}
 	return connector.SetupStep{QR: "2@ref" + strings.Repeat("x", f.setupCalls), Instructions: "scan it"}, nil
+}
+
+func (f *fake) Unlink(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.linked, f.setupCalls = false, 0
+	f.unlinks++
+	return nil
 }
 
 func (f *fake) sent() []approval.Record {

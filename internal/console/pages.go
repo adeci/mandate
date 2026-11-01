@@ -62,6 +62,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /connections", s.page(s.connectionsPage))
 	mux.HandleFunc("GET /connections/{name}/health", s.api(s.connectionHealth))
 	mux.HandleFunc("POST /connections/{name}/setup", s.api(s.setup))
+	mux.HandleFunc("POST /connections/{name}/unlink", s.api(s.unlink))
 	mux.HandleFunc("GET /keys", s.page(s.keysPage))
 	mux.HandleFunc("POST /keys/options", s.api(s.registerOptions))
 	mux.HandleFunc("POST /keys", s.api(s.addKey))
