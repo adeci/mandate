@@ -25,7 +25,7 @@ function applyTheme(theme) {
   const root = document.documentElement;
   if (theme) root.dataset.theme = theme;
   else delete root.dataset.theme;
-  const bg = getComputedStyle(root).getPropertyValue("--bg").trim();
+  const bg = getComputedStyle(root).backgroundColor;
   themeMetas.forEach((m, i) => (m.content = theme ? bg : themeDefaults[i]));
 }
 applyTheme(localStorage.getItem("theme"));

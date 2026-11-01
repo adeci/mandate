@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
-<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#fdfdfd" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0b0e12" media="(prefers-color-scheme: dark)">
 <title>{{.Title}} · mandate</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
@@ -212,7 +212,7 @@
     <form method="post" action="/r/{{.ID}}/deny"><button type="submit" class="danger big">Deny</button></form>
   </div>
   <div class="panel" id="review" hidden>
-    <header><h3>You are approving exactly this</h3><span class="status" data-tone="wait">not sent yet</span></header>
+    <header><h3>What will be sent</h3><span class="status" data-tone="wait">not sent yet</span></header>
     <div id="preview"></div>
     <div class="actions two">
       <button type="button" class="primary big" data-sign>Approve with passkey →</button>
