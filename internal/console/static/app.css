@@ -57,7 +57,7 @@ section { margin-bottom: calc(var(--lh) * 2); }
 .masthead { display: flex; flex-direction: column; justify-content: center; margin-bottom: var(--lh); }
 .brand { font-size: 2rem; line-height: calc(var(--lh) * 2); font-weight: var(--w-bold);
   text-transform: uppercase; text-decoration: none; }
-.brand::after { content: "_"; color: var(--fg-alt); }
+.brand::after { content: ""; display: inline-block; width: 1ch; height: 1cap; margin-left: .2ch; background: var(--fg-alt); }
 @media (prefers-reduced-motion: no-preference) {
   .brand::after { animation: blink 1.2s steps(1) infinite; }
 }
@@ -73,6 +73,7 @@ section { margin-bottom: calc(var(--lh) * 2); }
 .theme-toggle svg { width: var(--lh); height: var(--lh); fill: none; stroke: currentColor; stroke-width: var(--bw); }
 .theme-toggle svg * { vector-effect: non-scaling-stroke; }
 .theme-toggle path { fill: currentColor; stroke: none; }
+.theme-toggle:active { transform: none; background: var(--fg); color: var(--bg); }
 @media (max-width: 359px) {
   .site nav { display: grid; grid-template-columns: 1fr 1fr; gap: 0; border: var(--bw) solid var(--fg); }
   .site nav a { margin: 0; padding: calc(var(--lh) / 2 - var(--bw) / 2) 1ch; text-align: center; }
