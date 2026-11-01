@@ -56,6 +56,7 @@ let
       meta = {
         inherit description;
         mainProgram = pname;
+        license = lib.licenses.agpl3Only;
         platforms = lib.platforms.linux;
       };
     };
