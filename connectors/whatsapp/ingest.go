@@ -169,13 +169,19 @@ func (in *ingester) enrichSender(ctx context.Context, o *op) {
 	}
 }
 
-// Once per process. Groups without a name hint are looked up with
-// GetGroupInfo, a read-only query.
+// Once per process, except that later calls still record a date from
+// history. Groups without a name hint are looked up with GetGroupInfo, a
+// read-only query.
 func (in *ingester) ensureContainer(ctx context.Context, chat types.JID, base store.Container) error {
 	in.mu.Lock()
 	if in.seen[chat] {
 		in.mu.Unlock()
-		return nil
+		if base.LastMessageAt.IsZero() {
+			return nil
+		}
+		return in.st.UpsertContainer(ctx, store.Container{
+			ID: chat.String(), Kind: kindFor(chat), IsGroup: chat.Server == types.GroupServer, LastMessageAt: base.LastMessageAt,
+		})
 	}
 	in.seen[chat] = true
 	in.mu.Unlock()
@@ -190,6 +196,7 @@ func (in *ingester) ensureContainer(ctx context.Context, chat types.JID, base st
 			in.log.Warn("group info query failed", "chat", chat.String(), "err", err)
 		} else {
 			c = groupContainer(info, in.pn, in.nameFunc(ctx))
+			c.LastMessageAt = base.LastMessageAt
 		}
 	} else if !c.IsGroup {
 		if n := in.contactName(ctx, chat); n != "" {

@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -151,8 +152,14 @@ var (
 	guildsBody   = []map[string]any{{"id": guildID, "name": "Club", "icon": nil, "owner": false, "permissions": "0"}}
 	channelsBody = []map[string]any{
 		{"id": "1100000000000000010", "type": 4, "guild_id": guildID, "name": "Text", "position": 0},
-		{"id": chanRandom, "type": 0, "guild_id": guildID, "name": "random", "position": 2, "parent_id": "1100000000000000010"},
-		{"id": chanGeneral, "type": 0, "guild_id": guildID, "name": "general", "position": 1, "parent_id": "1100000000000000010"},
+		{
+			"id": chanRandom, "type": 0, "guild_id": guildID, "name": "random", "position": 2, "parent_id": "1100000000000000010",
+			"last_message_id": snowflakeAt(noon.Add(-48 * time.Hour)),
+		},
+		{
+			"id": chanGeneral, "type": 0, "guild_id": guildID, "name": "general", "position": 1, "parent_id": "1100000000000000010",
+			"last_message_id": snowflakeAt(noon.Add(-time.Hour)),
+		},
 	}
 	dmsBody = []map[string]any{{
 		"id": dmID, "type": 1, "last_message_id": msg4,
@@ -472,6 +479,29 @@ func TestSyncCounts(t *testing.T) {
 	h.callOK("sync", map[string]string{"guild_id": guildID}, &resp)
 	if resp.Containers != 4 { // guild + DM + two text channels (category skipped)
 		t.Errorf("guild sync upserted %d", resp.Containers)
+	}
+	// Chats are dated by last_message_id, so the gateway lists them most
+	// recent first before any message is fetched.
+	rows, err := h.st.DB().Query(`SELECT id, last_message_at FROM containers WHERE last_message_at IS NOT NULL ORDER BY last_message_at DESC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dated []string
+	for rows.Next() {
+		var id, at string
+		if err := rows.Scan(&id, &at); err != nil {
+			t.Fatal(err)
+		}
+		dated = append(dated, id+" "+at)
+	}
+	rows.Close()
+	want := []string{
+		chanGeneral + " " + noon.Add(-time.Hour).UTC().Format("2006-01-02T15:04:05.000Z"),
+		chanRandom + " " + noon.Add(-48*time.Hour).UTC().Format("2006-01-02T15:04:05.000Z"),
+		dmID + " 2024-10-27T07:35:52.832Z",
+	}
+	if !slices.Equal(dated, want) {
+		t.Errorf("dated chats\n got %v\nwant %v", dated, want)
 	}
 	// Cached lists cost nothing.
 	h.callOK("sync", map[string]string{"guild_id": guildID}, &resp)

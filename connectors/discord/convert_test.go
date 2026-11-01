@@ -206,9 +206,12 @@ func TestChannelContainer(t *testing.T) {
 			want: store.Container{ID: "t", Kind: "thread", ParentID: "g", Name: "topic"}, wantOK: true,
 		},
 		{
-			name: "dm uses the recipient's name",
-			in:   &apiChannel{ID: "d", Type: channelDM, Recipients: []apiUser{*alice}},
-			want: store.Container{ID: "d", Kind: "dm", Name: "Alice A", Participants: []store.Participant{{ID: "200", Name: "Alice A"}}}, wantOK: true,
+			name: "dm uses the recipient's name and is dated by its last message",
+			in:   &apiChannel{ID: "d", Type: channelDM, Recipients: []apiUser{*alice}, LastMessageID: "175928847299117063"},
+			want: store.Container{
+				ID: "d", Kind: "dm", Name: "Alice A", Participants: []store.Participant{{ID: "200", Name: "Alice A"}},
+				LastMessageAt: time.Date(2016, 4, 30, 11, 18, 25, 796e6, time.UTC),
+			}, wantOK: true,
 		},
 		{
 			name: "dm without recipients leaves participants unknown",
@@ -271,5 +274,20 @@ func TestGuildContainers(t *testing.T) {
 	}
 	if chans[1].GuildID != "" {
 		t.Error("input slice modified")
+	}
+}
+
+func TestSnowflakeTime(t *testing.T) {
+	// The example from Discord's API reference.
+	got, ok := snowflakeTime("175928847299117063")
+	if want := time.Date(2016, 4, 30, 11, 18, 25, 796e6, time.UTC); !ok || !got.Equal(want) {
+		t.Errorf("snowflakeTime = %v, %v; want %v", got, ok, want)
+	}
+	if _, ok := snowflakeTime(""); ok {
+		t.Error("empty ID has a time")
+	}
+	at := time.Date(2026, 10, 30, 18, 40, 0, 123e6, time.UTC)
+	if got, ok := snowflakeTime(snowflakeAt(at)); !ok || !got.Equal(at) {
+		t.Errorf("round trip = %v, want %v", got, at)
 	}
 }

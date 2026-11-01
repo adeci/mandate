@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"strings"
 	"time"
 
@@ -97,6 +98,9 @@ func historyContainer(chat types.JID, conv *waHistorySync.Conversation, pn pnRes
 	}
 	if c.Name == "" {
 		c.Name = conv.GetDisplayName()
+	}
+	if ts := cmp.Or(conv.GetLastMsgTimestamp(), conv.GetConversationTimestamp()); ts > 0 {
+		c.LastMessageAt = time.Unix(int64(ts), 0).UTC()
 	}
 	if c.IsGroup && len(conv.GetParticipant()) > 0 {
 		c.Participants = make([]store.Participant, 0, len(conv.GetParticipant()))

@@ -62,12 +62,13 @@ type apiGuild struct {
 }
 
 type apiChannel struct {
-	ID         string    `json:"id"`
-	Type       int       `json:"type"`
-	GuildID    string    `json:"guild_id"`
-	Name       string    `json:"name"`
-	Position   int       `json:"position"`
-	Recipients []apiUser `json:"recipients"`
+	ID            string    `json:"id"`
+	Type          int       `json:"type"`
+	GuildID       string    `json:"guild_id"`
+	Name          string    `json:"name"`
+	Position      int       `json:"position"`
+	Recipients    []apiUser `json:"recipients"`
+	LastMessageID string    `json:"last_message_id"`
 }
 
 func (c *apiChannel) isThread() bool {
@@ -155,10 +156,12 @@ func guildChannelContainers(guildID string, chans []apiChannel) []store.Containe
 
 // Threads also get ParentID = guild ID, so hiding a guild hides everything in it.
 // Channels are named "#name" as in Discord; the gateway adds the guild's name.
+// last_message_id dates the chat for the chats list before any message is fetched.
 func channelContainer(c *apiChannel) (store.Container, bool) {
 	if c == nil || c.ID == "" {
 		return store.Container{}, false
 	}
+	last, _ := snowflakeTime(c.LastMessageID)
 	switch {
 	case c.Type == channelDM:
 		ps := participants(c)
@@ -166,7 +169,7 @@ func channelContainer(c *apiChannel) (store.Container, bool) {
 		if name == "" && len(ps) > 0 {
 			name = ps[0].Name
 		}
-		return store.Container{ID: c.ID, Kind: kindDM, Name: name, Participants: ps}, true
+		return store.Container{ID: c.ID, Kind: kindDM, Name: name, Participants: ps, LastMessageAt: last}, true
 	case c.Type == channelGroupDM:
 		ps := participants(c)
 		name := c.Name
@@ -179,17 +182,17 @@ func channelContainer(c *apiChannel) (store.Container, bool) {
 			}
 			name = strings.Join(names, ", ")
 		}
-		return store.Container{ID: c.ID, Kind: kindGroup, Name: name, IsGroup: true, Participants: ps}, true
+		return store.Container{ID: c.ID, Kind: kindGroup, Name: name, IsGroup: true, Participants: ps, LastMessageAt: last}, true
 	case c.Type == channelGuildCategory, c.GuildID == "":
 		return store.Container{}, false
 	case c.isThread():
-		return store.Container{ID: c.ID, Kind: kindThread, ParentID: c.GuildID, Name: c.Name}, true
+		return store.Container{ID: c.ID, Kind: kindThread, ParentID: c.GuildID, Name: c.Name, LastMessageAt: last}, true
 	default:
 		name := c.Name
 		if name != "" {
 			name = "#" + name
 		}
-		return store.Container{ID: c.ID, Kind: kindChannel, ParentID: c.GuildID, Name: name}, true
+		return store.Container{ID: c.ID, Kind: kindChannel, ParentID: c.GuildID, Name: name, LastMessageAt: last}, true
 	}
 }
 
@@ -214,7 +217,12 @@ func snowflakeTime(id string) (time.Time, bool) {
 	if err != nil {
 		return time.Time{}, false
 	}
-	return time.UnixMilli(int64(n>>22) + discordEpochMS), true
+	return time.UnixMilli(int64(n>>22) + discordEpochMS).UTC(), true
+}
+
+// snowflakeAt is the smallest snowflake of t's millisecond, as clients make nonces.
+func snowflakeAt(t time.Time) string {
+	return strconv.FormatUint(uint64(t.UnixMilli()-discordEpochMS)<<22, 10)
 }
 
 func toMessage(m *apiMessage, selfID string) (store.Message, bool) {

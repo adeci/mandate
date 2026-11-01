@@ -378,9 +378,11 @@ func TestContainers(t *testing.T) {
 			},
 		},
 		{
-			name: "history dm",
-			got:  historyContainer(alice, &waHistorySync.Conversation{ID: proto.String(alice.String()), DisplayName: proto.String("Alice")}, pn),
-			want: store.Container{ID: "15550001111@s.whatsapp.net", Kind: "dm", Name: "Alice"},
+			name: "history dm dated by its conversation",
+			got: historyContainer(alice, &waHistorySync.Conversation{
+				ID: proto.String(alice.String()), DisplayName: proto.String("Alice"), ConversationTimestamp: proto.Uint64(1793385600),
+			}, pn),
+			want: store.Container{ID: "15550001111@s.whatsapp.net", Kind: "dm", Name: "Alice", LastMessageAt: time.Unix(1793385600, 0).UTC()},
 		},
 		{
 			name: "group info query",
