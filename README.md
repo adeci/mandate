@@ -46,7 +46,7 @@ mandate whatsapp send 15551234567@s.whatsapp.net "running 10 late" --wait 10m
 ## Connectors
 
 Each account is held by a connector, a program running as its own user with
-only its own credentials. `whatsapp`, `discord` and `http` (any token API
-behind an allowlist) are included. Any other program that speaks the
-[connector interface](docs/connectors.md) works too: point
+only its own credentials. `whatsapp`, `discord`, `matrix` and `http` (any
+token API behind an allowlist) are included. Any other program that speaks
+the [connector interface](docs/connectors.md) works too: point
 `services.mandate.connectors.<name>.package` at it.

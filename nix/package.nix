@@ -74,4 +74,11 @@ in
   mandate-whatsapp = connector "whatsapp" "WhatsApp connector for mandate";
   mandate-discord = connector "discord" "Discord connector for mandate";
   mandate-http = connector "http" "HTTP API connector for mandate";
+  # mautrix's pure-Go olm is behind the goolm tag. GOFLAGS rather than tags,
+  # so the checks' go test and golangci-lint build it too.
+  mandate-matrix = (connector "matrix" "Matrix connector for mandate").overrideAttrs (old: {
+    env = old.env // {
+      GOFLAGS = "${old.env.GOFLAGS} -tags=goolm";
+    };
+  });
 }
