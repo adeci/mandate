@@ -18,7 +18,7 @@ import (
 )
 
 const hostUsage = `
-host commands (for the owner): gateway, console, confirm-key, list
+host commands (for the owner): gateway, console, list
 `
 
 func main() {
@@ -43,8 +43,6 @@ func run() int {
 		err = gateway.Command(ctx, args)
 	case "console":
 		err = console.Command(ctx, args)
-	case "confirm-key":
-		err = console.ConfirmKey(ctx, args)
 	case "list":
 		err = admin.List(ctx, args)
 	case "-h", "--help", "help":

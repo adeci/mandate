@@ -46,8 +46,7 @@ type challenge struct {
 	Session  []byte
 }
 
-// keyChange is a key change waiting for approval, or an approved addition
-// waiting for the owner on the server.
+// keyChange is a key change waiting for approval.
 type keyChange struct {
 	ID        string
 	Op        string
@@ -55,8 +54,6 @@ type keyChange struct {
 	AAGUID    []byte
 	CreatedAt time.Time
 	ExpiresAt time.Time
-	// Approved is the signed log entry of an approved addition.
-	Approved *approval.SignedChange
 }
 
 type db struct {
@@ -207,7 +204,7 @@ func (d *db) version(ctx context.Context, now time.Time) (string, error) {
 		SELECT (SELECT count(*) || '.' || coalesce(max(created_at), 0) || '.' ||
 		               coalesce(sum(status = 'pending' AND expires_at > ?1), 0) || '.' || count(result)
 		        FROM proposals) || '.' ||
-		       (SELECT count(*) || '.' || coalesce(max(created_at), 0) || '.' || count(change)
+		       (SELECT count(*) || '.' || coalesce(max(created_at), 0)
 		        FROM key_requests WHERE expires_at > ?1)`, ms(now)).Scan(&v)
 	return v, err
 }
@@ -509,23 +506,6 @@ func (d *db) keyChange(ctx context.Context, id string, now time.Time) (keyChange
 	return cs[0], nil
 }
 
-// approveKeyChange stores sc, or clears it when nil, as the approval of a
-// waiting addition.
-func (d *db) approveKeyChange(ctx context.Context, id string, sc *approval.SignedChange, now time.Time) error {
-	var change, assertion []byte
-	var signer *string
-	if sc != nil {
-		change, signer, assertion = sc.Change, &sc.Signer, sc.Assertion
-	}
-	res, err := d.sql.ExecContext(ctx,
-		`UPDATE key_requests SET change = ?, signer = ?, assertion = ? WHERE id = ? AND op = 'add' AND expires_at > ?`,
-		change, signer, assertion, id, ms(now))
-	if err != nil {
-		return err
-	}
-	return oneRow(res, errNoKeyChange)
-}
-
 func (d *db) deleteKeyChange(ctx context.Context, id string) error {
 	res, err := d.sql.ExecContext(ctx, `DELETE FROM key_requests WHERE id = ?`, id)
 	if err != nil {
@@ -536,7 +516,7 @@ func (d *db) deleteKeyChange(ctx context.Context, id string) error {
 
 func (d *db) queryKeyChanges(ctx context.Context, where string, args ...any) ([]keyChange, error) {
 	rs, err := d.sql.QueryContext(ctx, `
-		SELECT id, op, name, credential_id, public_key, synced, aaguid, created_at, expires_at, change, signer, assertion
+		SELECT id, op, name, credential_id, public_key, synced, aaguid, created_at, expires_at
 		FROM key_requests `+where, args...)
 	if err != nil {
 		return nil, err
@@ -545,19 +525,14 @@ func (d *db) queryKeyChanges(ctx context.Context, where string, args ...any) ([]
 	var out []keyChange
 	for rs.Next() {
 		var (
-			c                 keyChange
-			created, expires  int64
-			change, assertion []byte
-			signer            sql.NullString
+			c                keyChange
+			created, expires int64
 		)
 		if err := rs.Scan(&c.ID, &c.Op, &c.Key.Name, &c.Key.CredentialID, &c.Key.PublicKey, &c.Key.Synced, &c.AAGUID,
-			&created, &expires, &change, &signer, &assertion); err != nil {
+			&created, &expires); err != nil {
 			return nil, err
 		}
 		c.CreatedAt, c.ExpiresAt = fromMS(created), fromMS(expires)
-		if change != nil {
-			c.Approved = &approval.SignedChange{Change: change, Signer: signer.String, Assertion: assertion}
-		}
 		out = append(out, c)
 	}
 	return out, rs.Err()

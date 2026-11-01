@@ -144,14 +144,6 @@ func (k *Keys) Apply(sc SignedChange) error {
 	return k.commit(next)
 }
 
-// Check verifies sc as Apply would, without appending it.
-func (k *Keys) Check(sc SignedChange) error {
-	k.mu.RLock()
-	defer k.mu.RUnlock()
-	next := k.st.clone()
-	return next.apply(sc, k.rpID, k.origin)
-}
-
 // Extend replaces the log with log if it begins with every entry held here
 // and the rest apply. An empty log thus trusts whatever first key it is
 // given.

@@ -63,13 +63,6 @@ let
     '';
   };
 
-  # Trusts a key addition a passkey approved in the console, through a
-  # socket in the console's state directory, which only root can reach.
-  confirmKey = pkgs.writeShellApplication {
-    name = "mandate-confirm-key";
-    text = ''exec ${exe} confirm-key --state ${state "console"} "$@"'';
-  };
-
   hardening = {
     NoNewPrivileges = true;
     ProtectSystem = "strict";
@@ -341,7 +334,6 @@ in
     environment.systemPackages = [
       cfg.package
       resetKeys
-      confirmKey
     ];
     system.checks = lib.mapAttrsToList (
       name: c:

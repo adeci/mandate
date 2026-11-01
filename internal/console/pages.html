@@ -340,17 +340,11 @@
     {{if .AAGUID}}<div><dt>AAGUID</dt><dd>{{.AAGUID}}{{with .Authenticator}} · {{.}}{{end}}</dd></div>{{end}}
     <div><dt>kind</dt><dd>{{if .Synced}}synced passkey{{else}}single-device key{{end}}</dd></div>
   </dl>
-  {{if .Approved}}
-  <p>Approved. To trust it, run on the server:</p>
-  <pre>sudo mandate-confirm-key {{.Fingerprint}}</pre>
-  <form method="post" action="/keys/changes/{{.ID}}/discard" class="actions"><button type="submit">Discard</button></form>
-  {{else}}
-  <p class="muted">Approve with any trusted key, from any device.{{if eq .Op "add"}} Then confirm it on the server.{{end}}</p>
+  <p class="muted">Approve with any trusted key, from any device.</p>
   <div class="actions two">
     <button type="button" class="primary" data-approve-key>Approve with passkey →</button>
     <form method="post" action="/keys/changes/{{.ID}}/discard"><button type="submit">Discard</button></form>
   </div>
-  {{end}}
   <p class="msg" role="status"></p>
 </section>
 {{end}}
@@ -365,7 +359,7 @@
     <input id="key-name" name="name" required maxlength="64" pattern="[\p{L}\p{N} ._\-]+" placeholder="phone" autocomplete="off">
     <button type="submit">+ Add key</button>
   </div>
-  {{if .Data.Keys}}<p class="hint">It waits until a trusted key approves it and you confirm it on the server.</p>{{end}}
+  {{if .Data.Keys}}<p class="hint">It waits until a trusted key approves it.</p>{{end}}
 </form>
 <p id="msg" class="msg" role="status"></p>
 </section>
