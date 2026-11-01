@@ -111,19 +111,19 @@ func (c *client) show(raw []byte) (proposal.Proposal, error) {
 func printProposal(w io.Writer, p proposal.Proposal) {
 	fmt.Fprintf(w, "%s %s: %s %s\n", p.ID, p.Status, p.Connector, p.Op)
 	for _, f := range p.Display {
-		fmt.Fprintf(w, "  %s: %s\n", f.Label, strings.ReplaceAll(f.Value, "\n", "\n    "))
+		fmt.Fprintf(w, "  %s: %s\n", sanitize(f.Label), strings.ReplaceAll(sanitize(f.Value), "\n", "\n    "))
 	}
 	if r := p.Result; r != nil {
 		fmt.Fprintf(w, "result: %s", r.Status)
 		if r.Ref != "" {
-			fmt.Fprintf(w, " ref=%s", r.Ref)
+			fmt.Fprintf(w, " ref=%s", sanitize(r.Ref))
 		}
 		if r.Detail != "" {
-			fmt.Fprintf(w, " (%s)", r.Detail)
+			fmt.Fprintf(w, " (%s)", sanitize(r.Detail))
 		}
 		fmt.Fprintln(w)
 		if r.Output != "" {
-			fmt.Fprintln(w, r.Output)
+			fmt.Fprintln(w, sanitize(r.Output))
 		}
 	}
 	if pending(p.Status) && p.URL != "" {
@@ -134,7 +134,7 @@ func printProposal(w io.Writer, p proposal.Proposal) {
 func outcome(p proposal.Proposal, waited time.Duration) error {
 	detail := ""
 	if p.Result != nil && p.Result.Detail != "" {
-		detail = ": " + p.Result.Detail
+		detail = ": " + sanitize(p.Result.Detail)
 	}
 	switch p.Status {
 	case proposal.Done:

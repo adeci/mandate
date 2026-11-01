@@ -69,6 +69,7 @@ pkgs.testers.runNixOSTest {
             reads = [ "GET /items" ];
             writes = [ "POST /items" ];
           };
+          serviceConfig.IPAddressAllow = [ "127.0.0.1" ];
         };
       };
     };
@@ -140,8 +141,12 @@ pkgs.testers.runNixOSTest {
         return curl(f"-X {method} -b {jar} -c {jar} --cacert /var/lib/acme/${host}/chain.pem "
                     f"--resolve ${host}:443:127.0.0.1 https://${host}{path}", body)
 
+    # Run as the gateway, which may read a connector's health and key head.
+    def connector_get(name, path):
+        return f"sudo -u mandate-gateway curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/{path}"
+
     def connector_keys(name):
-        return json.loads(machine.succeed(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/keys"))
+        return json.loads(machine.succeed(connector_get(name, "keys")))
 
     def recorded():
         lines = machine.succeed("cat /var/lib/recorder/log.jsonl 2>/dev/null || true").splitlines()
@@ -203,10 +208,10 @@ pkgs.testers.runNixOSTest {
     with subtest("unlinked WhatsApp, Discord, Signal, Matrix, Fastmail and Google Messages ask for the owner"):
         code, out = gw("POST", "/v1/whatsapp/send", {"args": {"chat": "fam@g.us", "text": "hi"}})
         assert code == 503 and "https://${host}/connections" in out["error"], (code, out)
-        health = json.loads(machine.succeed("curl -s --unix-socket /run/mandate-discord/connector.sock http://connector/health"))
+        health = json.loads(machine.succeed(connector_get("discord", "health")))
         assert health == {"state": "setup", "detail": "needs a token"}, health
         for name in ["signal", "matrix", "fastmail", "gmessages"]:
-            health = json.loads(machine.succeed(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/health"))
+            health = json.loads(machine.succeed(connector_get(name, "health")))
             assert health == {"state": "setup", "detail": "not linked"}, (name, health)
 
     with subtest("the owner sets the API token in the console, which never shows it"):
@@ -265,7 +270,7 @@ pkgs.testers.runNixOSTest {
         code, out = console("POST", "/keys", registration(options))
         assert code == 200 and out["trusted"], (code, out)
         for name in ["whatsapp", "discord", "http"]:
-            machine.wait_until_succeeds(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/keys | grep -q '\"length\":1'")
+            machine.wait_until_succeeds(connector_get(name, "keys") + " | grep -q '\"length\":1'")
         code, _ = console("GET", "/session")
         assert code == 401, code
         code, _ = console("POST", "/login", {"password": admin_password})
@@ -279,18 +284,17 @@ pkgs.testers.runNixOSTest {
                   "issued_at": "2026-10-31T00:00:00Z",
                   "assertion": {"id": "eA", "rawId": "eA", "type": "public-key", "response": {}}}
         data = base64.b64encode(json.dumps(forged).encode()).decode()
-        code = machine.succeed(
-            f"echo {data} | base64 -d | sudo -u mandate-gateway curl -s -o /dev/null -w '%{{http_code}}' "
-            "--unix-socket /run/mandate-http/connector.sock --data-binary @- http://connector/execute"
-        )
-        assert code == "403", code
-        code = machine.succeed(
-            "echo '[]' | sudo -u mandate-gateway curl -s -o /dev/null -w '%{http_code}' -X PUT "
-            "--unix-socket /run/mandate-http/connector.sock --data-binary @- http://connector/keys"
-        )
-        assert code == "409", code
+        for method, path, body in [("POST", "execute", data), ("PUT", "keys", base64.b64encode(b"[]").decode()),
+                                   ("POST", "setup", base64.b64encode(b"{}").decode()), ("POST", "unlink", "")]:
+            code = machine.succeed(
+                f"echo {body} | base64 -d | sudo -u mandate-gateway curl -s -o /dev/null -w '%{{http_code}}' -X {method} "
+                f"--unix-socket /run/mandate-http/connector.sock --data-binary @- http://connector/{path}"
+            )
+            assert code == "403", (path, code)
         assert connector_keys("http")["length"] == 1
         assert len(recorded()) == 1
+        code = machine.succeed("sudo -u mandate-gateway curl -s -o /dev/null -w '%{http_code}' --unix-socket /run/mandate-http/connector.sock http://connector/health")
+        assert code == "200", code
 
     with subtest("the owner edits and approves with the key; the API gets exactly that, once"):
         code, ch = console("POST", f"/r/{pid}/challenge", {"edits": {"body": "{\"text\": \"edited\"}"}})
@@ -312,7 +316,7 @@ pkgs.testers.runNixOSTest {
         assert code == 409, code
         machine.succeed("systemctl restart mandate-gateway.service mandate-console.service mandate-http.service")
         machine.wait_for_open_port(443)
-        machine.wait_until_succeeds("curl -s --unix-socket /run/mandate-http/connector.sock http://connector/keys | grep -q '\"length\":1'")
+        machine.wait_until_succeeds(connector_get("http", "keys") + " | grep -q '\"length\":1'")
         code, _ = console("POST", f"/r/{pid}/approve", approved)
         assert code == 409, code
         assert len(recorded()) == 2
@@ -440,7 +444,7 @@ pkgs.testers.runNixOSTest {
         machine.fail(f"sudo -u mandate-gateway mandate-confirm-key {fingerprint}")
         assert "laptop is trusted" in machine.succeed(f"mandate-confirm-key {fingerprint}")
         for name in ["whatsapp", "discord", "http"]:
-            machine.wait_until_succeeds(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/keys | grep -q '\"length\":2'")
+            machine.wait_until_succeeds(connector_get(name, "keys") + " | grep -q '\"length\":2'")
         code, options = console("POST", "/login/options", {}, jar="/tmp/laptopjar")
         code, out = console("POST", "/login", {"assertion": assertion(options, key=laptop, cred=laptop_cred)}, jar="/tmp/laptopjar")
         assert code == 200, (code, out)
@@ -449,7 +453,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed("mandate-reset-keys")
         machine.wait_for_open_port(443)
         for name in ["whatsapp", "discord", "http"]:
-            machine.wait_until_succeeds(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/keys | grep -q '\"length\":0'")
+            machine.wait_until_succeeds(connector_get(name, "keys") + " | grep -q '\"length\":0'")
         code, out = console("POST", "/login", {"password": admin_password}, jar="/tmp/resetjar")
         assert code == 200, (code, out)
 
@@ -469,5 +473,20 @@ pkgs.testers.runNixOSTest {
         for unit in ["mandate-gateway", "mandate-whatsapp", "mandate-discord", "mandate-signal", "mandate-matrix", "mandate-fastmail", "mandate-gmessages", "mandate-console", "mandate-http"]:
             machine.succeed(f"systemctl show -p MemoryDenyWriteExecute --value {unit} | grep -qx yes")
         machine.succeed("systemctl show -p CapabilityBoundingSet --value mandate-console | grep -qx cap_net_bind_service")
+
+    with subtest("connectors reach private addresses only where allowed"):
+        for unit in ["mandate-whatsapp", "mandate-discord", "mandate-signal", "mandate-matrix", "mandate-fastmail", "mandate-gmessages", "mandate-http"]:
+            deny = machine.succeed(f"systemctl show -p IPAddressDeny --value {unit}").split()
+            assert {"127.0.0.0/8", "10.0.0.0/8", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7"} <= set(deny), (unit, deny)
+            assert "127.0.0.53/32" in machine.succeed(f"systemctl show -p IPAddressAllow --value {unit}").split(), unit
+            machine.succeed(f"systemctl is-active {unit}")
+        assert "127.0.0.1/32" in machine.succeed("systemctl show -p IPAddressAllow --value mandate-http").split()
+
+        # The filter belongs to the unit's cgroup, so a curl moved into it is held to it.
+        def curl_as(unit):
+            return (f"sh -c 'echo $$ > /sys/fs/cgroup/system.slice/{unit}.service/cgroup.procs"
+                    " && exec curl -sf -o /dev/null --max-time 5 http://127.0.0.1:9000/items'")
+        machine.fail(curl_as("mandate-whatsapp"))
+        machine.succeed(curl_as("mandate-http"))
   '';
 }

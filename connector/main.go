@@ -12,7 +12,9 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"syscall"
 
 	"github.com/adeci/mandate/approval"
@@ -86,13 +88,16 @@ func (e *Env) Fail(err error) { e.fail(err) }
 // Main runs a connector program:
 //
 //	NAME --socket PATH --state DIR [--config FILE] [--rp-id ID --origin URL]
+//	     [--console-user USER] [--gateway-user USER]
 //	NAME --check-config FILE
 //
 // It decodes --config strictly into C (no file decodes "{}"), runs its
 // Validate method if it has one, then calls start and serves the protocol
 // until SIGINT or SIGTERM. --check-config only decodes and validates.
 // Trusted keys live in DIR/private/keys.json and change through PUT /keys.
-// Without --rp-id and --origin there are none and writes are refused. If the
+// Without --rp-id and --origin there are none and writes are refused. Only
+// the console user may set up, unlink, execute and push keys; the gateway
+// user may call the rest. Either defaults to the user Main runs as. If the
 // Connector is an io.Closer, it is closed after serving stops.
 func Main[C any](start func(ctx context.Context, env *Env, cfg C) (Connector, error)) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
@@ -116,6 +121,8 @@ func run[C any](ctx context.Context, name string, args []string, start func(cont
 	checkPath := flags.String("check-config", "", "only validate this settings file, then exit")
 	rpID := flags.String("rp-id", "", "WebAuthn relying party ID of the console")
 	origin := flags.String("origin", "", "origin of the console, e.g. https://mandate.example.com")
+	consoleUser := flags.String("console-user", "", "user of the console, which alone may set up, unlink, execute and push keys (default: this process's)")
+	gatewayUser := flags.String("gateway-user", "", "user of the gateway, which may read and prepare (default: this process's)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -136,6 +143,13 @@ func run[C any](ctx context.Context, name string, args []string, start func(cont
 	if err != nil {
 		return err
 	}
+	peers := &Peers{}
+	if peers.Console, err = lookupUID(*consoleUser); err != nil {
+		return fmt.Errorf("--console-user: %w", err)
+	}
+	if peers.Gateway, err = lookupUID(*gatewayUser); err != nil {
+		return fmt.Errorf("--gateway-user: %w", err)
+	}
 	env := &Env{StateDir: *stateDir, Log: slog.Default()}
 	if err := os.MkdirAll(env.PrivateDir(), 0o700); err != nil {
 		return err
@@ -144,7 +158,7 @@ func run[C any](ctx context.Context, name string, args []string, start func(cont
 	if err := os.Chmod(env.PrivateDir(), 0o700); err != nil {
 		return err
 	}
-	srv := &Server{Log: env.Log}
+	srv := &Server{Log: env.Log, Peers: peers}
 	if *rpID == "" {
 		env.Log.Warn("no --rp-id and --origin; writes are refused")
 	} else {
@@ -172,6 +186,19 @@ func run[C any](ctx context.Context, name string, args []string, start func(cont
 		return cause
 	}
 	return nil
+}
+
+// lookupUID resolves name, or the current user for "".
+func lookupUID(name string) (uint32, error) {
+	if name == "" {
+		return uint32(os.Getuid()), nil
+	}
+	u, err := user.Lookup(name)
+	if err != nil {
+		return 0, err
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	return uint32(uid), err
 }
 
 func loadConfig[C any](path string) (C, error) {

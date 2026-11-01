@@ -50,7 +50,8 @@ usage:
 Run mandate <connector> --help for its commands.
 
 Output is TSV with a header line (a table on a terminal), or JSON with --json.
-TSV escapes backslash, tab and newline in values as \\, \t and \n. Times are UTC.
+TSV escapes backslash, tab, newline and CR in values as \\, \t, \n and \r, and
+other control characters as \xHH or \uHHHH. Times are UTC.
 After proposing, tell the owner it is waiting, then run mandate status ID --wait 15m.
 
 exit codes:
