@@ -157,8 +157,7 @@ func (s *Server) nameTaken(pending []keyChange, name string) bool {
 }
 
 // addKey finishes a registration. The first key is trusted at once; any
-// later one waits for a trusted key to approve it and then for the owner to
-// confirm it on the server.
+// later one waits for a trusted key to approve it.
 func (s *Server) addKey(w http.ResponseWriter, r *http.Request, sess session) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
@@ -282,10 +281,6 @@ func (s *Server) keyChallenge(w http.ResponseWriter, r *http.Request, _ session)
 		connector.WriteError(w, notFound(err))
 		return
 	}
-	if c.Approved != nil {
-		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: "already approved; confirm it on the server"})
-		return
-	}
 	change, err := s.keys.Next(c.Op, c.Key, s.now())
 	if err != nil {
 		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: err.Error()})
@@ -328,14 +323,7 @@ func (s *Server) approveKeyChange(w http.ResponseWriter, r *http.Request, sess s
 		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: "this is not the change that is waiting"})
 		return
 	}
-	sc := approval.SignedChange{Change: change, Signer: b64(assertionRawID(req.Assertion)), Assertion: req.Assertion}
-	// An addition also waits for the owner on the server: script on this
-	// origin could get one touch to sign the addition of its own key.
-	if c.Op == approval.OpAdd {
-		err = s.keys.Check(sc)
-	} else {
-		err = s.keys.Apply(sc)
-	}
+	err = s.keys.Apply(approval.SignedChange{Change: change, Signer: b64(assertionRawID(req.Assertion)), Assertion: req.Assertion})
 	if errors.Is(err, approval.ErrOutOfOrder) {
 		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: "the keys changed meanwhile; start again"})
 		return
@@ -343,15 +331,6 @@ func (s *Server) approveKeyChange(w http.ResponseWriter, r *http.Request, sess s
 	if err != nil {
 		s.cfg.Log.Warn("key change refused", "id", id, "err", err)
 		connector.WriteError(w, forbidden(err))
-		return
-	}
-	if c.Op == approval.OpAdd {
-		if err := s.db.approveKeyChange(ctx, id, &sc, s.now()); err != nil {
-			connector.WriteError(w, notFound(err))
-			return
-		}
-		s.cfg.Log.Info("key addition waiting for the server", "key", c.Key.Name, "fingerprint", fingerprint(c.Key), "session", sess.who())
-		connector.WriteJSON(w, http.StatusOK, struct{}{})
 		return
 	}
 	if err := s.db.deleteKeyChange(ctx, id); err != nil {
@@ -362,61 +341,7 @@ func (s *Server) approveKeyChange(w http.ResponseWriter, r *http.Request, sess s
 	connector.WriteJSON(w, http.StatusOK, struct{}{})
 }
 
-type confirmRequest struct {
-	Fingerprint string `json:"fingerprint"`
-}
-
-type confirmResponse struct {
-	Name string `json:"name"`
-}
-
-// confirmKey applies the approved addition of the key with the given
-// fingerprint. It is served only on the admin socket.
-func (s *Server) confirmKey(w http.ResponseWriter, r *http.Request) {
-	var req confirmRequest
-	if !connector.DecodeJSON(w, r, &req, maxBody) {
-		return
-	}
-	ctx := r.Context()
-	changes, err := s.db.keyChanges(ctx, s.now())
-	if err != nil {
-		connector.WriteError(w, err)
-		return
-	}
-	i := slices.IndexFunc(changes, func(c keyChange) bool {
-		return c.Op == approval.OpAdd && fingerprint(c.Key) == req.Fingerprint
-	})
-	if i < 0 {
-		connector.WriteError(w, &connector.Error{Status: http.StatusNotFound, Message: fmt.Sprintf("no key with fingerprint %q is waiting to be added", req.Fingerprint)})
-		return
-	}
-	c := changes[i]
-	if c.Approved == nil {
-		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: fmt.Sprintf("approve adding %q with a trusted passkey in the console first", c.Key.Name)})
-		return
-	}
-	err = s.keys.Apply(*c.Approved)
-	if errors.Is(err, approval.ErrOutOfOrder) {
-		if err := s.db.approveKeyChange(ctx, c.ID, nil, s.now()); err != nil {
-			s.cfg.Log.Error("clear stale key approval", "id", c.ID, "err", err)
-		}
-		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: fmt.Sprintf("the keys changed since adding %q was approved; approve it again in the console", c.Key.Name)})
-		return
-	}
-	if err != nil {
-		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: err.Error()})
-		return
-	}
-	if err := s.db.deleteKeyChange(ctx, c.ID); err != nil {
-		s.cfg.Log.Error("delete applied key change", "id", c.ID, "err", err)
-	}
-	s.cfg.Log.Info("key change applied", "op", approval.OpAdd, "key", c.Key.Name, "by", "the server")
-	s.syncKeys(ctx)
-	connector.WriteJSON(w, http.StatusOK, confirmResponse{Name: c.Key.Name})
-}
-
-// fingerprint is a short hash of a credential for the owner to compare and
-// type on the server.
+// fingerprint is a short hash of a credential, for telling keys apart.
 func fingerprint(k approval.Key) string {
 	h := sha256.Sum256([]byte(k.CredentialID + "." + k.PublicKey))
 	x := hex.EncodeToString(h[:8])
@@ -495,7 +420,7 @@ type keyView struct {
 type keyChangeView struct {
 	ID, Op, Name, Left                 string
 	Fingerprint, AAGUID, Authenticator string
-	Synced, Approved                   bool
+	Synced                             bool
 }
 
 type keysView struct {
@@ -534,7 +459,7 @@ func (s *Server) keysPage(w http.ResponseWriter, r *http.Request, sess session) 
 		v.Changes = append(v.Changes, keyChangeView{
 			ID: c.ID, Op: c.Op, Name: c.Key.Name, Left: left(c.ExpiresAt.Sub(now)),
 			Fingerprint: fingerprint(c.Key), AAGUID: aaguid, Authenticator: authenticators[aaguid],
-			Synced: c.Key.Synced, Approved: c.Approved != nil,
+			Synced: c.Key.Synced,
 		})
 	}
 	v.Problems = s.keysProblems()

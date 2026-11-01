@@ -422,12 +422,15 @@ pkgs.testers.runNixOSTest {
         sent = [json.loads(r["body"]) for r in recorded()[2:]]
         assert sent == [{"text": "first"}, {"text": "second"}], sent
 
-    with subtest("a key a passkey approved waits for mandate-confirm-key on the server"):
+    with subtest("a trusted key approves a second one, which reaches every connector and signs in"):
         laptop, laptop_cred = ec.generate_private_key(ec.SECP256R1()), b"mandate-vm-test-laptop"
         code, options = console("POST", "/keys/options", {"name": "laptop"}, jar="/tmp/keyjar")
         assert code == 200, (code, options)
         code, out = console("POST", "/keys", registration(options, laptop, laptop_cred), jar="/tmp/keyjar")
         assert code == 200 and not out["trusted"], (code, out)
+        code, options = console("POST", "/login/options", {}, jar="/tmp/laptopjar")
+        code, _ = console("POST", "/login", {"assertion": assertion(options, key=laptop, cred=laptop_cred)}, jar="/tmp/laptopjar")
+        assert code == 403, code
         code, page = console("GET", "/keys", jar="/tmp/keyjar")
         [change] = re.findall(r'data-change="([^"]+)"', page)
         code, ch = console("POST", f"/keys/changes/{change}/challenge", jar="/tmp/keyjar")
@@ -435,14 +438,6 @@ pkgs.testers.runNixOSTest {
         code, out = console("POST", f"/keys/changes/{change}/approve",
                             {"change": ch["change"], "assertion": assertion(ch["options"])}, jar="/tmp/keyjar")
         assert code == 200, (code, out)
-        code, page = console("GET", "/keys", jar="/tmp/keyjar")
-        [fingerprint] = re.findall(r"sudo mandate-confirm-key ([0-9a-f-]+)", page)
-        assert connector_keys("http")["length"] == 1
-        code, options = console("POST", "/login/options", {}, jar="/tmp/laptopjar")
-        code, _ = console("POST", "/login", {"assertion": assertion(options, key=laptop, cred=laptop_cred)}, jar="/tmp/laptopjar")
-        assert code == 403, code
-        machine.fail(f"sudo -u mandate-gateway mandate-confirm-key {fingerprint}")
-        assert "laptop is trusted" in machine.succeed(f"mandate-confirm-key {fingerprint}")
         for name in ["whatsapp", "discord", "http"]:
             machine.wait_until_succeeds(connector_get(name, "keys") + " | grep -q '\"length\":2'")
         code, options = console("POST", "/login/options", {}, jar="/tmp/laptopjar")

@@ -50,11 +50,11 @@ instructions.
 
 Writes wait in the console's inbox. Approving with a passkey unlocks the tab
 for 10 minutes, so further approvals need no touch; lock or close the tab to
-end it sooner. Adding or removing passkeys needs a trusted one; an added
-passkey then waits until you run the `sudo mandate-confirm-key` command the
-console shows. Once a passkey is trusted, the admin password no longer signs
-in. Lost them all? `sudo mandate-reset-keys` lets the admin password sign in
-and add a first key again.
+end it sooner. To add a passkey, register it under Keys and approve the
+addition with a trusted one; removing one needs a trusted one too. Once a
+passkey is trusted, the admin password no longer signs in. Lost them all?
+`sudo mandate-reset-keys` lets the admin password sign in and add a first key
+again.
 
 To hide a chat from agents, list it in
 `/var/lib/mandate-gateway/exposure.toml`:

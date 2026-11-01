@@ -44,8 +44,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 DROP TABLE IF EXISTS passkeys;
 DROP TABLE IF EXISTS key_changes;
 
--- Key changes waiting for a trusted key to approve them, and approved
--- additions waiting for the owner to confirm them on the server.
+-- Key changes waiting for a trusted key to approve them.
 CREATE TABLE IF NOT EXISTS key_requests (
     id            TEXT PRIMARY KEY,
     op            TEXT NOT NULL,     -- add | remove
@@ -55,9 +54,5 @@ CREATE TABLE IF NOT EXISTS key_requests (
     synced        INTEGER NOT NULL,
     aaguid        BLOB,              -- the authenticator's model, for additions
     created_at    INTEGER NOT NULL,
-    expires_at    INTEGER NOT NULL,
-    -- The approved log entry of an addition, applied once confirmed.
-    change        BLOB,
-    signer        TEXT,
-    assertion     BLOB
+    expires_at    INTEGER NOT NULL
 ) STRICT;

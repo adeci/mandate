@@ -177,14 +177,6 @@ func (s *Server) ProposalHandler() http.Handler {
 	return mux
 }
 
-// AdminHandler serves the owner's commands on the server, on a socket in
-// the state directory, which only root and the console's user can reach.
-func (s *Server) AdminHandler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /keys/confirm", s.confirmKey)
-	return mux
-}
-
 func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	var req proposal.Request
 	if !connector.DecodeJSON(w, r, &req, maxBody) {
