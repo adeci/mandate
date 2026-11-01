@@ -224,6 +224,33 @@ func TestSetupLinksAndUnlinkForgets(t *testing.T) {
 	link()
 }
 
+// A setup that fails partway removes the tokens it already stored, so a
+// restart doesn't come up half linked.
+func TestFailedSetupStoresNothing(t *testing.T) {
+	t.Parallel()
+	env := newEnv(t)
+	cfg, err := parse([]byte(`{"services":{
+		"a":{"base_url":"https://a.example","reads":["GET /x"]},
+		"b":{"base_url":"https://b.example","reads":["GET /x"]}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(cfg, env.Secret, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// b's token can't be written over a directory; a's is stored first.
+	if err := os.Mkdir(filepath.Join(env.PrivateDir(), "b"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Setup(context.Background(), map[string]string{"a": token, "b": token}); err == nil {
+		t.Fatal("setup succeeded")
+	}
+	if _, err := os.Stat(filepath.Join(env.PrivateDir(), "a")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a's token left behind: %v", err)
+	}
+}
+
 type reply struct {
 	StatusCode int
 	Header     http.Header

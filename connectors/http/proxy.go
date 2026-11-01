@@ -152,8 +152,12 @@ func (p *Proxy) Setup(_ context.Context, args map[string]string) (connector.Setu
 		}
 		byName[name] = token
 	}
-	for _, name := range p.names {
+	for i, name := range p.names {
 		if err := p.secret(name).Store([]byte(byName[name])); err != nil {
+			// A failed setup leaves nothing behind for the next start to load.
+			for _, stored := range p.names[:i] {
+				_ = p.secret(stored).Delete()
+			}
 			return connector.SetupStep{}, fmt.Errorf("service %s: %w", name, err)
 		}
 	}
