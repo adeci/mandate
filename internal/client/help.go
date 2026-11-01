@@ -144,8 +144,8 @@ func writeConnectorHelp(w io.Writer, ci connectorInfo) {
 	fmt.Fprintln(w)
 	if ci.Source {
 		fmt.Fprintln(w, "Chats are addressed by id: find one with chats --search, then pass its id.")
-		fmt.Fprintln(w, "sender me is the owner; reply_to is the seq replied to. Bodies mark media as")
-		fmt.Fprintln(w, "[image] and the like, deleted messages as [deleted], login codes as [login code hidden].")
+		fmt.Fprintln(w, "sender me is the owner; reply_to is the seq replied to. Bodies may carry [image]")
+		fmt.Fprintln(w, "(or another media type), [deleted] or [login code hidden].")
 		fmt.Fprintln(w, "When more rows exist, stderr gives the --before value for the next page.")
 		if reads {
 			fmt.Fprintln(w, "Read ops print messages in search's columns.")
