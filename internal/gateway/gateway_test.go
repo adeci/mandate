@@ -242,6 +242,33 @@ func TestVerbsOrderBySentTimeAcrossIngestOrder(t *testing.T) {
 	}
 }
 
+// A connector built before last_message_at existed still lists its chats,
+// dated by stored messages alone.
+func TestChatsOnDatabaseWithoutLastMessageAt(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.db")
+	st, err := store.Open(context.Background(), path)
+	mustDo(t, err)
+	mustDo(t, st.UpsertContainer(context.Background(), store.Container{ID: "c1", Kind: "dm"}))
+	mustDo(t, st.UpsertMessage(context.Background(), store.Message{
+		ID: "m", ContainerID: "c1", SenderID: "u1", Body: "hi",
+		SentAt: time.Date(2026, 10, 30, 9, 0, 0, 0, time.UTC),
+	}))
+	_, err = st.DB().ExecContext(context.Background(), `ALTER TABLE containers DROP COLUMN last_message_at`)
+	mustDo(t, err)
+	mustDo(t, st.Close())
+	h := newHandler(Config{Sources: map[string]string{"wa": path}, ExposureFile: filepath.Join(dir, "exposure.toml"), Timeout: 2 * time.Second}, testToken)
+
+	status, res, body := getTable(t, h, "/v1/wa/chats")
+	if status != http.StatusOK {
+		t.Fatalf("chats = %d %s", status, body)
+	}
+	if got := column(t, res, "last_message"); !slices.Equal(got, []any{"2026-10-30 09:00"}) {
+		t.Errorf("last_message = %v", got)
+	}
+}
+
 // A connector's data.db appears when it first stores something; until then
 // its source reads as empty.
 func TestSourceAppearsOnceItsDatabaseExists(t *testing.T) {

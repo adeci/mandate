@@ -99,6 +99,22 @@ func (h *handler) openSource(ctx context.Context, name string) (_ *source, err e
 		}); err != nil {
 		return nil, err
 	}
+	// Connectors built before last_message_at existed have no such column; a
+	// temp view, which shadows the table, adds it as unknown.
+	stmt, _, err := db.Prepare(`SELECT count(*) FROM pragma_table_info('containers') WHERE name = 'last_message_at'`)
+	if err != nil {
+		return nil, err
+	}
+	stmt.Step()
+	missing := stmt.ColumnInt(0) == 0
+	if err := stmt.Close(); err != nil {
+		return nil, err
+	}
+	if missing {
+		if err := db.Exec(`CREATE TEMP VIEW containers AS SELECT *, NULL AS last_message_at FROM main.containers`); err != nil {
+			return nil, err
+		}
+	}
 	db.SetInterrupt(ctx)
 	s.db = db
 	return s, nil
