@@ -183,7 +183,7 @@ pkgs.testers.runNixOSTest {
         code, out = gw("GET", "/v1/whatsapp/chats")
         assert code == 200 and [r[0] for r in out["rows"]] == ["fam@g.us"], (code, out)
         code, out = gw("GET", "/v1/whatsapp/messages?chat=fam@g.us")
-        assert [r[-1] for r in out["rows"]] == [None, "dinner at 7?"], out
+        assert [r[-1] for r in out["rows"]] == ["[login code hidden]", "dinner at 7?"], out
         code, out = gw("GET", "/v1/whatsapp/messages?chat=hidden@s.whatsapp.net")
         assert code == 404, (code, out)
         code, out = gw("GET", "/v1/whatsapp/messages?chat=Family")
