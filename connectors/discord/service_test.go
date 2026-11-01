@@ -134,6 +134,7 @@ type harness struct {
 	t         *testing.T
 	clock     *fakeClock
 	discord   *fakeDiscord
+	gw        *fakeGateway
 	srv       *httptest.Server
 	st        *store.Store
 	statePath string
@@ -220,6 +221,7 @@ func newHarness(t *testing.T, seed func(*state)) *harness {
 	h.discord.reply(api("/channels/"+dmID+"/messages"), 200, dmMessagesBody)
 	h.srv = httptest.NewServer(h.discord)
 	t.Cleanup(h.srv.Close)
+	h.gw = newFakeGateway(t)
 
 	st, err := store.Open(context.Background(), filepath.Join(dir, "data.db"))
 	if err != nil {
@@ -228,7 +230,7 @@ func newHarness(t *testing.T, seed func(*state)) *harness {
 	t.Cleanup(func() { st.Close() })
 	h.st = st
 
-	s := &state{BuildNumber: defaultBuildNumber, BuildCheckedAt: noon}
+	s := &state{BuildNumber: defaultBuildNumber, BuildCheckedAt: noon, InstallationID: testInstallation}
 	if seed != nil {
 		seed(s)
 	}
@@ -241,9 +243,10 @@ func newHarness(t *testing.T, seed func(*state)) *harness {
 			h.stop()
 		}
 		for _, x := range h.discord.all() {
-			send := x.method == http.MethodPost && strings.HasPrefix(x.path, api("/channels/")) && strings.HasSuffix(x.path, "/messages")
-			if x.method != http.MethodGet && !send {
-				t.Errorf("upstream %s %s: only GET and sending a message are allowed", x.method, x.path)
+			write := x.method == http.MethodPost && strings.HasPrefix(x.path, api("/channels/")) &&
+				(strings.HasSuffix(x.path, "/messages") || strings.HasSuffix(x.path, "/typing"))
+			if x.method != http.MethodGet && !write {
+				t.Errorf("upstream %s %s: only GET, typing and sending a message are allowed", x.method, x.path)
 			}
 		}
 		logs := h.logs.String()
@@ -261,17 +264,19 @@ func (h *harness) start() {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	h.done = make(chan error, 1)
 	cfg := config{
-		store:     h.st,
-		statePath: h.statePath,
-		token:     h.token,
-		timezone:  "America/New_York",
-		transport: &fhttp.Client{},
-		apiBase:   h.srv.URL + "/api/v9",
-		webBase:   h.srv.URL,
-		clock:     h.clock,
-		rng:       fixedRand(0.5),
-		log:       slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
-		fail:      cancel,
+		store:       h.st,
+		statePath:   h.statePath,
+		token:       h.token,
+		timezone:    "America/New_York",
+		transport:   &fhttp.Client{},
+		apiBase:     h.srv.URL + "/api/v9",
+		webBase:     h.srv.URL,
+		gatewayURL:  h.gw.url,
+		dialGateway: testDial,
+		clock:       h.clock,
+		rng:         fixedRand(0.5),
+		log:         slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		fail:        cancel,
 	}
 	w, err := start(ctx, cfg)
 	if err != nil {
@@ -288,7 +293,7 @@ func (h *harness) start() {
 	for {
 		if c, err := net.Dial("unix", h.socket); err == nil {
 			c.Close()
-			return
+			break
 		}
 		select {
 		case err := <-h.done:
@@ -300,6 +305,8 @@ func (h *harness) start() {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	// A linked service is up once its gateway session is.
+	eventually(h.t, "the gateway session", func() bool { return w.svc.gw.health() == "" })
 }
 
 func (h *harness) stop() error {
@@ -533,7 +540,7 @@ func TestFetchUpsertsMessages(t *testing.T) {
 		t.Fatalf("upstream requests\n got %v\nwant %v", got, wantPaths)
 	}
 	m := h.discord.all()[2]
-	if m.query.Get("limit") != "50" || len(m.query) != 1 {
+	if m.query.Get("limit") != "10" || len(m.query) != 1 {
 		t.Errorf("fetch query %v", m.query)
 	}
 	if got := m.header.Get("Referer"); got != "https://discord.com/channels/@me/"+dmID {
@@ -553,6 +560,78 @@ func TestFetchUpsertsMessages(t *testing.T) {
 	}
 	if q := hits[3].query; q.Get("before") != msg4 || q.Get("limit") != "10" {
 		t.Errorf("second fetch query %v", q)
+	}
+}
+
+// Opening a chat loads the newest 10 messages and right away the 20 before
+// them, as the web client does; scrolling up loads 20 more each time.
+func TestFetchOpensLikeTheWebClient(t *testing.T) {
+	path := api("/channels/" + chanGeneral + "/messages")
+	const newest = 1300000000000001000
+	history := func(r *http.Request) []map[string]any {
+		start := newest
+		if b := r.URL.Query().Get("before"); b != "" {
+			start, _ = strconv.Atoi(b)
+			start--
+		}
+		n, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		var out []map[string]any
+		for id := start; id > start-n && id > newest-45; id-- {
+			out = append(out, map[string]any{
+				"id": strconv.Itoa(id), "channel_id": chanGeneral, "type": 0, "content": "x", "timestamp": "2026-10-28T12:00:00.000000+00:00",
+				"author": map[string]any{"id": aliceUser, "username": "alice"},
+			})
+		}
+		return out
+	}
+	tests := []struct {
+		limit string
+		pages []string // queries, in order
+		ids   int
+	}{
+		{"5", []string{"limit=10"}, 5},
+		{"30", []string{"limit=10", "before=1300000000000000991&limit=20"}, 30},
+		{"", []string{"limit=10", "before=1300000000000000991&limit=20", "before=1300000000000000971&limit=20"}, 45},
+	}
+	for _, tt := range tests {
+		t.Run("limit "+tt.limit, func(t *testing.T) {
+			h := newHarness(t, func(s *state) { s.SelfID, s.SelfCheckedAt = selfUser, noon })
+			if err := h.st.UpsertContainer(context.Background(), store.Container{ID: chanGeneral, Kind: kindChannel, ParentID: guildID}); err != nil {
+				t.Fatal(err)
+			}
+			h.discord.handle(path, func(w http.ResponseWriter, r *http.Request, _ int) {
+				connector.WriteJSON(w, http.StatusOK, history(r))
+			})
+			h.start()
+			args := map[string]string{"channel_id": chanGeneral}
+			if tt.limit != "" {
+				args["limit"] = tt.limit
+			}
+			var resp connector.ReadResult
+			h.callOK("fetch", args, &resp)
+			hits := h.discord.all()
+			var got []string
+			for _, x := range hits {
+				got = append(got, x.query.Encode())
+			}
+			if !slices.Equal(got, tt.pages) {
+				t.Fatalf("pages\n got %v\nwant %v", got, tt.pages)
+			}
+			if len(resp.MessageIDs) != tt.ids || resp.MessageIDs[0] != strconv.Itoa(newest) {
+				t.Errorf("%d ids, first %v", len(resp.MessageIDs), resp.MessageIDs[:1])
+			}
+			// The second page follows the first at once; later pages are paced.
+			if len(hits) > 1 {
+				if d := hits[1].at.Sub(hits[0].at); d > followMax {
+					t.Errorf("second page %v after the first", d)
+				}
+			}
+			if len(hits) > 2 {
+				if d := hits[2].at.Sub(hits[1].at); d < gapMin {
+					t.Errorf("third page %v after the second", d)
+				}
+			}
+		})
 	}
 }
 
@@ -915,6 +994,60 @@ func TestLinkUnlinkRelink(t *testing.T) {
 	}
 	if h.health().State != connector.Healthy {
 		t.Fatalf("after relink: health %+v", h.health())
+	}
+}
+
+// Discord issues the installation ID to a logged-out app, so linking starts
+// like the app before login; the ID then goes with every request and
+// identify, and outlives an unlink.
+func TestLinkStartsLoggedOut(t *testing.T) {
+	const (
+		fingerprint  = "1566000000000000001.ZmluZ2VycHJpbnRmaW5nZXJwcmlu"
+		installation = "1566000000000000002.aW5zdGFsbGF0aW9uaW5zdGFsbGF0"
+	)
+	h := newHarness(t, func(s *state) { s.InstallationID = "" })
+	if err := h.token.Delete(); err != nil {
+		t.Fatal(err)
+	}
+	h.discord.reply(api("/experiments"), 200, map[string]any{"fingerprint": fingerprint, "assignments": []any{}, "guild_experiments": []any{}})
+	h.discord.reply(api("/apex/experiments"), 200, map[string]any{"installation": installation, "assignments": []any{}})
+	h.start()
+	if err := h.setup(testToken); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{api("/experiments"), api("/apex/experiments"), api("/users/@me")}
+	if got := h.discord.paths(); !slices.Equal(got, want) {
+		t.Fatalf("requests\n got %v\nwant %v", got, want)
+	}
+	hits := h.discord.all()
+	exp, apex, me := hits[0], hits[1], hits[2]
+	if exp.header.Get("Authorization") != "" || exp.header.Get("X-Installation-Id") != "" ||
+		exp.header.Get("X-Context-Properties") != base64.StdEncoding.EncodeToString([]byte(`{"location":"Login"}`)) ||
+		exp.query.Get("with_guild_experiments") != "true" || exp.header.Get("Referer") != "https://discord.com/login" {
+		t.Errorf("/experiments %v %v", exp.query, exp.header)
+	}
+	if apex.header.Get("Authorization") != "" || apex.header.Get("X-Fingerprint") != fingerprint || apex.query.Get("surface") != "2" ||
+		apex.at.Sub(exp.at) > followMax {
+		t.Errorf("/apex/experiments %v %v", apex.query, apex.header)
+	}
+	if me.header.Get("Authorization") != testToken || me.header.Get("X-Installation-Id") != installation || me.header.Get("X-Fingerprint") != "" {
+		t.Errorf("/users/@me %v", me.header)
+	}
+	if h.state().InstallationID != installation {
+		t.Errorf("installation not kept: %q", h.state().InstallationID)
+	}
+	identify := h.gw.conn(t).next(t)
+	if !strings.Contains(identify.raw, `"installation_id":"`+installation+`"`) {
+		t.Errorf("identify %s", identify.D)
+	}
+	if err := h.client.Unlink(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.setup(testToken); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(h.discord.to(api("/experiments"))); n != 1 || h.state().InstallationID != installation {
+		t.Errorf("relink fetched /experiments %d times; installation %q", n, h.state().InstallationID)
 	}
 }
 

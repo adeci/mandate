@@ -121,7 +121,9 @@ type sendBody struct {
 	Flags             int    `json:"flags"`
 }
 
-// send never retries: once the POST is out, a failure is Unknown.
+// send shows the typing indicator, waits as long as typing the text takes,
+// then posts it. It never retries: once the message POST is out, a failure
+// is Unknown.
 func (s *service) send(ctx context.Context, dl time.Time, chat, text string) connector.Result {
 	c, err := s.storedContainer(ctx, chat)
 	if err != nil || c.ID == "" || !isSnowflake(chat) {
@@ -131,11 +133,17 @@ func (s *service) send(ctx context.Context, dl time.Time, chat, text string) con
 	if c.Kind == kindChannel || c.Kind == kindThread {
 		guild = c.ParentID
 	}
+	referer := channelURL(guild, chat)
+	typed, err := s.typing(ctx, dl, chat, referer, text)
+	if err != nil {
+		return connector.Result{Status: connector.Failed, Detail: err.Error()}
+	}
 	r := route{
 		template: "/channels/{channel_id}/messages",
 		path:     "/channels/" + chat + "/messages",
 		major:    chat,
-		referer:  channelURL(guild, chat),
+		referer:  referer,
+		context:  "chat_input",
 	}
 	// The nonce is made as the request goes out, as the client does.
 	body := func() []byte {
@@ -148,7 +156,7 @@ func (s *service) send(ctx context.Context, dl time.Time, chat, text string) con
 		return bytes.TrimSuffix(b.Bytes(), []byte("\n"))
 	}
 	var m apiMessage
-	maybeSent, err := s.up.post(ctx, dl, r, body, &m)
+	maybeSent, err := s.up.post(ctx, dl, kindFollow, r, typed, body, &m)
 	switch {
 	case err != nil && maybeSent:
 		return connector.Result{Status: connector.Unknown, Detail: err.Error()}
@@ -170,4 +178,24 @@ func (s *service) send(ctx context.Context, dl time.Time, chat, text string) con
 		res.Detail = "sent, but not stored: " + err.Error()
 	}
 	return res
+}
+
+// typing posts the typing indicator and returns when the message may follow.
+// Only a typing request that was never sent stops the send, since the
+// message would then skip the pacing gap.
+func (s *service) typing(ctx context.Context, dl time.Time, chat, referer, text string) (time.Time, error) {
+	r := route{
+		template: "/channels/{channel_id}/typing",
+		path:     "/channels/" + chat + "/typing",
+		major:    chat,
+		referer:  referer,
+	}
+	before := s.up.st.LastRequest
+	if _, err := s.up.post(ctx, dl, kindSend, r, time.Time{}, nil, nil); err != nil {
+		if s.up.st.LastRequest.Equal(before) || ctx.Err() != nil {
+			return time.Time{}, err
+		}
+		s.up.log.Warn("typing indicator failed; sending anyway", "chat", chat, "err", err)
+	}
+	return s.clock.Now().Add(s.up.pace.typingDelay(text)), nil
 }

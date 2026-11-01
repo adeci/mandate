@@ -1,9 +1,10 @@
-// Command mandate-discord is the on-demand Discord connector: it reads chats
-// and sends the messages the owner approves.
+// Command mandate-discord is the Discord connector: it reads chats, sends the
+// messages the owner approves, and keeps the gateway connection an open
+// Discord tab keeps, storing the messages it pushes.
 //
 // Account integrity comes first: every request looks like Chrome on Linux and
-// is paced like a person. Reads are GETs, a send is one POST, and nothing is
-// sent at startup.
+// is paced like a person. Reads are GETs, a send is a typing indicator and one
+// POST, and nothing but the gateway connection goes out at startup.
 package main
 
 import (
@@ -25,6 +26,7 @@ import (
 	fhttp "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
+	"github.com/bogdanfinn/websocket"
 
 	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/store"
@@ -49,19 +51,26 @@ func main() {
 			st.Close()
 			return nil, err
 		}
+		dial, err := newGatewayDialer()
+		if err != nil {
+			st.Close()
+			return nil, err
+		}
 		w, err := start(ctx, config{
-			store:     st,
-			statePath: filepath.Join(env.PrivateDir(), "state.json"),
-			token:     env.Secret("token"),
-			timezone:  tz,
-			transport: client,
-			jar:       jar,
-			apiBase:   defaultAPIBase,
-			webBase:   defaultWebBase,
-			clock:     realClock{},
-			rng:       globalRand{},
-			log:       env.Log,
-			fail:      env.Fail,
+			store:       st,
+			statePath:   filepath.Join(env.PrivateDir(), "state.json"),
+			token:       env.Secret("token"),
+			timezone:    tz,
+			transport:   client,
+			jar:         jar,
+			apiBase:     defaultAPIBase,
+			webBase:     defaultWebBase,
+			gatewayURL:  defaultGatewayURL,
+			dialGateway: dial,
+			clock:       realClock{},
+			rng:         globalRand{},
+			log:         env.Log,
+			fail:        env.Fail,
 		})
 		if err != nil {
 			st.Close()
@@ -79,8 +88,11 @@ type withStore struct {
 
 func (w withStore) Close() error { return errors.Join(w.worker.Close(), w.store.Close()) }
 
-// Chrome 152's TLS/HTTP2 fingerprint. Redirects are not followed: Discord
-// never redirects a logged-in browser.
+// tls-client's newest profile is Chrome 152 and the UA claims Chrome 156, the
+// owner's own browser on this account. Claiming 152 would make this session
+// an older Chrome than the owner's; a handshake a few releases behind its UA
+// is the smaller tell. Redirects are not followed: Discord never redirects a
+// logged-in browser.
 func newBrowserClient() (tls_client.HttpClient, tls_client.CookieJar, error) {
 	jar := tls_client.NewCookieJar()
 	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(),
@@ -94,6 +106,31 @@ func newBrowserClient() (tls_client.HttpClient, tls_client.CookieJar, error) {
 		return nil, nil, fmt.Errorf("create http client: %w", err)
 	}
 	return client, jar, nil
+}
+
+// newGatewayDialer opens WebSockets with the same TLS profile over HTTP/1.1,
+// as Chrome does.
+func newGatewayDialer() (dialFunc, error) {
+	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(),
+		tls_client.WithClientProfile(profiles.Chrome_152),
+		tls_client.WithRandomTLSExtensionOrder(),
+		tls_client.WithForceHttp1(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create websocket client: %w", err)
+	}
+	return func(ctx context.Context, url string, h fhttp.Header) (*websocket.Conn, error) {
+		ws, err := tls_client.NewWebsocket(tls_client.NewNoopLogger(),
+			tls_client.WithTlsClient(client),
+			tls_client.WithUrl(url),
+			tls_client.WithHeaders(h),
+			tls_client.WithHandshakeTimeoutMilliseconds(int(requestTimeout/time.Millisecond)),
+		)
+		if err != nil {
+			return nil, err
+		}
+		return ws.Connect(ctx)
+	}, nil
 }
 
 // Errors never include the token.
@@ -118,6 +155,8 @@ type config struct {
 	transport        transport
 	jar              fhttp.CookieJar // nil in tests
 	apiBase, webBase string
+	gatewayURL       string
+	dialGateway      dialFunc
 	clock            clock
 	rng              rng
 	log              *slog.Logger
@@ -168,8 +207,9 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 	// When ctx is done the worker stops before the socket shuts down, so a
 	// call still waiting for its slot is answered right away instead of
 	// holding up the exit.
+	gw := newGateway(cfg.gatewayURL, cfg.dialGateway, cfg.clock, cfg.rng, cfg.store, cfg.log)
 	w := &worker{
-		svc:   newService(cfg.store, up, cfg.clock),
+		svc:   newService(cfg.store, up, gw, cfg.clock),
 		token: cfg.token,
 		clock: cfg.clock,
 		ctx:   ctx,
@@ -179,6 +219,7 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 		log:   cfg.log,
 	}
 	w.snapshot()
+	w.syncGateway()
 	go func() {
 		defer close(w.done)
 		w.loop()
@@ -258,14 +299,27 @@ func (w *worker) Health(context.Context) connector.Health {
 	if until, why := p.rest(w.clock.Now()); !until.IsZero() {
 		return connector.Health{State: connector.Resting, Detail: why, Until: until}
 	}
+	if detail := w.svc.gw.health(); detail != "" {
+		return connector.Health{State: connector.Healthy, Detail: detail}
+	}
 	return connector.Health{State: connector.Healthy}
 }
 
 func (w *worker) loop() {
+	// A tab being closed.
+	defer w.svc.gw.stop(websocket.CloseGoingAway)
 	for {
 		select {
 		case <-w.ctx.Done():
 			return
+		case token := <-w.svc.gw.rejected:
+			if token == "" || token != w.svc.up.token {
+				continue // a token already replaced
+			}
+			w.svc.up.fatal = &ownerStop{"token rejected by the gateway (4004)", fixToken}
+			w.check()
+			w.snapshot()
+			w.syncGateway()
 		case j := <-w.jobs:
 			switch {
 			case j.link:
@@ -283,9 +337,37 @@ func (w *worker) loop() {
 			cancel()
 			w.check()
 			w.snapshot()
+			w.syncGateway()
 			j.done <- jobResult{v: v, err: err}
 		}
 	}
+}
+
+// syncGateway keeps the gateway connection open while the account is linked
+// and usable, for the tab the REST calls come from. It runs on the worker
+// goroutine, or before it starts.
+func (w *worker) syncGateway() {
+	up := w.svc.up
+	if up.token == "" || w.stopped != nil {
+		w.svc.gw.stop(closeNone)
+		return
+	}
+	st := up.st
+	// The web client reports an analytics session on connecting, starting
+	// a new one when the last has lapsed.
+	if now := w.clock.Now(); st.HeartbeatSessionID == "" || now.Sub(st.HeartbeatUsedAt) >= heartbeatTimeout {
+		up.touchHeartbeat(now)
+	}
+	t := tab{
+		token: up.token, buildNumber: st.buildNumber(), launchID: st.LaunchID, installationID: st.InstallationID,
+		heartbeatID: st.HeartbeatSessionID, heartbeatStart: st.HeartbeatStartedAt,
+	}
+	if up.relaunched {
+		up.relaunched = false
+		w.svc.gw.reload(t)
+		return
+	}
+	w.svc.gw.start(t)
 }
 
 // check acts on what upstream ran into. A rejected token is discarded so the
@@ -360,8 +442,11 @@ func (w *worker) link(ctx context.Context, dl time.Time, token string) error {
 	if err := w.forget(); err != nil {
 		return err
 	}
-	up.token = token
-	_, err := w.svc.selfID(ctx, dl)
+	err := up.ensureInstallation(ctx, dl)
+	if err == nil {
+		up.token = token
+		_, err = w.svc.selfID(ctx, dl)
+	}
 	if err != nil {
 		up.token = ""
 		var stop *ownerStop

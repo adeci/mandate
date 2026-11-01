@@ -3,14 +3,21 @@ package main
 import (
 	"context"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
 type fakeClock struct {
-	mu  sync.Mutex
-	now time.Time
+	mu      sync.Mutex
+	now     time.Time
+	waiters []waiter
+}
+
+type waiter struct {
+	at time.Time
+	ch chan time.Time
 }
 
 func (c *fakeClock) Now() time.Time {
@@ -27,13 +34,46 @@ func (c *fakeClock) Sleep(ctx context.Context, d time.Duration) error {
 	return nil
 }
 
+func (c *fakeClock) After(d time.Duration) <-chan time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ch := make(chan time.Time, 1)
+	if d <= 0 {
+		ch <- c.now
+		return ch
+	}
+	c.waiters = append(c.waiters, waiter{c.now.Add(d), ch})
+	return ch
+}
+
+// pending reports whether a timer is set for now+d.
+func (c *fakeClock) pending(d time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, w := range c.waiters {
+		if w.at.Equal(c.now.Add(d)) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *fakeClock) Advance(d time.Duration) {
 	if d <= 0 {
 		return
 	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.now = c.now.Add(d)
-	c.mu.Unlock()
+	kept := c.waiters[:0]
+	for _, w := range c.waiters {
+		if w.at.After(c.now) {
+			kept = append(kept, w)
+			continue
+		}
+		w.ch <- c.now
+	}
+	c.waiters = kept
 }
 
 type fixedRand float64
@@ -93,8 +133,27 @@ func TestAppOpenAfterIdle(t *testing.T) {
 		t.Errorf("first request waits %v, want 2s", slot.Sub(noon))
 	}
 	p.record(noon)
-	if slot, _ := p.slot(noon, kindSubresource, "js", time.Time{}); slot.Sub(noon) != 500*time.Millisecond {
-		t.Errorf("subresource waits %v", slot.Sub(noon))
+	if slot, _ := p.slot(noon, kindFollow, "js", time.Time{}); slot.Sub(noon) != 500*time.Millisecond {
+		t.Errorf("follow-up waits %v", slot.Sub(noon))
+	}
+	// A follow-up belongs to an action already under way, so a session break
+	// that began with the request before it does not hold it.
+	p.st.BreakUntil = noon.Add(10 * time.Minute)
+	if slot, reason := p.slot(noon, kindFollow, "r", noon.Add(3*time.Second)); reason != "follow-up" || !slot.Equal(noon.Add(3*time.Second)) {
+		t.Errorf("follow-up during a break: %v (%s)", slot.Sub(noon), reason)
+	}
+}
+
+func TestTypingDelay(t *testing.T) {
+	for _, r := range []float64{0, 0.5, 0.999} {
+		p := newPacer(&state{}, fixedRand(r))
+		short, long := p.typingDelay("ok"), p.typingDelay(strings.Repeat("é", 300))
+		if short < typingMin || short > time.Second || long != typingMax {
+			t.Errorf("rng %v: typing %v for 2 characters, %v for 300", r, short, long)
+		}
+		if mid := p.typingDelay(strings.Repeat("a", 40)); mid <= short || mid >= long {
+			t.Errorf("rng %v: typing 40 characters takes %v", r, mid)
+		}
 	}
 }
 

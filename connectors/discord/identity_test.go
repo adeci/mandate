@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -43,7 +44,7 @@ func TestSuperProperties(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := `{"os":"Linux","browser":"Chrome","device":"","device_model_name":"","system_locale":"en-US",` +
-		`"has_client_mods":false,"browser_user_agent":"` + userAgent + `","browser_version":"152.0.0.0",` +
+		`"has_client_mods":false,"browser_user_agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36","browser_version":"156.0.0.0",` +
 		`"os_version":"","referrer":"","referring_domain":"","referrer_current":"","referring_domain_current":"",` +
 		`"release_channel":"stable","client_build_number":655747,"client_event_source":null,` +
 		`"client_launch_id":"9a65c85b-401d-4cf0-9c17-9676a68a482c","launch_signature":"477bea01-90cb-422d-9a38-aaa66ed3e25e",` +
@@ -59,20 +60,26 @@ func TestSuperProperties(t *testing.T) {
 	}
 }
 
+const testInstallation = "1566328421632704573.aaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 var wantAPIOrder = []string{
-	"sec-ch-ua-platform", "authorization", "x-debug-options", "sec-ch-ua", "sec-ch-ua-mobile",
-	"x-discord-timezone", "x-super-properties", "x-discord-locale", "user-agent", "accept",
+	"sec-ch-ua-platform", "authorization", "x-super-properties", "x-installation-id", "x-discord-locale",
+	"x-discord-timezone", "x-debug-options", "sec-ch-ua", "sec-ch-ua-mobile", "user-agent", "accept",
 	"sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "referer", "accept-encoding",
 	"accept-language", "cookie", "priority",
 }
 
+func testState() *state {
+	return &state{LaunchID: newUUID(), LaunchSignature: newLaunchSignature(), HeartbeatSessionID: newUUID(), InstallationID: testInstallation}
+}
+
 func TestAPIHeaders(t *testing.T) {
-	st := &state{LaunchID: newUUID(), LaunchSignature: newLaunchSignature(), HeartbeatSessionID: newUUID()}
+	st := testState()
 	req, err := fhttp.NewRequest(fhttp.MethodGet, "https://discord.com/api/v9/users/@me", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	applyHeaders(req, apiHeaders(st, "tok", "America/New_York", "https://discord.com/channels/@me"))
+	applyHeaders(req, apiHeaders(st, call{token: "tok", timezone: "America/New_York", referer: "https://discord.com/channels/@me"}))
 	if got := req.Header[fhttp.HeaderOrderKey]; strings.Join(got, ",") != strings.Join(wantAPIOrder, ",") {
 		t.Errorf("order\n got %v\nwant %v", got, wantAPIOrder)
 	}
@@ -81,30 +88,74 @@ func TestAPIHeaders(t *testing.T) {
 		"Referer":            "https://discord.com/channels/@me",
 		"X-Discord-Timezone": "America/New_York",
 		"X-Super-Properties": encodeSuperProperties(st),
+		"X-Installation-Id":  testInstallation,
+		"X-Debug-Options":    "bugReporterEnabled",
 	} {
 		if got := req.Header.Get(k); got != v {
 			t.Errorf("%s = %q, want %q", k, got, v)
 		}
 	}
+	// No installation yet: the header is left out.
+	st.InstallationID = ""
+	for _, h := range apiHeaders(st, call{token: "tok"}) {
+		if h.name == "x-installation-id" {
+			t.Error("empty X-Installation-ID sent")
+		}
+	}
 }
 
+// The headers Discord's code sets on a send, in its order, as recorded from
+// the web client; a typing indicator has the same without a body's.
 func TestPostHeaders(t *testing.T) {
-	st := &state{LaunchID: newUUID(), LaunchSignature: newLaunchSignature(), HeartbeatSessionID: newUUID()}
-	req, err := fhttp.NewRequest(fhttp.MethodPost, "https://discord.com/api/v9/channels/1/messages", strings.NewReader("{}"))
-	if err != nil {
-		t.Fatal(err)
+	discordSet := map[string]bool{
+		"content-type": true, "x-context-properties": true, "authorization": true, "x-super-properties": true,
+		"x-installation-id": true, "x-discord-locale": true, "x-discord-timezone": true, "x-debug-options": true,
 	}
-	applyHeaders(req, jsonHeaders(apiHeaders(st, "tok", "UTC", "https://discord.com/channels/@me/1")))
-	want := []string{
-		"content-length", "sec-ch-ua-platform", "authorization", "x-debug-options", "sec-ch-ua", "sec-ch-ua-mobile",
-		"x-discord-timezone", "x-super-properties", "x-discord-locale", "user-agent", "content-type", "accept", "origin",
-		"sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "referer", "accept-encoding", "accept-language", "cookie", "priority",
+	tests := []struct {
+		name string
+		c    call
+		body string
+		want string
+	}{
+		{
+			"send",
+			call{token: "tok", timezone: "UTC", post: true, json: true, context: "chat_input"},
+			"{}",
+			"content-type,x-context-properties,authorization,x-super-properties,x-installation-id,x-discord-locale,x-discord-timezone,x-debug-options",
+		},
+		{
+			"typing",
+			call{token: "tok", timezone: "UTC", post: true},
+			"",
+			"authorization,x-super-properties,x-installation-id,x-discord-locale,x-discord-timezone,x-debug-options",
+		},
 	}
-	if got := req.Header[fhttp.HeaderOrderKey]; strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Errorf("order\n got %v\nwant %v", got, want)
+	for _, tt := range tests {
+		var body io.Reader
+		if tt.body != "" {
+			body = strings.NewReader(tt.body)
+		}
+		req, err := fhttp.NewRequest(fhttp.MethodPost, "https://discord.com/api/v9/channels/1/messages", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		applyHeaders(req, apiHeaders(testState(), tt.c))
+		order := req.Header[fhttp.HeaderOrderKey]
+		var own []string
+		for _, n := range order {
+			if discordSet[n] {
+				own = append(own, n)
+			}
+		}
+		if got := strings.Join(own, ","); got != tt.want {
+			t.Errorf("%s: Discord's headers\n got %s\nwant %s", tt.name, got, tt.want)
+		}
+		if order[0] != "content-length" || req.Header.Get("Origin") != "https://discord.com" {
+			t.Errorf("%s: order %v, origin %q", tt.name, order, req.Header.Get("Origin"))
+		}
 	}
-	if req.Header.Get("Content-Type") != "application/json" || req.Header.Get("Origin") != "https://discord.com" {
-		t.Errorf("headers %v", req.Header)
+	if got := contextProperties("chat_input"); got != "eyJsb2NhdGlvbiI6ImNoYXRfaW5wdXQifQ==" {
+		t.Errorf("X-Context-Properties = %s", got)
 	}
 }
 
@@ -136,12 +187,12 @@ func TestHeaderWireOrder(t *testing.T) {
 		c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"))
 		lines <- got
 	}()
-	st := &state{LaunchID: newUUID(), LaunchSignature: newLaunchSignature(), HeartbeatSessionID: newUUID()}
+	st := testState()
 	req, err := fhttp.NewRequest(fhttp.MethodGet, "http://"+ln.Addr().String()+"/api/v9/users/@me", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	applyHeaders(req, apiHeaders(st, "tok", "UTC", "https://discord.com/channels/@me"))
+	applyHeaders(req, apiHeaders(st, call{token: "tok", timezone: "UTC", referer: "https://discord.com/channels/@me"}))
 	resp, err := (&fhttp.Client{}).Do(req)
 	if err != nil {
 		t.Fatal(err)

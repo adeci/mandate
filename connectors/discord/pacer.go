@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Every upstream request, including the daily page load, goes through the pacer.
@@ -20,9 +21,11 @@ const (
 	openMin   = 1 * time.Second  // "app open" delay of the first request after idle
 	openMax   = 3 * time.Second
 
-	// Subresources of the app page load right after the page, as in a browser.
-	subresourceMin = 200 * time.Millisecond
-	subresourceMax = 800 * time.Millisecond
+	// A follow-up comes right after the request it belongs to: the app
+	// page's script, the second page when a chat opens, the message after
+	// its typing indicator.
+	followMin = 200 * time.Millisecond
+	followMax = 800 * time.Millisecond
 
 	sessionRequests = 40 // a session ends after this many requests ...
 	sessionLength   = 20 * time.Minute
@@ -33,20 +36,28 @@ const (
 	budgetWindow = 24 * time.Hour
 
 	maxSlotWait  = 90 * time.Second // longest a gateway call waits for a slot
-	linkSlotWait = 15 * time.Second // well inside the console's setup timeout
+	linkSlotWait = 20 * time.Second // well inside the console's setup timeout
 
 	rateLimitWindow    = time.Hour
 	rateLimitTrips     = 3                 // 429s within rateLimitWindow that trigger a cooldown
 	rateLimitMaxObey   = 300 * time.Second // longer retry_after triggers a cooldown
 	cooldownLength     = 6 * time.Hour
 	notReadyRetryAfter = 5 * time.Second // 202 without retry_after
+
+	// The web client posts the typing indicator on the first keystroke; its
+	// messages followed 0.2-5 s later.
+	typingMin     = 200 * time.Millisecond
+	typingPerChar = 60 * time.Millisecond
+	typingMax     = 5 * time.Second
 )
 
 type requestKind int
 
 const (
-	kindAPI         requestKind = iota // REST call or the app page itself
-	kindSubresource                    // a script loaded by the app page
+	kindAPI requestKind = iota // REST call or the app page itself
+	// kindFollow is part of the action of the request before it, so it never
+	// waits for a session break.
+	kindFollow
 	// kindSend is a message the owner approved. It skips reading pauses and
 	// session breaks; the gap, daily budget, cooldown and buckets still apply.
 	kindSend
@@ -55,11 +66,14 @@ const (
 type clock interface {
 	Now() time.Time
 	Sleep(ctx context.Context, d time.Duration) error
+	After(d time.Duration) <-chan time.Time
 }
 
 type realClock struct{}
 
 func (realClock) Now() time.Time { return time.Now() }
+
+func (realClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
 func (realClock) Sleep(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
@@ -87,7 +101,7 @@ type pacer struct {
 	st  *state
 	rng rng
 
-	gap, pause, open, subresource time.Duration // pre-rolled delays for the next request
+	gap, pause, open, follow time.Duration // pre-rolled delays for the next request
 
 	routeBuckets map[string]string    // route key -> X-RateLimit-Bucket
 	exhausted    map[string]time.Time // bucket -> reset time while Remaining is 0
@@ -114,7 +128,14 @@ func (p *pacer) roll() {
 		p.pause = p.uniform(pauseMin, pauseMax)
 	}
 	p.open = p.uniform(openMin, openMax)
-	p.subresource = p.uniform(subresourceMin, subresourceMax)
+	p.follow = p.uniform(followMin, followMax)
+}
+
+// typingDelay is how long typing text seems to take after the indicator.
+func (p *pacer) typingDelay(text string) time.Duration {
+	n := float64(utf8.RuneCountInString(text))
+	d := typingMin + time.Duration(n*float64(typingPerChar)*(0.75+0.5*p.rng.Float64()))
+	return min(d, typingMax)
 }
 
 func (p *pacer) slot(now time.Time, kind requestKind, route string, notBefore time.Time) (time.Time, string) {
@@ -122,9 +143,9 @@ func (p *pacer) slot(now time.Time, kind requestKind, route string, notBefore ti
 	var t time.Time
 	reason := "gap"
 	switch {
-	case kind == kindSubresource && !last.IsZero():
-		t = last.Add(p.subresource)
-		reason = "page load"
+	case kind == kindFollow && !last.IsZero():
+		t = last.Add(p.follow)
+		reason = "follow-up"
 	case last.IsZero() || now.Sub(last) > idleAfter:
 		t = now.Add(p.open)
 		reason = "app open"
@@ -136,8 +157,12 @@ func (p *pacer) slot(now time.Time, kind requestKind, route string, notBefore ti
 	if t.Before(now) {
 		t = now
 	}
+	// A follow-up's caller may ask for more time, such as typing a message.
 	if notBefore.After(t) {
-		t, reason = notBefore, "retry after"
+		t = notBefore
+		if kind != kindFollow {
+			reason = "retry after"
+		}
 	}
 	long := false
 	for range 16 {
@@ -161,7 +186,7 @@ func (p *pacer) blocker(t time.Time, kind requestKind, route string) (time.Time,
 	if p.st.CooldownUntil.After(t) {
 		return p.st.CooldownUntil, "cooldown", true
 	}
-	if p.st.BreakUntil.After(t) && kind != kindSend {
+	if p.st.BreakUntil.After(t) && kind == kindAPI {
 		return p.st.BreakUntil, "session break", true
 	}
 	if w := since(p.st.Requests, t.Add(-budgetWindow)); len(w) >= dailyBudget {

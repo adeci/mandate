@@ -42,6 +42,9 @@ func newSendHarness(t *testing.T, seed func(*state)) *harness {
 			t.Fatal(err)
 		}
 	}
+	h.discord.handle(api("/channels/"+dmID+"/typing"), func(w http.ResponseWriter, _ *http.Request, _ int) {
+		w.WriteHeader(http.StatusNoContent)
+	})
 	return h
 }
 
@@ -137,11 +140,13 @@ func TestPrepareSend(t *testing.T) {
 func TestExecuteSend(t *testing.T) {
 	tests := []struct {
 		name   string
+		typing int // status of the typing indicator, 0 for 204
 		reply  func(w http.ResponseWriter)
 		want   connector.Status
 		detail string
 	}{
 		{name: "sent", reply: sentMessage, want: connector.Done},
+		{name: "typing indicator failed", typing: http.StatusInternalServerError, reply: sentMessage, want: connector.Done},
 		{
 			name: "missing access",
 			reply: func(w http.ResponseWriter) {
@@ -180,6 +185,9 @@ func TestExecuteSend(t *testing.T) {
 			h := newSendHarness(t, func(s *state) {
 				s.LastRequest, s.BreakUntil = noon.Add(-30*time.Second), noon.Add(10*time.Minute)
 			})
+			if tt.typing != 0 {
+				h.discord.reply(api("/channels/"+dmID+"/typing"), tt.typing, map[string]any{"message": "oops"})
+			}
 			var p posts
 			p.handle(h, dmID, tt.reply)
 			h.start()
@@ -188,9 +196,11 @@ func TestExecuteSend(t *testing.T) {
 			if res.Status != tt.want || !strings.Contains(res.Detail, tt.detail) {
 				t.Fatalf("result %+v, want %s with %q", res, tt.want, tt.detail)
 			}
+			// The typing indicator, then the message once typing it took long
+			// enough; only the message is the send.
 			hits := h.discord.all()
-			if len(hits) != 1 || hits[0].method != http.MethodPost || len(p.all()) != 1 {
-				t.Fatalf("upstream %v, want exactly one POST", h.discord.paths())
+			if len(hits) != 2 || hits[0].path != api("/channels/"+dmID+"/typing") || hits[1].method != http.MethodPost || len(p.all()) != 1 {
+				t.Fatalf("upstream %v, want typing and exactly one message POST", h.discord.paths())
 			}
 			if tt.want != connector.Done {
 				if row := h.queryRow(`SELECT count(*) FROM messages`); row[0] != int64(0) {
@@ -199,9 +209,12 @@ func TestExecuteSend(t *testing.T) {
 				return
 			}
 
-			hit, body := hits[0], p.all()[0]
-			if !hit.at.Equal(noon) {
-				t.Errorf("sent at %v, want %v", hit.at, noon)
+			typing, hit, body := hits[0], hits[1], p.all()[0]
+			if !typing.at.Equal(noon) {
+				t.Errorf("typing at %v, want %v", typing.at, noon)
+			}
+			if want := (&pacer{rng: fixedRand(0.5)}).typingDelay(sentText); hit.at.Sub(typing.at) != want {
+				t.Errorf("message %v after typing, want %v", hit.at.Sub(typing.at), want)
 			}
 			nonce, _ := body["nonce"].(string)
 			if at, ok := snowflakeTime(nonce); !ok || !at.Equal(hit.at) {
@@ -212,13 +225,23 @@ func TestExecuteSend(t *testing.T) {
 				t.Errorf("body %v, want %v", body, want)
 			}
 			for k, v := range map[string]string{
-				"Authorization": testToken,
-				"Content-Type":  "application/json",
-				"Origin":        "https://discord.com",
-				"Referer":       "https://discord.com/channels/@me/" + dmID,
+				"Authorization":        testToken,
+				"Content-Type":         "application/json",
+				"Origin":               "https://discord.com",
+				"Referer":              "https://discord.com/channels/@me/" + dmID,
+				"X-Context-Properties": "eyJsb2NhdGlvbiI6ImNoYXRfaW5wdXQifQ==",
+				"X-Installation-Id":    testInstallation,
 			} {
 				if got := hit.header.Get(k); got != v {
 					t.Errorf("%s = %q, want %q", k, got, v)
+				}
+			}
+			for k, v := range map[string]string{
+				"Authorization": testToken, "Origin": "https://discord.com", "Content-Length": "0",
+				"Content-Type": "", "X-Context-Properties": "", "Referer": "https://discord.com/channels/@me/" + dmID,
+			} {
+				if got := typing.header.Get(k); got != v {
+					t.Errorf("typing %s = %q, want %q", k, got, v)
 				}
 			}
 			if res.Ref != sentID {
@@ -229,6 +252,22 @@ func TestExecuteSend(t *testing.T) {
 				t.Errorf("stored %v", row)
 			}
 		})
+	}
+}
+
+// A typing indicator that cannot go out yet holds the message too, so the
+// send never skips the pacing gap.
+func TestSendWaitsForTypingSlot(t *testing.T) {
+	h := newSendHarness(t, func(s *state) { s.CooldownUntil = noon.Add(time.Hour) })
+	var p posts
+	p.handle(h, dmID, sentMessage)
+	h.start()
+	res := h.w.Execute(context.Background(), sendRecord(dmID))
+	if res.Status != connector.Failed || !strings.Contains(res.Detail, "cooldown") {
+		t.Errorf("result %+v", res)
+	}
+	if n := len(h.discord.all()); n != 0 {
+		t.Errorf("%d requests", n)
 	}
 }
 
@@ -305,7 +344,7 @@ func TestApprovedSendRunsOnce(t *testing.T) {
 	if _, err := h.client.Execute(ctx, approve("fetch", map[string]string{"channel_id": dmID}, nil)); errStatus(err) != http.StatusForbidden {
 		t.Errorf("approved read: %v", err)
 	}
-	if n := len(p.all()); n != 1 || len(h.discord.all()) != 1 {
-		t.Errorf("upstream %v, want one POST", h.discord.paths())
+	if n := len(p.all()); n != 1 || len(h.discord.all()) != 2 {
+		t.Errorf("upstream %v, want typing and one POST", h.discord.paths())
 	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -26,6 +27,8 @@ const (
 	maxSearchOff   = 9975
 	defaultLimit   = 50
 	maxLimit       = 100
+	openPage       = 10 // messages the web client loads when a chat opens
+	scrollPage     = 20 // ... and on each page after
 )
 
 var searchHas = map[string]bool{"link": true, "embed": true, "file": true, "video": true, "image": true, "sound": true}
@@ -217,6 +220,7 @@ type cachedSearch struct {
 type service struct {
 	st    *store.Store
 	up    *upstream
+	gw    *gateway
 	clock clock
 
 	guilds   cachedList[apiGuild]
@@ -225,10 +229,11 @@ type service struct {
 	searches map[string]cachedSearch
 }
 
-func newService(st *store.Store, up *upstream, c clock) *service {
+func newService(st *store.Store, up *upstream, gw *gateway, c clock) *service {
 	return &service{
 		st:       st,
 		up:       up,
+		gw:       gw,
 		clock:    c,
 		channels: make(map[string]*cachedList[apiChannel]),
 		searches: make(map[string]cachedSearch),
@@ -591,35 +596,58 @@ func (s *service) fetch(ctx context.Context, dl time.Time, req fetchRequest) (co
 	if err != nil {
 		return connector.ReadResult{}, err
 	}
-	limit := req.Limit
-	if limit == 0 {
-		limit = defaultLimit
-	}
-	q.Set("limit", strconv.Itoa(limit))
+	limit := cmp.Or(req.Limit, defaultLimit)
 	guild := ""
 	if c.Kind == kindChannel || c.Kind == kindThread {
 		guild = c.ParentID
 	}
-	referer := channelURL(guild, req.ChannelID)
 	r := route{
 		template: "/channels/{channel_id}/messages",
 		path:     "/channels/" + req.ChannelID + "/messages",
 		query:    q,
 		major:    req.ChannelID,
-		referer:  referer,
+		referer:  channelURL(guild, req.ChannelID),
 		deny:     "channel:" + req.ChannelID,
 		denyWhat: "channel " + req.ChannelID,
 	}
-	var msgs []apiMessage
-	if err := s.up.get(ctx, dl, r, &msgs); err != nil {
-		return connector.ReadResult{}, err
+	// Opening a chat loads the newest 10 and right away the 20 before them;
+	// scrolling up loads 20 more at a time. A cursor is one page of limit.
+	page := limit
+	if req.Anchor == "" {
+		page = openPage
+		if c.Kind == kindDM || c.Kind == kindGroup {
+			s.gw.callConnect(req.ChannelID)
+		}
+	}
+	var msgs []apiMessage // newest first
+	for n := 0; ; n++ {
+		q.Set("limit", strconv.Itoa(page))
+		r.follow = n == 1
+		var got []apiMessage
+		if err := s.up.get(ctx, dl, r, &got); err != nil {
+			var pe *pacedError
+			if n > 0 && errors.As(err, &pe) {
+				break // keep what the earlier pages brought
+			}
+			return connector.ReadResult{}, err
+		}
+		msgs = append(msgs, got...)
+		if req.Anchor != "" || len(got) < page || len(msgs) >= limit {
+			break
+		}
+		oldest := got[len(got)-1].ID
+		if !isSnowflake(oldest) {
+			break
+		}
+		q.Set("before", oldest)
+		page = scrollPage
 	}
 	if upsert {
 		if err := s.st.UpsertContainer(ctx, c); err != nil {
 			return connector.ReadResult{}, err
 		}
 	}
-	ids := make([]string, 0, len(msgs))
+	ids := make([]string, 0, min(len(msgs), limit))
 	for i := range msgs {
 		m := &msgs[i]
 		if m.ChannelID == "" {
@@ -635,7 +663,9 @@ func (s *service) fetch(ctx context.Context, dl time.Time, req fetchRequest) (co
 		if err := s.st.UpsertMessage(ctx, msg); err != nil {
 			return connector.ReadResult{}, err
 		}
-		ids = append(ids, msg.ID)
+		if i < limit {
+			ids = append(ids, msg.ID)
+		}
 	}
 	return connector.ReadResult{MessageIDs: ids}, nil
 }

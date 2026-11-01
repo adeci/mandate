@@ -12,15 +12,15 @@ import (
 	fhttp "github.com/bogdanfinn/fhttp"
 )
 
-// The service presents itself as Google Chrome on Linux, matching the TLS and
-// HTTP/2 fingerprint of tls-client's Chrome_152 profile.
+// The service presents itself as Google Chrome 156 on Linux, the owner's own
+// browser; newBrowserClient explains the TLS profile.
 const (
-	chromeMajor  = 152
+	chromeMajor  = 156
 	systemLocale = "en-US"
 
-	// defaultBuildNumber is the web client build observed on 2026-10-29,
+	// defaultBuildNumber is the web client build observed on 2026-11-01,
 	// used only until the first successful extraction.
-	defaultBuildNumber = 655747
+	defaultBuildNumber = 657850
 )
 
 var (
@@ -95,42 +95,123 @@ func encodeSuperProperties(st *state) string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
-// Slices of header keep Chrome's wire order.
-type header struct{ name, value string }
+// identifyProperties are what the web client's fast-connect script sends in
+// IDENTIFY, in its field order: the super-properties without the per-tab
+// fields.
+type identifyProperties struct {
+	OS                     string  `json:"os"`
+	Browser                string  `json:"browser"`
+	Device                 string  `json:"device"`
+	DeviceModelName        string  `json:"device_model_name"`
+	SystemLocale           string  `json:"system_locale"`
+	HasClientMods          bool    `json:"has_client_mods"`
+	BrowserUserAgent       string  `json:"browser_user_agent"`
+	BrowserVersion         string  `json:"browser_version"`
+	OSVersion              string  `json:"os_version"`
+	Referrer               string  `json:"referrer"`
+	ReferringDomain        string  `json:"referring_domain"`
+	ReferrerCurrent        string  `json:"referrer_current"`
+	ReferringDomainCurrent string  `json:"referring_domain_current"`
+	ReleaseChannel         string  `json:"release_channel"`
+	ClientBuildNumber      int     `json:"client_build_number"`
+	ClientEventSource      *string `json:"client_event_source"`
+	ClientLaunchID         string  `json:"client_launch_id"`
+	IsFastConnect          bool    `json:"is_fast_connect"`
+	InstallationID         string  `json:"installation_id,omitempty"`
+}
 
-func apiHeaders(st *state, token, timezone, referer string) []header {
-	return []header{
-		{"sec-ch-ua-platform", `"Linux"`},
-		{"authorization", token},
-		{"x-debug-options", "bugReporterEnabled"},
-		{"sec-ch-ua", secChUA},
-		{"sec-ch-ua-mobile", "?0"},
-		{"x-discord-timezone", timezone},
-		{"x-super-properties", encodeSuperProperties(st)},
-		{"x-discord-locale", systemLocale},
-		{"user-agent", userAgent},
-		{"accept", "*/*"},
-		{"sec-fetch-site", "same-origin"},
-		{"sec-fetch-mode", "cors"},
-		{"sec-fetch-dest", "empty"},
-		{"referer", referer},
-		{"accept-encoding", "gzip, deflate, br, zstd"},
-		{"accept-language", "en-US,en;q=0.9"},
-		{"priority", "u=1, i"},
+func newIdentifyProperties(buildNumber int, launchID, installationID string, fast bool) identifyProperties {
+	return identifyProperties{
+		OS:                "Linux",
+		Browser:           "Chrome",
+		SystemLocale:      systemLocale,
+		BrowserUserAgent:  userAgent,
+		BrowserVersion:    chromeVersion,
+		ReleaseChannel:    "stable",
+		ClientBuildNumber: buildNumber,
+		ClientLaunchID:    launchID,
+		IsFastConnect:     fast,
+		InstallationID:    installationID,
 	}
 }
 
-// jsonHeaders adds what fetch sends with a JSON body to apiHeaders.
-func jsonHeaders(hs []header) []header {
-	out := make([]header, 0, len(hs)+2)
-	for _, h := range hs {
-		if h.name == "accept" {
-			out = append(out, header{"content-type", "application/json"}, h, header{"origin", defaultWebBase})
-			continue
-		}
-		out = append(out, h)
+// Slices of header keep Chrome's wire order.
+type header struct{ name, value string }
+
+// call is what Discord's code adds to one API request.
+type call struct {
+	token    string // "" while logged out
+	timezone string
+	referer  string
+	post     bool // Chrome adds Origin
+	json     bool // a JSON body
+	// context is the location in X-Context-Properties, "" for none.
+	context     string
+	fingerprint string // what /experiments assigned a logged-out browser
+	// superFirst: the caller passes X-Super-Properties itself, so it comes
+	// ahead of the headers Discord's request layer sets.
+	superFirst bool
+}
+
+// Discord's own headers go out in the order its code sets them, between
+// the ones Chrome adds.
+func apiHeaders(st *state, c call) []header {
+	hs := make([]header, 0, 24)
+	hs = append(hs, header{"sec-ch-ua-platform", `"Linux"`})
+	if c.json {
+		hs = append(hs, header{"content-type", "application/json"})
 	}
-	return out
+	sp := header{"x-super-properties", encodeSuperProperties(st)}
+	if c.superFirst {
+		hs = append(hs, sp)
+	}
+	if c.context != "" {
+		hs = append(hs, header{"x-context-properties", contextProperties(c.context)})
+	}
+	if c.token != "" {
+		hs = append(hs, header{"authorization", c.token})
+	}
+	if !c.superFirst {
+		hs = append(hs, sp)
+	}
+	if c.fingerprint != "" {
+		hs = append(hs, header{"x-fingerprint", c.fingerprint})
+	}
+	if st.InstallationID != "" {
+		hs = append(hs, header{"x-installation-id", st.InstallationID})
+	}
+	hs = append(hs,
+		header{"x-discord-locale", systemLocale},
+		header{"x-discord-timezone", c.timezone},
+		header{"x-debug-options", "bugReporterEnabled"},
+		header{"sec-ch-ua", secChUA},
+		header{"sec-ch-ua-mobile", "?0"},
+		header{"user-agent", userAgent},
+		header{"accept", "*/*"},
+	)
+	if c.post {
+		hs = append(hs, header{"origin", defaultWebBase})
+	}
+	return append(hs,
+		header{"sec-fetch-site", "same-origin"},
+		header{"sec-fetch-mode", "cors"},
+		header{"sec-fetch-dest", "empty"},
+		header{"referer", c.referer},
+		header{"accept-encoding", "gzip, deflate, br, zstd"},
+		header{"accept-language", "en-US,en;q=0.9"},
+		header{"priority", "u=1, i"},
+	)
+}
+
+// contextProperties encodes {"location": location} as the web client does.
+func contextProperties(location string) string {
+	b, err := json.Marshal(struct {
+		Location string `json:"location"`
+	}{location})
+	if err != nil {
+		panic(err) // a string
+	}
+	return base64.StdEncoding.EncodeToString(b)
 }
 
 // No referrer and no token: a navigation typed into the address bar.
@@ -169,11 +250,11 @@ func scriptHeaders(referer string) []header {
 	}
 }
 
-// Cookies from the jar go out after accept-language and a body's length
+// Cookies from the jar go out after accept-language and a POST's length
 // first, where Chrome sends them.
 func applyHeaders(req *fhttp.Request, hs []header) {
 	order := make([]string, 0, len(hs)+2)
-	if req.ContentLength > 0 {
+	if req.ContentLength > 0 || req.Method == fhttp.MethodPost {
 		order = append(order, "content-length")
 	}
 	for _, h := range hs {
@@ -186,11 +267,34 @@ func applyHeaders(req *fhttp.Request, hs []header) {
 	req.Header[fhttp.HeaderOrderKey] = order
 }
 
+// gatewayHeaders are Chrome's WebSocket handshake headers for the app's
+// gateway connection, which carries no cookies and no client hints. The
+// websocket package adds Connection, Upgrade and the Sec-WebSocket ones.
+// Chrome also offers permessage-deflate with context takeover, which the
+// package cannot decode, so no extension is offered.
+func gatewayHeaders() fhttp.Header {
+	return fhttp.Header{
+		"Pragma":          {"no-cache"},
+		"Cache-Control":   {"no-cache"},
+		"User-Agent":      {userAgent},
+		"Origin":          {defaultWebBase},
+		"Accept-Encoding": {"gzip, deflate, br, zstd"},
+		"Accept-Language": {"en-US,en;q=0.9"},
+		fhttp.HeaderOrderKey: {
+			"host", "connection", "pragma", "cache-control", "user-agent", "upgrade", "origin",
+			"sec-websocket-version", "accept-encoding", "accept-language", "sec-websocket-key",
+		},
+	}
+}
+
 var (
 	webJSRe         = regexp.MustCompile(`<script[^>]*\ssrc="(/assets/web\.[a-f0-9]{8,32}\.js)"`)
 	buildNumberJSRe = regexp.MustCompile(`(?:buildNumber|build_number):\s?['"]?(\d{6,9})['"]?`)
 	// Fallback: the page's GLOBAL_ENV.
 	buildNumberHTMLRe = regexp.MustCompile(`"BUILD_NUMBER"\s*:\s*"(\d{6,9})"`)
+	// Installation IDs and fingerprints are "<snowflake>.<base64url>"; only
+	// that shape is ever put into a header.
+	issuedIDRe = regexp.MustCompile(`^\d{15,21}\.[A-Za-z0-9_-]{20,64}$`)
 )
 
 // The path is always /assets/web.<hex>.js, so it is safe to request.

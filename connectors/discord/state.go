@@ -13,13 +13,19 @@ import (
 // state never holds the token or message content.
 type state struct {
 	// Browser identity, stable across restarts like one long-lived profile.
+	// The launch fields change when the app page loads again.
 	LaunchID           string    `json:"launch_id"`
 	LaunchSignature    string    `json:"launch_signature"`
 	HeartbeatSessionID string    `json:"heartbeat_session_id,omitempty"`
+	HeartbeatStartedAt time.Time `json:"heartbeat_started_at"`
 	HeartbeatUsedAt    time.Time `json:"heartbeat_used_at"`
 	BuildNumber        int       `json:"build_number,omitempty"`
 	BuildCheckedAt     time.Time `json:"build_checked_at"`
 	Cookies            []cookie  `json:"cookies,omitempty"`
+
+	// InstallationID is issued once to a logged-out app and outlives
+	// logouts, as the web client's installation_id_v3 does.
+	InstallationID string `json:"installation_id,omitempty"`
 
 	SelfID        string    `json:"self_id,omitempty"`
 	SelfCheckedAt time.Time `json:"self_checked_at"`
@@ -76,12 +82,14 @@ func loadState(path string) (*state, error) {
 }
 
 func (s *state) ensureIdentity() {
-	if s.LaunchID == "" {
-		s.LaunchID = newUUID()
+	if s.LaunchID == "" || s.LaunchSignature == "" {
+		s.newLaunch()
 	}
-	if s.LaunchSignature == "" {
-		s.LaunchSignature = newLaunchSignature()
-	}
+}
+
+// newLaunch is a load of the app page, which starts a new client launch.
+func (s *state) newLaunch() {
+	s.LaunchID, s.LaunchSignature = newUUID(), newLaunchSignature()
 }
 
 func (s *state) prune(now time.Time) {

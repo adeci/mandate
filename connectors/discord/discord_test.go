@@ -33,12 +33,12 @@ func TestChromeProfileSpeaksHTTP2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := &state{LaunchID: newUUID(), LaunchSignature: newLaunchSignature(), HeartbeatSessionID: newUUID()}
+	st := testState()
 	req, err := fhttp.NewRequest(fhttp.MethodGet, srv.URL+"/api/v9/users/@me", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	applyHeaders(req, apiHeaders(st, "tok", "UTC", "https://discord.com/channels/@me"))
+	applyHeaders(req, apiHeaders(st, call{token: "tok", timezone: "UTC", referer: "https://discord.com/channels/@me"}))
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
