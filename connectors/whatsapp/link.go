@@ -32,6 +32,7 @@ type waClient interface {
 	IsConnected() bool
 	IsLoggedIn() bool
 	SendMessage(ctx context.Context, to types.JID, msg *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
+	Download(ctx context.Context, msg whatsmeow.DownloadableMessage) ([]byte, error)
 	GetQRChannel(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error)
 	PairPhone(ctx context.Context, phone string, showPushNotification bool, clientType whatsmeow.PairClientType, clientDisplayName string) (string, error)
 	ConnectContext(ctx context.Context) error

@@ -186,7 +186,11 @@ func convert(evt *events.Message, pn pnResolver) (op, bool) {
 		SentAt:      evt.Info.Timestamp,
 		IsFromMe:    evt.Info.IsFromMe,
 		Body:        body,
-		MediaType:   media,
+	}
+	if file, ok := attachment(m); ok {
+		msg.Media = []store.Media{file}
+	} else {
+		msg.MediaType = media
 	}
 	if !sender.IsEmpty() {
 		msg.SenderID = sender.String()
