@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -227,9 +228,9 @@ func TestReadOpRunsAndAnswersThroughFilter(t *testing.T) {
 	}
 	var res table
 	mustDo(t, json.Unmarshal(rec.Body.Bytes(), &res))
-	want := []any{"mounting brackets", nil, "lol"}
-	if got := column(t, res, "body"); len(got) != 3 || got[0] != want[0] || got[1] != nil || got[2] != want[2] {
-		t.Errorf("bodies = %v, want %v (connector order; hidden sender and hidden guild dropped, OTP blanked)", got, want)
+	want := []any{"mounting brackets", "[login code hidden]", "lol"}
+	if got := column(t, res, "body"); !slices.Equal(got, want) {
+		t.Errorf("bodies = %v, want %v (connector order; hidden sender and hidden guild dropped, OTP replaced)", got, want)
 	}
 	if res.TotalResults != 40 {
 		t.Errorf("total_results = %d, want 40", res.TotalResults)

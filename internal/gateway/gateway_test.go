@@ -37,11 +37,11 @@ func fixture(t *testing.T) map[string]string {
 		mustDo(t, wa.UpsertContainer(ctx, c))
 	}
 	for i, m := range []store.Message{
-		{ID: "m1", ContainerID: "conv-family", SenderID: "+15550001", SenderName: "Mom", Body: "dinner at 7?"},
+		{ID: "m1", ContainerID: "conv-family", SenderID: "+15550001", SenderName: "Mom", Body: "dinner at 7?", ReplyToID: "m5"},
 		{ID: "m2", ContainerID: "conv-family", SenderID: "+15550002", SenderName: "Hidden Cousin", Body: "secret gossip"},
 		{ID: "m3", ContainerID: "conv-private", SenderID: "+15550003", Body: "private thing"},
 		{ID: "m4", ContainerID: "conv-bank", SenderID: "72975", Body: "Your code is 482913"},
-		{ID: "m5", ContainerID: "conv-family", SenderID: "+15550001", Body: "Your login code is 482913, don't share"},
+		{ID: "m5", ContainerID: "conv-family", SenderID: "+15550001", Body: "Your login code is 482913, don't share", ReplyToID: "m2"},
 		{ID: "m6", ContainerID: "+15550002", SenderID: "+15559990000", IsFromMe: true, Body: "dinner with you?"},
 	} {
 		m.SentAt = at.Add(time.Duration(i) * time.Minute)
@@ -119,13 +119,20 @@ func TestVerbsNeverShowHiddenChatsOrLoginCodes(t *testing.T) {
 		t.Errorf("whatsapp chats = %v, want family and bank (hidden chat and hidden sender's DM dropped)", got)
 	}
 	_, res, _ = getTable(t, h, "/v1/discord/chats")
-	if got := column(t, res, "id"); len(got) != 2 || slices.Contains(got, "g-work") || slices.Contains(got, "c-general") {
-		t.Errorf("discord chats = %v, want fun and memes (hidden guild hides its channels)", got)
+	if got := column(t, res, "name"); !slices.Equal(got, []any{"Fun / memes", "Fun"}) {
+		t.Errorf("discord chats = %v, want memes named under its guild (hidden guild hides its channels)", got)
+	}
+	_, res, _ = getTable(t, h, "/v1/discord/search?text=lol")
+	if got := column(t, res, "chat"); !slices.Equal(got, []any{"Fun / memes"}) {
+		t.Errorf("discord search chat = %v", got)
 	}
 
 	_, res, _ = getTable(t, h, "/v1/whatsapp/messages?chat=conv-family")
-	if got := column(t, res, "body"); !slices.Equal(got, []any{nil, "dinner at 7?"}) {
-		t.Errorf("family messages = %v, want the login code blanked and the hidden sender dropped", got)
+	if got := column(t, res, "body"); !slices.Equal(got, []any{"[login code hidden]", "dinner at 7?"}) {
+		t.Errorf("family messages = %v, want the login code replaced and the hidden sender dropped", got)
+	}
+	if got := column(t, res, "reply_to"); !slices.Equal(got, []any{nil, float64(5)}) {
+		t.Errorf("family reply_to = %v, want nothing for the reply to a hidden sender", got)
 	}
 
 	for _, chat := range []string{"conv-private", "+15550002", "c-general", "nope"} {
@@ -227,7 +234,7 @@ func TestVerbsOrderBySentTimeAcrossIngestOrder(t *testing.T) {
 	if got, want := column(t, res, "id"), []any{"c1", "c2", "c3"}; !slices.Equal(got, want) {
 		t.Errorf("chats = %v, want %v", got, want)
 	}
-	if got := column(t, res, "last_message")[0]; got != "2026-10-30T18:40:00Z" {
+	if got := column(t, res, "last_message")[0]; got != "2026-10-30 18:40" {
 		t.Errorf("last_message = %v", got)
 	}
 }

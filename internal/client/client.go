@@ -42,6 +42,7 @@ type client struct {
 	errOut io.Writer
 	tty    bool
 	json   bool
+	name   string
 }
 
 func fromEnv(getenv func(string) string, out, errOut io.Writer, tty bool) (*client, error) {
@@ -105,6 +106,7 @@ func usage(text string, err error) error {
 }
 
 func (c *client) connector(ctx context.Context, name string, args []string) error {
+	c.name = name
 	if len(args) == 0 || isHelp(args[0]) {
 		return c.connectorHelp(ctx, name)
 	}
@@ -310,7 +312,10 @@ func (c *client) table(raw []byte) error {
 		tw = tabwriter.NewWriter(c.out, 0, 0, 2, ' ', 0)
 		w = tw
 	}
-	fmt.Fprintln(w, strings.Join(t.Columns, "\t"))
+	// A sync answers only a count of chats.
+	if len(t.Rows) > 0 || t.Containers == 0 {
+		fmt.Fprintln(w, strings.Join(t.Columns, "\t"))
+	}
 	for _, row := range t.Rows {
 		cells := make([]string, len(row))
 		for i, v := range row {
@@ -332,10 +337,13 @@ func (c *client) table(raw []byte) error {
 		fmt.Fprintf(c.errOut, "%d of %d results\n", len(t.Rows), t.TotalResults)
 	}
 	if t.Containers > 0 {
-		fmt.Fprintf(c.errOut, "%d chats updated\n", t.Containers)
+		fmt.Fprintf(c.errOut, "%d chats updated; list them with mandate %s chats\n", t.Containers, c.name)
 	}
 	return nil
 }
+
+// escapeTSV keeps a value on one line and in one cell; help documents it.
+var escapeTSV = strings.NewReplacer(`\`, `\\`, "\t", `\t`, "\n", `\n`, "\r", `\r`)
 
 func cell(v any) string {
 	switch v := v.(type) {
@@ -344,7 +352,7 @@ func cell(v any) string {
 	case float64:
 		return strconv.FormatFloat(v, 'f', -1, 64)
 	case string:
-		return strings.Join(strings.Fields(v), " ")
+		return escapeTSV.Replace(v)
 	default:
 		return fmt.Sprint(v)
 	}

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/adeci/mandate/internal/exitcode"
@@ -40,7 +41,7 @@ func (c *client) submit(ctx context.Context, path string, args map[string]string
 		return err
 	}
 	if wait == 0 {
-		fmt.Fprintf(c.errOut, "tell the owner it is waiting, then: mandate status %s --wait 15m\n", p.ID)
+		fmt.Fprintf(c.errOut, "next: send the owner the approve link, then run mandate status %s --wait 15m\n", p.ID)
 		return nil
 	}
 	fmt.Fprintf(c.errOut, "waiting up to %s for the owner to decide\n", wait)
@@ -108,9 +109,9 @@ func (c *client) show(raw []byte) (proposal.Proposal, error) {
 }
 
 func printProposal(w io.Writer, p proposal.Proposal) {
-	fmt.Fprintf(w, "%s  %s  %s %s\n", p.ID, p.Status, p.Connector, p.Op)
+	fmt.Fprintf(w, "%s %s: %s %s\n", p.ID, p.Status, p.Connector, p.Op)
 	for _, f := range p.Display {
-		fmt.Fprintf(w, "  %s: %s\n", f.Label, f.Value)
+		fmt.Fprintf(w, "  %s: %s\n", f.Label, strings.ReplaceAll(f.Value, "\n", "\n    "))
 	}
 	if r := p.Result; r != nil {
 		fmt.Fprintf(w, "result: %s", r.Status)
@@ -126,7 +127,7 @@ func printProposal(w io.Writer, p proposal.Proposal) {
 		}
 	}
 	if pending(p.Status) && p.URL != "" {
-		fmt.Fprintf(w, "approve at: %s\n", p.URL)
+		fmt.Fprintf(w, "approve: %s\n", p.URL)
 	}
 }
 

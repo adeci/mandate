@@ -14,23 +14,35 @@ import (
 )
 
 // filter prefixes every query: chats leaves out hidden containers, their
-// children and DMs with hidden senders; msgs leaves out hidden senders and
-// blanks login-code bodies. ?1 and ?2 are the hidden container and sender
-// IDs as JSON arrays.
+// children and DMs with hidden senders; named gives each chat its parent's
+// name as a prefix; msgs leaves out hidden senders and blanks login-code
+// bodies. ?1 and ?2 are the hidden container and sender IDs as JSON arrays.
+//
+// msgs.text is the body as agents see it: login codes replaced, deletions and
+// media marked in brackets. Search matches body, not the markers.
 const filter = `WITH
 hidden_chat(id) AS (SELECT value FROM json_each(?1)),
 hidden_sender(id) AS (SELECT value FROM json_each(?2)),
 chats AS (
-  SELECT id, kind, name, updated_at FROM containers
+  SELECT id, kind, parent_id, name FROM containers
   WHERE id NOT IN (SELECT id FROM hidden_chat)
     AND id NOT IN (SELECT id FROM hidden_sender)
     AND COALESCE(parent_id, '') NOT IN (SELECT id FROM hidden_chat)),
-msgs AS (
-  SELECT m.seq, m.id, m.container_id, m.sent_at, strftime('%Y-%m-%dT%H:%M:%SZ', m.sent_at) AS at,
-         COALESCE(m.sender_name, m.sender_id) AS sender,
-         CASE WHEN is_auth(m.sender_id, m.body) THEN NULL ELSE m.body END AS body
+named AS (
+  SELECT c.id, c.kind, CASE WHEN p.name IS NULL THEN c.name ELSE p.name || ' / ' || COALESCE(c.name, c.id) END AS name
+  FROM chats AS c LEFT JOIN chats AS p ON p.id = c.parent_id),
+visible AS (
+  SELECT m.*, is_auth(m.sender_id, m.body) AS auth
   FROM messages AS m JOIN chats AS c ON c.id = m.container_id
-  WHERE COALESCE(m.sender_id, '') NOT IN (SELECT id FROM hidden_sender))
+  WHERE COALESCE(m.sender_id, '') NOT IN (SELECT id FROM hidden_sender)),
+msgs AS (
+  SELECT seq, id, container_id, sent_at, strftime('%Y-%m-%d %H:%M', sent_at) AS at, reply_to_id,
+         sender_id, CASE WHEN is_from_me THEN 'me' ELSE sender_name END AS sender,
+         CASE WHEN auth THEN NULL ELSE body END AS body,
+         CASE WHEN auth THEN '[login code hidden]'
+              ELSE rtrim(iif(deleted, '[deleted] ', '') || COALESCE('[' || media_type || '] ', '') || COALESCE(body, ''), ' ')
+         END AS text
+  FROM visible)
 `
 
 type table struct {
@@ -169,13 +181,17 @@ func page(t *table, rows [][]any, limit int64, seqCol int) *table {
 
 var (
 	chatColumns    = []string{"id", "kind", "name", "last_message"}
-	messageColumns = []string{"seq", "sent_at", "sender", "body"}
-	searchColumns  = []string{"seq", "sent_at", "chat", "sender", "body"}
+	messageColumns = []string{"seq", "sent_at", "sender_id", "sender", "reply_to", "body"}
+	searchColumns  = []string{"seq", "sent_at", "chat_id", "chat", "sender_id", "sender", "reply_to", "body"}
 )
 
+// replyTo is the seq of the visible message m replies to.
+const replyTo = `(SELECT r.seq FROM msgs AS r WHERE r.id = m.reply_to_id)`
+
 func (s *source) chats(search string, limit int64) (*table, error) {
-	rows, err := s.query(`SELECT c.id, c.kind, c.name, (SELECT max(at) FROM msgs WHERE container_id = c.id) AS last
-FROM chats AS c
+	rows, err := s.query(`SELECT c.id, c.kind, c.name,
+  strftime('%Y-%m-%d %H:%M', (SELECT max(sent_at) FROM msgs WHERE container_id = c.id)) AS last
+FROM named AS c
 WHERE ?3 = '' OR instr(lower(COALESCE(c.name, '')), lower(?3)) OR instr(lower(c.id), lower(?3))
 ORDER BY last DESC NULLS LAST, c.id LIMIT ?4`, search, limit+1)
 	if err != nil {
@@ -187,21 +203,23 @@ ORDER BY last DESC NULLS LAST, c.id LIMIT ?4`, search, limit+1)
 // before is the seq of the last message seen; the page continues after it in
 // (sent_at, seq) order, since seq follows ingestion, not sending.
 func (s *source) messages(chat string, before, limit int64) (*table, error) {
-	rows, err := s.query(`SELECT seq, at, sender, body FROM msgs
-WHERE container_id = ?3 AND (?4 = 0 OR (sent_at, seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?4))
-ORDER BY sent_at DESC, seq DESC LIMIT ?5`, chat, before, limit+1)
+	rows, err := s.query(`SELECT m.seq, m.at, m.sender_id, m.sender, `+replyTo+`, m.text FROM msgs AS m
+WHERE m.container_id = ?3 AND (?4 = 0 OR (m.sent_at, m.seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?4))
+ORDER BY m.sent_at DESC, m.seq DESC LIMIT ?5`, chat, before, limit+1)
 	if err != nil {
 		return nil, err
 	}
 	return page(&table{Columns: messageColumns}, rows, limit, 0), nil
 }
 
+const searchSelect = `SELECT m.seq, m.at, m.container_id, c.name, m.sender_id, m.sender, ` + replyTo + `, m.text`
+
 // Matches the filtered body, where login codes are blank. before as in messages.
 func (s *source) search(text, chat, since string, before, limit int64) (*table, error) {
-	rows, err := s.query(`SELECT seq, at, container_id, sender, body FROM msgs
-WHERE instr(lower(body), lower(?3)) AND (?4 = '' OR container_id = ?4) AND sent_at >= ?5
-  AND (?6 = 0 OR (sent_at, seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?6))
-ORDER BY sent_at DESC, seq DESC LIMIT ?7`, text, chat, since, before, limit+1)
+	rows, err := s.query(searchSelect+` FROM msgs AS m JOIN named AS c ON c.id = m.container_id
+WHERE instr(lower(m.body), lower(?3)) AND (?4 = '' OR m.container_id = ?4) AND m.sent_at >= ?5
+  AND (?6 = 0 OR (m.sent_at, m.seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?6))
+ORDER BY m.sent_at DESC, m.seq DESC LIMIT ?7`, text, chat, since, before, limit+1)
 	if err != nil {
 		return nil, err
 	}
@@ -214,8 +232,8 @@ func (s *source) byID(ids []string) (*table, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.query(`SELECT m.seq, m.at, m.container_id, m.sender, m.body
-FROM json_each(?3) AS j JOIN msgs AS m ON m.id = j.value ORDER BY j.key`, string(b))
+	rows, err := s.query(searchSelect+` FROM json_each(?3) AS j JOIN msgs AS m ON m.id = j.value
+JOIN named AS c ON c.id = m.container_id ORDER BY j.key`, string(b))
 	if err != nil {
 		return nil, err
 	}

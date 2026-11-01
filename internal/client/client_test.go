@@ -47,7 +47,7 @@ func testClient(t *testing.T, url string, tty bool) (*client, *bytes.Buffer, *by
 	return c, &out, &errOut
 }
 
-const rowsReply = `{"columns":["seq","sender","body"],"rows":[[7,"Farid","see you\nat 5"],[8,"Mom",null]],"more":true,"next_before":7}` + "\n"
+const rowsReply = `{"columns":["seq","sender","body"],"rows":[[7,"Farid","see you\nat 5\t\\o/"],[8,"Mom",null]],"more":true,"next_before":7}` + "\n"
 
 func TestOutputModes(t *testing.T) {
 	t.Parallel()
@@ -57,8 +57,8 @@ func TestOutputModes(t *testing.T) {
 		args []string
 		want string
 	}{
-		"piped is TSV":   {false, nil, "seq\tsender\tbody\n7\tFarid\tsee you at 5\n8\tMom\t\n"},
-		"terminal table": {true, nil, "seq  sender  body\n7    Farid   see you at 5\n8    Mom     \n"},
+		"piped is TSV":   {false, nil, "seq\tsender\tbody\n7\tFarid\tsee you\\nat 5\\t\\\\o/\n8\tMom\t\n"},
+		"terminal table": {true, nil, "seq  sender  body\n7    Farid   see you\\nat 5\\t\\\\o/\n8    Mom     \n"},
 		"json":           {false, []string{"--json"}, rowsReply},
 	} {
 		c, out, errOut := testClient(t, srv.URL, tc.tty)
@@ -247,7 +247,7 @@ func TestWaitTimesOut(t *testing.T) {
 	if d := time.Since(start); d < 1500*time.Millisecond || d > 5*time.Second {
 		t.Errorf("--wait 1500ms returned after %v", d)
 	}
-	if n := strings.Count(out.String(), "p1  pending"); n != 2 {
+	if n := strings.Count(out.String(), "p1 pending"); n != 2 {
 		t.Errorf("output: %s, want the proposal then its final state", out)
 	}
 }

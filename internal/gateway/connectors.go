@@ -229,7 +229,7 @@ func intParam(q url.Values, key string, def, lo, hi int64) (int64, error) {
 	}
 	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil || n < lo || n > hi {
-		return 0, fmt.Errorf("%s must be a whole number from %d to %d", key, lo, hi)
+		return 0, fmt.Errorf("--%s must be a whole number from %d to %d", key, lo, hi)
 	}
 	return n, nil
 }
@@ -274,7 +274,7 @@ func (h *handler) verb(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if _, err := time.Parse(time.DateOnly, since); since != "" && err != nil {
-			writeError(w, http.StatusBadRequest, "since must be a date like 2026-10-01")
+			writeError(w, http.StatusBadRequest, "--since must be YYYY-MM-DD")
 			return
 		}
 		if !q.Has("limit") {
@@ -375,7 +375,17 @@ func (h *handler) op(w http.ResponseWriter, r *http.Request) {
 	}
 	op, ok := spec.Op(opName)
 	if !ok {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("connector %s has no op %q; see mandate %s --help", name, opName, name))
+		var cmds []string
+		if _, ok := h.cfg.Sources[name]; ok {
+			cmds = append(cmds, "chats", "messages", "search")
+		}
+		for _, op := range spec.Ops {
+			cmds = append(cmds, op.Name)
+		}
+		if spec.Forward {
+			cmds = append(cmds, "get")
+		}
+		writeError(w, http.StatusNotFound, fmt.Sprintf("no command %q; %s commands: %s", opName, name, strings.Join(cmds, " ")))
 		return
 	}
 	if op.Kind == connector.Write && h.console == nil {

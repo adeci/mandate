@@ -49,8 +49,9 @@ usage:
 	fmt.Fprint(w, `
 Run mandate <connector> --help for its commands.
 
+Output is TSV with a header line (a table on a terminal), or JSON with --json.
+TSV escapes backslash, tab and newline in values as \\, \t and \n. Times are UTC.
 After proposing, tell the owner it is waiting, then run mandate status ID --wait 15m.
-Output is TSV with a header line, a table on a terminal; add --json for JSON.
 
 exit codes:
   0   done
@@ -106,14 +107,16 @@ func writeConnectorHelp(w io.Writer, ci connectorInfo) {
 	fmt.Fprintln(w)
 	if ci.Source {
 		fmt.Fprintf(w, "  "+chatsUsage+"\n      id kind name last_message, most recent first\n", ci.Name)
-		fmt.Fprintf(w, "  "+messagesUsage+"\n      seq sent_at sender body, newest first\n", ci.Name)
-		fmt.Fprintf(w, "  "+searchUsage+"\n      seq sent_at chat sender body, newest first\n", ci.Name)
+		fmt.Fprintf(w, "  "+messagesUsage+"\n      seq sent_at sender_id sender reply_to body, newest first\n", ci.Name)
+		fmt.Fprintf(w, "  "+searchUsage+"\n      seq sent_at chat_id chat sender_id sender reply_to body, newest first\n", ci.Name)
 	}
-	writes := false
+	writes, reads := false, false
 	for _, op := range ci.Ops {
 		kind := "read"
 		if op.Kind == connector.Write {
 			kind, writes = "proposal", true
+		} else {
+			reads = true
 		}
 		if op.Name == "send" {
 			fmt.Fprintf(w, "  "+sendUsage+"\n      %s (%s)\n", ci.Name, op.Summary, kind)
@@ -141,7 +144,12 @@ func writeConnectorHelp(w io.Writer, ci connectorInfo) {
 	fmt.Fprintln(w)
 	if ci.Source {
 		fmt.Fprintln(w, "Chats are addressed by id: find one with chats --search, then pass its id.")
+		fmt.Fprintln(w, "sender me is the owner; reply_to is the seq replied to. Bodies mark media as")
+		fmt.Fprintln(w, "[image] and the like, deleted messages as [deleted], login codes as [login code hidden].")
 		fmt.Fprintln(w, "When more rows exist, stderr gives the --before value for the next page.")
+		if reads {
+			fmt.Fprintln(w, "Read ops print messages in search's columns.")
+		}
 	}
 	if writes {
 		fmt.Fprintln(w, "--note is shown to the owner with the proposal.")
