@@ -800,3 +800,45 @@ func TestSubmit(t *testing.T) {
 		t.Fatal("get unknown proposal succeeded")
 	}
 }
+
+// Open pages reload when the version moves, so everything another device or
+// the clock can change must move it.
+func TestVersionMoves(t *testing.T) {
+	h := start(t)
+	last := h.srv.version(context.Background())
+	moved := func(what string) {
+		t.Helper()
+		v := h.srv.version(context.Background())
+		if v == last {
+			t.Fatalf("version unchanged after %s", what)
+		}
+		last = v
+	}
+
+	p := h.submit(t, "one")
+	moved("a proposal arrived")
+	if status, _ := h.post(t, "/r/"+p.ID+"/deny", nil); status != http.StatusSeeOther {
+		t.Fatalf("deny = %d", status)
+	}
+	moved("a denial")
+	p = h.submit(t, "two")
+	moved("a proposal arrived")
+	nonce, c, _ := h.challenge(t, p.ID, nil)
+	if status, _ := h.approve(t, p.ID, nonce, h.key.Assert(c)); status != http.StatusOK {
+		t.Fatalf("approve = %d", status)
+	}
+	moved("an approval")
+	h.submit(t, "three")
+	moved("a proposal arrived")
+
+	if h.addKey(t, h.session, approvaltest.New(t, rpID, origin), "phone") {
+		t.Fatal("second key trusted without approval")
+	}
+	moved("a key change was requested")
+	if status := h.approveChange(t, h.session, h.waiting(t), h.key); status != http.StatusOK {
+		t.Fatalf("approve key = %d", status)
+	}
+	moved("a key change was approved")
+	h.clock.advance(proposalTTL + time.Minute)
+	moved("a proposal expired")
+}

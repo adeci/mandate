@@ -2,6 +2,7 @@ package console
 
 import (
 	"bytes"
+	"context"
 	"embed"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -70,6 +72,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /session", s.api(func(w http.ResponseWriter, _ *http.Request, _ session) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
+	mux.HandleFunc("GET /version", s.api(func(w http.ResponseWriter, r *http.Request, _ session) {
+		connector.WriteJSON(w, http.StatusOK, map[string]string{"version": s.version(r.Context())})
+	}))
 	mux.HandleFunc("POST /logout", s.api(s.logout))
 
 	cop := http.NewCrossOriginProtection()
@@ -98,6 +103,7 @@ type page struct {
 	Nav     string
 	Pending int
 	Who     string
+	Version string
 	Data    any
 }
 
@@ -124,7 +130,18 @@ func (s *Server) owner(w http.ResponseWriter, r *http.Request, sess session, nam
 	if err != nil {
 		s.cfg.Log.Error("count pending", "err", err)
 	}
-	s.render(w, http.StatusOK, name, page{Title: title, Nav: nav, Pending: n, Who: sess.who(), Data: data})
+	s.render(w, http.StatusOK, name, page{Title: title, Nav: nav, Pending: n, Who: sess.who(), Version: sess.version, Data: data})
+}
+
+// version changes whenever something a page shows may have, so open pages
+// can reload after a decision made on another device.
+func (s *Server) version(ctx context.Context) string {
+	v, err := s.db.version(ctx, s.now())
+	if err != nil {
+		s.cfg.Log.Error("console version", "err", err)
+	}
+	n, head := s.keys.Head()
+	return v + "." + strconv.Itoa(n) + "." + head
 }
 
 func (s *Server) errorPage(w http.ResponseWriter, status int, msg string) {

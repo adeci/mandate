@@ -330,7 +330,7 @@ func (s *Server) syncConn(ctx context.Context, c *conn) string {
 		_, err = c.client.PutKeys(ctx, s.keys.Log())
 	}
 	problem := ""
-	if err != nil {
+	if err != nil && !unreachable(err) {
 		problem = err.Error()
 	}
 	c.mu.Lock()

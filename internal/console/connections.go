@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"rsc.io/qr"
@@ -37,18 +38,26 @@ func (s *Server) view(ctx context.Context, c *conn) connView {
 	v := connView{Name: c.name}
 	spec, err := c.getSpec(ctx, s.now())
 	if err != nil {
-		v.Health = connector.Health{State: connector.Broken, Detail: specProblem(err)}
+		v.Health = connector.Health{State: connector.Broken, Detail: problem(err)}
 		return v
 	}
 	v.Setup = spec.Setup
 	if v.Health, err = c.client.Health(ctx); err != nil {
-		v.Health = connector.Health{State: connector.Broken, Detail: err.Error()}
+		v.Health = connector.Health{State: connector.Broken, Detail: problem(err)}
 	}
 	v.Keys = s.syncConn(ctx, c)
 	return v
 }
 
-func specProblem(err error) string {
+// unreachable means nothing serves the connector's socket.
+func unreachable(err error) bool {
+	return errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED)
+}
+
+func problem(err error) string {
+	if unreachable(err) {
+		return "not running"
+	}
 	if pe, ok := errors.AsType[*connector.ProtocolError](err); ok {
 		return pe.Error()
 	}

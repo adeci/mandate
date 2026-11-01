@@ -15,6 +15,28 @@ const toB64 = (buf) => {
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
+// A theme is stored only while it differs from the system's; this runs in
+// <head> so a stored one applies before the first paint.
+const themeMetas = $$('meta[name="theme-color"]');
+const themeDefaults = themeMetas.map((m) => m.content);
+const systemTheme = () => (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+
+function applyTheme(theme) {
+  const root = document.documentElement;
+  if (theme) root.dataset.theme = theme;
+  else delete root.dataset.theme;
+  const bg = getComputedStyle(root).getPropertyValue("--bg").trim();
+  themeMetas.forEach((m, i) => (m.content = theme ? bg : themeDefaults[i]));
+}
+applyTheme(localStorage.getItem("theme"));
+
+function toggleTheme() {
+  const next = (document.documentElement.dataset.theme || systemTheme()) === "dark" ? "light" : "dark";
+  if (next === systemTheme()) localStorage.removeItem("theme");
+  else localStorage.setItem("theme", next);
+  applyTheme(next === systemTheme() ? null : next);
+}
+
 function say(text, isError, el = $("#msg")) {
   if (!el) return;
   el.textContent = text ? (isError ? "! " : "") + text : "";
@@ -224,7 +246,30 @@ function busy(el, action) {
   };
 }
 
+// Reloads after something changed elsewhere, e.g. a key approved on another
+// device, once the owner isn't in the middle of something here.
+function watch(version) {
+  let stale = false;
+  const engaged = () =>
+    pending !== null ||
+    $("#review:not([hidden]), .linking:not([hidden]), button:disabled, input:focus, textarea:focus") ||
+    $$("textarea[data-param]").some((ta) => ta.value !== ta.defaultValue);
+  const check = async () => {
+    if (document.hidden) return;
+    if (!stale) {
+      const res = await call("GET", "/version").catch(() => null);
+      stale = res !== null && res.version !== version;
+    }
+    if (stale && !engaged()) location.reload();
+  };
+  setInterval(check, 3000);
+  document.addEventListener("visibilitychange", check);
+}
+
 document.addEventListener("DOMContentLoaded", () => {
+  if (document.body.dataset.version) watch(document.body.dataset.version);
+  $("[data-theme-toggle]").addEventListener("click", toggleTheme);
+
   const loginButton = $("[data-login]");
   if (loginButton) loginButton.addEventListener("click", busy(loginButton, () => login(loginButton)));
   const passwordForm = $("#password-login");
@@ -232,6 +277,8 @@ document.addEventListener("DOMContentLoaded", () => {
     resumeSession(passwordForm.dataset.next);
     passwordForm.addEventListener("submit", busy(passwordForm, () => passwordLogin(passwordForm)));
   }
+  const fallback = $("#password-fallback");
+  if (fallback) fallback.addEventListener("toggle", () => fallback.open && $("#password").focus());
 
   const reviewButton = $("[data-review]");
   if (reviewButton) reviewButton.addEventListener("click", busy(reviewButton, review));

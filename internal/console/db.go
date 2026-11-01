@@ -149,6 +149,19 @@ func (d *db) pendingCount(ctx context.Context) (int, error) {
 	return n, err
 }
 
+// version sums up proposals arriving, leaving pending (decided or expired)
+// and finishing, and key changes being requested or resolved.
+func (d *db) version(ctx context.Context, now time.Time) (string, error) {
+	var v string
+	err := d.sql.QueryRowContext(ctx, `
+		SELECT (SELECT count(*) || '.' || coalesce(max(created_at), 0) || '.' ||
+		               coalesce(sum(status = 'pending' AND expires_at > ?1), 0) || '.' || count(result)
+		        FROM proposals) || '.' ||
+		       (SELECT count(*) || '.' || coalesce(max(created_at), 0)
+		        FROM key_changes WHERE expires_at > ?1)`, ms(now)).Scan(&v)
+	return v, err
+}
+
 func (d *db) query(ctx context.Context, where string, args ...any) ([]row, error) {
 	rs, err := d.sql.QueryContext(ctx, `
 		SELECT id, connector, op, args, display, note, status, result,

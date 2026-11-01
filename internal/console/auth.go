@@ -32,6 +32,8 @@ const (
 type session struct {
 	hash []byte
 	key  approval.Key
+	// version is the console's state as the page began loading.
+	version string
 }
 
 func (s session) who() string {
@@ -77,6 +79,7 @@ func (s *Server) page(h func(http.ResponseWriter, *http.Request, session)) http.
 			http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
 			return
 		}
+		sess.version = s.version(r.Context())
 		h(w, r, sess)
 	}
 }

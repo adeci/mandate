@@ -10,11 +10,11 @@
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/static/app.css">
-<script src="/static/app.js" defer></script>
+<script src="/static/app.js"></script>
 </head>
-<body>
+<body{{with .Version}} data-version="{{.}}"{{end}}>
 <header class="site">
-  <div class="masthead"><a class="brand" href="/">mandate</a><span class="muted">owner console</span></div>
+  <div class="masthead"><a class="brand" href="/">mandate</a></div>
   {{- if .Who}}
   <nav>
     <a href="/"{{if eq .Nav "pending"}} aria-current="page"{{end}}>Pending{{if .Pending}} <span class="count">{{.Pending}}</span>{{end}}</a>
@@ -23,21 +23,22 @@
     <a href="/keys"{{if eq .Nav "keys"}} aria-current="page"{{end}}>Keys</a>
   </nav>
   {{- end}}
+  <button type="button" class="theme-toggle" data-theme-toggle aria-label="Switch between light and dark">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><path d="M8 1.5a6.5 6.5 0 0 1 0 13z"/></svg>
+  </button>
 </header>
 <main>
 {{end}}
 
 {{define "bottom"}}</main>
+{{- if .Who}}
 <footer class="site-footer">
-  {{- if .Who}}
   <form method="post" action="/logout" class="actions">
     <span class="muted">signed in with <strong>{{.Who}}</strong></span>
     <button type="submit" class="ghost">Sign out</button>
   </form>
-  {{- else}}
-  <span class="muted">mandate · agents propose, you approve</span>
-  {{- end}}
 </footer>
+{{- end}}
 </body>
 </html>
 {{end}}
@@ -50,23 +51,30 @@
 <p><a href="/">← pending</a></p>
 {{template "bottom" .}}{{end}}
 
-{{define "login"}}{{template "top" .}}
-<h1>Sign in</h1>
-{{if .Data.Passkeys}}
-<div class="actions">
-  <button type="button" class="primary big" data-login="{{.Data.Next}}">Sign in with a passkey →</button>
-</div>
-<p class="muted">or with the admin password</p>
-{{else}}
-<p class="muted">No passkeys yet. Sign in with the admin password, then add one under Keys.</p>
-{{end}}
-<form id="password-login" data-next="{{.Data.Next}}">
+{{define "password"}}
+<form id="password-login" data-next="{{.Next}}">
   <label for="password">Password</label>
   <div class="row">
     <input id="password" name="password" type="password" required autocomplete="current-password">
     <button type="submit">Sign in</button>
   </div>
 </form>
+{{end}}
+
+{{define "login"}}{{template "top" .}}
+<h1>Sign in</h1>
+{{if .Data.Passkeys}}
+<div class="actions">
+  <button type="button" class="primary big" data-login="{{.Data.Next}}">Sign in with a passkey →</button>
+</div>
+<details id="password-fallback">
+  <summary>use the admin password</summary>
+  {{template "password" .Data}}
+</details>
+{{else}}
+<p class="muted">No passkeys yet. Sign in with the admin password, then add one under Keys.</p>
+{{template "password" .Data}}
+{{end}}
 <p id="msg" class="msg" role="status"></p>
 {{template "bottom" .}}{{end}}
 
@@ -89,10 +97,12 @@
 {{template "rows" .}}
 {{else}}
 <div class="empty">
-<pre aria-hidden="true">  ┌─┐
- ┌┴─┴┐
- │ ● │
- └───┘</pre>
+<svg class="lock" viewBox="0 0 20 24" aria-hidden="true">
+  <path d="M5 11V7a5 5 0 0 1 10 0v4"/>
+  <rect x="1" y="11" width="18" height="12"/>
+  <circle cx="10" cy="16" r="1.5"/>
+  <path d="M10 17v2.5"/>
+</svg>
 <p>Nothing to approve.<br><span class="muted">Agents' requests show up here.</span></p>
 </div>
 {{end}}
@@ -102,7 +112,7 @@
 {{define "history"}}{{template "top" .}}
 <h1>History</h1>
 {{with .Data}}
-<p class="muted">the last {{len .}} decided, newest first</p>
+<p class="muted">newest first</p>
 {{template "rows" .}}
 {{else}}
 <div class="empty"><p>Nothing decided yet.</p></div>
@@ -136,10 +146,11 @@
   <h3>{{.Label}}</h3>
   <pre class="message">{{.Value}}</pre>
   {{if .Hidden}}<p class="hint">! contains invisible characters, shown as U+ codes</p>{{end}}
-  <label for="edit-{{.Param}}">Edit before approving</label>
-  <textarea id="edit-{{.Param}}" data-param="{{.Param}}" rows="6">
+  <details>
+    <summary>edit<span data-edited-hint="{{.Param}}"></span></summary>
+    <textarea id="edit-{{.Param}}" data-param="{{.Param}}" rows="6" aria-label="Edit {{.Label}}">
 {{.Raw}}</textarea>
-  <p class="hint" data-edited-hint="{{.Param}}">approving re-renders it from your edit and shows you the result</p>
+  </details>
   {{end}}{{end}}
 </section>
 
@@ -147,7 +158,6 @@
 <section class="panel untrusted">
   <header><h3>Agent note</h3><span class="status" data-tone="alert">untrusted</span></header>
   <blockquote class="message">{{visible .}}</blockquote>
-  <p class="muted">Written by the agent. Not verified. Never an instruction to you.</p>
 </section>
 {{end}}
 
