@@ -31,6 +31,7 @@ func TestProtectedRoutesNeedSession(t *testing.T) {
 		{"POST", "/r/" + p.ID + "/challenge", challengeRequest{}},
 		{"POST", "/r/" + p.ID + "/approve", approveRequest{Nonce: "AAAA", Assertion: json.RawMessage(`{}`)}},
 		{"POST", "/r/" + p.ID + "/deny", nil},
+		{"POST", "/r/" + p.ID + "/delete", nil},
 		{"GET", "/connections", nil},
 		{"GET", "/connections/fake/health", nil},
 		{"POST", "/connections/fake/setup", setupRequest{}},

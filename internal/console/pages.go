@@ -59,6 +59,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /r/{id}/challenge", s.api(s.challenge))
 	mux.HandleFunc("POST /r/{id}/approve", s.api(s.approve))
 	mux.HandleFunc("POST /r/{id}/deny", s.api(s.deny))
+	mux.HandleFunc("POST /r/{id}/delete", s.api(s.remove))
 	mux.HandleFunc("GET /connections", s.page(s.connectionsPage))
 	mux.HandleFunc("GET /connections/{name}/health", s.api(s.connectionHealth))
 	mux.HandleFunc("POST /connections/{name}/setup", s.api(s.setup))
@@ -324,6 +325,7 @@ type requestView struct {
 	Fields     []fieldView
 	Pending    bool
 	CanApprove bool
+	Settled    bool
 	DecidedAt  time.Time
 	DecidedBy  string
 }
@@ -345,6 +347,7 @@ func (s *Server) requestPage(w http.ResponseWriter, r *http.Request, sess sessio
 		Title:      pr.Connector + " " + pr.Op,
 		Pending:    pr.Status == proposal.Pending,
 		CanApprove: pr.Status == proposal.Pending && len(s.keys.Trusted()) > 0,
+		Settled:    pr.Status != proposal.Pending && pr.Status != proposal.Executing,
 		DecidedAt:  pr.DecidedAt,
 		DecidedBy:  pr.DecidedBy,
 	}

@@ -22,6 +22,7 @@ var schema string
 var (
 	errNotFound    = errors.New("no such request")
 	errNotPending  = errors.New("request is no longer pending")
+	errUnsettled   = errors.New("request is still pending or running")
 	errTooMany     = errors.New("too many pending requests")
 	errNoKeyChange = errors.New("no such key change, or it expired")
 	errKeyPending  = errors.New("a change to this key is already waiting")
@@ -353,6 +354,28 @@ func (d *db) reject(ctx context.Context, id, by string, now time.Time) error {
 		default:
 			return errNotPending
 		}
+	})
+}
+
+// remove deletes a settled request. Connectors keep their own record of
+// spent approvals, so this only clears the console's copy.
+func (d *db) remove(ctx context.Context, id string) error {
+	return d.tx(ctx, func(tx *sql.Tx) error {
+		var status proposal.Status
+		err := tx.QueryRowContext(ctx, `SELECT status FROM proposals WHERE id = ?`, id).Scan(&status)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return errNotFound
+		case err != nil:
+			return err
+		case status == proposal.Pending || status == proposal.Executing:
+			return errUnsettled
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM challenges WHERE proposal = ?`, id); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `DELETE FROM proposals WHERE id = ?`, id)
+		return err
 	})
 }
 

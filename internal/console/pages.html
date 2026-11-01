@@ -127,10 +127,10 @@
     <summary>filters</summary>
     <div class="filters">
       <label>connector
-        <select name="connector"><option value="">any</option>{{range .Connectors}}<option{{if eq . $.Data.Connector}} selected{{end}}>{{.}}</option>{{end}}</select>
+        <span class="select"><select name="connector"><option value="">any</option>{{range .Connectors}}<option{{if eq . $.Data.Connector}} selected{{end}}>{{.}}</option>{{end}}</select></span>
       </label>
       <label>outcome
-        <select name="status"><option value="">any</option>{{range .Statuses}}<option{{if eq (print .) $.Data.Status}} selected{{end}}>{{.}}</option>{{end}}</select>
+        <span class="select"><select name="status"><option value="">any</option>{{range .Statuses}}<option{{if eq (print .) $.Data.Status}} selected{{end}}>{{.}}</option>{{end}}</select></span>
       </label>
       <label>from <input type="date" name="from" value="{{.From}}"></label>
       <label>to <input type="date" name="to" value="{{.To}}"></label>
@@ -187,6 +187,9 @@
   {{with .Detail}}<p class="message">{{.}}</p>{{end}}
   {{with .Output}}<pre class="output">{{.}}</pre>{{end}}
 </section>
+{{end}}
+{{if .Settled}}
+<form method="post" action="/r/{{.ID}}/delete" class="actions"><button type="submit" data-confirm="Confirm delete">Delete</button></form>
 {{end}}
 
 {{if .Pending}}

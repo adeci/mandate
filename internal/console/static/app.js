@@ -567,4 +567,8 @@ function bind() {
       again.addEventListener("click", confirmFirst(again, "Confirm relink", () => relink(panel)));
     }
   }
+
+  for (const button of $$("button[data-confirm]")) {
+    button.addEventListener("click", confirmFirst(button, button.dataset.confirm, async () => button.form.submit()));
+  }
 }

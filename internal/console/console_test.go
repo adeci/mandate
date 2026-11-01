@@ -746,6 +746,24 @@ func TestDeny(t *testing.T) {
 	}
 }
 
+func TestDelete(t *testing.T) {
+	h := start(t)
+	p := h.submit(t, "running late")
+	if status, _ := h.post(t, "/r/"+p.ID+"/delete", nil); status != http.StatusConflict {
+		t.Fatalf("delete pending = %d, want 409", status)
+	}
+	h.post(t, "/r/"+p.ID+"/deny", nil)
+	if status, _ := h.post(t, "/r/"+p.ID+"/delete", nil); status != http.StatusSeeOther {
+		t.Fatalf("delete = %d, want 303", status)
+	}
+	if status, _ := h.page(t, "/r/"+p.ID); status != http.StatusNotFound {
+		t.Fatalf("deleted request page = %d, want 404", status)
+	}
+	if status, _ := h.post(t, "/r/"+p.ID+"/delete", nil); status != http.StatusNotFound {
+		t.Fatalf("second delete = %d, want 404", status)
+	}
+}
+
 func TestConnectorFailures(t *testing.T) {
 	t.Run("connection lost mid-execute is unknown", func(t *testing.T) {
 		h := start(t)

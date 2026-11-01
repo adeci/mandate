@@ -215,7 +215,20 @@ button.danger:hover { background: var(--error); color: var(--bg); }
 .search details { margin-top: calc(var(--lh) / 2); }
 .filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(16ch, 1fr)); gap: calc(var(--lh) / 2) 2ch; }
 .filters label { font-weight: var(--w-normal); color: var(--fg-alt); }
-select { appearance: auto; }
+.select { position: relative; display: block; }
+.select::after { content: "▾"; position: absolute; right: 1ch; top: 50%; translate: 0 -50%; color: var(--fg-alt); pointer-events: none; }
+select { padding-right: 3ch; cursor: pointer; }
+select:hover { background: var(--bg-hover); }
+input::-webkit-calendar-picker-indicator { cursor: pointer; opacity: .6; }
+/* Where supported, the open list is ours too; elsewhere it stays native. */
+@supports (appearance: base-select) {
+  select, ::picker(select) { appearance: base-select; }
+  select::picker-icon, option::checkmark { display: none; }
+  ::picker(select) { border: var(--bw) solid var(--line-strong); background: var(--bg); color: var(--fg-strong); padding: 0; position-try-order: normal; }
+  option { padding: calc(var(--lh) / 4) calc(1ch - var(--bw)); }
+  option:hover, option:focus-visible { background: var(--bg-hover); outline: none; }
+  option:checked { color: var(--accent); background: var(--accent-bg); }
+}
 .pager { display: flex; justify-content: space-between; margin-bottom: var(--lh); }
 .pager .older { margin-left: auto; }
 

@@ -534,6 +534,25 @@ func (s *Server) deny(w http.ResponseWriter, r *http.Request, sess session) {
 	http.Redirect(w, r, "/r/"+id, http.StatusSeeOther)
 }
 
+func (s *Server) remove(w http.ResponseWriter, r *http.Request, sess session) {
+	id := r.PathValue("id")
+	err := s.db.remove(r.Context(), id)
+	switch {
+	case errors.Is(err, errNotFound):
+		s.errorPage(w, http.StatusNotFound, "No such request.")
+		return
+	case errors.Is(err, errUnsettled):
+		s.errorPage(w, http.StatusConflict, "Deny the request before deleting it.")
+		return
+	case err != nil:
+		s.cfg.Log.Error("delete", "id", id, "err", err)
+		s.errorPage(w, http.StatusInternalServerError, "Couldn't delete the request.")
+		return
+	}
+	s.cfg.Log.Info("deleted", "id", id, "by", sess.who())
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 func assertionRawID(assertion json.RawMessage) []byte {
 	var cred struct {
 		RawID string `json:"rawId"`
