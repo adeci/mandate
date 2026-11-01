@@ -69,6 +69,7 @@ pkgs.testers.runNixOSTest {
             reads = [ "GET /items" ];
             writes = [ "POST /items" ];
           };
+          serviceConfig.IPAddressAllow = [ "127.0.0.1" ];
         };
       };
     };
@@ -435,5 +436,20 @@ pkgs.testers.runNixOSTest {
         for unit in ["mandate-gateway", "mandate-whatsapp", "mandate-discord", "mandate-signal", "mandate-matrix", "mandate-fastmail", "mandate-gmessages", "mandate-console", "mandate-http"]:
             machine.succeed(f"systemctl show -p MemoryDenyWriteExecute --value {unit} | grep -qx yes")
         machine.succeed("systemctl show -p CapabilityBoundingSet --value mandate-console | grep -qx cap_net_bind_service")
+
+    with subtest("connectors reach private addresses only where allowed"):
+        for unit in ["mandate-whatsapp", "mandate-discord", "mandate-signal", "mandate-matrix", "mandate-fastmail", "mandate-gmessages", "mandate-http"]:
+            deny = machine.succeed(f"systemctl show -p IPAddressDeny --value {unit}").split()
+            assert {"127.0.0.0/8", "10.0.0.0/8", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7"} <= set(deny), (unit, deny)
+            assert "127.0.0.53/32" in machine.succeed(f"systemctl show -p IPAddressAllow --value {unit}").split(), unit
+            machine.succeed(f"systemctl is-active {unit}")
+        assert "127.0.0.1/32" in machine.succeed("systemctl show -p IPAddressAllow --value mandate-http").split()
+
+        # The filter belongs to the unit's cgroup, so a curl moved into it is held to it.
+        def curl_as(unit):
+            return (f"sh -c 'echo $$ > /sys/fs/cgroup/system.slice/{unit}.service/cgroup.procs"
+                    " && exec curl -sf -o /dev/null --max-time 5 http://127.0.0.1:9000/items'")
+        machine.fail(curl_as("mandate-whatsapp"))
+        machine.succeed(curl_as("mandate-http"))
   '';
 }

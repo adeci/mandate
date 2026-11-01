@@ -205,3 +205,14 @@ mandate-webhook --socket PATH --state DIR --config FILE --rp-id HOST --origin UR
 and checks the settings at build time with `mandate-webhook --check-config
 FILE`. `connector.Main` handles both. Secrets belong in `DIR/private`; the
 gateway can read the rest of `DIR`.
+
+A connector reaches the internet, but not localhost, the LAN or the tailnet,
+apart from systemd-resolved's stubs at 127.0.0.53 and 127.0.0.54. Allow a
+host it needs, such as a self-hosted homeserver or an API on the LAN, with
+
+```nix
+services.mandate.connectors.matrix.serviceConfig.IPAddressAllow = [ "192.168.1.20" ];
+```
+
+Without systemd-resolved, allow the DNS servers in `/etc/resolv.conf` the
+same way.

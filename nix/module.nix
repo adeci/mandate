@@ -127,6 +127,25 @@ let
 
   configFile = name: c: json.generate "mandate-${name}.json" c.settings;
 
+  # Connectors talk to the internet. Reaching the LAN, the tailnet or
+  # localhost takes an IPAddressAllow in the connector's serviceConfig.
+  privateNets = [
+    "127.0.0.0/8"
+    "::1/128"
+    "10.0.0.0/8"
+    "172.16.0.0/12"
+    "192.168.0.0/16"
+    "100.64.0.0/10"
+    "169.254.0.0/16"
+    "fc00::/7"
+    "fe80::/10"
+  ];
+  # systemd-resolved's stub listeners.
+  dnsStub = [
+    "127.0.0.53"
+    "127.0.0.54"
+  ];
+
   connectorService =
     name: c:
     service name (
@@ -149,8 +168,12 @@ let
           "mandate-gateway"
         ];
         RestartSec = "30s";
+        IPAddressDeny = privateNets;
       }
       // c.serviceConfig
+      // {
+        IPAddressAllow = dnsStub ++ lib.toList (c.serviceConfig.IPAddressAllow or [ ]);
+      }
     )
     // {
       after = [ "network-online.target" ];
@@ -179,7 +202,15 @@ let
         serviceConfig = lib.mkOption {
           type = lib.types.attrsOf lib.types.anything;
           default = { };
-          description = "systemd service settings merged over the defaults.";
+          example = {
+            IPAddressAllow = [ "192.168.1.20" ];
+          };
+          description = ''
+            systemd service settings merged over the defaults. Connectors
+            may not reach localhost, the LAN or the tailnet; list a host in
+            `IPAddressAllow` to let this one reach it, e.g. a self-hosted
+            homeserver or a LAN API.
+          '';
         };
       };
     };
