@@ -17,9 +17,10 @@ its spec.
 | `GET`, `PUT /keys` | the owner's trusted keys, kept in sync by the console |
 
 `connector.Main` serves all of it. `/execute` checks the owner's passkey
-signature over the exact record against the connector's own key list, re-runs
-`Prepare` and refuses if anything changed, spends the nonce, and only then
-calls your `Execute`.
+signature over the exact record against the connector's own key list (or,
+in an unlock window, the passkey's delegation to a session key and that key's
+signature over the record), re-runs `Prepare` and refuses if anything
+changed, spends the nonce, and only then calls your `Execute`.
 
 ## A webhook connector
 

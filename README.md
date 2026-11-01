@@ -27,6 +27,10 @@ The first one is trusted right away; adding or removing keys after that needs
 a trusted key. Then link your accounts under Connections. Lost every key?
 `sudo mandate-reset-keys` lets the password add a first key again.
 
+Approving or signing in with a passkey unlocks that tab for 10 minutes: more
+approvals need no touch, and each connector still checks that a trusted key
+opened the window. Lock, reload or close the tab to end it sooner.
+
 To hide a chat from agents, add its ID to
 `/var/lib/mandate-gateway/exposure.toml`:
 

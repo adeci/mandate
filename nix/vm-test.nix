@@ -98,10 +98,13 @@ pkgs.testers.runNixOSTest {
     import base64
     import hashlib
     import json
+    import time
 
     import cbor2
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
     start_all()
     for unit in ["recorder", "mandate-gateway", "mandate-whatsapp", "mandate-discord", "mandate-console", "mandate-http"]:
@@ -314,6 +317,91 @@ pkgs.testers.runNixOSTest {
         machine.fail("sudo -u mandate-gateway ls /var/lib/mandate-console")
         machine.fail("sudo -u mandate-gateway cat /var/lib/mandate-http/private/api")
         machine.fail("sudo -u mandate-whatsapp test -w /run/mandate-http/connector.sock")
+
+    with subtest("one touch opens an unlock window; the next write needs only the session key"):
+        def unb64(s):
+            return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+        def hash_parts(*parts):
+            h = hashlib.sha256()
+            for p in parts:
+                h.update(len(p).to_bytes(8, "big") + p)
+            return h.digest()
+
+        # A page's session key, and the passkey's delegation to it until expires.
+        def unlock(covers, expires):
+            key = ec.generate_private_key(ec.SECP256R1())
+            pub = key.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+            at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expires))
+            challenge = hash_parts(b"mandate-unlock-v1", pub, at.encode(), covers)
+            return key, {"public_key": b64(pub), "expires_at": at, "covers": b64(covers),
+                         "assertion": assertion({"challenge": b64(challenge), "rpId": "${host}"})}
+
+        # WebCrypto's ECDSA signature: r and s, 32 bytes each.
+        def session_sign(key, challenge):
+            r, s = decode_dss_signature(key.sign(challenge, ec.ECDSA(hashes.SHA256())))
+            return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+        def propose(text):
+            code, p = gw("POST", "/v1/http/request", {"args": {
+                "service": "api", "method": "POST", "path": "/items", "body": json.dumps({"text": text})}})
+            assert code == 202, (code, p)
+            return p["id"]
+
+        def challenge(pid):
+            code, ch = console("POST", f"/r/{pid}/challenge", {"edits": {}}, jar="/tmp/keyjar")
+            assert code == 200, (code, ch)
+            return ch["nonce"], unb64(ch["options"]["challenge"])
+
+        def approve_in(pid, nonce, delegation, signature):
+            return console("POST", f"/r/{pid}/approve", {"nonce": nonce, "delegation": delegation,
+                                                         "signature": b64(signature)}, jar="/tmp/keyjar")
+
+        now = int(machine.succeed("date +%s"))
+        first, second, third = propose("first"), propose("second"), propose("third")
+        nonce, c = challenge(first)
+        session, delegation = unlock(c, now + 600)
+        code, out = approve_in(first, nonce, delegation, session_sign(session, c))
+        assert code == 200 and out["status"] == "done", (code, out)
+        nonce, c = challenge(second)
+        code, out = approve_in(second, nonce, delegation, session_sign(session, c))
+        assert code == 200 and out["status"] == "done", (code, out)
+
+        nonce, c = challenge(third)
+        forger = ec.generate_private_key(ec.SECP256R1())
+        old_session, expired = unlock(c, now - 1)
+        refused = [(delegation, session_sign(forger, c)), (expired, session_sign(old_session, c))]
+        for d, sig in refused:
+            code, out = approve_in(third, nonce, d, sig)
+            assert code == 403, (code, out)
+
+        # The connector refuses them too, even sent by the console's user.
+        rec, n, issued = machine.succeed(
+            "sqlite3 -separator ' ' /var/lib/mandate-console/console.db "
+            f"\"SELECT hex(record), hex(nonce), issued_at FROM challenges WHERE nonce = x'{unb64(nonce).hex()}'\""
+        ).split()
+        ns = int(issued)
+        issued_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ns // 10**9)) + f".{ns % 10**9:09d}Z"
+
+        def std(b):
+            return base64.b64encode(b).decode()
+
+        for d, sig in refused:
+            body = {"record": std(bytes.fromhex(rec)), "nonce": std(bytes.fromhex(n)), "issued_at": issued_at,
+                    "delegation": {"public_key": std(unb64(d["public_key"])), "expires_at": d["expires_at"],
+                                   "covers": std(unb64(d["covers"])), "assertion": d["assertion"]},
+                    "signature": std(sig)}
+            data = base64.b64encode(json.dumps(body).encode()).decode()
+            code = machine.succeed(
+                f"echo {data} | base64 -d | sudo -u mandate-console curl -s -o /dev/null -w '%{{http_code}}' "
+                "--unix-socket /run/mandate-http/connector.sock --data-binary @- http://connector/execute"
+            )
+            assert code == "403", code
+
+        code, p = gw("GET", f"/v1/proposals/{third}")
+        assert p["status"] == "pending", p
+        sent = [json.loads(r["body"]) for r in recorded()[2:]]
+        assert sent == [{"text": "first"}, {"text": "second"}], sent
 
     with subtest("mandate-reset-keys clears every key list"):
         machine.succeed("mandate-reset-keys")
