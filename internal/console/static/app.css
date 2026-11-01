@@ -253,6 +253,7 @@ summary:hover { color: var(--fg-strong); }
   .linking > .steps { grid-column: 1 / -1; }
   .linking > .qr-box { grid-row: 2 / span 3; width: 264px; }
   .linking > .confirm { grid-column: 1 / -1; }
+  .linking:has(> .qr-box[hidden]) { display: block; }
 }
 
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
