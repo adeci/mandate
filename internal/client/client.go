@@ -296,12 +296,11 @@ func (c *client) forward(ctx context.Context, name string, args []string) error 
 }
 
 type table struct {
-	Columns      []string `json:"columns"`
-	Rows         [][]any  `json:"rows"`
-	More         bool     `json:"more"`
-	NextBefore   int64    `json:"next_before"`
-	TotalResults int      `json:"total_results"`
-	Containers   int      `json:"containers"`
+	Columns    []string `json:"columns"`
+	Rows       [][]any  `json:"rows"`
+	More       bool     `json:"more"`
+	NextBefore int64    `json:"next_before"`
+	Containers int      `json:"containers"`
 }
 
 func (c *client) rows(ctx context.Context, path, query string) error {
@@ -349,9 +348,7 @@ func (c *client) table(raw []byte) error {
 	case t.NextBefore > 0:
 		fmt.Fprintf(c.errOut, "next: --before %d\n", t.NextBefore)
 	case t.More:
-		fmt.Fprintln(c.errOut, "more: raise --limit or narrow the search")
-	case t.TotalResults > len(t.Rows):
-		fmt.Fprintf(c.errOut, "%d of %d results\n", len(t.Rows), t.TotalResults)
+		fmt.Fprintln(c.errOut, "more: raise --limit (or offset= for an op), or narrow the search")
 	}
 	if t.Containers > 0 {
 		fmt.Fprintf(c.errOut, "%d chats updated; list them with mandate %s chats\n", t.Containers, c.name)

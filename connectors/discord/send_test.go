@@ -21,7 +21,9 @@ import (
 
 const (
 	groupID = "1100000000000000006"
-	sentID  = "1300000000000000099"
+	// Another DM whose user took Alice's display name.
+	dm2ID  = "1100000000000000007"
+	sentID = "1300000000000000099"
 	// Holds secretBody, so the harness fails if it is ever logged; the HTML
 	// characters go out unescaped, as from a browser.
 	sentText = "rig build log is up <b>&</b>"
@@ -34,8 +36,9 @@ func newSendHarness(t *testing.T, seed func(*state)) *harness {
 	for _, c := range []store.Container{
 		{ID: guildID, Kind: kindGuild, Name: "Club"},
 		{ID: chanGeneral, Kind: kindChannel, ParentID: guildID, Name: "#general"},
-		{ID: threadID, Kind: kindThread, ParentID: guildID, Name: "rig thread"},
-		{ID: dmID, Kind: kindDM, Name: "Alice A"},
+		{ID: threadID, Kind: kindThread, ParentID: chanGeneral, Name: "rig thread"},
+		{ID: dmID, Kind: kindDM, Name: "Alice A", Participants: []store.Participant{{ID: aliceUser, Name: "Alice A", Handle: "alice"}}},
+		{ID: dm2ID, Kind: kindDM, Name: "Alice A", Participants: []store.Participant{{ID: "1000000000000000007", Name: "Alice A", Handle: "mallory"}}},
 		{ID: groupID, Kind: kindGroup, Name: "crew", IsGroup: true},
 	} {
 		if err := h.st.UpsertContainer(context.Background(), c); err != nil {
@@ -94,10 +97,11 @@ func TestPrepareSend(t *testing.T) {
 	ctx := context.Background()
 	text := strings.Repeat("😀", maxMessageLength) // Discord counts characters, not bytes
 	for chat, want := range map[string]approval.Field{
-		dmID:        {Label: "To", Value: "Alice A"},
-		groupID:     {Label: "Group", Value: "crew"},
-		chanGeneral: {Label: "Channel", Value: "Club / #general"},
-		threadID:    {Label: "Thread", Value: "Club / rig thread"},
+		dmID:        {Label: "To", Value: "~Alice A (@alice)"},
+		dm2ID:       {Label: "To", Value: "~Alice A (@mallory)"},
+		groupID:     {Label: "Group", Value: "~crew (" + groupID + ")"},
+		chanGeneral: {Label: "Channel", Value: "~Club / #general (" + chanGeneral + ")"},
+		threadID:    {Label: "Thread", Value: "~Club / #general / rig thread (" + threadID + ")"},
 	} {
 		p, err := h.client.Prepare(ctx, "send", map[string]string{"chat": chat, "text": text})
 		if err != nil {

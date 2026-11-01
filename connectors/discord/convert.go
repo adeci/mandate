@@ -50,9 +50,10 @@ var storedTypes = map[int]bool{
 const discordEpochMS = 1420070400000
 
 type apiUser struct {
-	ID         string `json:"id"`
-	Username   string `json:"username"`
-	GlobalName string `json:"global_name"`
+	ID            string `json:"id"`
+	Username      string `json:"username"`
+	Discriminator string `json:"discriminator"`
+	GlobalName    string `json:"global_name"`
 }
 
 type apiGuild struct {
@@ -65,6 +66,7 @@ type apiChannel struct {
 	ID            string    `json:"id"`
 	Type          int       `json:"type"`
 	GuildID       string    `json:"guild_id"`
+	ParentID      string    `json:"parent_id"`
 	Name          string    `json:"name"`
 	Position      int       `json:"position"`
 	Recipients    []apiUser `json:"recipients"`
@@ -133,6 +135,18 @@ func displayName(u *apiUser) string {
 	return u.Username
 }
 
+// handle is the unique @name Discord shows for u; accounts not yet moved to
+// unique usernames, such as bots, keep a #discriminator.
+func handle(u *apiUser) string {
+	if u == nil || u.Username == "" {
+		return ""
+	}
+	if u.Discriminator != "" && u.Discriminator != "0" {
+		return u.Username + "#" + u.Discriminator
+	}
+	return u.Username
+}
+
 func guildContainer(g *apiGuild) (store.Container, bool) {
 	if g == nil || g.ID == "" || g.Unavailable {
 		return store.Container{}, false
@@ -140,21 +154,36 @@ func guildContainer(g *apiGuild) (store.Container, bool) {
 	return store.Container{ID: g.ID, Kind: kindGuild, Name: g.Name}, true
 }
 
+// guildChannelContainers converts chans, which default to guildID. A
+// thread's parent channel is stored too, if only by ID, so that hiding the
+// guild hides the thread through it.
 func guildChannelContainers(guildID string, chans []apiChannel) []store.Container {
 	out := make([]store.Container, 0, len(chans))
+	listed := make(map[string]bool, len(chans))
+	for i := range chans {
+		listed[chans[i].ID] = true
+	}
 	for i := range chans {
 		c := chans[i]
 		if c.GuildID == "" {
 			c.GuildID = guildID
 		}
-		if cc, ok := channelContainer(&c); ok {
-			out = append(out, cc)
+		cc, ok := channelContainer(&c)
+		if !ok {
+			continue
 		}
+		if c.isThread() && cc.ParentID != "" && !listed[cc.ParentID] {
+			listed[cc.ParentID] = true
+			out = append(out, store.Container{ID: cc.ParentID, Kind: kindChannel, ParentID: c.GuildID})
+		}
+		out = append(out, cc)
 	}
 	return out
 }
 
-// Threads also get ParentID = guild ID, so hiding a guild hides everything in it.
+// A thread's parent is its channel, whose parent is the guild, so hiding
+// either hides the thread. Discord leaves parent_id out of some thread
+// payloads; an empty ParentID keeps the stored one.
 // Channels are named "#name" as in Discord; the gateway adds the guild's name.
 // last_message_id dates the chat for the chats list before any message is fetched.
 func channelContainer(c *apiChannel) (store.Container, bool) {
@@ -186,7 +215,7 @@ func channelContainer(c *apiChannel) (store.Container, bool) {
 	case c.Type == channelGuildCategory, c.GuildID == "":
 		return store.Container{}, false
 	case c.isThread():
-		return store.Container{ID: c.ID, Kind: kindThread, ParentID: c.GuildID, Name: c.Name, LastMessageAt: last}, true
+		return store.Container{ID: c.ID, Kind: kindThread, ParentID: c.ParentID, Name: c.Name, LastMessageAt: last}, true
 	default:
 		name := c.Name
 		if name != "" {
@@ -202,7 +231,7 @@ func participants(c *apiChannel) []store.Participant {
 	var ps []store.Participant
 	for i := range c.Recipients {
 		if u := &c.Recipients[i]; u.ID != "" {
-			ps = append(ps, store.Participant{ID: u.ID, Name: displayName(u)})
+			ps = append(ps, store.Participant{ID: u.ID, Name: displayName(u), Handle: handle(u)})
 		}
 	}
 	return ps

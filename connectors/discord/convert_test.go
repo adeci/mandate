@@ -14,7 +14,7 @@ const self = "100"
 var (
 	ts    = time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 	alice = &apiUser{ID: "200", Username: "alice", GlobalName: "Alice A"}
-	bob   = &apiUser{ID: "300", Username: "bob"}
+	bob   = &apiUser{ID: "300", Username: "bob", Discriminator: "0042"}
 	me    = &apiUser{ID: self, Username: "me"}
 )
 
@@ -201,15 +201,15 @@ func TestChannelContainer(t *testing.T) {
 			want: store.Container{ID: "c", Kind: "channel", ParentID: "g", Name: "#general"}, wantOK: true,
 		},
 		{
-			name: "public thread parents to guild, not channel",
-			in:   &apiChannel{ID: "t", GuildID: "g", Name: "topic", Type: channelPublicThread},
-			want: store.Container{ID: "t", Kind: "thread", ParentID: "g", Name: "topic"}, wantOK: true,
+			name: "public thread parents to its channel",
+			in:   &apiChannel{ID: "t", GuildID: "g", ParentID: "c", Name: "topic", Type: channelPublicThread},
+			want: store.Container{ID: "t", Kind: "thread", ParentID: "c", Name: "topic"}, wantOK: true,
 		},
 		{
 			name: "dm uses the recipient's name and is dated by its last message",
 			in:   &apiChannel{ID: "d", Type: channelDM, Recipients: []apiUser{*alice}, LastMessageID: "175928847299117063"},
 			want: store.Container{
-				ID: "d", Kind: "dm", Name: "Alice A", Participants: []store.Participant{{ID: "200", Name: "Alice A"}},
+				ID: "d", Kind: "dm", Name: "Alice A", Participants: []store.Participant{{ID: "200", Name: "Alice A", Handle: "alice"}},
 				LastMessageAt: time.Date(2016, 4, 30, 11, 18, 25, 796e6, time.UTC),
 			}, wantOK: true,
 		},
@@ -223,7 +223,7 @@ func TestChannelContainer(t *testing.T) {
 			in:   &apiChannel{ID: "gd", Name: "crew", Type: channelGroupDM, Recipients: []apiUser{*alice, *bob}},
 			want: store.Container{
 				ID: "gd", Kind: "group", Name: "crew", IsGroup: true,
-				Participants: []store.Participant{{ID: "200", Name: "Alice A"}, {ID: "300", Name: "bob"}},
+				Participants: []store.Participant{{ID: "200", Name: "Alice A", Handle: "alice"}, {ID: "300", Name: "bob", Handle: "bob#0042"}},
 			}, wantOK: true,
 		},
 		{
@@ -231,7 +231,7 @@ func TestChannelContainer(t *testing.T) {
 			in:   &apiChannel{ID: "gd", Type: channelGroupDM, Recipients: []apiUser{*alice, *bob}},
 			want: store.Container{
 				ID: "gd", Kind: "group", Name: "Alice A, bob", IsGroup: true,
-				Participants: []store.Participant{{ID: "200", Name: "Alice A"}, {ID: "300", Name: "bob"}},
+				Participants: []store.Participant{{ID: "200", Name: "Alice A", Handle: "alice"}, {ID: "300", Name: "bob", Handle: "bob#0042"}},
 			}, wantOK: true,
 		},
 		{name: "category skipped", in: &apiChannel{ID: "cat", GuildID: "g", Type: channelGuildCategory}},
@@ -262,12 +262,17 @@ func TestGuildContainers(t *testing.T) {
 	}
 	chans := []apiChannel{
 		{ID: "cat", GuildID: "g", Type: channelGuildCategory, Name: "Text"},
-		{ID: "c", Type: 0, Name: "general"}, // guild_id omitted
-		{ID: "t", Type: channelPublicThread, Name: "topic"},
+		{ID: "c", Type: 0, ParentID: "cat", Name: "general"}, // guild_id omitted
+		{ID: "t", Type: channelPublicThread, ParentID: "c", Name: "topic"},
+		{ID: "t2", Type: channelPublicThread, ParentID: "c2", Name: "elsewhere"},
 	}
+	// A thread's channel that was not listed is stored by ID, so the thread
+	// still hangs under the guild.
 	want := []store.Container{
 		{ID: "c", Kind: "channel", ParentID: "g", Name: "#general"},
-		{ID: "t", Kind: "thread", ParentID: "g", Name: "topic"},
+		{ID: "t", Kind: "thread", ParentID: "c", Name: "topic"},
+		{ID: "c2", Kind: "channel", ParentID: "g"},
+		{ID: "t2", Kind: "thread", ParentID: "c2", Name: "elsewhere"},
 	}
 	if got := guildChannelContainers("g", chans); !reflect.DeepEqual(got, want) {
 		t.Errorf("got  %+v\nwant %+v", got, want)

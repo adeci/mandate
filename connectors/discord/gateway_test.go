@@ -569,6 +569,8 @@ func TestGatewayReadyNamesGuildChats(t *testing.T) {
 		newGuild  = "1200000000000000001"
 		newChan   = "1200000000000000002"
 		newThread = "1200000000000000003"
+		orphan    = "1200000000000000004"
+		later     = "1300000000000000005"
 	)
 	h := newHarness(t, nil)
 	ready := h.gw.ready
@@ -601,7 +603,7 @@ FROM containers AS c LEFT JOIN containers AS p ON p.id = c.parent_id WHERE c.id 
 	if row := chat(chanGeneral); row[0] != kindChannel || row[1] != "Club / #general" || row[2] != snowflakeTimeString(msg3) {
 		t.Errorf("channel %v", row)
 	}
-	if row := chat(threadID); row[0] != kindThread || row[1] != "Club / rig thread" {
+	if row := chat(threadID); row[0] != kindThread || row[1] != "#general / rig thread" {
 		t.Errorf("thread %v", row)
 	}
 	if stored(category) {
@@ -619,15 +621,44 @@ FROM containers AS c LEFT JOIN containers AS p ON p.id = c.parent_id WHERE c.id 
 	})
 	c.dispatch("THREAD_CREATE", map[string]any{"id": newThread, "type": 11, "guild_id": newGuild, "parent_id": newChan, "name": "plans"})
 	c.dispatch("CHANNEL_UPDATE", map[string]any{"id": chanGeneral, "type": 0, "guild_id": guildID, "name": "general-chat"})
-	eventually(t, "events stored", func() bool { return stored(newThread) })
+	eventually(t, "events stored", func() bool { return chat(chanGeneral)[1] == "Club / #general-chat" })
 	if row := chat(chanGeneral); row[1] != "Club / #general-chat" || row[2] != snowflakeTimeString(msg4) {
 		t.Errorf("channel after a message and a rename %v", row)
 	}
 	if row := chat(newChan); row[1] != "Other / #lobby" {
 		t.Errorf("new guild channel %v", row)
 	}
-	if row := chat(newThread); row[1] != "Other / plans" {
+	if row := chat(newThread); row[1] != "#lobby / plans" {
 		t.Errorf("new thread %v", row)
+	}
+
+	// A message names its thread but not the thread's channel: the thread
+	// goes under the guild until Discord says which channel it is in, and
+	// stays there after.
+	parent := func(id string) any { return h.queryRow(`SELECT parent_id FROM containers WHERE id = ?`, id)[0] }
+	message := func(id string) map[string]any {
+		return map[string]any{
+			"id": id, "channel_id": orphan, "guild_id": newGuild, "channel_type": channelPublicThread, "type": 0, "content": "hi",
+			"timestamp": "2026-10-29T16:00:00.000000+00:00", "author": map[string]any{"id": aliceUser, "username": "alice"},
+		}
+	}
+	messageStored := func(id string) func() bool {
+		return func() bool {
+			var n int
+			_ = h.st.DB().QueryRowContext(ctx, `SELECT count(*) FROM messages WHERE id = ?`, id).Scan(&n)
+			return n == 1
+		}
+	}
+	c.dispatch("MESSAGE_CREATE", message(msg3))
+	eventually(t, "thread message stored", messageStored(msg3))
+	if p := parent(orphan); p != newGuild {
+		t.Errorf("thread seen in a message has parent %v, want the guild", p)
+	}
+	c.dispatch("THREAD_UPDATE", map[string]any{"id": orphan, "type": 11, "guild_id": newGuild, "parent_id": newChan, "name": "later"})
+	c.dispatch("MESSAGE_CREATE", message(later))
+	eventually(t, "second thread message stored", messageStored(later))
+	if p := parent(orphan); p != newChan {
+		t.Errorf("thread parent %v after THREAD_UPDATE and another message, want its channel", p)
 	}
 	if n := len(h.discord.all()); n != 0 {
 		t.Errorf("%d REST requests", n)

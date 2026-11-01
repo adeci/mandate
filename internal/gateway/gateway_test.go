@@ -53,16 +53,34 @@ func fixture(t *testing.T) map[string]string {
 		t.Fatal(err)
 	}
 	defer dc.Close()
+	// Threads hang under channels under guilds; a DM's ID is not its other
+	// participant's, which the participants or the messages say.
 	for _, c := range []store.Container{
 		{ID: "g-work", Kind: "guild", Name: "Work"},
 		{ID: "c-general", Kind: "channel", ParentID: "g-work", Name: "general"},
+		{ID: "t-standup", Kind: "thread", ParentID: "c-general", Name: "standup"},
 		{ID: "g-fun", Kind: "guild", Name: "Fun"},
 		{ID: "c-memes", Kind: "channel", ParentID: "g-fun", Name: "memes"},
+		{ID: "t-cats", Kind: "thread", ParentID: "c-memes", Name: "cats"},
+		{ID: "c-secret", Kind: "channel", ParentID: "g-fun", Name: "secret"},
+		{ID: "t-plans", Kind: "thread", ParentID: "c-secret", Name: "plans"},
+		{ID: "dm-known", Kind: "dm", Name: "Hidden", Participants: []store.Participant{{ID: "u-hidden"}}},
+		{ID: "dm-unknown", Kind: "dm", Name: "Hidden too"},
 	} {
 		mustDo(t, dc.UpsertContainer(ctx, c))
 	}
-	mustDo(t, dc.UpsertMessage(ctx, store.Message{ID: "d1", ContainerID: "c-general", SenderID: "u1", Body: "standup", SentAt: at}))
-	mustDo(t, dc.UpsertMessage(ctx, store.Message{ID: "d2", ContainerID: "c-memes", SenderID: "u2", Body: "lol", SentAt: at}))
+	for _, m := range []store.Message{
+		{ID: "d1", ContainerID: "c-general", SenderID: "u1", Body: "standup"},
+		{ID: "d2", ContainerID: "c-memes", SenderID: "u2", Body: "lol"},
+		{ID: "d6", ContainerID: "t-standup", SenderID: "u1", Body: "thread notes"},
+		{ID: "d7", ContainerID: "t-plans", SenderID: "u2", Body: "secret plans"},
+		{ID: "d8", ContainerID: "dm-known", SenderID: "u-me", IsFromMe: true, Body: "hey, about the plans"},
+		{ID: "d9", ContainerID: "dm-unknown", SenderID: "u-hidden", Body: "hi"},
+		{ID: "d10", ContainerID: "dm-unknown", SenderID: "u-me", IsFromMe: true, Body: "hey you"},
+	} {
+		m.SentAt = at
+		mustDo(t, dc.UpsertMessage(ctx, m))
+	}
 
 	return map[string]string{
 		"whatsapp": filepath.Join(dir, "whatsapp.db"),
@@ -76,7 +94,7 @@ hide_containers = ["conv-private"]
 hide_senders = ["+15550002"]
 
 [discord]
-hide_containers = ["g-work"]
+hide_containers = ["g-work", "c-secret"]
 hide_senders = ["u-hidden"]
 `
 
@@ -119,8 +137,10 @@ func TestVerbsNeverShowHiddenChatsOrLoginCodes(t *testing.T) {
 		t.Errorf("whatsapp chats = %v, want family and bank (hidden chat and hidden sender's DM dropped)", got)
 	}
 	_, res, _ = getTable(t, h, "/v1/discord/chats")
-	if got := column(t, res, "name"); !slices.Equal(got, []any{"Fun / memes", "Fun"}) {
-		t.Errorf("discord chats = %v, want memes named under its guild (hidden guild hides its channels)", got)
+	got := column(t, res, "name")
+	slices.SortFunc(got, func(a, b any) int { return strings.Compare(a.(string), b.(string)) })
+	if want := []any{"Fun", "Fun / memes", "Fun / memes / cats"}; !slices.Equal(got, want) {
+		t.Errorf("discord chats = %v, want %v: threads named under their channel and guild, hidden ones and what is under them dropped", got, want)
 	}
 	_, res, _ = getTable(t, h, "/v1/discord/search?text=lol")
 	if got := column(t, res, "chat"); !slices.Equal(got, []any{"Fun / memes"}) {
@@ -339,7 +359,7 @@ func TestParseExposureStrict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("valid config rejected: %v", err)
 	}
-	if got := pol.sources["discord"].HideContainers; len(got) != 1 || got[0] != "g-work" {
+	if got := pol.sources["discord"].HideContainers; !slices.Equal(got, []string{"g-work", "c-secret"}) {
 		t.Errorf("discord hide_containers = %v", got)
 	}
 	if !pol.classifier.IsAuth("bank", "hello") {
@@ -347,6 +367,20 @@ func TestParseExposureStrict(t *testing.T) {
 	}
 	if _, err := parseExposure("", nil); err != nil {
 		t.Errorf("empty config rejected: %v", err)
+	}
+}
+
+// Hidden IDs that match nothing stored are reported, as a typo or an ID in
+// another form would hide nothing.
+func TestUnmatchedHiddenIDs(t *testing.T) {
+	t.Parallel()
+	got, err := unmatched(fixture(t)["discord"], sourceExposure{
+		HideContainers: []string{"g-work", "g-typo"},
+		HideSenders:    []string{"u-hidden", "u1", "u-ghost"},
+	})
+	mustDo(t, err)
+	if want := []miss{{"hide_containers", "g-typo"}, {"hide_senders", "u-ghost"}}; !slices.Equal(got, want) {
+		t.Errorf("unmatched = %v, want %v", got, want)
 	}
 }
 

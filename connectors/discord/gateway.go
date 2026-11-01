@@ -703,8 +703,11 @@ func (g *gateway) storeChannel(ctx context.Context, d json.RawMessage) {
 	if json.Unmarshal(d, &ch) != nil || !isSnowflake(ch.ID) {
 		return
 	}
-	if cc, ok := channelContainer(&ch); ok {
-		g.storeContainers(ctx, []store.Container{cc})
+	g.storeContainers(ctx, guildChannelContainers(ch.GuildID, []apiChannel{ch}))
+	if ch.isThread() {
+		if err := adopt(ctx, g.store.DB(), ch.ID, ch.GuildID); err != nil {
+			g.log.Error("store thread", "id", ch.ID, "err", err)
+		}
 	}
 }
 
@@ -852,11 +855,18 @@ func (g *gateway) storeCreated(ctx context.Context, d json.RawMessage, selfID st
 	}
 	if c.Kind == kindDM && m.Author != nil && m.Author.ID != selfID && isSnowflake(m.Author.ID) {
 		c.Name = displayName(m.Author)
-		c.Participants = []store.Participant{{ID: m.Author.ID, Name: c.Name}}
+		c.Participants = []store.Participant{{ID: m.Author.ID, Name: c.Name, Handle: handle(m.Author)}}
 	}
 	if err := g.store.UpsertContainer(ctx, c); err != nil {
 		g.log.Error("store chat", "id", c.ID, "err", err)
 		return
+	}
+	// A message names its thread but not the thread's channel.
+	if c.Kind == kindThread {
+		if err := adopt(ctx, g.store.DB(), c.ID, m.GuildID); err != nil {
+			g.log.Error("store chat", "id", c.ID, "err", err)
+			return
+		}
 	}
 	msg, ok := toMessage(&m.apiMessage, selfID)
 	if !ok {

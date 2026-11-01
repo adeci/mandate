@@ -53,6 +53,11 @@ To hide a chat from agents, list it in
 hide_containers = ["15551234567@s.whatsapp.net"]
 ```
 
+Hiding a chat also hides the chats under it, such as a Discord server's
+channels and their threads; `hide_senders` hides a person's messages and
+DMs. The gateway logs a warning for each listed ID that matches nothing it
+has stored.
+
 ## Connectors
 
 `whatsapp`, `signal`, `matrix`, `discord`, `gmessages` (Google Messages, for

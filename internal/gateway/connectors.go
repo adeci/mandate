@@ -427,7 +427,7 @@ func (h *handler) read(w http.ResponseWriter, r *http.Request, name, op string, 
 		writeError(w, http.StatusBadGateway, "connector returned an invalid read result")
 		return
 	}
-	slog.Info("read", append(attrs, "messages", len(res.MessageIDs), "containers", res.Containers)...)
+	slog.Info("read", append(attrs, "messages", len(res.MessageIDs), "containers", len(res.ContainerIDs))...)
 	ctx, cancel := context.WithTimeout(r.Context(), h.cfg.Timeout)
 	defer cancel()
 	s, ok := h.source(ctx, w, name)
@@ -441,7 +441,12 @@ func (h *handler) read(w http.ResponseWriter, r *http.Request, name, op string, 
 		writeError(w, http.StatusServiceUnavailable, "gateway unavailable; tell the owner")
 		return
 	}
-	t.TotalResults, t.Containers = res.TotalResults, res.Containers
+	if t.Containers, err = s.visibleCount(res.ContainerIDs); err != nil {
+		slog.Error("count chats", "source", name, "err", err)
+		writeError(w, http.StatusServiceUnavailable, "gateway unavailable; tell the owner")
+		return
+	}
+	t.More = res.More
 	connector.WriteJSON(w, http.StatusOK, t)
 }
 

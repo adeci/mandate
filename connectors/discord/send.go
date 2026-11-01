@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/adeci/mandate/approval"
 	"github.com/adeci/mandate/connector"
+	"github.com/adeci/mandate/store"
 )
 
 const maxMessageLength = 2000 // characters, Discord's limit without Nitro
@@ -65,11 +67,12 @@ func (w *worker) writable() error {
 }
 
 // recipient checks that chat is stored and can take messages, and names it
-// as the gateway's chats verb does.
+// as the gateway's chats verb does, marked ~ as chosen by others, next to
+// what the send targets: the user's @handle for a DM, else the channel ID.
 func recipient(ctx context.Context, db *sql.DB, chat string) (approval.Field, error) {
-	var kind, name, parent string
-	err := db.QueryRowContext(ctx, `SELECT c.kind, COALESCE(c.name, ''), COALESCE(p.name, '')
-FROM containers AS c LEFT JOIN containers AS p ON p.id = c.parent_id WHERE c.id = ?1`, chat).Scan(&kind, &name, &parent)
+	var kind, name, parent, parts string
+	err := db.QueryRowContext(ctx, `SELECT kind, COALESCE(name, ''), COALESCE(parent_id, ''), participants_json
+FROM containers WHERE id = ?1`, chat).Scan(&kind, &name, &parent, &parts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return approval.Field{}, connector.Invalid("unknown chat %q: run mandate discord chats --search %s", chat, chat)
 	}
@@ -79,23 +82,53 @@ FROM containers AS c LEFT JOIN containers AS p ON p.id = c.parent_id WHERE c.id 
 	if !isSnowflake(chat) {
 		return approval.Field{}, connector.Invalid("invalid chat ID %q", chat)
 	}
-	if name == "" {
-		name = chat
-	}
-	if parent != "" {
-		name = parent + " / " + name
-	}
 	switch kind {
 	case kindDM:
-		return approval.Field{Label: "To", Value: name}, nil
+		var ps []store.Participant
+		if err := json.Unmarshal([]byte(parts), &ps); err != nil {
+			return approval.Field{}, fmt.Errorf("chat %s participants: %w", chat, err)
+		}
+		id := chat
+		if len(ps) == 1 && ps[0].Handle != "" {
+			id = "@" + ps[0].Handle
+		}
+		return approval.Field{Label: "To", Value: withID(name, id)}, nil
 	case kindGroup:
-		return approval.Field{Label: "Group", Value: name}, nil
-	case kindChannel:
-		return approval.Field{Label: "Channel", Value: name}, nil
-	case kindThread:
-		return approval.Field{Label: "Thread", Value: name}, nil
+		return approval.Field{Label: "Group", Value: withID(name, chat)}, nil
+	case kindChannel, kindThread:
+		// The guild and, for a thread, its channel, as the gateway's chats
+		// verb prefixes them.
+		for range 2 {
+			if parent == "" {
+				break
+			}
+			var pname string
+			err := db.QueryRowContext(ctx, `SELECT COALESCE(name, ''), COALESCE(parent_id, '') FROM containers WHERE id = ?1`, parent).
+				Scan(&pname, &parent)
+			if errors.Is(err, sql.ErrNoRows) {
+				break
+			}
+			if err != nil {
+				return approval.Field{}, fmt.Errorf("look up chat: %w", err)
+			}
+			if pname != "" {
+				name = pname + " / " + cmp.Or(name, chat)
+			}
+		}
+		label := "Channel"
+		if kind == kindThread {
+			label = "Thread"
+		}
+		return approval.Field{Label: label, Value: withID(name, chat)}, nil
 	}
 	return approval.Field{}, connector.Invalid("cannot send to a %s; pick a channel, thread or DM", kind)
+}
+
+func withID(name, id string) string {
+	if name == "" {
+		return id
+	}
+	return "~" + name + " (" + id + ")"
 }
 
 // Execute runs on the worker like a read, so a stopped or unlinked connector
@@ -129,9 +162,9 @@ func (s *service) send(ctx context.Context, dl time.Time, chat, text string) con
 	if err != nil || c.ID == "" || !isSnowflake(chat) {
 		return connector.Result{Status: connector.Failed, Detail: "unknown chat " + chat}
 	}
-	guild := ""
-	if c.Kind == kindChannel || c.Kind == kindThread {
-		guild = c.ParentID
+	guild, err := s.guildOf(ctx, c)
+	if err != nil {
+		return connector.Result{Status: connector.Failed, Detail: err.Error()}
 	}
 	referer := channelURL(guild, chat)
 	typed, err := s.typing(ctx, dl, chat, referer, text)

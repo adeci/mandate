@@ -117,10 +117,13 @@ type Result struct {
 // same filter as its message verbs, so hidden and OTP rules apply to fetched
 // data too.
 type ReadResult struct {
-	MessageIDs   []string `json:"message_ids,omitempty"`
-	TotalResults int      `json:"total_results,omitempty"`
-	// Containers counts containers upserted by sync-style reads.
-	Containers int `json:"containers,omitempty"`
+	MessageIDs []string `json:"message_ids,omitempty"`
+	// More says the service has results past this page. Totals are not
+	// passed on: they count hidden chats and senders too.
+	More bool `json:"more,omitempty"`
+	// ContainerIDs are the containers a sync-style read stored; agents get
+	// the count of the visible ones.
+	ContainerIDs []string `json:"container_ids,omitempty"`
 }
 
 type Connector interface {
