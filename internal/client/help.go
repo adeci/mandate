@@ -118,7 +118,7 @@ func writeConnectorHelp(w io.Writer, ci connectorInfo) {
 		} else {
 			reads = true
 		}
-		if op.Name == "send" {
+		if op.Name == "send" && chatText(op.Params) {
 			fmt.Fprintf(w, "  "+sendUsage+"\n      %s (%s)\n", ci.Name, op.Summary, kind)
 			continue
 		}
@@ -155,6 +155,11 @@ func writeConnectorHelp(w io.Writer, ci connectorInfo) {
 		fmt.Fprintln(w, "--note is shown to the owner with the proposal.")
 	}
 	fmt.Fprintln(w, "Every command takes --json.")
+}
+
+// chatText reports whether a send op takes the CHAT_ID TEXT shorthand.
+func chatText(params []connector.Param) bool {
+	return len(params) == 2 && params[0].Name == "chat" && params[1].Name == "text"
 }
 
 func paramTags(p connector.Param) string {

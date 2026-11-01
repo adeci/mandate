@@ -104,6 +104,15 @@ func TestRequests(t *testing.T) {
 			args:   []string{"send", "123@g.us", "--", "-5 outside"},
 			method: "POST", path: "/v1/whatsapp/send", body: `{"args":{"chat":"123@g.us","text":"-5 outside"}}`,
 		},
+		"send to a base64 chat ID": {
+			args:   []string{"send", "Zm9vYmFy+/a2V5=", "hi"},
+			method: "POST", path: "/v1/whatsapp/send", body: `{"args":{"chat":"Zm9vYmFy+/a2V5=","text":"hi"}}`,
+		},
+		"send with KEY=VALUE": {
+			args:   []string{"send", "to=a@example.com", "subject=Lunch", "body=at 1?", "--note", "Alex asked"},
+			method: "POST", path: "/v1/whatsapp/send",
+			body: `{"args":{"body":"at 1?","subject":"Lunch","to":"a@example.com"},"note":"Alex asked"}`,
+		},
 		"other op": {
 			args:   []string{"fetch", "channel_id=9", "content=a=b c"},
 			method: "POST", path: "/v1/whatsapp/fetch", body: `{"args":{"channel_id":"9","content":"a=b c"}}`,

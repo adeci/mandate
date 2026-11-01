@@ -142,22 +142,13 @@ func (c *client) connector(ctx context.Context, name string, args []string) erro
 			return err
 		}
 		return c.rows(ctx, base+"search", query("text", strings.Join(pos, " "), "chat", *chat, "since", *since, "limit", *limit, "before", *before))
-	case "send":
-		help := fmt.Sprintf(sendUsage, name)
-		note := fs.String("note", "", "")
-		wait := fs.Duration("wait", 0, "")
-		pos, err := c.parse(fs, help, args, 2, -1)
-		if err != nil {
-			return err
-		}
-		if *wait < 0 {
-			return usage(help, errNegativeWait)
-		}
-		return c.submit(ctx, base+"send", map[string]string{"chat": pos[0], "text": strings.Join(pos[1:], " ")}, *note, *wait)
 	case "get":
 		return c.forward(ctx, name, args)
 	}
 	help := fmt.Sprintf(opUsage, name, cmd)
+	if cmd == "send" {
+		help = fmt.Sprintf(sendUsage, name)
+	}
 	note := fs.String("note", "", "")
 	wait := fs.Duration("wait", 0, "")
 	pos, err := c.parse(fs, help, args, 0, -1)
@@ -167,11 +158,37 @@ func (c *client) connector(ctx context.Context, name string, args []string) erro
 	if *wait < 0 {
 		return usage(help, errNegativeWait)
 	}
+	// send CHAT_ID TEXT is shorthand for chat= and text=; a send whose
+	// params differ, like an email's, takes KEY=VALUE as other ops do.
+	if cmd == "send" {
+		if len(pos) == 0 || !isKeyValue(pos[0]) {
+			if len(pos) < 2 {
+				return usage(help, nil)
+			}
+			return c.submit(ctx, base+"send", map[string]string{"chat": pos[0], "text": strings.Join(pos[1:], " ")}, *note, *wait)
+		}
+		help = fmt.Sprintf(opUsage, name, cmd)
+	}
 	kv, err := keyValues(pos)
 	if err != nil {
 		return usage(help, err)
 	}
 	return c.submit(ctx, base+url.PathEscape(cmd), kv, *note, *wait)
+}
+
+// isKeyValue reports whether s starts with a param name and "=". Base64
+// chat IDs end in "=" too, but hold more than lowercase letters and digits.
+func isKeyValue(s string) bool {
+	k, _, ok := strings.Cut(s, "=")
+	if !ok || k == "" || k[0] < 'a' || k[0] > 'z' {
+		return false
+	}
+	for _, r := range k {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 func isHelp(s string) bool { return s == "-h" || s == "--help" || s == "help" }
