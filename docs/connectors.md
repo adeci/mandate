@@ -133,3 +133,14 @@ services.mandate.connectors.webhook = {
 
 It runs as its own user (`mandate-webhook`) with only that token, and shows up
 in `mandate --help` and the console on the next deploy.
+
+The module starts it as
+
+```
+mandate-webhook --socket PATH --state DIR --config FILE --rp-id HOST --origin URL
+```
+
+with credentials as files in `$CREDENTIALS_DIRECTORY`, and checks the
+settings at build time with `mandate-webhook --check-config FILE`.
+`connector.Main` handles both. Secrets belong in `DIR/private`; the gateway
+can read the rest of `DIR`.
