@@ -133,6 +133,10 @@ func (f *fixture) link() id.DeviceID {
 // encrypt encrypts text as the owner's device el would in room, in a new
 // room key that it shares with the owner's devices.
 func (f *fixture) encrypt(el *account, room id.RoomID, eventID, text string, ts int64) (map[string]any, *event.EncryptedEventContent) {
+	return f.encryptContent(el, room, eventID, &event.MessageEventContent{MsgType: event.MsgText, Body: text}, ts)
+}
+
+func (f *fixture) encryptContent(el *account, room id.RoomID, eventID string, content *event.MessageEventContent, ts int64) (map[string]any, *event.EncryptedEventContent) {
 	f.t.Helper()
 	ctx := context.Background()
 	if err := el.crypto.RemoveOutboundGroupSession(ctx, room); err != nil {
@@ -145,7 +149,7 @@ func (f *fixture) encrypt(el *account, room id.RoomID, eventID, text string, ts 
 	if err := el.mach.ShareGroupSession(ctx, room, []id.UserID{owner}); err != nil {
 		f.t.Fatal(err)
 	}
-	enc, err := el.mach.EncryptMegolmEvent(ctx, room, event.EventMessage, &event.MessageEventContent{MsgType: event.MsgText, Body: text})
+	enc, err := el.mach.EncryptMegolmEvent(ctx, room, event.EventMessage, content)
 	if err != nil {
 		f.t.Fatal(err)
 	}
