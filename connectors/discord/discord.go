@@ -276,7 +276,7 @@ func (w *worker) Health(context.Context) connector.Health {
 	case w.owner != "":
 		return connector.Health{State: connector.NeedsSetup, Detail: w.owner}
 	case !w.linked:
-		return connector.Health{State: connector.NeedsSetup, Detail: fixLink}
+		return connector.Health{State: connector.NeedsSetup, Detail: "needs a token"}
 	}
 	p := &pacer{st: &w.pace, hours: w.svc.up.pace.hours}
 	if until, why := p.rest(w.clock.Now()); !until.IsZero() {
@@ -385,7 +385,10 @@ func (w *worker) link(ctx context.Context, dl time.Time, token string) error {
 		return err
 	}
 	up.token = token
-	if _, err := w.svc.selfID(ctx, dl); err != nil {
+	up.pace.atKeyboard = true
+	_, err := w.svc.selfID(ctx, dl)
+	up.pace.atKeyboard = false
+	if err != nil {
 		up.token = ""
 		var stop *ownerStop
 		if errors.As(up.fatal, &stop) {

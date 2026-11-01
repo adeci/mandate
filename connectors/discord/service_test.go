@@ -826,7 +826,7 @@ func TestLinkUnlinkRelink(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.start()
-	if got := h.health(); got.State != connector.NeedsSetup || got.Detail != fixLink {
+	if got := h.health(); got.State != connector.NeedsSetup || got.Detail != "needs a token" {
 		t.Errorf("unlinked health = %+v", got)
 	}
 	if e := h.callErr("sync", map[string]string{}, http.StatusServiceUnavailable); !strings.Contains(e.Message, "console") {
@@ -883,6 +883,26 @@ func TestLinkUnlinkRelink(t *testing.T) {
 	}
 	if h.health().State != connector.Healthy {
 		t.Fatalf("after relink: health %+v", h.health())
+	}
+}
+
+// The owner pasting a token is at the keyboard, so setup ignores active
+// hours; reads still wait for them.
+func TestSetupAtNight(t *testing.T) {
+	h := newHarness(t, nil)
+	if err := h.token.Delete(); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.now = noon.Add(-10 * time.Hour)
+	h.start()
+	if err := h.setup("night-token.abc.def"); err != nil {
+		t.Fatalf("setup outside active hours: %v", err)
+	}
+	if h.storedToken() != "night-token.abc.def" {
+		t.Fatal("token not stored")
+	}
+	if e := h.callErr("sync", map[string]string{}, http.StatusTooManyRequests); !strings.Contains(e.Message, "outside active hours") {
+		t.Errorf("read at night: %q", e.Message)
 	}
 }
 

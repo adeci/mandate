@@ -121,6 +121,10 @@ type pacer struct {
 
 	gap, open, subresource time.Duration // pre-rolled delays for the next request
 
+	// atKeyboard is set while the owner links from the console, which is
+	// human activity at any hour, so active hours don't apply.
+	atKeyboard bool
+
 	routeBuckets map[string]string    // route key -> X-RateLimit-Bucket
 	exhausted    map[string]time.Time // bucket -> reset time while Remaining is 0
 }
@@ -199,7 +203,7 @@ func (p *pacer) blocker(t time.Time, route string) (time.Time, string, bool) {
 		// Wait until enough old requests leave the window.
 		return w[len(w)-dailyBudget].Add(budgetWindow + time.Millisecond), "daily budget", true
 	}
-	if !p.hours.active(t) {
+	if !p.atKeyboard && !p.hours.active(t) {
 		return p.hours.next(t), "outside active hours", true
 	}
 	if until, ok := p.exhausted[p.bucket(route)]; ok && until.After(t) {
