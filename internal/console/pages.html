@@ -17,8 +17,7 @@
   <div class="masthead"><a class="brand" href="/">mandate</a></div>
   {{- if .Who}}
   <nav>
-    <a href="/"{{if eq .Nav "pending"}} aria-current="page"{{end}}>Pending{{if .Pending}} <span class="count">{{.Pending}}</span>{{end}}</a>
-    <a href="/history"{{if eq .Nav "history"}} aria-current="page"{{end}}>History</a>
+    <a href="/"{{if eq .Nav "inbox"}} aria-current="page"{{end}}>Inbox{{if .Pending}} <span class="count">{{.Pending}}</span>{{end}}</a>
     <a href="/connections"{{if eq .Nav "connections"}} aria-current="page"{{end}}>Connections</a>
     <a href="/keys"{{if eq .Nav "keys"}} aria-current="page"{{end}}>Keys</a>
   </nav>
@@ -48,7 +47,7 @@
 {{define "error"}}{{template "top" .}}
 <h1>Error</h1>
 <p class="flash" data-kind="error">{{.Data}}</p>
-<p><a href="/">← pending</a></p>
+<p><a href="/">← inbox</a></p>
 {{template "bottom" .}}{{end}}
 
 {{define "password"}}
@@ -82,18 +81,21 @@
 <ul class="rows">
 {{range .}}
   <li><a href="/r/{{.ID}}">
-    <span class="line spread">{{template "status" .Status}}<span class="muted">{{.When}}</span></span>
-    <span class="line"><span class="action">{{.Action}}</span>{{with .Who}} → {{.}}{{end}}</span>
-    {{with .What}}<span class="line">{{.}}</span>{{end}}
+    <span class="state">{{template "status" .Status}}</span>
+    <span class="when muted">{{.When}}</span>
+    <span class="line summary"><span class="action">{{.Action}}</span>{{with .Who}} → {{.}}{{end}}</span>
+    <span class="line what">{{.What}}</span>
   </a></li>
 {{end}}
 </ul>
 {{end}}
 
-{{define "pending"}}{{template "top" .}}
-<h1>Pending</h1>
+{{define "inbox"}}{{template "top" .}}
+<h1>Inbox</h1>
 {{with .Data}}
-<p class="muted">{{len .}} waiting · newest first</p>
+<section>
+<h2>Waiting</h2>
+{{with .Waiting}}
 {{template "rows" .}}
 {{else}}
 <div class="empty">
@@ -106,16 +108,39 @@
 <p>Nothing to approve.<br><span class="muted">Agents' requests show up here.</span></p>
 </div>
 {{end}}
-<p><a href="/history">history →</a></p>
-{{template "bottom" .}}{{end}}
+</section>
 
-{{define "history"}}{{template "top" .}}
-<h1>History</h1>
-{{with .Data}}
-<p class="muted">newest first</p>
-{{template "rows" .}}
+<section>
+<h2>Done</h2>
+<form class="search" method="get" action="/">
+  <div class="row">
+    <input type="search" name="q" value="{{.Q}}" placeholder="text, note, connector" aria-label="Search">
+    <button type="submit">Search</button>
+  </div>
+  <details{{if or .Connector .Status .From .To}} open{{end}}>
+    <summary>filters</summary>
+    <div class="filters">
+      <label>connector
+        <select name="connector"><option value="">any</option>{{range .Connectors}}<option{{if eq . $.Data.Connector}} selected{{end}}>{{.}}</option>{{end}}</select>
+      </label>
+      <label>outcome
+        <select name="status"><option value="">any</option>{{range .Statuses}}<option{{if eq (print .) $.Data.Status}} selected{{end}}>{{.}}</option>{{end}}</select>
+      </label>
+      <label>from <input type="date" name="from" value="{{.From}}"></label>
+      <label>to <input type="date" name="to" value="{{.To}}"></label>
+    </div>
+  </details>
+</form>
+{{if .Done}}
+<p class="muted">{{.First}}–{{.Last}} of {{.Total}}</p>
+<div class="done">{{template "rows" .Done}}</div>
+<nav class="pager">{{with .Newer}}<a href="{{.}}">← newer</a>{{end}}{{with .Older}}<a href="{{.}}" class="older">older →</a>{{end}}</nav>
+{{else if or .Q .Connector .Status .From .To}}
+<p class="muted">No matches. <a href="/">Clear the search</a></p>
 {{else}}
-<div class="empty"><p>Nothing decided yet.</p></div>
+<p class="muted">Nothing decided yet.</p>
+{{end}}
+</section>
 {{end}}
 {{template "bottom" .}}{{end}}
 
@@ -132,7 +157,7 @@
 
 {{define "request"}}{{template "top" .}}
 {{with .Data}}
-<p><a href="/">← pending</a></p>
+<p><a href="/">← inbox</a></p>
 <div class="page-heading">
   <h1>{{.Title}}</h1>
   {{template "status" .Status}}

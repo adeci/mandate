@@ -28,7 +28,6 @@ const (
 	specTTL        = 5 * time.Minute
 	executeTimeout = 2 * time.Minute
 	maxBody        = 1 << 20
-	historySize    = 50
 )
 
 type Config struct {

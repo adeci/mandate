@@ -353,7 +353,7 @@ func kind(synced bool) string {
 	if synced {
 		return "synced"
 	}
-	return "hardware"
+	return "device-bound"
 }
 
 type keyView struct {

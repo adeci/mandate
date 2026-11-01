@@ -252,7 +252,7 @@ function watch(version) {
   let stale = false;
   const engaged = () =>
     pending !== null ||
-    $("#review:not([hidden]), .linking:not([hidden]), button:disabled, input:focus, textarea:focus") ||
+    $("#review:not([hidden]), .linking:not([hidden]), button:disabled, input:focus, textarea:focus, select:focus") ||
     $$("textarea[data-param]").some((ta) => ta.value !== ta.defaultValue);
   const check = async () => {
     if (document.hidden) return;

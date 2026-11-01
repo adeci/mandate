@@ -139,8 +139,52 @@ func (d *db) pending(ctx context.Context) ([]row, error) {
 	return d.query(ctx, `WHERE status = 'pending' ORDER BY created_at DESC`)
 }
 
-func (d *db) decided(ctx context.Context, limit int) ([]row, error) {
-	return d.query(ctx, `WHERE status != 'pending' ORDER BY decided_at DESC LIMIT ?`, limit)
+// search narrows decided proposals; To is exclusive and zero times are open.
+type search struct {
+	Text, Connector, Status string
+	From, To                time.Time
+}
+
+// decided returns a page of decided proposals matching q, newest first, and
+// how many match in all.
+func (d *db) decided(ctx context.Context, q search, limit, offset int) ([]row, int, error) {
+	bound := func(t time.Time) int64 {
+		if t.IsZero() {
+			return 0
+		}
+		return ms(t)
+	}
+	where := `WHERE status != 'pending'
+		AND (?1 = '' OR instr(lower(note), lower(?1)) OR instr(lower(connector || ' ' || op), lower(?1))
+		     OR EXISTS (SELECT 1 FROM json_each(display) WHERE instr(lower(json_extract(value, '$.value')), lower(?1))))
+		AND (?2 = '' OR connector = ?2)
+		AND (?3 = '' OR status = ?3)
+		AND (?4 = 0 OR decided_at >= ?4)
+		AND (?5 = 0 OR decided_at < ?5)`
+	args := []any{q.Text, q.Connector, q.Status, bound(q.From), bound(q.To)}
+	var total int
+	if err := d.sql.QueryRowContext(ctx, `SELECT count(*) FROM proposals `+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := d.query(ctx, where+` ORDER BY decided_at DESC, id DESC LIMIT ?6 OFFSET ?7`, append(args, limit, offset)...)
+	return rows, total, err
+}
+
+func (d *db) decidedConnectors(ctx context.Context) ([]string, error) {
+	rs, err := d.sql.QueryContext(ctx, `SELECT DISTINCT connector FROM proposals WHERE status != 'pending' ORDER BY 1`)
+	if err != nil {
+		return nil, err
+	}
+	defer rs.Close()
+	var out []string
+	for rs.Next() {
+		var c string
+		if err := rs.Scan(&c); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rs.Err()
 }
 
 func (d *db) pendingCount(ctx context.Context) (int, error) {

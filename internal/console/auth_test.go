@@ -27,7 +27,6 @@ func TestProtectedRoutesNeedSession(t *testing.T) {
 		body         any
 	}{
 		{"GET", "/", nil},
-		{"GET", "/history", nil},
 		{"GET", "/r/" + p.ID, nil},
 		{"POST", "/r/" + p.ID + "/challenge", challengeRequest{}},
 		{"POST", "/r/" + p.ID + "/approve", approveRequest{Nonce: "AAAA", Assertion: json.RawMessage(`{}`)}},

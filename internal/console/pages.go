@@ -9,6 +9,7 @@ import (
 	"html"
 	"html/template"
 	"io/fs"
+	"maps"
 	"net/http"
 	"strconv"
 	"strings"
@@ -28,7 +29,7 @@ var pagesHTML string
 var staticFS embed.FS
 
 var templates = template.Must(template.New("").Funcs(template.FuncMap{
-	"when":    func(t time.Time) string { return t.Local().Format("Jan 2 15:04") },
+	"when":    func(t time.Time) string { return t.Local().Format(stamp) },
 	"visible": visible,
 	"tone":    tone,
 }).Parse(pagesHTML))
@@ -53,8 +54,7 @@ func (s *Server) Handler() http.Handler {
 		files.ServeHTTP(w, r)
 	}))
 
-	mux.HandleFunc("GET /{$}", s.page(s.pendingPage))
-	mux.HandleFunc("GET /history", s.page(s.historyPage))
+	mux.HandleFunc("GET /{$}", s.page(s.inboxPage))
 	mux.HandleFunc("GET /r/{id}", s.page(s.requestPage))
 	mux.HandleFunc("POST /r/{id}/challenge", s.api(s.challenge))
 	mux.HandleFunc("POST /r/{id}/approve", s.api(s.approve))
@@ -188,7 +188,7 @@ func (s *Server) item(pr row) listItem {
 	if pr.Status == proposal.Pending {
 		it.When = left(pr.ExpiresAt.Sub(s.now()))
 	} else {
-		it.When = pr.DecidedAt.Local().Format("Jan 2 15:04")
+		it.When = pr.DecidedAt.Local().Format(stamp)
 	}
 	return it
 }
@@ -201,38 +201,92 @@ func oneLine(s string, n int) string {
 	return s
 }
 
-func (s *Server) pendingPage(w http.ResponseWriter, r *http.Request, sess session) {
-	if err := s.db.expireDue(r.Context(), s.now()); err != nil {
-		s.cfg.Log.Error("expire proposals", "err", err)
-	}
-	rows, err := s.db.pending(r.Context())
-	if err != nil {
-		s.cfg.Log.Error("list proposals", "err", err)
-		s.errorPage(w, http.StatusInternalServerError, "Couldn't load requests.")
-		return
-	}
-	items := make([]listItem, 0, len(rows))
-	for _, pr := range rows {
-		items = append(items, s.item(pr))
-	}
-	s.owner(w, r, sess, "pending", "Pending", "pending", items)
+const (
+	stamp    = "2006-01-02 15:04"
+	pageSize = 25
+)
+
+type inboxView struct {
+	Waiting, Done []listItem
+	// The search form as submitted.
+	Q, Connector, Status, From, To string
+	Connectors                     []string
+	Statuses                       []proposal.Status
+	First, Last, Total             int
+	Newer, Older                   string
 }
 
-func (s *Server) historyPage(w http.ResponseWriter, r *http.Request, sess session) {
-	if err := s.db.expireDue(r.Context(), s.now()); err != nil {
+var decidedStatuses = []proposal.Status{proposal.Done, proposal.Rejected, proposal.Expired, proposal.Failed, proposal.Unknown}
+
+// inboxPage lists every waiting request, then one page of decided ones
+// matching the search form.
+func (s *Server) inboxPage(w http.ResponseWriter, r *http.Request, sess session) {
+	ctx := r.Context()
+	fail := func(err error) {
+		s.cfg.Log.Error("load inbox", "err", err)
+		s.errorPage(w, http.StatusInternalServerError, "Couldn't load the inbox.")
+	}
+	if err := s.db.expireDue(ctx, s.now()); err != nil {
 		s.cfg.Log.Error("expire proposals", "err", err)
 	}
-	rows, err := s.db.decided(r.Context(), historySize)
+	form := r.URL.Query()
+	v := inboxView{
+		Q: form.Get("q"), Connector: form.Get("connector"), Status: form.Get("status"),
+		From: form.Get("from"), To: form.Get("to"), Statuses: decidedStatuses,
+	}
+	q := search{Text: strings.TrimSpace(v.Q), Connector: v.Connector, Status: v.Status}
+	if t, err := time.ParseInLocation(time.DateOnly, v.From, time.Local); err == nil {
+		q.From = t
+	}
+	if t, err := time.ParseInLocation(time.DateOnly, v.To, time.Local); err == nil {
+		q.To = t.AddDate(0, 0, 1)
+	}
+	n, _ := strconv.Atoi(form.Get("page"))
+	n = max(n, 1)
+
+	waiting, err := s.db.pending(ctx)
 	if err != nil {
-		s.cfg.Log.Error("list history", "err", err)
-		s.errorPage(w, http.StatusInternalServerError, "Couldn't load history.")
+		fail(err)
 		return
 	}
-	items := make([]listItem, 0, len(rows))
-	for _, pr := range rows {
-		items = append(items, s.item(pr))
+	done, total, err := s.db.decided(ctx, q, pageSize, (n-1)*pageSize)
+	if err != nil {
+		fail(err)
+		return
 	}
-	s.owner(w, r, sess, "history", "History", "history", items)
+	if v.Connectors, err = s.db.decidedConnectors(ctx); err != nil {
+		fail(err)
+		return
+	}
+	for _, pr := range waiting {
+		v.Waiting = append(v.Waiting, s.item(pr))
+	}
+	for _, pr := range done {
+		v.Done = append(v.Done, s.item(pr))
+	}
+	v.Total = total
+	if len(done) > 0 {
+		v.First = (n-1)*pageSize + 1
+		v.Last = v.First + len(done) - 1
+	}
+	link := func(p int) string {
+		u := maps.Clone(form)
+		u.Set("page", strconv.Itoa(p))
+		if p == 1 {
+			u.Del("page")
+		}
+		if len(u) == 0 {
+			return "/"
+		}
+		return "/?" + u.Encode()
+	}
+	if n > 1 {
+		v.Newer = link(n - 1)
+	}
+	if v.Last > 0 && v.Last < total {
+		v.Older = link(n + 1)
+	}
+	s.owner(w, r, sess, "inbox", "Inbox", "inbox", v)
 }
 
 type fieldView struct {
@@ -300,7 +354,7 @@ func (s *Server) requestPage(w http.ResponseWriter, r *http.Request, sess sessio
 		}
 	}
 	v.Fields = fieldViews(pr.Display, pr.Args, editable)
-	s.owner(w, r, sess, "request", v.Title, "pending", v)
+	s.owner(w, r, sess, "request", v.Title, "inbox", v)
 }
 
 func (s *Server) connectionsPage(w http.ResponseWriter, r *http.Request, sess session) {
