@@ -653,12 +653,8 @@ func TestMedia(t *testing.T) {
 		t.Fatalf("fetched %+v %q %v", file, body, err)
 	}
 
-	// Stored before attachments were recorded: found on Fastmail by ID.
-	if _, err := f.c.st.DB().Exec(`DELETE FROM media`); err != nil {
-		t.Fatal(err)
-	}
-	if file, body, err := fetch(0); err != nil || file.Type != "image/png" || file.Size != 4 || body != "\x89PNG" {
-		t.Fatalf("old message: %+v %q %v", file, body, err)
+	if file, body, err := fetch(0); err != nil || file.Type != "image/png" || file.Name != "" || file.Size != 4 || body != "\x89PNG" {
+		t.Fatalf("fetched %+v %q %v", file, body, err)
 	}
 
 	var ce *connector.Error
@@ -668,5 +664,49 @@ func TestMedia(t *testing.T) {
 	}
 	if _, _, err := fetch(2); !errors.As(err, &ce) || ce.Status != http.StatusNotFound {
 		t.Fatalf("no such index: %v", err)
+	}
+}
+
+func TestBackfill(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t)
+	e := textEmail("e1", "t1", alice, []address{owner}, "Topo", "route attached", now, "mb-inbox")
+	e.Attachments = []bodyPart{{Type: "application/pdf", Name: "topo.pdf", BlobID: "b-topo", Size: 9}}
+	f.jm.add(e)
+	f.link()
+	clean := f.message("e1").Body
+
+	// Restarted on emails stored before attachments were recorded.
+	restart := func() {
+		t.Helper()
+		for _, q := range []string{
+			`DELETE FROM media`,
+			`UPDATE messages SET body = body || char(10, 10) || '[attachment: topo.pdf]' WHERE id = 'e1'`,
+		} {
+			if _, err := f.c.st.DB().Exec(q); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.c.Close()
+		f.start()
+		f.jm.add(textEmail("n"+f.jm.currentState(), "t2", alice, []address{owner}, "ping", "x", now, "mb-inbox"))
+		f.synced()
+	}
+	if _, err := f.c.st.DB().Exec(`DELETE FROM fastmail_backfill`); err != nil {
+		t.Fatal(err)
+	}
+	restart()
+	got, err := f.c.st.Media(ctx, "e1", 0)
+	if err != nil || !reflect.DeepEqual(got, store.Media{Type: "application/pdf", Name: "topo.pdf", Size: 9, Ref: []byte("b-topo")}) {
+		t.Fatalf("backfilled %+v %v", got, err)
+	}
+	if body := f.message("e1").Body; body != clean {
+		t.Fatalf("backfilled body %q, want %q", body, clean)
+	}
+
+	restart()
+	if _, err := f.c.st.Media(ctx, "e1", 0); !errors.Is(err, store.ErrNoMedia) {
+		t.Fatalf("backfill ran twice: %v", err)
 	}
 }

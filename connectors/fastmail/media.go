@@ -38,15 +38,7 @@ func (c *fmConnector) Media(ctx context.Context, message string, index int) (con
 	}
 	item, err := c.st.Media(ctx, message, index)
 	if errors.Is(err, store.ErrNoMedia) {
-		// Stored before attachments were recorded: ask Fastmail again.
-		list, err := c.getEmails(ctx, a, cn, []string{message}, []string{"id", "attachments"}, 0)
-		if err != nil {
-			return connector.MediaFile{}, &connector.Error{Status: http.StatusBadGateway, Message: "read from Fastmail: " + err.Error()}
-		}
-		if len(list) == 0 || index < 0 || index >= len(list[0].Attachments) {
-			return connector.MediaFile{}, errNoFile
-		}
-		item = media(list[0].Attachments)[index]
+		return connector.MediaFile{}, errNoFile
 	} else if err != nil {
 		return connector.MediaFile{}, err
 	}
