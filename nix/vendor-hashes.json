@@ -2,6 +2,7 @@
   "mandate": "sha256-Qmvz4eVjMRhHVGRd4QAaLHnu622UjreOwY4vPIMHx+I=",
   "mandate-discord": "sha256-w0mN6R2nIiCQd94MMkUPs31auyJyFn6H0byOTnGwhWA=",
   "mandate-http": "sha256-Aj7WGaOogu/XTYZwVPGwiW1/5CPI6pzcYL2woafxjZc=",
+  "mandate-matrix": "sha256-aj+2m9Zj5wd1xk0/Au7dnYGQl73cw81LoxCe/tCZjzY=",
   "mandate-signal": "sha256-1ogIHtP+wgIPzso3y6VCfF0nido+pZi/54/1AjsDV44=",
   "mandate-whatsapp": "sha256-HNOHd+F86/LQUxOQXcwju9gcQicC7u6TNUPKiKGCfC8="
 }

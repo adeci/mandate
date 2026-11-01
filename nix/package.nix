@@ -90,4 +90,12 @@ in
       zlib
     ];
   } "signal" "Signal connector for mandate";
+
+  # mautrix's pure-Go olm is behind the goolm tag. GOFLAGS rather than tags,
+  # so the checks' go test and golangci-lint build it too.
+  mandate-matrix = (connector "matrix" "Matrix connector for mandate").overrideAttrs (old: {
+    env = old.env // {
+      GOFLAGS = "${old.env.GOFLAGS} -tags=goolm";
+    };
+  });
 }

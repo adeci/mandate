@@ -4,6 +4,7 @@ use (
 	.
 	./connectors/discord
 	./connectors/http
+	./connectors/matrix
 	./connectors/signal
 	./connectors/whatsapp
 )
