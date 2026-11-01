@@ -83,7 +83,17 @@ func (s *Server) connections(ctx context.Context) []connView {
 		})
 	}
 	wg.Wait()
-	slices.SortFunc(out, func(a, b connView) int { return strings.Compare(a.Name, b.Name) })
+	// Connections that need the owner come first.
+	slices.SortFunc(out, func(a, b connView) int {
+		aOK, bOK := a.Health.State == connector.Healthy, b.Health.State == connector.Healthy
+		if aOK != bOK {
+			if bOK {
+				return -1
+			}
+			return 1
+		}
+		return strings.Compare(a.Name, b.Name)
+	})
 	return out
 }
 
