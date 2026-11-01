@@ -70,9 +70,9 @@ type account struct {
 
 // conn is what the account's session and settings say.
 type conn struct {
-	api, accountID, username string
-	roles                    map[string]string // mailbox role → ID
-	identities               []identity
+	api, download, accountID, username string
+	roles                              map[string]string // mailbox role → ID
+	identities                         []identity
 }
 
 func newConnector(ctx context.Context, st *store.Store, token connector.Secret, log *slog.Logger,
@@ -230,7 +230,7 @@ func (c *fmConnector) connect(ctx context.Context, a *account) (*conn, error) {
 	if mail == "" || mail != sub || s.Accounts[mail].IsReadOnly {
 		return nil, errScope
 	}
-	return c.refresh(ctx, a, &conn{api: s.APIURL, accountID: mail, username: s.Username})
+	return c.refresh(ctx, a, &conn{api: s.APIURL, download: s.DownloadURL, accountID: mail, username: s.Username})
 }
 
 // refresh reads cn's mailboxes and identities anew.

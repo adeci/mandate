@@ -53,6 +53,7 @@ func (e *methodError) Error() string {
 
 type session struct {
 	APIURL          string            `json:"apiUrl"`
+	DownloadURL     string            `json:"downloadUrl"`
 	Username        string            `json:"username"`
 	PrimaryAccounts map[string]string `json:"primaryAccounts"`
 	Accounts        map[string]struct {
@@ -244,6 +245,8 @@ type bodyPart struct {
 	PartID string `json:"partId,omitempty"`
 	Type   string `json:"type"`
 	Name   string `json:"name,omitempty"`
+	BlobID string `json:"blobId,omitempty"`
+	Size   int64  `json:"size,omitempty"`
 }
 
 type bodyValue struct {

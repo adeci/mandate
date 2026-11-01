@@ -284,6 +284,7 @@ func (c *fmConnector) put(ctx context.Context, cn *conn, e email) error {
 		ContainerID: e.ThreadID,
 		SentAt:      e.ReceivedAt,
 		Body:        render(e, maxText),
+		Media:       media(e.Attachments),
 	}
 	if len(e.From) > 0 {
 		msg.SenderID, msg.SenderName = strings.ToLower(e.From[0].Email), e.From[0].Name

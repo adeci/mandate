@@ -42,6 +42,7 @@ type fakeJMAP struct {
 	mailboxes    []mailbox
 	identities   []identity
 	emails       map[string]*email
+	blobs        map[string]string
 	log          []change
 	state        int
 	minState     int    // Email/changes refuses older states
@@ -53,7 +54,7 @@ type fakeJMAP struct {
 
 func newFakeJMAP(t *testing.T) *fakeJMAP {
 	f := &fakeJMAP{
-		t: t, token: goodToken, emails: map[string]*email{},
+		t: t, token: goodToken, emails: map[string]*email{}, blobs: map[string]string{},
 		mailboxes: []mailbox{
 			{ID: "mb-inbox", Role: "inbox"},
 			{ID: "mb-sent", Role: "sent"},
@@ -70,6 +71,7 @@ func newFakeJMAP(t *testing.T) *fakeJMAP {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /jmap/session", f.session)
 	mux.HandleFunc("POST /jmap/api", f.api)
+	mux.HandleFunc("GET /jmap/download/{account}/{blob}/{name}", f.download)
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
 	return f
@@ -97,10 +99,26 @@ func (f *fakeJMAP) session(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]any{
 		"apiUrl":          f.srv.URL + "/jmap/api",
+		"downloadUrl":     f.srv.URL + "/jmap/download/{accountId}/{blobId}/{name}?type={type}",
 		"username":        "owner@fastmail.com",
 		"primaryAccounts": primary,
 		"accounts":        map[string]any{accountID: map[string]any{"isReadOnly": f.readOnly}},
 	})
+}
+
+func (f *fakeJMAP) download(w http.ResponseWriter, r *http.Request) {
+	if !f.authorized(w, r) {
+		return
+	}
+	f.mu.Lock()
+	blob, ok := f.blobs[r.PathValue("blob")]
+	f.mu.Unlock()
+	if r.PathValue("account") != accountID || !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", r.URL.Query().Get("type"))
+	w.Write([]byte(blob))
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
