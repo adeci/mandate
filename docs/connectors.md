@@ -156,9 +156,20 @@ func main() {
 
 ## Rules
 
-- **Render `Display` from `Args`**, not from anything a third party chose
-  (like a sender's display name). The owner approves what `Display` says;
-  `Args` is what runs.
+- **Render `Display` from `Args`** and what the connector has stored. The
+  owner approves what `Display` says; `Args` is what runs. A rename between
+  approving and running changes `Display`, so the connector refuses to run
+  the request.
+- **Name recipients by what `Args` targets**, an ID the other side can't
+  change: a Matrix MXID for a DM or the room ID, a Discord `@username` for a
+  DM or the channel ID, a WhatsApp JID or phone number, a Signal number or
+  group ID, phone numbers or a conversation ID, an email address. Put a name
+  next to it with a `~` unless the owner chose it (a contact name or a
+  nickname they set); display names, profile names, Discord global names,
+  group subjects, room names and server names all get one:
+  `~Mom (@mallory:evil.example)`, `~Family (120363…@g.us)`,
+  `Farid Haddad (+1 555 123 0001)`, labelled `To`, `Group`, `Room` or
+  `Channel`.
 - **`Prepare` must be idempotent**: preparing its own output gives the same
   args and display, which is how the connector detects tampering.
 - **Don't retry in `Execute`.** If the request may have reached the service,
@@ -216,3 +227,19 @@ services.mandate.connectors.matrix.serviceConfig.IPAddressAllow = [ "192.168.1.2
 
 Without systemd-resolved, allow the DNS servers in `/etc/resolv.conf` the
 same way.
+
+## The http connector
+
+`http` relays agents' requests to token APIs listed in its settings:
+
+```nix
+services.mandate.connectors.http.settings.services.github = {
+  base_url = "https://api.github.com";
+  reads = [ "GET /repos/*/*/issues" ];
+  writes = [ "POST /repos/*/*/issues" ];
+};
+```
+
+`reads` run with the token and without approval. Some APIs write on a GET
+(Slack's `chat.postMessage` takes one), so allow GET only on APIs where it
+reads; anything else belongs in `writes`.
