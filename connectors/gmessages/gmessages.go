@@ -37,14 +37,14 @@ func start(ctx context.Context, env *connector.Env, _ struct{}) (connector.Conne
 		cli := libgm.NewClient(auth, nil, log, exhttp.SensibleClientSettings)
 		cli.SetPingInterval(pingInterval)
 		cli.SetEventHandler(onEvent)
-		return cli
+		return libgmClient{cli}
 	}
 	newPairing := func(auth *libgm.AuthData, paired func()) pairClient {
 		cli := libgm.NewClient(auth, nil, log, exhttp.SensibleClientSettings)
 		cli.SetEventHandler(func(any) {})
 		cb := func(*gmproto.PairedData) { paired() }
 		cli.PairCallback.Store(&cb)
-		return cli
+		return libgmClient{cli}
 	}
 	c := newConnector(ctx, st, env.Log, env.Secret("session.json"), newClient, newPairing)
 	if err := c.resume(); err != nil {
@@ -65,3 +65,8 @@ func (p *program) Close() error {
 	p.disconnect()
 	return p.st.Close()
 }
+
+// libgmClient adds the account of the fetched config to *libgm.Client.
+type libgmClient struct{ *libgm.Client }
+
+func (c libgmClient) Account() string { return c.Config.GetDeviceInfo().GetEmail() }

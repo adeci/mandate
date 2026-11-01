@@ -25,6 +25,14 @@ func (c *gmConnector) Spec() connector.Spec {
 			{Name: "chat", Doc: "chat ID from mandate gmessages chats", Required: true, Container: true},
 			{Name: "text", Doc: "message text", Required: true, Editable: true},
 		},
+	}}, Setup: []connector.Param{{
+		Name: "cookies", Secret: true,
+		Doc: "For pairing with your Google account, when the phone's Device pairing offers no QR code scanner. " +
+			"In a desktop browser, preferably a private window, sign in to messages.google.com/web with the Google account your phone's Messages uses. " +
+			"Open devtools → Network, pick any request to messages.google.com and copy its Cookie request header (Copy as cURL works too), then close the window. " +
+			"These cookies are a signed-in Google session: mandate-gmessages can act as that Google account. " +
+			"After unlinking, you can end that session under Google Account → Security → Your devices. " +
+			"Leave it empty to pair by QR code where Google still offers it.",
 	}}}
 }
 

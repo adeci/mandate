@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -34,6 +35,16 @@ type phone struct {
 	sendResp  *gmproto.SendMessageResponse
 	sendErr   error
 	connected map[*fakeClient]bool
+	// account is the Google account the config names; empty when the
+	// cookies are signed out.
+	account string
+	gaiaErr error
+}
+
+func (p *phone) set(f func(p *phone)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	f(p)
 }
 
 func (p *phone) setConvs(convs ...*gmproto.Conversation) {
@@ -69,6 +80,12 @@ type fakeClient struct {
 }
 
 func (f *fakeClient) FetchConfig(context.Context) error { return nil }
+
+func (f *fakeClient) Account() string {
+	f.p.mu.Lock()
+	defer f.p.mu.Unlock()
+	return f.p.account
+}
 
 func (f *fakeClient) Connect(context.Context) error {
 	f.mu.Lock()
@@ -146,11 +163,15 @@ func (f *fakeClient) SendMessage(_ context.Context, req *gmproto.SendMessageRequ
 	return f.p.sendResp, f.p.sendErr
 }
 
-// fakePairing numbers its codes qr-PAIRING-CODE.
+// fakePairing numbers its codes qr-PAIRING-CODE and always shows the fox
+// emoji for a Google account pairing.
 type fakePairing struct {
 	n      int
+	p      *phone
 	auth   *libgm.AuthData
 	paired func()
+	// answer is the phone's answer to a Google account pairing.
+	answer chan error
 
 	mu           sync.Mutex
 	codes        int
@@ -159,6 +180,38 @@ type fakePairing struct {
 }
 
 func (f *fakePairing) FetchConfig(context.Context) error { return nil }
+
+func (f *fakePairing) Account() string {
+	f.p.mu.Lock()
+	defer f.p.mu.Unlock()
+	return f.p.account
+}
+
+func (f *fakePairing) StartGaiaPairing(context.Context, context.Context) (string, *libgm.PairingSession, error) {
+	f.p.mu.Lock()
+	err := f.p.gaiaErr
+	f.p.mu.Unlock()
+	if err != nil {
+		return "", nil, err
+	}
+	f.auth.Browser = &gmproto.Device{UserID: 1, SourceID: "browser"}
+	f.auth.Mobile = &gmproto.Device{UserID: 1, SourceID: "owner@example.com"}
+	f.auth.TachyonAuthToken = []byte("token-1")
+	f.auth.DestRegID[0] = 1
+	return "🦊", &libgm.PairingSession{}, nil
+}
+
+func (f *fakePairing) FinishGaiaPairing(ctx context.Context, _ *libgm.PairingSession) (string, error) {
+	select {
+	case err := <-f.answer:
+		if err == nil {
+			f.auth.PairingID[0] = 1
+		}
+		return "phone", err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
 
 func (f *fakePairing) StartLogin(context.Context) (string, error) {
 	f.mu.Lock()
@@ -238,6 +291,7 @@ func newFixture(t *testing.T, linked bool) *fixture {
 			fetchErr:  make(map[string]error),
 			connected: make(map[*fakeClient]bool),
 			sendResp:  &gmproto.SendMessageResponse{Status: gmproto.SendMessageResponse_SUCCESS},
+			account:   "owner@example.com",
 		},
 	}
 	if linked {
@@ -279,7 +333,7 @@ func (f *fixture) newClient(auth *libgm.AuthData, onEvent func(any)) gmClient {
 func (f *fixture) newPairing(auth *libgm.AuthData, paired func()) pairClient {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	p := &fakePairing{n: len(f.pairings) + 1, auth: auth, paired: paired}
+	p := &fakePairing{n: len(f.pairings) + 1, p: f.phone, auth: auth, paired: paired, answer: make(chan error, 1)}
 	f.pairings = append(f.pairings, p)
 	return p
 }
@@ -346,13 +400,14 @@ func wantStatus(t *testing.T, err error, status int) {
 	}
 }
 
-// setupUntil polls Setup like the console does until ok accepts the step.
-func setupUntil(t *testing.T, c *gmConnector, ok func(connector.SetupStep) bool) connector.SetupStep {
+// setupUntil polls Setup with args like the console does until ok accepts
+// the step.
+func setupUntil(t *testing.T, c *gmConnector, args map[string]string, ok func(connector.SetupStep) bool) connector.SetupStep {
 	t.Helper()
 	var step connector.SetupStep
 	var err error
 	eventually(t, "setup step", func() bool {
-		step, err = c.Setup(context.Background(), nil)
+		step, err = c.Setup(context.Background(), args)
 		return err == nil && ok(step)
 	})
 	return step
@@ -387,10 +442,10 @@ func TestPairFromConsole(t *testing.T) {
 		t.Fatalf("first step %+v, %v", step, err)
 	}
 	// Codes rotate within the one pairing while the console polls.
-	setupUntil(t, f.c, func(s connector.SetupStep) bool { return s.QR == "qr-1-2" })
+	setupUntil(t, f.c, nil, func(s connector.SetupStep) bool { return s.QR == "qr-1-2" })
 
 	f.pairing(0).scan()
-	setupUntil(t, f.c, func(s connector.SetupStep) bool { return s.Done })
+	setupUntil(t, f.c, nil, func(s connector.SetupStep) bool { return s.Done })
 	if auth := storedSession(t, f.session); auth.Browser.GetSourceID() != "browser" || string(auth.TachyonAuthToken) != "token-1" {
 		t.Fatalf("stored session %+v", auth)
 	}
@@ -414,7 +469,7 @@ func TestPairingExpires(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Once its codes ran out, the next poll starts a new pairing.
-	setupUntil(t, f.c, func(s connector.SetupStep) bool { return s.QR == "qr-2-1" })
+	setupUntil(t, f.c, nil, func(s connector.SetupStep) bool { return s.QR == "qr-2-1" })
 	if p := f.pairing(0).state(); !p.disconnected || p.codes != 2 {
 		t.Fatalf("expired pairing: %+v", p)
 	}
@@ -502,7 +557,7 @@ func TestUnpairedFromPhone(t *testing.T) {
 			t.Fatalf("%T: re-pair %+v, %v", evt, step, err)
 		}
 		f.pairing(0).scan()
-		setupUntil(t, f.c, func(s connector.SetupStep) bool { return s.Done })
+		setupUntil(t, f.c, nil, func(s connector.SetupStep) bool { return s.Done })
 		// A late event from the old client leaves the new session alone.
 		old.emit(&gmproto.RevokePairData{})
 		wantHealth(t, f.c, connector.Broken)
@@ -538,5 +593,136 @@ func TestUnlink(t *testing.T) {
 	step, err := f.c.Setup(ctx, nil)
 	if err != nil || step.QR != "qr-2-1" {
 		t.Fatalf("after unlink: %+v, %v", step, err)
+	}
+}
+
+func (f *fixture) pairingCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.pairings)
+}
+
+func TestPairWithGoogleAccount(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, false)
+	ctx := context.Background()
+	_, err := f.c.Setup(ctx, map[string]string{"cookies": "SID=sid1"})
+	wantStatus(t, err, http.StatusBadRequest)
+	if f.pairingCount() != 0 {
+		t.Fatal("incomplete cookies started pairing")
+	}
+
+	// The console repeats the same cookies while it polls.
+	args := map[string]string{"cookies": "Cookie: " + jar}
+	for range 2 {
+		step, err := f.c.Setup(ctx, args)
+		if err != nil || step.Code != "🦊" || step.Instructions != emojiInstructions || step.QR != "" {
+			t.Fatalf("step %+v, %v", step, err)
+		}
+	}
+	if n := f.pairingCount(); n != 1 {
+		t.Fatalf("%d pairings", n)
+	}
+	if data, _ := f.session.Load(); data != nil {
+		t.Fatal("stored before the phone confirmed")
+	}
+
+	f.pairing(0).answer <- nil
+	setupUntil(t, f.c, args, func(s connector.SetupStep) bool { return s.Done })
+	auth := storedSession(t, f.session)
+	if !auth.IsGoogleAccount() || auth.Cookies["OSID"] != "osid=1" || auth.Cookies["NID"] != "" {
+		t.Fatalf("stored session: google account %v, cookies %v", auth.IsGoogleAccount(), auth.Cookies)
+	}
+	eventually(t, "connect", f.client(0).isConnected)
+	wantHealth(t, f.c, connector.Broken)
+	f.activate()
+
+	// Unlinking unpairs and forgets the cookies with the session.
+	cli := f.cli()
+	if err := f.c.Unlink(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cli.unpairs != 1 {
+		t.Fatalf("%d unpairs", cli.unpairs)
+	}
+	if data, _ := f.session.Load(); data != nil {
+		t.Fatal("session kept")
+	}
+}
+
+func TestGoogleAccountPairingFails(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	args := map[string]string{"cookies": jar}
+	for name, tc := range map[string]struct {
+		phone  func(*phone)
+		answer error
+		says   string
+	}{
+		"wrong emoji":     {answer: libgm.ErrIncorrectEmoji, says: "a different emoji was tapped"},
+		"timeout":         {answer: fmt.Errorf("%w (code: 2/5)", libgm.ErrPairingTimeout), says: "did not confirm in time"},
+		"cancelled":       {answer: libgm.ErrPairingCancelled, says: "cancelled on the phone"},
+		"no phone":        {phone: func(p *phone) { p.gaiaErr = libgm.ErrNoDevicesFound }, says: "no phone was found"},
+		"signed out jar":  {phone: func(p *phone) { p.account = "" }, says: "not signed in"},
+		"phone not there": {phone: func(p *phone) { p.gaiaErr = libgm.ErrPairingInitTimeout }, says: "the phone did not answer"},
+	} {
+		f := newFixture(t, false)
+		if tc.phone != nil {
+			f.phone.set(tc.phone)
+		}
+		if tc.answer != nil {
+			if step, err := f.c.Setup(ctx, args); err != nil || step.Code != "🦊" {
+				t.Fatalf("%s: step %+v, %v", name, step, err)
+			}
+			f.pairing(0).answer <- tc.answer
+		}
+		var err error
+		eventually(t, name, func() bool {
+			_, err = f.c.Setup(ctx, args)
+			return err != nil
+		})
+		if !strings.Contains(err.Error(), tc.says) {
+			t.Errorf("%s: %v, want it to say %q", name, err, tc.says)
+		}
+		if data, _ := f.session.Load(); data != nil {
+			t.Errorf("%s: session stored", name)
+		}
+		if !f.pairing(0).state().disconnected {
+			t.Errorf("%s: pairing left connected", name)
+		}
+		wantHealth(t, f.c, connector.NeedsSetup)
+
+		// The next try starts again.
+		f.phone.set(func(p *phone) { p.account, p.gaiaErr = "owner@example.com", nil })
+		if step, err := f.c.Setup(ctx, args); err != nil || step.Code != "🦊" || f.pairingCount() != 2 {
+			t.Fatalf("%s: retry %+v, %v", name, step, err)
+		}
+	}
+}
+
+func TestResumeGoogleAccount(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, false)
+	auth := libgm.NewAuthData()
+	auth.Browser = &gmproto.Device{SourceID: "browser"}
+	auth.DestRegID[0] = 1
+	auth.Cookies = map[string]string{"SID": "sid1"}
+	if err := f.c.store(auth); err != nil {
+		t.Fatal(err)
+	}
+	f.start()
+	if cli := f.cli(); !cli.isConnected() || cli.auth.Cookies["SID"] != "sid1" {
+		t.Fatal("did not connect with the stored cookies")
+	}
+
+	// Cookies Google signed out end the session on the next start.
+	f.c.disconnect()
+	f.phone.set(func(p *phone) { p.account = "" })
+	f.start()
+	if h := wantHealth(t, f.c, connector.NeedsSetup); !strings.Contains(h.Detail, "cookies") {
+		t.Fatalf("health %+v", h)
+	}
+	if data, _ := f.session.Load(); data != nil {
+		t.Fatal("session kept")
 	}
 }
