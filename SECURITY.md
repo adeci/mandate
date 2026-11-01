@@ -31,7 +31,8 @@ What each part is trusted with:
 - Run agents on a machine that has no SSH keys, ssh-agent or secrets for your
   other machines, so a prompt-injected agent can do no more than the token
   allows.
-- Use the console in a browser profile without extensions.
+- Keep extensions off the console's site, apart from your passkey manager:
+  set their site access to "on click", or use a browser profile without them.
 - Read recipients by their ID. A name starting with `~` was chosen by that
   person or a group member, not by you.
 - Back up `/var/lib/mandate-*` encrypted. The databases hold your full message
@@ -42,8 +43,10 @@ What each part is trusted with:
 - **Script on the console origin**, for example from a browser extension,
   can do whatever your session can: approve anything while the tab is
   unlocked, read pending requests, unlink accounts, or replace a linking QR
-  code. It can't add a key that lasts: a new key takes effect only after
-  `sudo mandate-confirm-key` on the server.
+  code. A passkey prompt names the site, not the action, so the script can
+  also turn your next touch into approving a key it registered, which lasts
+  until you remove it. Your passkey manager is trusted further still: it
+  holds the keys.
 - **First key.** A connector with no key log, after a fresh install or
   `mandate-reset-keys`, accepts the first log the console sends it.
 - **One token** gives every agent the same access, with no per-agent scope.
