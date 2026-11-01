@@ -78,7 +78,11 @@ func (c *apiChannel) isThread() bool {
 }
 
 type apiAttachment struct {
+	ID          string `json:"id"`
+	Filename    string `json:"filename"`
 	ContentType string `json:"content_type"`
+	Size        int64  `json:"size"`
+	URL         string `json:"url"`
 }
 
 type apiMessageReference struct {
@@ -278,24 +282,28 @@ func toMessage(m *apiMessage, selfID string) (store.Message, bool) {
 	if m.Type == messageReply && m.MessageReference != nil {
 		out.ReplyToID = m.MessageReference.MessageID
 	}
-	// A forward's payload is the snapshot of the forwarded message.
-	content := m
-	if m.MessageReference != nil && m.MessageReference.Type == referenceForward &&
-		len(m.MessageSnapshots) > 0 && m.MessageSnapshots[0].Message != nil {
-		content = m.MessageSnapshots[0].Message
-	}
+	content := carried(m)
 	out.Body = content.Content
 	out.MediaType = mediaType(content)
+	out.Media = storedFiles(m.ChannelID, m.ID, content.Attachments)
 	return out, true
 }
 
+// carried is the message whose content m carries: a forward's is the
+// snapshot of the forwarded message.
+func carried(m *apiMessage) *apiMessage {
+	if m.MessageReference != nil && m.MessageReference.Type == referenceForward &&
+		len(m.MessageSnapshots) > 0 && m.MessageSnapshots[0].Message != nil {
+		return m.MessageSnapshots[0].Message
+	}
+	return m
+}
+
+// A message with files is marked by them.
 func mediaType(m *apiMessage) string {
 	switch {
 	case len(m.Attachments) > 0:
-		if ct := m.Attachments[0].ContentType; ct != "" {
-			return ct
-		}
-		return "attachment"
+		return ""
 	case len(m.StickerItems) > 0:
 		return "sticker"
 	case m.Content == "" && len(m.Embeds) > 0:

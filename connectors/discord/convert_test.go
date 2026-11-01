@@ -41,20 +41,30 @@ func TestToMessage(t *testing.T) {
 			want: store.Message{ID: "1", ContainerID: "c", SenderID: self, SenderName: "me", SentAt: ts, IsFromMe: true, Body: "yo"}, wantOK: true,
 		},
 		{
-			name: "attachment with content type and caption",
+			name: "attachments with caption",
 			in: &apiMessage{
 				ID: "1", ChannelID: "c", Content: "look", Timestamp: ts, Author: alice,
-				Attachments: []apiAttachment{{ContentType: "image/png"}, {ContentType: "video/mp4"}},
+				Attachments: []apiAttachment{
+					{ID: "a1", Filename: "rig.png", ContentType: "image/png", Size: 3, URL: "https://cdn.discordapp.com/attachments/1100000000000000002/1200000000000000001/rig.png?ex=1&is=2&hm=3&"},
+					{ID: "a2", Size: 5},
+				},
 			},
-			want: store.Message{ID: "1", ContainerID: "c", SenderID: "200", SenderName: "Alice A", SentAt: ts, Body: "look", MediaType: "image/png"}, wantOK: true,
+			want: store.Message{
+				ID: "1", ContainerID: "c", SenderID: "200", SenderName: "Alice A", SentAt: ts, Body: "look",
+				Media: []store.Media{
+					{
+						Type: "image/png", Name: "rig.png", Size: 3,
+						Ref: []byte(`{"channel_id":"c","message_id":"1","id":"a1","path":"/attachments/1100000000000000002/1200000000000000001/rig.png"}`),
+					},
+					{Type: "application/octet-stream", Size: 5, Ref: []byte(`{"channel_id":"c","message_id":"1","id":"a2"}`)},
+				},
+			},
+			wantOK: true,
 		},
 		{
-			name: "attachment without content type",
-			in: &apiMessage{
-				ID: "1", ChannelID: "c", Timestamp: ts, Author: alice,
-				Attachments: []apiAttachment{{}},
-			},
-			want: store.Message{ID: "1", ContainerID: "c", SenderID: "200", SenderName: "Alice A", SentAt: ts, MediaType: "attachment"}, wantOK: true,
+			name: "attachments present but none",
+			in:   &apiMessage{ID: "1", ChannelID: "c", Content: "x", Timestamp: ts, Author: alice, Attachments: []apiAttachment{}},
+			want: store.Message{ID: "1", ContainerID: "c", SenderID: "200", SenderName: "Alice A", SentAt: ts, Body: "x", Media: []store.Media{}}, wantOK: true,
 		},
 		{
 			name: "sticker",
@@ -88,16 +98,20 @@ func TestToMessage(t *testing.T) {
 			want: store.Message{ID: "2", ContainerID: "c", SenderID: "200", SenderName: "Alice A", SentAt: ts, Body: "news"}, wantOK: true,
 		},
 		{
-			name: "forward uses snapshot content",
+			name: "forward uses snapshot content, filed under the forward",
 			in: &apiMessage{
 				ID: "2", ChannelID: "c", Timestamp: ts, Author: me,
 				MessageReference: &apiMessageReference{Type: referenceForward, MessageID: "9"},
 				MessageSnapshots: []apiSnapshot{{Message: &apiMessage{
 					Content:     "fwd",
-					Attachments: []apiAttachment{{ContentType: "audio/ogg"}},
+					Attachments: []apiAttachment{{ID: "a1", ContentType: "audio/ogg"}},
 				}}},
 			},
-			want: store.Message{ID: "2", ContainerID: "c", SenderID: self, SenderName: "me", SentAt: ts, IsFromMe: true, Body: "fwd", MediaType: "audio/ogg"}, wantOK: true,
+			want: store.Message{
+				ID: "2", ContainerID: "c", SenderID: self, SenderName: "me", SentAt: ts, IsFromMe: true, Body: "fwd",
+				Media: []store.Media{{Type: "audio/ogg", Ref: []byte(`{"channel_id":"c","message_id":"2","id":"a1"}`)}},
+			},
+			wantOK: true,
 		},
 		{
 			name: "timestamp from snowflake",
@@ -141,7 +155,8 @@ func TestMessageJSON(t *testing.T) {
 	raw := `{"id":"1300000000000000002","channel_id":"1300000000000000010","type":19,"content":"re",
 		"timestamp":"2026-10-01T12:00:00.123000+00:00","edited_timestamp":null,
 		"author":{"id":"200","username":"alice","global_name":"Alice A"},
-		"attachments":[{"id":"a","filename":"p.png","content_type":"image/png"}],"embeds":[{"type":"rich"}],
+		"attachments":[{"id":"1400000000000000001","filename":"p.png","content_type":"image/png","size":7,
+			"url":"https://cdn.discordapp.com/attachments/1300000000000000010/1400000000000000001/p.png?ex=1&is=2&hm=3&"}],"embeds":[{"type":"rich"}],
 		"sticker_items":[{"id":"s"}],"message_reference":{"type":0,"message_id":"1300000000000000001","channel_id":"1300000000000000010"},
 		"message_snapshots":[{"message":{"content":"fwd"}}],"hit":true}`
 	var m apiMessage
@@ -154,7 +169,12 @@ func TestMessageJSON(t *testing.T) {
 	}
 	want := store.Message{
 		ID: "1300000000000000002", ContainerID: "1300000000000000010", SenderID: "200", SenderName: "Alice A",
-		SentAt: time.Date(2026, 10, 1, 12, 0, 0, 123000000, time.UTC), Body: "re", MediaType: "image/png", ReplyToID: "1300000000000000001",
+		SentAt: time.Date(2026, 10, 1, 12, 0, 0, 123000000, time.UTC), Body: "re", ReplyToID: "1300000000000000001",
+		Media: []store.Media{{
+			Type: "image/png", Name: "p.png", Size: 7,
+			Ref: []byte(`{"channel_id":"1300000000000000010","message_id":"1300000000000000002","id":"1400000000000000001",` +
+				`"path":"/attachments/1300000000000000010/1400000000000000001/p.png"}`),
+		}},
 	}
 	if !got.SentAt.Equal(want.SentAt) {
 		t.Errorf("SentAt = %v, want %v", got.SentAt, want.SentAt)

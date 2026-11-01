@@ -141,11 +141,13 @@ func (r route) key() string { return r.method + r.template + "|" + r.major }
 // Only the worker goroutine uses upstream.
 type upstream struct {
 	tr        transport
+	cdn       transport       // for attachment downloads, without the API's deadline
 	jar       fhttp.CookieJar // nil in tests
 	token     string
 	timezone  string
 	apiBase   string
 	webBase   string
+	cdnBase   string
 	clock     clock
 	pace      *pacer
 	st        *state
