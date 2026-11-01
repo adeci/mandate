@@ -4,8 +4,8 @@
 //
 // Account integrity comes first: every request looks like Chrome on Linux and
 // is paced like a person. Reads are GETs, a send is a typing indicator and one
-// POST, and at startup it loads the app page and connects, as a browser
-// restoring the tab does.
+// POST, a file is a refreshed link and its download, and at startup it loads
+// the app page and connects, as a browser restoring the tab does.
 package main
 
 import (
@@ -47,7 +47,7 @@ func main() {
 		if err != nil {
 			return nil, fmt.Errorf("open store: %w", err)
 		}
-		client, jar, err := newBrowserClient()
+		client, cdn, jar, err := newBrowserClients()
 		if err != nil {
 			st.Close()
 			return nil, err
@@ -63,9 +63,11 @@ func main() {
 			token:       env.Secret("token"),
 			timezone:    tz,
 			transport:   client,
+			cdn:         cdn,
 			jar:         jar,
 			apiBase:     defaultAPIBase,
 			webBase:     defaultWebBase,
+			cdnBase:     defaultCDNBase,
 			gatewayURL:  defaultGatewayURL,
 			dialGateway: dial,
 			clock:       realClock{},
@@ -93,20 +95,26 @@ func (w withStore) Close() error { return errors.Join(w.worker.Close(), w.store.
 // owner's own browser on this account. Claiming 152 would make this session
 // an older Chrome than the owner's; a handshake a few releases behind its UA
 // is the smaller tell. Redirects are not followed: Discord never redirects a
-// logged-in browser.
-func newBrowserClient() (tls_client.HttpClient, tls_client.CookieJar, error) {
-	jar := tls_client.NewCookieJar()
-	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(),
-		tls_client.WithClientProfile(profiles.Chrome_152),
-		tls_client.WithRandomTLSExtensionOrder(),
-		tls_client.WithCookieJar(jar),
-		tls_client.WithTimeoutSeconds(int(requestTimeout/time.Second)),
-		tls_client.WithNotFollowRedirects(),
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf("create http client: %w", err)
+// logged-in browser. Attachment downloads get a client of their own, since a
+// large file takes longer than any API call may.
+func newBrowserClients() (api, cdn tls_client.HttpClient, jar tls_client.CookieJar, err error) {
+	jar = tls_client.NewCookieJar()
+	client := func(timeout time.Duration) (tls_client.HttpClient, error) {
+		return tls_client.NewHttpClient(tls_client.NewNoopLogger(),
+			tls_client.WithClientProfile(profiles.Chrome_152),
+			tls_client.WithRandomTLSExtensionOrder(),
+			tls_client.WithCookieJar(jar),
+			tls_client.WithTimeoutSeconds(int(timeout/time.Second)),
+			tls_client.WithNotFollowRedirects(),
+		)
 	}
-	return client, jar, nil
+	if api, err = client(requestTimeout); err != nil {
+		return nil, nil, nil, fmt.Errorf("create http client: %w", err)
+	}
+	if cdn, err = client(0); err != nil {
+		return nil, nil, nil, fmt.Errorf("create http client: %w", err)
+	}
+	return api, cdn, jar, nil
 }
 
 // newGatewayDialer opens WebSockets with the same TLS profile over HTTP/1.1,
@@ -154,8 +162,10 @@ type config struct {
 	token            connector.Secret
 	timezone         string
 	transport        transport
+	cdn              transport
 	jar              fhttp.CookieJar // nil in tests
 	apiBase, webBase string
+	cdnBase          string
 	gatewayURL       string
 	dialGateway      dialFunc
 	clock            clock
@@ -188,11 +198,13 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 	}
 	up := &upstream{
 		tr:        cfg.transport,
+		cdn:       cfg.cdn,
 		jar:       cfg.jar,
 		token:     token,
 		timezone:  cfg.timezone,
 		apiBase:   cfg.apiBase,
 		webBase:   cfg.webBase,
+		cdnBase:   cfg.cdnBase,
 		clock:     cfg.clock,
 		pace:      newPacer(st, cfg.rng),
 		st:        st,

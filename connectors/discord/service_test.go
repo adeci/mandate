@@ -244,10 +244,11 @@ func newHarness(t *testing.T, seed func(*state)) *harness {
 			h.stop()
 		}
 		for _, x := range h.discord.all() {
-			write := x.method == http.MethodPost && strings.HasPrefix(x.path, api("/channels/")) &&
-				(strings.HasSuffix(x.path, "/messages") || strings.HasSuffix(x.path, "/typing"))
-			if x.method != http.MethodGet && !write {
-				t.Errorf("upstream %s %s: only GET, typing and sending a message are allowed", x.method, x.path)
+			post := x.method == http.MethodPost && strings.HasPrefix(x.path, api("/channels/")) &&
+				(strings.HasSuffix(x.path, "/messages") || strings.HasSuffix(x.path, "/typing")) ||
+				x.method == http.MethodPost && x.path == api(refreshPath)
+			if x.method != http.MethodGet && !post {
+				t.Errorf("upstream %s %s: only GET, typing, sending a message and refreshing file links are allowed", x.method, x.path)
 			}
 		}
 		logs := h.logs.String()
@@ -271,8 +272,10 @@ func (h *harness) start() {
 		token:       h.token,
 		timezone:    "America/New_York",
 		transport:   &fhttp.Client{},
+		cdn:         &fhttp.Client{},
 		apiBase:     h.srv.URL + "/api/v9",
 		webBase:     h.srv.URL,
+		cdnBase:     h.srv.URL,
 		gatewayURL:  h.gw.url,
 		dialGateway: testDial,
 		clock:       h.clock,

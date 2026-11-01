@@ -13,7 +13,7 @@ import (
 )
 
 // The service presents itself as Google Chrome 156 on Linux, the owner's own
-// browser; newBrowserClient explains the TLS profile.
+// browser; newBrowserClients explains the TLS profile.
 const (
 	chromeMajor  = 156
 	systemLocale = "en-US"
@@ -227,6 +227,27 @@ func documentHeaders() []header {
 		{"sec-fetch-mode", "navigate"},
 		{"sec-fetch-user", "?1"},
 		{"sec-fetch-dest", "document"},
+		{"accept-encoding", "gzip, deflate, br, zstd"},
+		{"accept-language", "en-US,en;q=0.9"},
+		{"priority", "u=0, i"},
+	}
+}
+
+// A file opened from the app in a new tab: a navigation to the CDN, which
+// gets only discord.com's origin as referrer.
+func attachmentHeaders() []header {
+	return []header{
+		{"sec-ch-ua", secChUA},
+		{"sec-ch-ua-mobile", "?0"},
+		{"sec-ch-ua-platform", `"Linux"`},
+		{"upgrade-insecure-requests", "1"},
+		{"user-agent", userAgent},
+		{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
+		{"sec-fetch-site", "cross-site"},
+		{"sec-fetch-mode", "navigate"},
+		{"sec-fetch-user", "?1"},
+		{"sec-fetch-dest", "document"},
+		{"referer", defaultWebBase + "/"},
 		{"accept-encoding", "gzip, deflate, br, zstd"},
 		{"accept-language", "en-US,en;q=0.9"},
 		{"priority", "u=0, i"},
