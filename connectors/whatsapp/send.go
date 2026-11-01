@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -58,59 +59,115 @@ func (c *waConnector) Prepare(ctx context.Context, op string, args map[string]st
 	}
 	return connector.Prepared{
 		Args:      map[string]string{"chat": chat, "text": text},
-		Display:   []approval.Field{to, {Label: "Text", Value: text, Param: "text"}},
+		Display:   append(to, approval.Field{Label: "Text", Value: text, Param: "text"}),
 		Container: chat,
 	}, nil
 }
 
-// recipient checks that chat is stored and renders it for the owner.
-func (c *waConnector) recipient(ctx context.Context, dev *wastore.Device, chat string) (approval.Field, error) {
-	var group string
-	err := c.st.DB().QueryRowContext(ctx, `SELECT COALESCE(name, '') FROM containers WHERE id = ?1`, chat).Scan(&group)
+// recipient checks that chat is stored and renders it for the owner, with
+// a warning when a security code behind it changed in the last week.
+func (c *waConnector) recipient(ctx context.Context, dev *wastore.Device, chat string) ([]approval.Field, error) {
+	var subject, members string
+	err := c.st.DB().QueryRowContext(ctx, `SELECT COALESCE(name, ''), participants_json FROM containers WHERE id = ?1`, chat).
+		Scan(&subject, &members)
 	if errors.Is(err, sql.ErrNoRows) {
-		return approval.Field{}, connector.Invalid("unknown chat %q: run mandate whatsapp chats --search %s", chat, chat)
+		return nil, connector.Invalid("unknown chat %q: run mandate whatsapp chats --search %s", chat, chat)
 	}
 	if err != nil {
-		return approval.Field{}, fmt.Errorf("look up chat: %w", err)
+		return nil, fmt.Errorf("look up chat: %w", err)
 	}
 	j, err := types.ParseJID(chat)
 	if err != nil {
-		return approval.Field{}, connector.Invalid("invalid chat ID %q", chat)
+		return nil, connector.Invalid("invalid chat ID %q", chat)
 	}
 	switch j.Server {
 	case types.GroupServer:
-		if group == "" {
-			group = chat
-		}
-		return approval.Field{Label: "Group", Value: group}, nil
+		return c.group(ctx, chat, subject, members)
 	case types.DefaultUserServer, types.HiddenUserServer:
 	default:
-		return approval.Field{}, connector.Invalid("cannot send to %s", chat)
+		return nil, connector.Invalid("cannot send to %s", chat)
 	}
 	var pn, lid types.JID
 	if j.Server == types.HiddenUserServer {
 		lid = j
 		if pn, err = dev.LIDs.GetPNForLID(ctx, j); err != nil {
-			return approval.Field{}, fmt.Errorf("look up phone number: %w", err)
+			return nil, fmt.Errorf("look up phone number: %w", err)
 		}
 	} else {
 		pn = j
 		if lid, err = dev.LIDs.GetLIDForPN(ctx, j); err != nil {
-			return approval.Field{}, fmt.Errorf("look up lid: %w", err)
+			return nil, fmt.Errorf("look up lid: %w", err)
 		}
 	}
 	name, err := addressBookName(ctx, dev, pn, lid)
 	if err != nil {
-		return approval.Field{}, err
+		return nil, err
 	}
 	number := chat
 	if !pn.IsEmpty() {
 		number = "+" + pn.User
 	}
-	if name == "" {
-		return approval.Field{Label: "To", Value: number + " (not in your contacts)"}, nil
+	to := approval.Field{Label: "To", Value: number + " (not in your contacts)"}
+	if name != "" {
+		to.Value = name + " (" + number + ")"
 	}
-	return approval.Field{Label: "To", Value: name + " (" + number + ")"}, nil
+	var ids []string
+	for _, u := range []types.JID{pn, lid} {
+		if !u.IsEmpty() {
+			ids = append(ids, u.String())
+		}
+	}
+	changes, err := identityChanges(ctx, c.st.DB(), ids)
+	if err != nil {
+		return nil, err
+	}
+	var latest time.Time
+	for _, t := range changes {
+		if t.After(latest) {
+			latest = t
+		}
+	}
+	if latest.IsZero() {
+		return []approval.Field{to}, nil
+	}
+	return []approval.Field{to, security(changedAt(latest))}, nil
+}
+
+// group renders a group by its subject, which any admin may set, and its
+// ID, with the members whose security code changed.
+func (c *waConnector) group(ctx context.Context, chat, subject, members string) ([]approval.Field, error) {
+	g := approval.Field{Label: "Group", Value: chat}
+	if subject != "" {
+		g.Value = "~" + subject + " (" + chat + ")"
+	}
+	var ps []store.Participant
+	if err := json.Unmarshal([]byte(members), &ps); err != nil {
+		return nil, fmt.Errorf("read group members: %w", err)
+	}
+	ids := make([]string, 0, len(ps))
+	for _, p := range ps {
+		ids = append(ids, p.ID)
+	}
+	changes, err := identityChanges(ctx, c.st.DB(), ids)
+	if err != nil {
+		return nil, err
+	}
+	var changed []string
+	for _, p := range ps {
+		t, ok := changes[p.ID]
+		if !ok {
+			continue
+		}
+		member := p.ID
+		if j, err := types.ParseJID(p.ID); err == nil && j.Server == types.DefaultUserServer {
+			member = "+" + j.User
+		}
+		changed = append(changed, "for "+member+" "+changedAt(t))
+	}
+	if len(changed) == 0 {
+		return []approval.Field{g}, nil
+	}
+	return []approval.Field{g, security(changed...)}, nil
 }
 
 // Only address-book names are shown; push names are set by the sender.

@@ -55,7 +55,7 @@ func groupInfo(id string) types.MessageInfo {
 }
 
 func TestConvert(t *testing.T) {
-	editAt := ts.Add(time.Minute)
+	claimed := ts.Add(-time.Hour) // the editor's own clock, which is ignored
 	tests := []struct {
 		name  string
 		evt   *events.Message
@@ -164,9 +164,9 @@ func TestConvert(t *testing.T) {
 				Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
 				Key:           &waCommon.MessageKey{ID: proto.String("A1")},
 				EditedMessage: &waE2E.Message{Conversation: proto.String("hi!")},
-				TimestampMS:   proto.Int64(editAt.UnixMilli()),
+				TimestampMS:   proto.Int64(claimed.UnixMilli()),
 			}}},
-			want: op{kind: opEdit, chat: alice, target: "15550001111@s.whatsapp.net/A1", body: "hi!", at: editAt},
+			want: op{kind: opEdit, chat: alice, sender: alice, target: "15550001111@s.whatsapp.net/A1", body: "hi!", at: ts},
 		},
 		{
 			name: "edit of caption",
@@ -177,7 +177,7 @@ func TestConvert(t *testing.T) {
 					Caption: proto.String("look again"),
 				}},
 			}}},
-			want: op{kind: opEdit, chat: group, target: "120363000000000001@g.us/A3", body: "look again", at: ts},
+			want: op{kind: opEdit, chat: group, sender: alice, target: "120363000000000001@g.us/A3", body: "look again", at: ts},
 		},
 		{
 			name: "revoke",
@@ -185,7 +185,7 @@ func TestConvert(t *testing.T) {
 				Type: waE2E.ProtocolMessage_REVOKE.Enum(),
 				Key:  &waCommon.MessageKey{ID: proto.String("A3")},
 			}}},
-			want: op{kind: opDelete, chat: group, target: "120363000000000001@g.us/A3"},
+			want: op{kind: opDelete, chat: group, sender: alice, target: "120363000000000001@g.us/A3", at: ts},
 		},
 		{
 			name: "reaction skipped",
@@ -298,7 +298,7 @@ func TestConvertHistorySync(t *testing.T) {
 				MessageTimestamp: &sec,
 				MessageStubType:  waWeb.WebMessageInfo_REVOKE.Enum(),
 			},
-			want: op{kind: opDelete, chat: alice, target: "15550001111@s.whatsapp.net/H4"},
+			want: op{kind: opDelete, chat: alice, sender: alice, target: "15550001111@s.whatsapp.net/H4", at: ts},
 		},
 		{
 			name: "system stub skipped",
@@ -331,6 +331,7 @@ func TestConvertHistorySync(t *testing.T) {
 			if !got.msg.SentAt.IsZero() {
 				got.msg.SentAt = got.msg.SentAt.UTC()
 			}
+			got.at = got.at.UTC()
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("convert =\n%+v\nwant\n%+v", got, tt.want)
 			}

@@ -46,10 +46,11 @@ type devices interface {
 }
 
 type sgConnector struct {
-	st      *store.Store
-	log     *slog.Logger
-	devices devices
-	timers  *timers
+	st         *store.Store
+	log        *slog.Logger
+	devices    devices
+	timers     *timers
+	identities *identities
 	// ctx outlives requests: the connection and linking run until shutdown.
 	ctx       context.Context
 	provision func(ctx context.Context) <-chan signalmeow.ProvisioningResponse
@@ -71,7 +72,7 @@ func newConnector(ctx context.Context, st *store.Store, log *slog.Logger, sess *
 	newClient func(*sgstore.Device, func(events.SignalEvent)) sgClient,
 ) *sgConnector {
 	c := &sgConnector{
-		st: st, log: log, devices: sess.devices, timers: sess.timers,
+		st: st, log: log, devices: sess.devices, timers: sess.timers, identities: sess.identities,
 		ctx: ctx, provision: provision, newClient: newClient,
 	}
 	if dev != nil {

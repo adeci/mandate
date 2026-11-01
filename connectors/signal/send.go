@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -58,47 +59,104 @@ func (c *sgConnector) Prepare(ctx context.Context, op string, args map[string]st
 	}
 	return connector.Prepared{
 		Args:      map[string]string{"chat": chat, "text": text},
-		Display:   []approval.Field{to, {Label: "Text", Value: text, Param: "text"}},
+		Display:   append(to, approval.Field{Label: "Text", Value: text, Param: "text"}),
 		Container: chat,
 	}, nil
 }
 
 // recipient checks that chat is stored and renders it for the owner from
-// the local contact store.
-func (c *sgConnector) recipient(ctx context.Context, dev *sgstore.Device, chat string) (approval.Field, error) {
-	var group string
-	err := c.st.DB().QueryRowContext(ctx, `SELECT COALESCE(name, '') FROM containers WHERE id = ?1`, chat).Scan(&group)
+// the local contact store, with a warning when a safety number behind it
+// changed in the last week.
+func (c *sgConnector) recipient(ctx context.Context, dev *sgstore.Device, chat string) ([]approval.Field, error) {
+	var title, members string
+	err := c.st.DB().QueryRowContext(ctx, `SELECT COALESCE(name, ''), participants_json FROM containers WHERE id = ?1`, chat).
+		Scan(&title, &members)
 	if errors.Is(err, sql.ErrNoRows) {
-		return approval.Field{}, connector.Invalid("unknown chat %q: run mandate signal chats --search %s", chat, chat)
+		return nil, connector.Invalid("unknown chat %q: run mandate signal chats --search %s", chat, chat)
 	}
 	if err != nil {
-		return approval.Field{}, fmt.Errorf("look up chat: %w", err)
+		return nil, fmt.Errorf("look up chat: %w", err)
 	}
 	if isGroup(chat) {
-		if group == "" {
-			group = chat
-		}
-		return approval.Field{Label: "Group", Value: group}, nil
+		return c.group(ctx, dev, chat, title, members)
 	}
 	sid, err := libsignalgo.ServiceIDFromString(chat)
 	if err != nil {
-		return approval.Field{}, connector.Invalid("invalid chat ID %q", chat)
+		return nil, connector.Invalid("invalid chat ID %q", chat)
 	}
 	aci, pni := sid.ToACIAndPNI()
 	r, err := dev.RecipientStore.LoadAndUpdateRecipient(ctx, aci, pni, nil)
 	if err != nil {
-		return approval.Field{}, fmt.Errorf("look up contact: %w", err)
+		return nil, fmt.Errorf("look up contact: %w", err)
 	}
 	name, number := displayName(r, dev.ACI), r.E164
-	switch {
-	case name != "" && number != "":
-		return approval.Field{Label: "To", Value: name + " (" + number + ")"}, nil
-	case name != "":
-		return approval.Field{Label: "To", Value: name}, nil
-	case number != "":
-		return approval.Field{Label: "To", Value: number + " (not in your contacts)"}, nil
+	if number == "" {
+		number = chat
 	}
-	return approval.Field{Label: "To", Value: chat + " (not in your contacts)"}, nil
+	to := approval.Field{Label: "To", Value: number + " (not in your contacts)"}
+	if name != "" {
+		to.Value = name + " (" + number + ")"
+	}
+	ids := []string{chat}
+	if r.ACI != uuid.Nil {
+		ids = append(ids, libsignalgo.NewACIServiceID(r.ACI).String())
+	}
+	if r.PNI != uuid.Nil {
+		ids = append(ids, libsignalgo.NewPNIServiceID(r.PNI).String())
+	}
+	changes, err := c.identities.recent(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	var latest time.Time
+	for _, t := range changes {
+		if t.After(latest) {
+			latest = t
+		}
+	}
+	if latest.IsZero() {
+		return []approval.Field{to}, nil
+	}
+	return []approval.Field{to, security(changedAt(latest))}, nil
+}
+
+// group renders a group by its title, which members may set, and its ID,
+// with the members whose safety number changed.
+func (c *sgConnector) group(ctx context.Context, dev *sgstore.Device, chat, title, members string) ([]approval.Field, error) {
+	g := approval.Field{Label: "Group", Value: chat}
+	if title != "" {
+		g.Value = "~" + title + " (" + chat + ")"
+	}
+	var ps []store.Participant
+	if err := json.Unmarshal([]byte(members), &ps); err != nil {
+		return nil, fmt.Errorf("read group members: %w", err)
+	}
+	ids := make([]string, 0, len(ps))
+	for _, p := range ps {
+		ids = append(ids, p.ID)
+	}
+	changes, err := c.identities.recent(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	var changed []string
+	for _, p := range ps {
+		t, ok := changes[p.ID]
+		if !ok {
+			continue
+		}
+		member := p.ID
+		if aci, err := uuid.Parse(p.ID); err == nil {
+			if r, err := dev.RecipientStore.LoadAndUpdateRecipient(ctx, aci, uuid.Nil, nil); err == nil && r.E164 != "" {
+				member = r.E164
+			}
+		}
+		changed = append(changed, "for "+member+" "+changedAt(t))
+	}
+	if len(changed) == 0 {
+		return []approval.Field{g}, nil
+	}
+	return []approval.Field{g, security(changed...)}, nil
 }
 
 // Execute never retries: once a send starts the message may have been

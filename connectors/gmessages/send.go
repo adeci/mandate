@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -57,7 +58,8 @@ func (c *gmConnector) Prepare(ctx context.Context, op string, args map[string]st
 }
 
 // recipient checks that chat is stored and renders it for the owner: a
-// group by its stored name, a direct chat by the phone's contact entry.
+// direct chat by the phone's contact entry, otherwise by the stored name,
+// which members may set, and the members' numbers.
 func (c *gmConnector) recipient(ctx context.Context, cli gmClient, chat string) (approval.Field, error) {
 	var kind, name string
 	err := c.st.DB().QueryRowContext(ctx, `SELECT kind, COALESCE(name, '') FROM containers WHERE id = ?1`, chat).Scan(&kind, &name)
@@ -67,36 +69,44 @@ func (c *gmConnector) recipient(ctx context.Context, cli gmClient, chat string) 
 	if err != nil {
 		return approval.Field{}, fmt.Errorf("look up chat: %w", err)
 	}
-	if name == "" {
-		name = chat
-	}
-	if kind == "group" {
-		return approval.Field{Label: "Group", Value: name}, nil
-	}
 	conv, err := c.in.lookup(ctx, cli, chat)
 	if err != nil {
 		return approval.Field{}, &connector.Error{Status: http.StatusServiceUnavailable, Message: "look up the chat on the phone: " + err.Error()}
 	}
 	ps := others(conv)
-	if len(ps) != 1 {
-		return approval.Field{Label: "Chat", Value: name}, nil
+	if kind == "group" || len(ps) != 1 {
+		var numbers []string
+		for _, p := range ps {
+			if n := number(p); n != "" {
+				numbers = append(numbers, n)
+			}
+		}
+		id := strings.Join(numbers, ", ")
+		if id == "" {
+			id = "conversation " + chat
+		}
+		f := approval.Field{Label: "Chat", Value: id}
+		if kind == "group" {
+			f.Label = "Group"
+		}
+		if name != "" {
+			f.Value = "~" + name + " (" + id + ")"
+		}
+		return f, nil
 	}
 	p := ps[0]
-	number := p.GetFormattedNumber()
-	if number == "" {
-		number = p.GetID().GetNumber()
+	id := number(p)
+	if id == "" {
+		id = "conversation " + chat
 	}
-	contact := p.GetFullName()
-	if contact == "" {
-		contact = p.GetFirstName()
+	if contact := cmp.Or(p.GetFullName(), p.GetFirstName()); p.GetContactID() != "" && contact != "" {
+		return approval.Field{Label: "To", Value: contact + " (" + id + ")"}, nil
 	}
-	switch {
-	case p.GetContactID() == "" || contact == "":
-		return approval.Field{Label: "To", Value: number + " (not in your contacts)"}, nil
-	case number == "":
-		return approval.Field{Label: "To", Value: contact}, nil
-	}
-	return approval.Field{Label: "To", Value: contact + " (" + number + ")"}, nil
+	return approval.Field{Label: "To", Value: id + " (not in your contacts)"}, nil
+}
+
+func number(p *gmproto.Participant) string {
+	return cmp.Or(p.GetFormattedNumber(), p.GetID().GetNumber())
 }
 
 // Execute does not retry: once SendMessage is called the phone may send the

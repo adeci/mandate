@@ -24,7 +24,6 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/adeci/mandate/connector"
-	"github.com/adeci/mandate/store"
 )
 
 func main() {
@@ -33,7 +32,7 @@ func main() {
 
 func start(ctx context.Context, env *connector.Env, _ struct{}) (connector.Connector, error) {
 	ctx = withLibraryLogger(ctx)
-	st, err := store.Open(ctx, env.DataPath())
+	st, err := openStore(ctx, env.DataPath())
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
 	}

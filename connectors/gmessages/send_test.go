@@ -16,14 +16,17 @@ import (
 )
 
 // newSendFixture is a connected session whose phone has the test
-// conversations, stored as a sync would.
+// conversations, stored as a sync would. Two groups share a name.
 func newSendFixture(t *testing.T) *fixture {
 	t.Helper()
 	f := newFixture(t, true)
-	f.phone.setConvs(faridDM(), strangerDM(), family())
+	other := family()
+	other.ConversationID = "5"
+	other.Participants = []*gmproto.Participant{self("4"), participant("31", "+15559990031", "(555) 999-0031")}
+	f.phone.setConvs(faridDM(), strangerDM(), family(), other)
 	f.activate()
 	eventually(t, "the sync", func() bool {
-		if len(chats(t, f)) != 3 {
+		if len(chats(t, f)) != 4 {
 			return false
 		}
 		f.c.in.mu.Lock()
@@ -46,7 +49,8 @@ func TestPrepare(t *testing.T) {
 		{"1", approval.Field{Label: "To", Value: "Farid Haddad ((555) 123-0001)"}},
 		// The name the stranger chose is not shown.
 		{"2", approval.Field{Label: "To", Value: "(555) 999-0002 (not in your contacts)"}},
-		{"3", approval.Field{Label: "Group", Value: "Family"}},
+		{"3", approval.Field{Label: "Group", Value: "~Family ((555) 123-0001, (555) 123-0003)"}},
+		{"5", approval.Field{Label: "Group", Value: "~Family ((555) 999-0031)"}},
 	} {
 		args := map[string]string{"chat": tc.chat, "text": "hi"}
 		p, err := f.c.Prepare(ctx, "send", args)

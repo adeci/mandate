@@ -20,6 +20,7 @@ import (
 	wastore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 
 	"github.com/adeci/mandate/approval"
 	"github.com/adeci/mandate/approval/approvaltest"
@@ -28,13 +29,14 @@ import (
 )
 
 var (
-	owner    = types.NewADJID("15559990000", 0, 3)
-	farid    = types.NewJID("15551234567", types.DefaultUserServer)
-	samLee   = types.NewJID("15550001111", types.DefaultUserServer)
-	samPark  = types.NewJID("447700900123", types.DefaultUserServer)
-	samParkL = types.NewJID("111222333", types.HiddenUserServer)
-	stranger = types.NewJID("15557654321", types.DefaultUserServer)
-	climbing = types.NewJID("120363000000000777", types.GroupServer)
+	owner     = types.NewADJID("15559990000", 0, 3)
+	farid     = types.NewJID("15551234567", types.DefaultUserServer)
+	samLee    = types.NewJID("15550001111", types.DefaultUserServer)
+	samPark   = types.NewJID("447700900123", types.DefaultUserServer)
+	samParkL  = types.NewJID("111222333", types.HiddenUserServer)
+	stranger  = types.NewJID("15557654321", types.DefaultUserServer)
+	climbing  = types.NewJID("120363000000000777", types.GroupServer)
+	climbing2 = types.NewJID("120363000000000888", types.GroupServer)
 )
 
 type sent struct {
@@ -147,7 +149,7 @@ func newBareFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { container.Close() })
-	st, err := store.Open(context.Background(), filepath.Join(dir, "data.db"))
+	st, err := openStore(context.Background(), filepath.Join(dir, "data.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +222,11 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	for _, c := range []store.Container{
-		{ID: climbing.String(), Kind: "group", IsGroup: true, Name: "Climbing crew"},
+		{
+			ID: climbing.String(), Kind: "group", IsGroup: true, Name: "Climbing crew",
+			Participants: []store.Participant{{ID: farid.String()}, {ID: samPark.String()}},
+		},
+		{ID: climbing2.String(), Kind: "group", IsGroup: true, Name: "Climbing crew"},
 		{ID: farid.String(), Kind: "dm", Name: "Bank Support"},
 		{ID: samParkL.String(), Kind: "dm"},
 		{ID: stranger.String(), Kind: "dm", Name: "Mom"},
@@ -238,10 +244,11 @@ func TestPrepareKnownChat(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	for chat, want := range map[types.JID]approval.Field{
-		farid:    {Label: "To", Value: "Farid Haddad (+15551234567)"},
-		samParkL: {Label: "To", Value: "Sam Park (+447700900123)"},
-		stranger: {Label: "To", Value: "+15557654321 (not in your contacts)"},
-		climbing: {Label: "Group", Value: "Climbing crew"},
+		farid:     {Label: "To", Value: "Farid Haddad (+15551234567)"},
+		samParkL:  {Label: "To", Value: "Sam Park (+447700900123)"},
+		stranger:  {Label: "To", Value: "+15557654321 (not in your contacts)"},
+		climbing:  {Label: "Group", Value: "~Climbing crew (120363000000000777@g.us)"},
+		climbing2: {Label: "Group", Value: "~Climbing crew (120363000000000888@g.us)"},
 	} {
 		ctx := context.Background()
 		p, err := f.c.Prepare(ctx, "send", map[string]string{"chat": chat.String(), "text": "on my way"})
@@ -355,10 +362,10 @@ func TestExecute(t *testing.T) {
 	}
 }
 
-func TestApprovedSendRunsOnce(t *testing.T) {
-	t.Parallel()
+// serve runs f's connector behind connector.Server, which checks approvals.
+func serve(t *testing.T, f *fixture) (*connector.Client, *approvaltest.Authenticator) {
+	t.Helper()
 	const rpID, origin = "box.example.ts.net", "https://box.example.ts.net:8781"
-	f := newFixture(t)
 	key := approvaltest.New(t, rpID, origin)
 	dir := t.TempDir()
 	seen, err := approval.OpenSeen(filepath.Join(dir, "seen.json"))
@@ -385,11 +392,11 @@ func TestApprovedSendRunsOnce(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	return client, key
+}
 
-	p, err := client.Prepare(context.Background(), "send", map[string]string{"chat": farid.String(), "text": "running late"})
-	if err != nil {
-		t.Fatal(err)
-	}
+func approve(t *testing.T, key *approvaltest.Authenticator, p connector.Prepared) approval.Approval {
+	t.Helper()
 	b, err := approval.Encode(approval.Record{
 		ID: "p1", Connector: "whatsapp", Op: "send", Args: p.Args, Display: p.Display,
 		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
@@ -397,7 +404,18 @@ func TestApprovedSendRunsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := key.Approve(b, time.Now())
+	return key.Approve(b, time.Now())
+}
+
+func TestApprovedSendRunsOnce(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	client, key := serve(t, f)
+	p, err := client.Prepare(context.Background(), "send", map[string]string{"chat": farid.String(), "text": "running late"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := approve(t, key, p)
 
 	res, err := client.Execute(context.Background(), a)
 	if err != nil || res.Status != connector.Done {
@@ -409,5 +427,62 @@ func TestApprovedSendRunsOnce(t *testing.T) {
 	}
 	if got := f.cli.calls(); !reflect.DeepEqual(got, []sent{{to: farid, text: "running late"}}) {
 		t.Fatalf("sends = %+v", got)
+	}
+}
+
+// A security code that changed in the last week is shown on the approval,
+// and one that changes after approving stops the send.
+func TestIdentityChange(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t)
+	dev, err := f.container.GetFirstDevice(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	client, key := serve(t, f)
+	security := func(chat types.JID) string {
+		t.Helper()
+		p, err := f.c.Prepare(ctx, "send", map[string]string{"chat": chat.String(), "text": "hi"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range p.Display {
+			if d.Label == "Security" {
+				return d.Value
+			}
+		}
+		return ""
+	}
+
+	now := time.Now().UTC()
+	in.handle(ctx, &events.IdentityChange{JID: farid, Timestamp: now.Add(-8 * 24 * time.Hour)})
+	in.handle(ctx, &events.IdentityChange{JID: types.NewADJID(stranger.User, 0, 5), Timestamp: now, Implicit: true})
+	if got := security(farid) + security(stranger); got != "" {
+		t.Fatalf("old change or relinked device shown: %q", got)
+	}
+
+	in.handle(ctx, &events.IdentityChange{JID: samParkL, Timestamp: now.Add(-time.Hour)})
+	at := now.Add(-time.Hour).Format("2006-01-02 15:04 UTC")
+	if got, want := security(samParkL), "! security code changed "+at; got != want {
+		t.Fatalf("dm: %q, want %q", got, want)
+	}
+	if got, want := security(climbing), "! security code changed for +447700900123 "+at; got != want {
+		t.Fatalf("group: %q, want %q", got, want)
+	}
+
+	p, err := client.Prepare(ctx, "send", map[string]string{"chat": samParkL.String(), "text": "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := approve(t, key, p)
+	in.handle(ctx, &events.IdentityChange{JID: samParkL, Timestamp: now})
+	var cerr *connector.Error
+	if _, err := client.Execute(ctx, a); !errors.As(err, &cerr) || cerr.Status != http.StatusConflict {
+		t.Fatalf("execute after a change: %v", err)
+	}
+	if got := f.cli.calls(); len(got) != 0 {
+		t.Fatalf("sent %+v", got)
 	}
 }
