@@ -156,11 +156,12 @@ func TestLoggedOutFromPhone(t *testing.T) {
 		f := newFixture(t)
 		old := f.cli()
 		logout(f)
-		eventually(t, func() bool { return f.c.Health(ctx).Detail == "logged out from the phone" })
+		// The session is deleted just after the health changes.
+		eventually(t, func() bool {
+			dev, err := f.sess.devices.DeviceByACI(ctx, owner)
+			return f.c.Health(ctx).Detail == "logged out from the phone" && dev == nil && err == nil
+		})
 		wantHealth(t, f.c, connector.NeedsSetup)
-		if dev, err := f.sess.devices.DeviceByACI(ctx, owner); dev != nil || err != nil {
-			t.Fatalf("session kept: %v", err)
-		}
 		_, err := f.c.Prepare(ctx, "send", map[string]string{"chat": farid.String(), "text": "hi"})
 		wantStatus(t, err, http.StatusServiceUnavailable)
 		res := f.c.Execute(ctx, approval.Record{Op: "send", Args: map[string]string{"chat": farid.String(), "text": "hi"}})
