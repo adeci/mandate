@@ -21,9 +21,12 @@ import (
 	"github.com/adeci/mandate/internal/exitcode"
 )
 
-// Above the gateway's own 120 s connector read timeout, so its answer always
-// wins. Long-polls add their wait on top.
-const requestTimeout = 150 * time.Second
+// Above the gateway's own timeouts for connector reads (120 s) and files
+// (10 min), so its answer always wins. Long-polls add their wait on top.
+const (
+	requestTimeout = 150 * time.Second
+	mediaTimeout   = 11 * time.Minute
+)
 
 const (
 	chatsUsage    = "mandate %s chats [--search TEXT] [--limit 20]"
@@ -32,6 +35,7 @@ const (
 	sendUsage     = "mandate %s send CHAT_ID TEXT [--note WHY] [--wait DUR]"
 	opUsage       = "mandate %s %s [KEY=VALUE...] [--note WHY] [--wait DUR]"
 	getUsage      = "mandate %s get PATH [--head]"
+	mediaUsage    = "mandate %s media CHAT_ID SEQ [--index N] [-o PATH]"
 	statusUsage   = "mandate status ID [--wait DUR]"
 )
 
@@ -145,6 +149,8 @@ func (c *client) connector(ctx context.Context, name string, args []string) erro
 		return c.rows(ctx, base+"search", query("text", strings.Join(pos, " "), "chat", *chat, "since", *since, "limit", *limit, "before", *before))
 	case "get":
 		return c.forward(ctx, name, args)
+	case "media":
+		return c.media(ctx, name, args)
 	}
 	help := fmt.Sprintf(opUsage, name, cmd)
 	if cmd == "send" {
@@ -399,17 +405,32 @@ func cell(v any) string {
 func (c *client) do(ctx context.Context, timeout time.Duration, method, path string, body any) (int, http.Header, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	resp, err := c.send(ctx, method, path, body)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	return resp.StatusCode, resp.Header, data, nil
+}
+
+// send answers a successful response for the caller to read and close, and
+// turns anything else into an error for the agent.
+func (c *client) send(ctx context.Context, method, path string, body any) (*http.Response, error) {
 	var rd io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
-			return 0, nil, nil, err
+			return nil, err
 		}
 		rd = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.url+path, rd)
 	if err != nil {
-		return 0, nil, nil, err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	if body != nil {
@@ -417,15 +438,15 @@ func (c *client) do(ctx context.Context, timeout time.Duration, method, path str
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, nil, nil, fmt.Errorf("%w; check MANDATE_URL, and tell the owner if the gateway stays unreachable", err)
+		return nil, fmt.Errorf("%w; check MANDATE_URL, and tell the owner if the gateway stays unreachable", err)
+	}
+	if resp.StatusCode/100 == 2 {
+		return resp, nil
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
-		return 0, nil, nil, err
-	}
-	if resp.StatusCode/100 == 2 {
-		return resp.StatusCode, resp.Header, data, nil
+		return nil, err
 	}
 	var e struct {
 		Error             string `json:"error"`
@@ -439,12 +460,12 @@ func (c *client) do(ctx context.Context, timeout time.Duration, method, path str
 	}
 	switch resp.StatusCode {
 	case http.StatusTooManyRequests:
-		return 0, nil, nil, &exitError{
+		return nil, &exitError{
 			msg:  fmt.Sprintf("%s; retry in %s", e.Error, time.Duration(e.RetryAfterSeconds)*time.Second),
 			code: exitcode.ErrTryLater,
 		}
 	case http.StatusUnauthorized:
-		return 0, nil, nil, errors.New("the gateway refused the token; ask the owner to check MANDATE_TOKEN")
+		return nil, errors.New("the gateway refused the token; ask the owner to check MANDATE_TOKEN")
 	}
-	return 0, nil, nil, errors.New(e.Error)
+	return nil, errors.New(e.Error)
 }

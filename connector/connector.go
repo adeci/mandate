@@ -10,6 +10,7 @@
 //	POST /prepare  validate and normalize a write, render what the owner will see
 //	POST /execute  run an approved write, verifying the approval itself
 //	GET  /forward/{path...}  raw read, only for connectors that are a Forwarder
+//	POST /media    stream a stored message's file, only for connectors that are a MediaFetcher
 //
 // A connector program is usually just a call to Main.
 package connector
@@ -19,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -53,6 +55,9 @@ type Spec struct {
 	// Unlink is set by Server for an Unlinker: the console offers to unlink
 	// and relink.
 	Unlink bool `json:"unlink,omitempty"`
+	// Media is set by Server for a MediaFetcher: agents can fetch the files
+	// of stored messages.
+	Media bool `json:"media,omitempty"`
 }
 
 type Op struct {
@@ -146,6 +151,22 @@ type Reader interface {
 // cleaned, so ".." and %2F reach the connector to refuse or keep.
 type Forwarder interface {
 	Forward(w http.ResponseWriter, r *http.Request, path string)
+}
+
+// MediaFetcher is implemented by connectors that fetch the files of stored
+// messages (store.Media) when an agent asks. Media gets the stored ID of a
+// message the agent may see and the file's index among its media; it may
+// use the stored reference or look the file up again.
+type MediaFetcher interface {
+	Media(ctx context.Context, message string, index int) (MediaFile, error)
+}
+
+// MediaFile is one file. Body yields exactly Size bytes; Server closes it.
+type MediaFile struct {
+	Type string // MIME type
+	Name string // file name, if any
+	Size int64
+	Body io.ReadCloser
 }
 
 type HealthState string

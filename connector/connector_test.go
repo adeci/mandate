@@ -69,6 +69,13 @@ func (f *fake) Read(context.Context, string, map[string]string) (json.RawMessage
 	return json.RawMessage(`{"ids":["a"]}`), nil
 }
 
+func (f *fake) Media(_ context.Context, message string, index int) (connector.MediaFile, error) {
+	if message != "m1" || index != 0 {
+		return connector.MediaFile{}, &connector.Error{Status: http.StatusNotFound, Message: "no such file"}
+	}
+	return connector.MediaFile{Type: "image/png", Name: "dot.png", Size: 3, Body: io.NopCloser(strings.NewReader("png"))}, nil
+}
+
 type harness struct {
 	fake   *fake
 	client *connector.Client
@@ -172,6 +179,19 @@ func TestControlRoutesOnlyFromConsole(t *testing.T) {
 	if _, err := h.client.Keys(ctx); err != nil {
 		t.Fatalf("gateway keys: %v", err)
 	}
+	resp, err := h.client.Media(ctx, "m1", 0)
+	if err != nil {
+		t.Fatalf("gateway media: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || string(body) != "png" || resp.ContentLength != 3 || resp.Header.Get("Content-Type") != "image/png" ||
+		resp.Header.Get("Content-Disposition") != `attachment; filename=dot.png` {
+		t.Fatalf("gateway media: %q %v %+v", body, err, resp.Header)
+	}
+	if mediaStatus(h, "m2") != http.StatusNotFound {
+		t.Fatal("media of another message served")
+	}
 	for name, call := range map[string]func() error{
 		"execute":  func() error { _, err := h.client.Execute(ctx, h.approved(t, nil)); return err },
 		"setup":    func() error { _, err := h.client.Setup(ctx, nil); return err },
@@ -198,6 +218,18 @@ func TestControlRoutesOnlyFromConsole(t *testing.T) {
 	if _, err := h.client.Prepare(ctx, "send", map[string]string{"to": "Farid", "text": "hi"}); status(err) != http.StatusForbidden {
 		t.Fatalf("stranger prepare: %v", err)
 	}
+	if mediaStatus(h, "m1") != http.StatusForbidden {
+		t.Fatal("stranger got media")
+	}
+}
+
+// mediaStatus asks for a message's first file and answers the refusal's status.
+func mediaStatus(h *harness, message string) int {
+	resp, err := h.client.Media(context.Background(), message, 0)
+	if err == nil {
+		resp.Body.Close()
+	}
+	return status(err)
 }
 
 func TestExecuteRunsSessionKeyApprovalOnce(t *testing.T) {

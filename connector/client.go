@@ -115,6 +115,29 @@ func (c *Client) PutKeys(ctx context.Context, log []approval.SignedChange) (Keys
 	return h, err
 }
 
+// Media streams a stored message's file; the caller closes the body.
+// Refusals come back as *Error.
+func (c *Client) Media(ctx context.Context, message string, index int) (*http.Response, error) {
+	b, err := json.Marshal(mediaRequest{Message: message, Index: index})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://connector/media", bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode/100 != 2 {
+		defer resp.Body.Close()
+		return nil, refusal(resp)
+	}
+	return resp, nil
+}
+
 // Do sends a JSON request over the socket; refusals come back as *Error.
 func (c *Client) Do(ctx context.Context, method, path string, body, out any) error {
 	var rd io.Reader
@@ -135,19 +158,27 @@ func (c *Client) Do(ctx context.Context, method, path string, body, out any) err
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return refusal(resp)
+	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
 		return err
-	}
-	if resp.StatusCode/100 != 2 {
-		e := &Error{Status: resp.StatusCode}
-		if json.Unmarshal(data, e) != nil || e.Message == "" {
-			e.Message = strings.TrimSpace(string(data))
-		}
-		return e
 	}
 	if err := json.Unmarshal(data, out); err != nil {
 		return fmt.Errorf("decode %s response: %w", path, err)
 	}
 	return nil
+}
+
+func refusal(resp *http.Response) error {
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if err != nil {
+		return err
+	}
+	e := &Error{Status: resp.StatusCode}
+	if json.Unmarshal(data, e) != nil || e.Message == "" {
+		e.Message = strings.TrimSpace(string(data))
+	}
+	return e
 }

@@ -74,6 +74,9 @@ func commands(ci connectorInfo) []string {
 	var out []string
 	if ci.Source {
 		out = append(out, "chats", "messages", "search")
+		if ci.Media {
+			out = append(out, "media")
+		}
 	}
 	for _, op := range ci.Ops {
 		out = append(out, op.Name)
@@ -110,6 +113,9 @@ func writeConnectorHelp(w io.Writer, ci connectorInfo) {
 		fmt.Fprintf(w, "  "+chatsUsage+"\n      id kind name last_message, most recent first\n", ci.Name)
 		fmt.Fprintf(w, "  "+messagesUsage+"\n      seq sent_at sender_id sender reply_to body, newest first\n", ci.Name)
 		fmt.Fprintf(w, "  "+searchUsage+"\n      seq sent_at chat_id chat sender_id sender reply_to body, newest first\n", ci.Name)
+		if ci.Media {
+			fmt.Fprintf(w, "  "+mediaUsage+"\n      save a message's file, by default as %s-SEQ.EXT here; prints path type size name\n", ci.Name, ci.Name)
+		}
 	}
 	writes, reads := false, false
 	for _, op := range ci.Ops {
@@ -145,8 +151,11 @@ func writeConnectorHelp(w io.Writer, ci connectorInfo) {
 	fmt.Fprintln(w)
 	if ci.Source {
 		fmt.Fprintln(w, "Chats are addressed by id: find one with chats --search, then pass its id.")
-		fmt.Fprintln(w, "sender me is the owner; reply_to is the seq replied to. Bodies may carry [image]")
+		fmt.Fprintln(w, "sender me is the owner; reply_to is the seq replied to. Bodies may carry [image/jpeg]")
 		fmt.Fprintln(w, "(or another media type), [deleted] or [login code hidden].")
+		if ci.Media {
+			fmt.Fprintln(w, "A message with several files marks them [#0 image/png] [#1 ...]; pass that --index.")
+		}
 		fmt.Fprintln(w, "When more rows exist, stderr gives the --before value for the next page.")
 		if reads {
 			fmt.Fprintln(w, "Read ops print messages in search's columns.")

@@ -262,9 +262,9 @@ func TestVerbsOrderBySentTimeAcrossIngestOrder(t *testing.T) {
 	}
 }
 
-// A connector built before last_message_at existed still lists its chats,
-// dated by stored messages alone.
-func TestChatsOnDatabaseWithoutLastMessageAt(t *testing.T) {
+// A connector built before last_message_at and media existed still lists its
+// chats, dated by stored messages alone, and their messages.
+func TestReadsOnDatabaseOfOlderConnector(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "data.db")
@@ -275,8 +275,10 @@ func TestChatsOnDatabaseWithoutLastMessageAt(t *testing.T) {
 		ID: "m", ContainerID: "c1", SenderID: "u1", Body: "hi",
 		SentAt: time.Date(2026, 10, 30, 9, 0, 0, 0, time.UTC),
 	}))
-	_, err = st.DB().ExecContext(context.Background(), `ALTER TABLE containers DROP COLUMN last_message_at`)
-	mustDo(t, err)
+	for _, q := range []string{`ALTER TABLE containers DROP COLUMN last_message_at`, `DROP TABLE media`} {
+		_, err = st.DB().ExecContext(context.Background(), q)
+		mustDo(t, err)
+	}
 	mustDo(t, st.Close())
 	h := newHandler(Config{Sources: map[string]string{"wa": path}, ExposureFile: filepath.Join(dir, "exposure.toml"), Timeout: 2 * time.Second}, testToken)
 
@@ -286,6 +288,9 @@ func TestChatsOnDatabaseWithoutLastMessageAt(t *testing.T) {
 	}
 	if got := column(t, res, "last_message"); !slices.Equal(got, []any{"2026-10-30 09:00"}) {
 		t.Errorf("last_message = %v", got)
+	}
+	if status, res, body = getTable(t, h, "/v1/wa/messages?chat=c1"); status != http.StatusOK || !slices.Equal(column(t, res, "body"), []any{"hi"}) {
+		t.Errorf("messages = %d %s", status, body)
 	}
 }
 

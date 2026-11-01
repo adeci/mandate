@@ -17,7 +17,11 @@ let
     INSERT INTO messages (id, container_id, sender_id, sent_at, body, ingested_at) VALUES
       ('fam@g.us/1', 'fam@g.us', '1555@s.whatsapp.net', '2026-10-01T12:00:00.000Z', 'dinner at 7?', '2026-10-01T12:00:00.000Z'),
       ('fam@g.us/2', 'fam@g.us', '1555@s.whatsapp.net', '2026-10-01T12:01:00.000Z', 'Your WhatsApp code: 482-913', '2026-10-01T12:01:00.000Z'),
-      ('hidden@s.whatsapp.net/3', 'hidden@s.whatsapp.net', '1666@s.whatsapp.net', '2026-10-01T12:02:00.000Z', 'private', '2026-10-01T12:02:00.000Z');
+      ('hidden@s.whatsapp.net/3', 'hidden@s.whatsapp.net', '1666@s.whatsapp.net', '2026-10-01T12:02:00.000Z', 'private', '2026-10-01T12:02:00.000Z'),
+      ('fam@g.us/4', 'fam@g.us', '1555@s.whatsapp.net', '2026-10-01T12:03:00.000Z', 'look', '2026-10-01T12:03:00.000Z');
+    INSERT INTO media (message_id, idx, type, size) VALUES
+      ('hidden@s.whatsapp.net/3', 0, 'image/jpeg', 5),
+      ('fam@g.us/4', 0, 'image/jpeg', 5);
   '';
 
   # Logs every request to the stand-in API as a JSON line.
@@ -134,7 +138,7 @@ pkgs.testers.runNixOSTest {
             return code, out
 
     def gw(method, path, body=None):
-        return curl(f"-X {method} -H 'Authorization: Bearer {token}' http://127.0.0.1:8780{path}", body)
+        return curl(f"-X {method} -H 'Authorization: Bearer {token}' 'http://127.0.0.1:8780{path}'", body)
 
     # The console only admits localhost and the tailnet, so reach it over loopback.
     def console(method, path, body=None, jar="/tmp/jar"):
@@ -192,11 +196,18 @@ pkgs.testers.runNixOSTest {
         code, out = gw("GET", "/v1/whatsapp/chats")
         assert code == 200 and [r[0] for r in out["rows"]] == ["fam@g.us"], (code, out)
         code, out = gw("GET", "/v1/whatsapp/messages?chat=fam@g.us")
-        assert [r[-1] for r in out["rows"]] == ["[login code hidden]", "dinner at 7?"], out
+        assert [r[-1] for r in out["rows"]] == ["[image/jpeg] look", "[login code hidden]", "dinner at 7?"], out
         code, out = gw("GET", "/v1/whatsapp/messages?chat=hidden@s.whatsapp.net")
         assert code == 404, (code, out)
         code, out = gw("GET", "/v1/whatsapp/messages?chat=Family")
         assert code == 404 and "chats --search" in out["error"], (code, out)
+        code, out = gw("GET", "/v1/whatsapp/media?chat=hidden@s.whatsapp.net&seq=3")
+        assert code == 404 and "unknown chat" in out["error"], (code, out)
+        code, out = gw("GET", "/v1/whatsapp/media?chat=fam@g.us&seq=1")
+        assert code == 404 and "no media" in out["error"], (code, out)
+        # Unlinked, so the gateway gets as far as asking whether it is healthy.
+        code, out = gw("GET", "/v1/whatsapp/media?chat=fam@g.us&seq=4")
+        assert code == 503 and "needs the owner" in out["error"], (code, out)
         machine.fail("curl -sf http://127.0.0.1:8780/v1/whatsapp/chats")
 
     with subtest("broken exposure fails closed"):

@@ -48,9 +48,28 @@ type Message struct {
 	SentAt      time.Time
 	IsFromMe    bool
 	Body        string
-	MediaType   string
-	ReplyToID   string
+	// MediaType marks content without files to fetch, such as "poll" or
+	// "location"; agents see it as [poll]. A message with Media is marked by
+	// its files instead.
+	MediaType string
+	ReplyToID string
+	// Media are the message's files in the service's order; nil keeps the
+	// stored ones, an empty slice removes them.
+	Media []Media
 }
+
+// Media is a file attached to a message. Its content stays with the service
+// until an agent asks for it.
+type Media struct {
+	Type string // MIME type, application/octet-stream if unknown
+	Name string // file name, if the sender gave one
+	Size int64  // bytes, 0 if unknown
+	// Ref is what the connector needs to fetch the file, such as a URL, an
+	// ID or a decryption key. Agents never see it.
+	Ref []byte
+}
+
+var ErrNoMedia = errors.New("store: no such media item")
 
 type Store struct {
 	db *sql.DB
@@ -158,8 +177,18 @@ func (s *Store) UpsertMessage(ctx context.Context, m Message) error {
 	if m.SentAt.IsZero() {
 		return errors.New("store: message sent_at is required")
 	}
+	for _, md := range m.Media {
+		if md.Type == "" {
+			return errors.New("store: media type is required")
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // a no-op after Commit
 	ts := now()
-	_, err := s.db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 INSERT INTO messages (id, container_id, sender_id, sender_name, sent_at, is_from_me,
                       body, media_type, reply_to_id, ingested_at)
 VALUES (?1, ?2, NULLIF(?3, ''), NULLIF(?4, ''), ?5, ?6, ?7, NULLIF(?8, ''), NULLIF(?9, ''), ?10)
@@ -170,8 +199,38 @@ ON CONFLICT(id) DO UPDATE SET
     body        = excluded.body
 WHERE NOT messages.deleted`,
 		m.ID, m.ContainerID, m.SenderID, m.SenderName, formatTime(m.SentAt), m.IsFromMe,
-		m.Body, m.MediaType, m.ReplyToID, ts)
-	return err
+		m.Body, m.MediaType, m.ReplyToID, ts); err != nil {
+		return err
+	}
+	if m.Media != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM media WHERE message_id = ?1`, m.ID); err != nil {
+			return err
+		}
+		for i, md := range m.Media {
+			if _, err := tx.ExecContext(ctx, `
+INSERT INTO media (message_id, idx, type, name, size, ref)
+SELECT ?1, ?2, ?3, NULLIF(?4, ''), NULLIF(?5, 0), ?6
+WHERE EXISTS (SELECT 1 FROM messages WHERE id = ?1 AND NOT deleted)`,
+				m.ID, i, md.Type, md.Name, md.Size, md.Ref); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
+}
+
+// Media returns item index of a message's files, or ErrNoMedia.
+func (s *Store) Media(ctx context.Context, messageID string, index int) (Media, error) {
+	var m Media
+	var name sql.NullString
+	var size sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `SELECT type, name, size, ref FROM media WHERE message_id = ?1 AND idx = ?2`,
+		messageID, index).Scan(&m.Type, &name, &size, &m.Ref)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Media{}, ErrNoMedia
+	}
+	m.Name, m.Size = name.String, size.Int64
+	return m, err
 }
 
 // Unknown and deleted IDs are ignored.
@@ -182,10 +241,20 @@ func (s *Store) EditMessage(ctx context.Context, id, body string, at time.Time) 
 	return err
 }
 
-// DeleteMessage flags the message and clears its body.
+// DeleteMessage flags the message and clears its body and files.
 func (s *Store) DeleteMessage(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE messages SET deleted = 1, body = NULL WHERE id = ?1`, id)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // a no-op after Commit
+	if _, err := tx.ExecContext(ctx, `UPDATE messages SET deleted = 1, body = NULL WHERE id = ?1`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM media WHERE message_id = ?1`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func formatTime(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z") }

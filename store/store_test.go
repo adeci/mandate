@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -99,6 +100,40 @@ func TestUpsertMessageLifecycle(t *testing.T) {
 	must(t, s.UpsertMessage(ctx, msg))
 	if r := get(t, s, "m1"); r.deleted != 1 || r.body.Valid {
 		t.Fatalf("deleted message restored: %+v", r)
+	}
+}
+
+func TestMediaRoundTrip(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := t.Context()
+	at := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	must(t, s.UpsertContainer(ctx, Container{ID: "c1", Kind: "dm"}))
+	photo := Media{Type: "image/jpeg", Size: 1234, Ref: []byte{0, 1, 2}}
+	doc := Media{Type: "application/pdf", Name: "plan.pdf", Ref: []byte("key")}
+	msg := Message{ID: "m1", ContainerID: "c1", SentAt: at, Body: "look", Media: []Media{photo, doc}}
+	must(t, s.UpsertMessage(ctx, msg))
+
+	// Redelivery without files keeps them.
+	msg.Media = nil
+	must(t, s.UpsertMessage(ctx, msg))
+	for i, want := range []Media{photo, doc} {
+		got, err := s.Media(ctx, "m1", i)
+		must(t, err)
+		if got.Type != want.Type || got.Name != want.Name || got.Size != want.Size || string(got.Ref) != string(want.Ref) {
+			t.Errorf("item %d = %+v, want %+v", i, got, want)
+		}
+	}
+	if _, err := s.Media(ctx, "m1", 2); !errors.Is(err, ErrNoMedia) {
+		t.Errorf("past the last item: %v, want ErrNoMedia", err)
+	}
+
+	// A deleted message keeps no references, and redelivery adds none.
+	must(t, s.DeleteMessage(ctx, "m1"))
+	msg.Media = []Media{photo}
+	must(t, s.UpsertMessage(ctx, msg))
+	if _, err := s.Media(ctx, "m1", 0); !errors.Is(err, ErrNoMedia) {
+		t.Errorf("deleted message: %v, want ErrNoMedia", err)
 	}
 }
 
