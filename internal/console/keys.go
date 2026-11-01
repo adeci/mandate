@@ -349,22 +349,14 @@ func (c *conn) keysProblemNow() string {
 	return c.keysProblem
 }
 
-func kind(synced bool) string {
-	if synced {
-		return "synced"
-	}
-	return "device-bound"
-}
-
 type keyView struct {
 	approval.Key
-	Kind    string
 	Added   time.Time
 	Current bool
 }
 
 type keyChangeView struct {
-	ID, Op, Name, Kind, Left string
+	ID, Op, Name, Left string
 }
 
 type keysView struct {
@@ -396,10 +388,10 @@ func (s *Server) keysPage(w http.ResponseWriter, r *http.Request, sess session) 
 	}
 	var v keysView
 	for _, k := range s.keys.Trusted() {
-		v.Keys = append(v.Keys, keyView{Key: k, Kind: kind(k.Synced), Added: added[k.CredentialID], Current: k.CredentialID == sess.key.CredentialID})
+		v.Keys = append(v.Keys, keyView{Key: k, Added: added[k.CredentialID], Current: k.CredentialID == sess.key.CredentialID})
 	}
 	for _, c := range changes {
-		v.Changes = append(v.Changes, keyChangeView{ID: c.ID, Op: c.Op, Name: c.Key.Name, Kind: kind(c.Key.Synced), Left: left(c.ExpiresAt.Sub(now))})
+		v.Changes = append(v.Changes, keyChangeView{ID: c.ID, Op: c.Op, Name: c.Key.Name, Left: left(c.ExpiresAt.Sub(now))})
 	}
 	v.Problems = s.keysProblems()
 	s.owner(w, r, sess, "keys", "Keys", "keys", v)

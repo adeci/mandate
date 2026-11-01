@@ -298,7 +298,7 @@
   <tbody>
   {{range .}}
   <tr>
-    <td>{{.Name}}{{if .Current}} <span class="status" data-tone="ok">this session</span>{{end}}<br><span class="muted">{{.Kind}}</span></td>
+    <td>{{.Name}}{{if .Current}} <span class="status" data-tone="ok">this session</span>{{end}}</td>
     <td class="width-min">{{when .Added}}</td>
     {{- if $removable}}
     <td class="width-min"><form method="post" action="/keys/remove"><input type="hidden" name="credential_id" value="{{.CredentialID}}"><button type="submit" class="compact">Remove</button></form></td>
@@ -318,7 +318,7 @@
 {{range .}}
 <section class="panel dashed" data-change="{{.ID}}">
   <header><h3>{{if eq .Op "add"}}Add{{else}}Remove{{end}} {{.Name}}</h3><span class="status" data-tone="wait">{{.Left}}</span></header>
-  <p class="muted">{{.Kind}} · approve with any trusted key, from any device</p>
+  <p class="muted">Approve with any trusted key, from any device.</p>
   <div class="actions two">
     <button type="button" class="primary" data-approve-key>Approve with passkey →</button>
     <form method="post" action="/keys/changes/{{.ID}}/discard"><button type="submit">Discard</button></form>
