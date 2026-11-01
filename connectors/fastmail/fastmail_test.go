@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -143,7 +144,7 @@ func seed(jm *fakeJMAP) {
 	e3.TextBody = []bodyPart{{PartID: "1", Type: "text/html"}}
 	e3.BodyValues["1"] = bodyValue{Value: `<html><head><style>p{color:red}</style></head><body>` +
 		`<p>Big &amp; bold</p><p>See <a href="https://shop.example/x">this</a></p></body></html>`}
-	e3.Attachments = []bodyPart{{Type: "application/pdf", Name: "invoice.pdf"}}
+	e3.Attachments = []bodyPart{{Type: "application/pdf", Name: "invoice.pdf", BlobID: "b-invoice", Size: 7}}
 	jm.add(e3)
 	jm.add(textEmail("trashed", "t3", alice, []address{owner}, "old news", "x", now.Add(-time.Hour), "mb-trash"))
 	jm.add(textEmail("ancient", "t4", alice, []address{owner}, "2025", "x", now.Add(-200*24*time.Hour), "mb-inbox"))
@@ -246,7 +247,7 @@ func TestSync(t *testing.T) {
 		},
 		"e3": {
 			Chat: "t2", SenderID: "news@shop.example", Sender: "Shop",
-			Body: "Subject: Deals\nTo: hi@owner.dev\n\nBig & bold\n\nSee this (https://shop.example/x)\n\n[attachment: invoice.pdf]",
+			Body: "Subject: Deals\nTo: hi@owner.dev\n\nBig & bold\n\nSee this (https://shop.example/x)",
 		},
 	}
 	for id, w := range want {
@@ -617,5 +618,95 @@ func TestExecuteOutcomes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMedia(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t)
+	e := textEmail("e1", "t1", alice, []address{owner}, "Topo", "route attached", now, "mb-inbox")
+	e.Attachments = []bodyPart{
+		{Type: "image/png", BlobID: "b-logo", Size: 4},
+		{Type: "application/pdf", Name: "topo plan.pdf", BlobID: "b/topo", Size: 9},
+	}
+	f.jm.add(e)
+	f.jm.set(func(j *fakeJMAP) { j.blobs = map[string]string{"b-logo": "\x89PNG", "b/topo": "%PDF-1.7\n"} })
+	f.link()
+
+	got, err := f.c.st.Media(ctx, "e1", 1)
+	if err != nil || !reflect.DeepEqual(got, store.Media{Type: "application/pdf", Name: "topo plan.pdf", Size: 9, Ref: []byte("b/topo")}) {
+		t.Fatalf("recorded %+v %v", got, err)
+	}
+	fetch := func(index int) (connector.MediaFile, string, error) {
+		t.Helper()
+		file, err := f.c.Media(ctx, "e1", index)
+		if err != nil {
+			return file, "", err
+		}
+		defer file.Body.Close()
+		b, err := io.ReadAll(file.Body)
+		return file, string(b), err
+	}
+	file, body, err := fetch(1)
+	if err != nil || file.Type != "application/pdf" || file.Name != "topo plan.pdf" || file.Size != 9 || body != "%PDF-1.7\n" {
+		t.Fatalf("fetched %+v %q %v", file, body, err)
+	}
+
+	if file, body, err := fetch(0); err != nil || file.Type != "image/png" || file.Name != "" || file.Size != 4 || body != "\x89PNG" {
+		t.Fatalf("fetched %+v %q %v", file, body, err)
+	}
+
+	var ce *connector.Error
+	f.jm.set(func(j *fakeJMAP) { delete(j.blobs, "b/topo") })
+	if _, _, err := fetch(1); !errors.As(err, &ce) || ce.Status != http.StatusNotFound {
+		t.Fatalf("missing blob: %v", err)
+	}
+	if _, _, err := fetch(2); !errors.As(err, &ce) || ce.Status != http.StatusNotFound {
+		t.Fatalf("no such index: %v", err)
+	}
+}
+
+func TestBackfill(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t)
+	e := textEmail("e1", "t1", alice, []address{owner}, "Topo", "route attached", now, "mb-inbox")
+	e.Attachments = []bodyPart{{Type: "application/pdf", Name: "topo.pdf", BlobID: "b-topo", Size: 9}}
+	f.jm.add(e)
+	f.link()
+	clean := f.message("e1").Body
+
+	// Restarted on emails stored before attachments were recorded.
+	restart := func() {
+		t.Helper()
+		for _, q := range []string{
+			`DELETE FROM media`,
+			`UPDATE messages SET body = body || char(10, 10) || '[attachment: topo.pdf]' WHERE id = 'e1'`,
+		} {
+			if _, err := f.c.st.DB().Exec(q); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.c.Close()
+		f.start()
+		f.jm.add(textEmail("n"+f.jm.currentState(), "t2", alice, []address{owner}, "ping", "x", now, "mb-inbox"))
+		f.synced()
+	}
+	if _, err := f.c.st.DB().Exec(`DELETE FROM fastmail_backfill`); err != nil {
+		t.Fatal(err)
+	}
+	restart()
+	got, err := f.c.st.Media(ctx, "e1", 0)
+	if err != nil || !reflect.DeepEqual(got, store.Media{Type: "application/pdf", Name: "topo.pdf", Size: 9, Ref: []byte("b-topo")}) {
+		t.Fatalf("backfilled %+v %v", got, err)
+	}
+	if body := f.message("e1").Body; body != clean {
+		t.Fatalf("backfilled body %q, want %q", body, clean)
+	}
+
+	restart()
+	if _, err := f.c.st.Media(ctx, "e1", 0); !errors.Is(err, store.ErrNoMedia) {
+		t.Fatalf("backfill ran twice: %v", err)
 	}
 }

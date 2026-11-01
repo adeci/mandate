@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS fastmail_emails (
     reply_to   TEXT NOT NULL, -- where a reply goes, comma-separated
     recipients TEXT NOT NULL  -- its To and Cc, lowercase, comma-separated
 );
+-- Accounts whose emails stored before attachments were recorded have them.
+CREATE TABLE IF NOT EXISTS fastmail_backfill (
+    account_id TEXT PRIMARY KEY
+);
 CREATE INDEX IF NOT EXISTS fastmail_emails_message_id ON fastmail_emails(message_id);
 `
 
@@ -86,6 +90,9 @@ func (c *fmConnector) cycle(ctx context.Context, a *account) error {
 	a.mu.Lock()
 	a.conn = cn
 	a.mu.Unlock()
+	if err := c.backfill(ctx, a, cn); err != nil {
+		return err
+	}
 	var state string
 	err = c.st.DB().QueryRowContext(ctx, `SELECT email_state FROM fastmail_sync WHERE account_id = ?1`, cn.accountID).Scan(&state)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -284,6 +291,7 @@ func (c *fmConnector) put(ctx context.Context, cn *conn, e email) error {
 		ContainerID: e.ThreadID,
 		SentAt:      e.ReceivedAt,
 		Body:        render(e, maxText),
+		Media:       media(e.Attachments),
 	}
 	if len(e.From) > 0 {
 		msg.SenderID, msg.SenderName = strings.ToLower(e.From[0].Email), e.From[0].Name
@@ -340,4 +348,69 @@ func addresses(as []address) string {
 		s[i] = a.Email
 	}
 	return strings.Join(s, ", ")
+}
+
+// backfill records the attachments of emails stored before they were, once,
+// and renders their bodies without the attachment lines those had.
+func (c *fmConnector) backfill(ctx context.Context, a *account, cn *conn) error {
+	var done bool
+	err := c.st.DB().QueryRowContext(ctx, `SELECT 1 FROM fastmail_backfill WHERE account_id = ?1`, cn.accountID).Scan(&done)
+	if err == nil || !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	rows, err := c.st.DB().QueryContext(ctx, `
+SELECT id FROM messages WHERE NOT EXISTS (SELECT 1 FROM media WHERE message_id = messages.id)`)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for batch := range slices.Chunk(ids, getBatch) {
+		list, err := c.getEmails(ctx, a, cn, batch, emailProperties, 4*maxText)
+		if err != nil {
+			return err
+		}
+		for _, e := range list {
+			if len(e.Attachments) == 0 {
+				continue
+			}
+			if err := c.addMedia(ctx, e); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = c.st.DB().ExecContext(ctx, `INSERT INTO fastmail_backfill (account_id) VALUES (?1)`, cn.accountID)
+	return err
+}
+
+// addMedia stores the attachments and body of a stored e in place: the email
+// is the same, so this is not an edit.
+func (c *fmConnector) addMedia(ctx context.Context, e email) error {
+	tx, err := c.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `UPDATE messages SET body = ?2 WHERE id = ?1`, e.ID, render(e, maxText)); err != nil {
+		return err
+	}
+	for i, m := range media(e.Attachments) {
+		if _, err := tx.ExecContext(ctx, `
+INSERT OR REPLACE INTO media (message_id, idx, type, name, size, ref) VALUES (?1, ?2, ?3, NULLIF(?4, ''), NULLIF(?5, 0), ?6)`,
+			e.ID, i, m.Type, m.Name, m.Size, m.Ref); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }

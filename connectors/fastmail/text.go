@@ -13,7 +13,7 @@ import (
 const truncatedMarker = "[truncated; fetch reads the whole email]"
 
 // render is the stored body of e: subject and recipients, the text up to
-// limit bytes, then a line per attachment.
+// limit bytes. Attachments are its Media.
 func render(e email, limit int) string {
 	var head []string
 	if e.Subject != "" {
@@ -26,15 +26,12 @@ func render(e email, limit int) string {
 		head = append(head, "Cc: "+named(e.Cc))
 	}
 	text, cut := plainText(e, limit)
-	var tail []string
-	for _, p := range e.Attachments {
-		tail = append(tail, "[attachment: "+oneLine(cmp.Or(p.Name, p.Type))+"]")
-	}
+	var tail string
 	if cut {
-		tail = append(tail, truncatedMarker)
+		tail = truncatedMarker
 	}
 	var parts []string
-	for _, p := range []string{strings.Join(head, "\n"), text, strings.Join(tail, "\n")} {
+	for _, p := range []string{strings.Join(head, "\n"), text, tail} {
 		if p != "" {
 			parts = append(parts, p)
 		}
