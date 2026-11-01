@@ -150,16 +150,21 @@
 {{end}}
 {{template "bottom" .}}{{end}}
 
-{{define "fields"}}
-<dl class="kv">
-{{range .}}{{if and (not .Edit) (eq .Param "")}}<div><dt>{{.Label}}</dt><dd class="message">{{.Value}}</dd></div>
-{{end}}{{end}}</dl>
-{{range .}}{{if and (not .Edit) (ne .Param "")}}
-<h3>{{.Label}}</h3>
-<pre class="message">{{.Value}}</pre>
-{{if .Hidden}}<p class="hint">! contains invisible characters, shown as U+ codes</p>{{end}}
-{{end}}{{end}}
+{{define "field"}}<div><dt>{{.Label}}</dt><dd>
+  {{- if eq .Param ""}}<span class="message">{{.Value}}</span>
+  {{- else}}<pre class="message">{{.Value}}</pre>
+    {{- if .Hidden}}<p class="hint">! contains invisible characters, shown as U+ codes</p>{{end}}
+    {{- if .Edit}}
+    <details>
+      <summary>edit<span data-edited-hint="{{.Param}}"></span></summary>
+      <textarea id="edit-{{.Param}}" data-param="{{.Param}}" rows="6" aria-label="Edit {{.Label}}">
+{{.Raw}}</textarea>
+    </details>
+    {{- end}}
+  {{- end}}</dd></div>
 {{end}}
+
+{{define "fields"}}<dl class="kv fields">{{range .}}{{template "field" .}}{{end}}</dl>{{end}}
 
 {{define "request"}}{{template "top" .}}
 {{with .Data}}
@@ -170,37 +175,17 @@
 </div>
 <p class="muted">{{if .Pending}}expires {{when .ExpiresAt}}{{else if .DecidedBy}}{{if eq .Status "rejected"}}denied{{else}}approved{{end}} by {{.DecidedBy}} {{when .DecidedAt}}{{else}}{{.Status}} {{when .DecidedAt}}{{end}} · asked {{when .CreatedAt}}</p>
 
-<section>
-  <h2>Request</h2>
+<section class="panel request">
   {{template "fields" .Fields}}
-  {{range .Fields}}{{if .Edit}}
-  <h3>{{.Label}}</h3>
-  <pre class="message">{{.Value}}</pre>
-  {{if .Hidden}}<p class="hint">! contains invisible characters, shown as U+ codes</p>{{end}}
-  <details>
-    <summary>edit<span data-edited-hint="{{.Param}}"></span></summary>
-    <textarea id="edit-{{.Param}}" data-param="{{.Param}}" rows="6" aria-label="Edit {{.Label}}">
-{{.Raw}}</textarea>
-  </details>
-  {{end}}{{end}}
 </section>
-
-{{with .Note}}
-<section class="panel untrusted">
-  <header><h3>Agent note</h3><span class="status" data-tone="alert">untrusted</span></header>
-  <blockquote class="message">{{visible .}}</blockquote>
-</section>
-{{end}}
+{{with .Note}}<p class="note"><span class="muted">agent's note</span> <span class="message">{{visible .}}</span></p>{{end}}
 
 {{with .Result}}
 <section>
   <h2>Result</h2>
-  <dl class="kv">
-    <div><dt>status</dt><dd>{{template "status" .Status}}</dd></div>
-    {{with .Detail}}<div><dt>detail</dt><dd class="message">{{.}}</dd></div>{{end}}
-    {{with .Ref}}<div><dt>ref</dt><dd><code>{{.}}</code></dd></div>{{end}}
-  </dl>
-  {{with .Output}}<h3>Output</h3><pre class="output">{{.}}</pre>{{end}}
+  <p>{{template "status" .Status}}{{with .Ref}} · ref <code>{{.}}</code>{{end}}</p>
+  {{with .Detail}}<p class="message">{{.}}</p>{{end}}
+  {{with .Output}}<pre class="output">{{.}}</pre>{{end}}
 </section>
 {{end}}
 

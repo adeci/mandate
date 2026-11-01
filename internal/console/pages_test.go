@@ -40,7 +40,7 @@ func TestRequestPage(t *testing.T) {
 		t.Fatalf("request page = %d", status)
 	}
 	for _, want := range []string{
-		"Farid", "untrusted", "she asked",
+		"Farid", "she asked",
 		"&lt;script&gt;alert(1)&lt;/script&gt;",
 		`pay<span class="cp">U+200B</span>pal`, `<span class="cp">U+202E</span>gnp.exe`,
 		"invisible characters",

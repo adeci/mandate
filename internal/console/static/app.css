@@ -115,6 +115,13 @@ dl.kv > div { display: grid; grid-template-columns: minmax(10ch, max-content) mi
 dl.kv dt { color: var(--fg-alt); font-weight: var(--w-medium); }
 dl.kv dd { margin: 0; overflow-wrap: anywhere; color: var(--fg-strong); }
 dl.kv:empty { display: none; }
+dl.fields { margin: 0 0 var(--lh); }
+dl.fields > div + div { margin-top: calc(var(--lh) / 2); }
+dl.fields pre, dl.fields details { margin: 0; }
+dl.fields details { margin-top: calc(var(--lh) / 2); }
+@media (max-width: 480px) { dl.fields > div { grid-template-columns: 1fr; } }
+.note { border-left: 2px solid var(--line-strong); padding-left: 2ch; color: var(--fg-alt); font-style: italic; }
+.note .muted { font-style: normal; margin-right: 1ch; }
 
 input, textarea, select, button, .button {
   font: inherit; color: var(--fg-strong); background: var(--bg); margin: 0;
@@ -177,8 +184,7 @@ button.danger:hover { background: var(--error); color: var(--bg); }
   flex-wrap: wrap; gap: 0 2ch; margin-bottom: var(--lh); }
 .panel > header h3 { margin: 0; text-transform: none; }
 .panel > :last-child { margin-bottom: 0; }
-.panel.dashed, .panel.untrusted { border-style: dashed; }
-.panel.untrusted blockquote { margin: 0 0 var(--lh); color: var(--fg-alt); font-style: italic; }
+.panel.dashed { border-style: dashed; }
 .panel.danger { border-color: var(--notice); }
 .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(32ch, 1fr)); gap: var(--lh) 2ch; }
 .cols > .panel { margin: 0; }
