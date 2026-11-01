@@ -47,6 +47,9 @@ type requestKind int
 const (
 	kindAPI         requestKind = iota // REST call or the app page itself
 	kindSubresource                    // a script loaded by the app page
+	// kindSend is a message the owner approved. It skips reading pauses and
+	// session breaks; the gap, daily budget, cooldown and buckets still apply.
+	kindSend
 )
 
 type clock interface {
@@ -84,7 +87,7 @@ type pacer struct {
 	st  *state
 	rng rng
 
-	gap, open, subresource time.Duration // pre-rolled delays for the next request
+	gap, pause, open, subresource time.Duration // pre-rolled delays for the next request
 
 	routeBuckets map[string]string    // route key -> X-RateLimit-Bucket
 	exhausted    map[string]time.Time // bucket -> reset time while Remaining is 0
@@ -106,9 +109,9 @@ func (p *pacer) uniform(lo, hi time.Duration) time.Duration {
 }
 
 func (p *pacer) roll() {
-	p.gap = p.uniform(gapMin, gapMax)
+	p.gap, p.pause = p.uniform(gapMin, gapMax), 0
 	if p.rng.Float64() < pauseChance {
-		p.gap += p.uniform(pauseMin, pauseMax)
+		p.pause = p.uniform(pauseMin, pauseMax)
 	}
 	p.open = p.uniform(openMin, openMax)
 	p.subresource = p.uniform(subresourceMin, subresourceMax)
@@ -125,8 +128,10 @@ func (p *pacer) slot(now time.Time, kind requestKind, route string, notBefore ti
 	case last.IsZero() || now.Sub(last) > idleAfter:
 		t = now.Add(p.open)
 		reason = "app open"
-	default:
+	case kind == kindSend:
 		t = last.Add(p.gap)
+	default:
+		t = last.Add(p.gap + p.pause)
 	}
 	if t.Before(now) {
 		t = now
@@ -136,7 +141,7 @@ func (p *pacer) slot(now time.Time, kind requestKind, route string, notBefore ti
 	}
 	long := false
 	for range 16 {
-		until, why, isLong := p.blocker(t, route)
+		until, why, isLong := p.blocker(t, kind, route)
 		if !until.After(t) {
 			break
 		}
@@ -152,11 +157,11 @@ func (p *pacer) slot(now time.Time, kind requestKind, route string, notBefore ti
 
 // blocker returns when a hard limit stops blocking a request at t (t itself
 // if none applies), its name, and whether it is a long block.
-func (p *pacer) blocker(t time.Time, route string) (time.Time, string, bool) {
+func (p *pacer) blocker(t time.Time, kind requestKind, route string) (time.Time, string, bool) {
 	if p.st.CooldownUntil.After(t) {
 		return p.st.CooldownUntil, "cooldown", true
 	}
-	if p.st.BreakUntil.After(t) {
+	if p.st.BreakUntil.After(t) && kind != kindSend {
 		return p.st.BreakUntil, "session break", true
 	}
 	if w := since(p.st.Requests, t.Add(-budgetWindow)); len(w) >= dailyBudget {
@@ -226,7 +231,7 @@ func (p *pacer) rest(now time.Time) (time.Time, string) {
 	var reason string
 	t := now
 	for range 16 {
-		next, why, long := p.blocker(t, "")
+		next, why, long := p.blocker(t, kindAPI, "")
 		if !long || !next.After(t) {
 			break
 		}

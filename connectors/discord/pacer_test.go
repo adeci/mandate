@@ -195,3 +195,24 @@ func TestCooldownAndBuckets(t *testing.T) {
 		t.Errorf("bucket still blocked: %s", reason)
 	}
 }
+
+// An approved send skips reading pauses and breaks but not the gap or the budget.
+func TestSendPacing(t *testing.T) {
+	st := &state{}
+	p := newPacer(st, fixedRand(0.1)) // rolls a reading pause
+	p.record(noon)
+	st.BreakUntil = noon.Add(10 * time.Minute)
+	if slot, reason := p.slot(noon, kindAPI, "r", time.Time{}); reason != "session break" || slot.Before(st.BreakUntil) {
+		t.Errorf("read slot %v (%s), want after the break", slot, reason)
+	}
+	slot, reason := p.slot(noon, kindSend, "r", time.Time{})
+	if want := gapMin + (gapMax-gapMin)/10; reason != "gap" || slot.Sub(noon) != want {
+		t.Errorf("send slot %v (%s), want the plain %v gap", slot.Sub(noon), reason, want)
+	}
+	for range dailyBudget {
+		st.Requests = append(st.Requests, noon)
+	}
+	if _, reason := p.slot(noon, kindSend, "r", time.Time{}); reason != "daily budget" {
+		t.Errorf("send with the budget spent: %s", reason)
+	}
+}

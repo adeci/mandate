@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -102,12 +104,21 @@ func (e *upstreamError) Error() string {
 	return fmt.Sprintf("discord answered %d%s", e.status, e.msg)
 }
 
+// refusedError is a write Discord declined, so nothing was sent.
+type refusedError struct {
+	status int
+	msg    string
+}
+
+func (e *refusedError) Error() string { return fmt.Sprintf("discord refused (%d)%s", e.status, e.msg) }
+
 func retrySeconds(d time.Duration) int {
 	return max(1, int(math.Ceil(d.Seconds())))
 }
 
 // route is built only from validated IDs.
 type route struct {
+	method   string     // "" for GET
 	template string     // path template for logs, e.g. /channels/{id}/messages
 	path     string     // concrete path below the API base
 	query    url.Values // nil for none
@@ -117,7 +128,8 @@ type route struct {
 	denyWhat string     // human name for the denial
 }
 
-func (r route) key() string { return r.template + "|" + r.major }
+// Discord buckets each method on a path separately.
+func (r route) key() string { return r.method + r.template + "|" + r.major }
 
 // Only the worker goroutine uses upstream.
 type upstream struct {
@@ -246,16 +258,69 @@ func (u *upstream) rateLimited(now time.Time, resp *fhttp.Response, body []byte,
 }
 
 func (u *upstream) send(ctx context.Context, dl time.Time, kind requestKind, r route, notBefore time.Time) (*fhttp.Response, []byte, error) {
+	wait, reason, err := u.await(ctx, dl, kind, r, notBefore)
+	if err != nil {
+		return nil, nil, err
+	}
+	return u.do(ctx, kind, r, nil, wait, reason)
+}
+
+// post sends a JSON body once and never retries it. When it fails, maybeSent
+// reports whether Discord may have acted on the request anyway.
+func (u *upstream) post(ctx context.Context, dl time.Time, r route, body func() []byte, out any) (maybeSent bool, err error) {
+	if u.fatal != nil {
+		return false, u.fatal
+	}
+	r.method = fhttp.MethodPost
+	wait, reason, err := u.await(ctx, dl, kindSend, r, time.Time{})
+	if err != nil {
+		return false, err
+	}
+	resp, respBody, err := u.do(ctx, kindSend, r, body(), wait, reason)
+	if err != nil {
+		return true, err
+	}
+	s := resp.StatusCode
+	if s >= 200 && s < 300 {
+		// A reply that does not decode leaves out empty.
+		_ = json.Unmarshal(respBody, out)
+		return false, nil
+	}
+	if stop := ownerProblem(s, respBody); stop != nil {
+		u.fatal = stop
+		u.log.Error("discord account needs manual action", "reason", stop.reason, "status", s, "route", r.template)
+		return false, stop
+	}
+	switch {
+	case s == fhttp.StatusTooManyRequests:
+		wait := retryAfter(resp, respBody)
+		if err := u.rateLimited(u.clock.Now(), resp, respBody, wait); err != nil {
+			return false, err
+		}
+		return false, &pacedError{retryAfter: wait, reason: "rate limited by discord"}
+	case s >= 400 && s < 500:
+		return false, &refusedError{status: s, msg: refusal(respBody)}
+	default:
+		return true, &upstreamError{status: s, msg: errorCode(respBody)}
+	}
+}
+
+// await sleeps until the request's slot; nothing has been sent when it fails.
+func (u *upstream) await(ctx context.Context, dl time.Time, kind requestKind, r route, notBefore time.Time) (time.Duration, string, error) {
 	now := u.clock.Now()
 	at, reason := u.pace.slot(now, kind, r.key(), notBefore)
 	if at.After(dl) {
-		return nil, nil, &pacedError{retryAfter: at.Sub(now), reason: reason}
+		return 0, "", &pacedError{retryAfter: at.Sub(now), reason: reason}
 	}
 	wait := at.Sub(now)
 	if err := u.clock.Sleep(ctx, wait); err != nil {
-		return nil, nil, err
+		return 0, "", err
 	}
+	return wait, reason, nil
+}
 
+// do sends one request right away, with payload as its JSON body if set.
+func (u *upstream) do(ctx context.Context, kind requestKind, r route, payload []byte, wait time.Duration, reason string) (*fhttp.Response, []byte, error) {
 	var target string
 	var hs []header
 	switch {
@@ -273,9 +338,15 @@ func (u *upstream) send(ctx context.Context, dl time.Time, kind requestKind, r r
 	if len(r.query) > 0 {
 		target += "?" + r.query.Encode()
 	}
+	method := cmp.Or(r.method, fhttp.MethodGet)
+	var rd io.Reader
+	if payload != nil {
+		hs = jsonHeaders(hs)
+		rd = bytes.NewReader(payload)
+	}
 	rctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
-	req, err := fhttp.NewRequestWithContext(rctx, fhttp.MethodGet, target, nil)
+	req, err := fhttp.NewRequestWithContext(rctx, method, target, rd)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -300,7 +371,7 @@ func (u *upstream) send(ctx context.Context, dl time.Time, kind requestKind, r r
 			resp.Header.Get("X-RateLimit-Remaining"), resp.Header.Get("X-RateLimit-Reset-After"))
 		u.keepCookies(sent, resp)
 	}
-	u.log.Info("upstream", "method", fhttp.MethodGet, "route", r.template, "status", status,
+	u.log.Info("upstream", "method", method, "route", r.template, "status", status,
 		"wait", wait.Round(time.Millisecond), "wait_reason", reason,
 		"duration", u.clock.Now().Sub(sent).Round(time.Millisecond),
 		"budget_used", len(u.st.Requests))
@@ -487,4 +558,16 @@ func errorCode(body []byte) string {
 		return fmt.Sprintf(" (code %d)", e.Code)
 	}
 	return ""
+}
+
+// refusal renders Discord's message and code for a refused send, for the
+// owner's result only: the message may quote what was sent, so it is not logged.
+func refusal(body []byte) string {
+	var e struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(body, &e) != nil || e.Message == "" {
+		return errorCode(body)
+	}
+	return ": " + e.Message + errorCode(body)
 }

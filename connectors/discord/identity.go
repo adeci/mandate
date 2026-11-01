@@ -120,6 +120,19 @@ func apiHeaders(st *state, token, timezone, referer string) []header {
 	}
 }
 
+// jsonHeaders adds what fetch sends with a JSON body to apiHeaders.
+func jsonHeaders(hs []header) []header {
+	out := make([]header, 0, len(hs)+2)
+	for _, h := range hs {
+		if h.name == "accept" {
+			out = append(out, header{"content-type", "application/json"}, h, header{"origin", defaultWebBase})
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
 // No referrer and no token: a navigation typed into the address bar.
 func documentHeaders() []header {
 	return []header{
@@ -156,9 +169,13 @@ func scriptHeaders(referer string) []header {
 	}
 }
 
-// Cookies from the jar go out after accept-language, where Chrome sends them.
+// Cookies from the jar go out after accept-language and a body's length
+// first, where Chrome sends them.
 func applyHeaders(req *fhttp.Request, hs []header) {
-	order := make([]string, 0, len(hs)+1)
+	order := make([]string, 0, len(hs)+2)
+	if req.ContentLength > 0 {
+		order = append(order, "content-length")
+	}
 	for _, h := range hs {
 		if h.name == "priority" {
 			order = append(order, "cookie")

@@ -1,7 +1,9 @@
-// Command mandate-discord is the on-demand, read-only Discord connector.
+// Command mandate-discord is the on-demand Discord connector: it reads chats
+// and sends the messages the owner approves.
 //
 // Account integrity comes first: every request looks like Chrome on Linux and
-// is paced like a person. Only GETs are sent, and nothing at startup.
+// is paced like a person. Reads are GETs, a send is one POST, and nothing is
+// sent at startup.
 package main
 
 import (
@@ -24,7 +26,6 @@ import (
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 
-	"github.com/adeci/mandate/approval"
 	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/store"
 )
@@ -392,7 +393,8 @@ func (w *worker) Unlink(ctx context.Context) error {
 
 var spec = connector.Spec{
 	Name: "discord",
-	Doc: "sync, fetch and guild-search ask Discord and store what they get; chats, messages and search read only what is stored.\n" +
+	Doc: "sync, fetch and guild-search ask Discord and store what they get; chats, messages and search answer from what is stored.\n" +
+		"send proposes a message; it goes out from the owner's account once they approve it.\n" +
 		"Discord calls are paced like a person and may take a while. Start with sync, then sync guild_id=ID for a server's channels.",
 	Setup: []connector.Param{{
 		Name: "token", Required: true, Secret: true,
@@ -429,18 +431,18 @@ var spec = connector.Spec{
 				{Name: "limit", Doc: "1 to 100, default 50"},
 			},
 		},
+		{
+			Name: "send", Kind: connector.Write,
+			Summary: "Send a message to a DM, group, channel or thread.",
+			Params: []connector.Param{
+				{Name: "chat", Doc: "chat ID from mandate discord chats", Required: true, Container: true},
+				{Name: "text", Doc: "message text, up to 2000 characters", Required: true, Editable: true},
+			},
+		},
 	},
 }
 
 func (w *worker) Spec() connector.Spec { return spec }
-
-func (w *worker) Prepare(context.Context, string, map[string]string) (connector.Prepared, error) {
-	return connector.Prepared{}, connector.Invalid("discord has no write ops")
-}
-
-func (w *worker) Execute(context.Context, approval.Record) connector.Result {
-	return connector.Result{Status: connector.Failed, Detail: "discord has no write ops"}
-}
 
 func (w *worker) Read(ctx context.Context, op string, args map[string]string) (json.RawMessage, error) {
 	var run func(ctx context.Context, dl time.Time) (connector.ReadResult, error)

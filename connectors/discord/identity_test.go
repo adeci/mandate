@@ -88,6 +88,26 @@ func TestAPIHeaders(t *testing.T) {
 	}
 }
 
+func TestPostHeaders(t *testing.T) {
+	st := &state{LaunchID: newUUID(), LaunchSignature: newLaunchSignature(), HeartbeatSessionID: newUUID()}
+	req, err := fhttp.NewRequest(fhttp.MethodPost, "https://discord.com/api/v9/channels/1/messages", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyHeaders(req, jsonHeaders(apiHeaders(st, "tok", "UTC", "https://discord.com/channels/@me/1")))
+	want := []string{
+		"content-length", "sec-ch-ua-platform", "authorization", "x-debug-options", "sec-ch-ua", "sec-ch-ua-mobile",
+		"x-discord-timezone", "x-super-properties", "x-discord-locale", "user-agent", "content-type", "accept", "origin",
+		"sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "referer", "accept-encoding", "accept-language", "cookie", "priority",
+	}
+	if got := req.Header[fhttp.HeaderOrderKey]; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("order\n got %v\nwant %v", got, want)
+	}
+	if req.Header.Get("Content-Type") != "application/json" || req.Header.Get("Origin") != "https://discord.com" {
+		t.Errorf("headers %v", req.Header)
+	}
+}
+
 // HTTP/1.1 here; HTTP/2 uses the same order key.
 func TestHeaderWireOrder(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

@@ -25,7 +25,6 @@ import (
 	fhttp "github.com/bogdanfinn/fhttp"
 
 	"github.com/adeci/mandate/approval"
-	"github.com/adeci/mandate/approval/approvaltest"
 	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/store"
 )
@@ -144,6 +143,10 @@ type harness struct {
 	cancel    context.CancelFunc
 	done      chan error
 	client    *connector.Client
+	w         *worker
+	// keys and seen, if set before start, let the server execute approvals.
+	keys *approval.Keys
+	seen *approval.Seen
 }
 
 func api(p string) string { return "/api/v9" + p }
@@ -238,8 +241,9 @@ func newHarness(t *testing.T, seed func(*state)) *harness {
 			h.stop()
 		}
 		for _, x := range h.discord.all() {
-			if x.method != http.MethodGet {
-				t.Errorf("upstream %s %s: only GET is allowed", x.method, x.path)
+			send := x.method == http.MethodPost && strings.HasPrefix(x.path, api("/channels/")) && strings.HasSuffix(x.path, "/messages")
+			if x.method != http.MethodGet && !send {
+				t.Errorf("upstream %s %s: only GET and sending a message are allowed", x.method, x.path)
 			}
 		}
 		logs := h.logs.String()
@@ -275,8 +279,9 @@ func (h *harness) start() {
 		h.t.Fatal(err)
 	}
 	h.cancel = func() { cancel(nil) }
+	h.w = w
 	go func() {
-		srv := &connector.Server{Connector: w, Log: cfg.log}
+		srv := &connector.Server{Connector: w, Keys: h.keys, Seen: h.seen, Log: cfg.log}
 		h.done <- errors.Join(srv.Serve(ctx, h.socket), w.Close())
 	}()
 	deadline := time.Now().Add(5 * time.Second)
@@ -1068,40 +1073,6 @@ func TestValidation(t *testing.T) {
 	}
 	if hits := h.discord.all(); len(hits) != 0 {
 		t.Errorf("invalid calls reached Discord: %v", h.discord.paths())
-	}
-}
-
-// Every op is a read, and a really signed approval is still refused without
-// anything going upstream.
-func TestWritesRefused(t *testing.T) {
-	h := newHarness(t, nil)
-	h.start()
-	ctx := context.Background()
-
-	spec, err := h.client.Spec(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, op := range spec.Ops {
-		if op.Kind != connector.Read {
-			t.Errorf("op %s is %s", op.Name, op.Kind)
-		}
-	}
-
-	rec, err := approval.Encode(approval.Record{
-		V: 1, ID: "p1", Connector: "discord", Op: "fetch", Args: map[string]string{"channel_id": dmID},
-		CreatedAt: noon, ExpiresAt: noon.Add(time.Hour),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	pk := approvaltest.New(t, "mandate.example", "https://mandate.example")
-	_, err = h.client.Execute(ctx, pk.Approve(rec, noon))
-	if e, ok := errors.AsType[*connector.Error](err); !ok || e.Status != http.StatusForbidden {
-		t.Errorf("execute: %v", err)
-	}
-	if hits := h.discord.all(); len(hits) != 0 {
-		t.Errorf("refused calls reached Discord: %v", h.discord.paths())
 	}
 }
 

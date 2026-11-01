@@ -79,22 +79,13 @@ func Open(ctx context.Context, path string) (*Store, error) {
 // migrate adds what schema.sql's CREATE TABLE IF NOT EXISTS cannot add to a
 // database created by an older version.
 func migrate(ctx context.Context, db *sql.DB) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 	var n int
-	if err := tx.QueryRowContext(ctx,
-		`SELECT count(*) FROM pragma_table_info('containers') WHERE name = 'last_message_at'`).Scan(&n); err != nil {
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM pragma_table_info('containers') WHERE name = 'last_message_at'`).Scan(&n); err != nil || n > 0 {
 		return err
 	}
-	if n == 0 {
-		if _, err := tx.ExecContext(ctx, `ALTER TABLE containers ADD COLUMN last_message_at TEXT`); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	_, err := db.ExecContext(ctx, `ALTER TABLE containers ADD COLUMN last_message_at TEXT`)
+	return err
 }
 
 func (s *Store) Close() error { return s.db.Close() }
