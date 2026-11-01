@@ -5,6 +5,7 @@
 //	GET  /spec     ops the connector offers
 //	GET  /health   whether it is working or needs the owner
 //	POST /setup    link it to the owner's account (console only)
+//	POST /unlink   forget that link, for connectors that are an Unlinker (console only)
 //	POST /read     run a read op (no approval; results land in the connector's data.db)
 //	POST /prepare  validate and normalize a write, render what the owner will see
 //	POST /execute  run an approved write, verifying the approval itself
@@ -41,7 +42,7 @@ type Spec struct {
 	Name     string `json:"name"`
 	Ops      []Op   `json:"ops"`
 	// Setup are the inputs the console offers the owner when linking the
-	// connector, all optional, e.g. a phone number for a pairing code.
+	// connector, e.g. a phone number for a pairing code or an API token.
 	Setup []Param `json:"setup,omitempty"`
 	// Doc is markdown for agents beyond the ops, e.g. which API paths the
 	// http connector allows.
@@ -49,6 +50,9 @@ type Spec struct {
 	// Forward is set by Server for a Forwarder: the gateway relays agents'
 	// GET and HEAD to /forward/ without approval.
 	Forward bool `json:"forward,omitempty"`
+	// Unlink is set by Server for an Unlinker: the console offers to unlink
+	// and relink.
+	Unlink bool `json:"unlink,omitempty"`
 }
 
 type Op struct {
@@ -67,6 +71,8 @@ type Param struct {
 	// Container params name a container (chat, channel, ...); the gateway refuses the op
 	// before it reaches the connector unless the container is stored and not hidden.
 	Container bool `json:"container,omitempty"`
+	// Secret setup inputs are typed hidden and never shown again.
+	Secret bool `json:"secret,omitempty"`
 }
 
 func (s Spec) Op(name string) (Op, bool) {
@@ -175,6 +181,13 @@ type SetupStep struct {
 // Setup starts or continues linking; it must refuse while already linked.
 type Setupper interface {
 	Setup(ctx context.Context, args map[string]string) (SetupStep, error)
+}
+
+// Unlinker is implemented by connectors the owner can unlink from the
+// console. Unlink forgets the credentials or session Setup made, leaving
+// stored messages alone; Health is then NeedsSetup.
+type Unlinker interface {
+	Unlink(ctx context.Context) error
 }
 
 // Error is a request the connector refused, with a message meant for the

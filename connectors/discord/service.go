@@ -235,6 +235,13 @@ func newService(st *store.Store, up *upstream, c clock) *service {
 	}
 }
 
+// forget drops what was cached for the current token.
+func (s *service) forget() {
+	s.guilds, s.dms = cachedList[apiGuild]{}, cachedList[apiChannel]{}
+	clear(s.channels)
+	clear(s.searches)
+}
+
 const refererHome = "https://discord.com/channels/@me"
 
 func channelURL(guildID, channelID string) string {

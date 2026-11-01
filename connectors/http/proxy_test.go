@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -78,16 +80,38 @@ func echo(w http.ResponseWriter, r *http.Request) {
 
 type harness struct {
 	up     *upstream
+	env    *connector.Env
+	cfg    Config
 	proxy  *Proxy
 	sock   string
 	client *connector.Client
 	key    *approvaltest.Authenticator
 }
 
+// newEnv is a state directory as connector.Main prepares it.
+func newEnv(t *testing.T) *connector.Env {
+	t.Helper()
+	env := &connector.Env{StateDir: t.TempDir()}
+	if err := os.Mkdir(env.PrivateDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return env
+}
+
+// start serves a proxy linked through setup.
 func start(t *testing.T, h http.HandlerFunc) *harness {
 	t.Helper()
-	up := newUpstream(t, h)
-	dir := t.TempDir()
+	hs := serve(t, newUpstream(t, h))
+	if _, err := hs.client.Setup(context.Background(), map[string]string{"github": token + "\n"}); err != nil {
+		t.Fatal(err)
+	}
+	return hs
+}
+
+// serve serves an unlinked proxy for up.
+func serve(t *testing.T, up *upstream) *harness {
+	t.Helper()
+	env := newEnv(t)
 	cfg, err := parse([]byte(`{"services":{"github":{"base_url":"` + up.URL + `",
 		"reads":["GET /repos/*/*/issues"],
 		"writes":["POST /repos/*/*/issues"]}}}`))
@@ -95,12 +119,12 @@ func start(t *testing.T, h http.HandlerFunc) *harness {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	p, err := New(cfg, func(string) ([]byte, error) { return []byte(token + "\n"), nil }, log)
+	p, err := New(cfg, env.Secret, log)
 	if err != nil {
 		t.Fatal(err)
 	}
 	key := approvaltest.New(t, rpID, origin)
-	seen, err := approval.OpenSeen(filepath.Join(dir, "seen.json"))
+	seen, err := approval.OpenSeen(filepath.Join(env.StateDir, "seen.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +134,7 @@ func start(t *testing.T, h http.HandlerFunc) *harness {
 		Seen:      seen,
 		Log:       log,
 	}
-	sock := filepath.Join(dir, "p.sock")
+	sock := filepath.Join(env.StateDir, "p.sock")
 	ln, err := connector.ListenUnix(sock)
 	if err != nil {
 		t.Fatal(err)
@@ -119,7 +143,85 @@ func start(t *testing.T, h http.HandlerFunc) *harness {
 	go hs.Serve(ln)
 	t.Cleanup(func() { hs.Close() })
 	c := connector.Dial(sock, 5*time.Second)
-	return &harness{up: up, proxy: p, sock: sock, client: c, key: key}
+	return &harness{up: up, env: env, cfg: cfg, proxy: p, sock: sock, client: c, key: key}
+}
+
+func TestSetupLinksAndUnlinkForgets(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	h := serve(t, newUpstream(t, echo))
+	stored := filepath.Join(h.env.PrivateDir(), "github")
+
+	spec, err := h.client.Spec(ctx)
+	want := []connector.Param{{Name: "github", Doc: "token for " + strings.TrimPrefix(h.up.URL, "http://"), Required: true, Secret: true}}
+	if err != nil || !spec.Unlink || fmt.Sprint(spec.Setup) != fmt.Sprint(want) {
+		t.Fatalf("spec: unlink %v, setup %+v (%v)", spec.Unlink, spec.Setup, err)
+	}
+
+	unlinked := func(when string) {
+		t.Helper()
+		if health, err := h.client.Health(ctx); err != nil || health.State != connector.NeedsSetup {
+			t.Errorf("%s: health %+v (%v)", when, health, err)
+		}
+		if resp, body := h.raw(t, "GET", "/forward/github/repos/a/b/issues", nil, ""); resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(body, "console") {
+			t.Errorf("%s: forward %d: %s", when, resp.StatusCode, body)
+		}
+		args := map[string]string{"service": "github", "method": "POST", "path": "/repos/a/b/issues"}
+		if _, err := h.client.Prepare(ctx, "request", args); !isStatus(err, http.StatusServiceUnavailable) {
+			t.Errorf("%s: prepare: %v", when, err)
+		}
+		if _, err := os.Stat(stored); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s: token file: %v", when, err)
+		}
+	}
+	link := func() {
+		t.Helper()
+		if step, err := h.client.Setup(ctx, map[string]string{"github": token}); err != nil || !step.Done {
+			t.Fatalf("setup: %+v (%v)", step, err)
+		}
+		if health, err := h.client.Health(ctx); err != nil || health.State != connector.Healthy {
+			t.Errorf("health %+v (%v)", health, err)
+		}
+		resp, body := h.raw(t, "GET", "/forward/github/repos/a/b/issues", nil, "")
+		reqs := h.up.requests()
+		if resp.StatusCode != http.StatusCreated || reqs[len(reqs)-1].header.Get("Authorization") != "Bearer "+token {
+			t.Fatalf("forward %d: %s", resp.StatusCode, body)
+		}
+		if leaksToken(body) || !strings.Contains(body, redacted) {
+			t.Errorf("not scrubbed: %s", body)
+		}
+		if b, err := os.ReadFile(stored); err != nil || string(b) != token {
+			t.Errorf("stored %q (%v)", b, err)
+		}
+	}
+
+	unlinked("before setup")
+	for _, args := range []map[string]string{
+		{},
+		{"github": "ghp_short"},
+		{"github": "ghp_with space 0123456789"},
+		{"github": token, "gitlab": token},
+	} {
+		if _, err := h.client.Setup(ctx, args); !isStatus(err, http.StatusBadRequest) || strings.Contains(err.Error(), "ghp_") {
+			t.Errorf("setup %v: %v", args, err)
+		}
+	}
+	unlinked("after refused setup")
+
+	link()
+	if _, err := h.client.Setup(ctx, map[string]string{"github": token}); !isStatus(err, http.StatusConflict) {
+		t.Errorf("setup while linked: %v", err)
+	}
+	restarted, err := New(h.cfg, h.env.Secret, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil || restarted.Health(ctx).State != connector.Healthy {
+		t.Fatalf("after restart: %v", err)
+	}
+
+	if err := h.client.Unlink(ctx); err != nil {
+		t.Fatal(err)
+	}
+	unlinked("after unlink")
+	link()
 }
 
 type reply struct {

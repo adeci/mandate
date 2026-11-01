@@ -1,8 +1,9 @@
-# Boots every unit under its real sandbox. WhatsApp is unlinked and Discord
-# has no network, so both are checked for wiring only. A recorder stands in
-# for an HTTP API, and the test driver plays the owner's passkey. The console
-# serves the ACME module's self-signed placeholder certificate, and the token
-# and admin password are generated on first start.
+# Boots every unit under its real sandbox. WhatsApp and Discord stay unlinked,
+# so both are checked for wiring only. A recorder stands in for an HTTP API,
+# whose token the owner sets in the console, and the test driver plays the
+# owner's passkey. The console serves the ACME module's self-signed
+# placeholder certificate, and the token and admin password are generated on
+# first start.
 { pkgs, self }:
 let
   apiToken = "api-token-0123456789abcdef";
@@ -57,14 +58,13 @@ pkgs.testers.runNixOSTest {
       openFirewallOn = "eth1";
       connectors = {
         whatsapp = { };
-        discord.credentials.token = "/etc/discord-token";
+        discord = { };
         http = {
           settings.services.api = {
             base_url = "http://127.0.0.1:9000";
             reads = [ "GET /items" ];
             writes = [ "POST /items" ];
           };
-          credentials.api = "/etc/api-token";
         };
       };
     };
@@ -75,10 +75,6 @@ pkgs.testers.runNixOSTest {
       certs.${host}.webroot = "/var/lib/acme/acme-challenge";
     };
     time.timeZone = "Europe/Berlin";
-    environment.etc = {
-      "discord-token".text = "not-a-real-token";
-      "api-token".text = apiToken;
-    };
     systemd.services.recorder = {
       wantedBy = [ "multi-user.target" ];
       before = [ "mandate-http.service" ];
@@ -196,9 +192,25 @@ pkgs.testers.runNixOSTest {
         assert code != 200, code
         machine.succeed("printf '[whatsapp]\\nhide_containers = [\"hidden@s.whatsapp.net\"]\\n' > /var/lib/mandate-gateway/exposure.toml")
 
-    with subtest("unlinked WhatsApp asks for the owner"):
+    with subtest("unlinked WhatsApp and Discord ask for the owner"):
         code, out = gw("POST", "/v1/whatsapp/send", {"args": {"chat": "fam@g.us", "text": "hi"}})
         assert code == 503 and "https://${host}/connections" in out["error"], (code, out)
+        health = json.loads(machine.succeed("curl -s --unix-socket /run/mandate-discord/connector.sock http://connector/health"))
+        assert health["state"] == "setup" and "console" in health["detail"], health
+
+    with subtest("the owner sets the API token in the console, which never shows it"):
+        code, _ = console("POST", "/connections/http/setup", {"args": {"api": "${apiToken}"}}, jar="/tmp/linkjar")
+        assert code == 401, code
+        code, out = gw("GET", "/v1/forward/http/api/items")
+        assert code == 503 and "console" in out["error"], (code, out)
+        code, out = console("POST", "/login", {"password": admin_password}, jar="/tmp/linkjar")
+        assert code == 200, (code, out)
+        code, out = console("POST", "/connections/http/setup", {"args": {"api": "${apiToken}"}}, jar="/tmp/linkjar")
+        assert code == 200 and out["done"], (code, out)
+        code, page = console("GET", "/connections", jar="/tmp/linkjar")
+        assert code == 200 and "${apiToken}" not in page, code
+        assert machine.succeed("stat -c %a /var/lib/mandate-http/private/api").strip() == "600"
+        assert recorded() == []
 
     with subtest("API reads get the token added and the agent's credentials stripped"):
         code, out = gw("GET", "/v1/forward/http/api/items")
@@ -300,7 +312,7 @@ pkgs.testers.runNixOSTest {
         code, out = console("POST", "/login", {"assertion": assertion(options)}, jar="/tmp/keyjar")
         assert code == 200, (code, out)
         machine.fail("sudo -u mandate-gateway ls /var/lib/mandate-console")
-        machine.fail("sudo -u mandate-gateway cat /run/credentials/mandate-http.service/api")
+        machine.fail("sudo -u mandate-gateway cat /var/lib/mandate-http/private/api")
         machine.fail("sudo -u mandate-whatsapp test -w /run/mandate-http/connector.sock")
 
     with subtest("mandate-reset-keys clears every key list"):

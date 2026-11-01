@@ -131,7 +131,6 @@ let
     name: c:
     service name (
       {
-        LoadCredential = lib.mapAttrsToList (cred: path: "${cred}:${path}") c.credentials;
         ExecStart = utils.escapeSystemdExecArgs [
           (lib.getExe c.package)
           "--socket"
@@ -172,14 +171,6 @@ let
           inherit (json) type;
           default = { };
           description = "Connector settings, passed as JSON and validated by the connector at build time.";
-        };
-        credentials = lib.mkOption {
-          type = lib.types.attrsOf lib.types.externalPath;
-          default = { };
-          example = {
-            token = "/run/secrets/discord-token";
-          };
-          description = "Secret files the connector reads by name, loaded with LoadCredential.";
         };
         serviceConfig = lib.mkOption {
           type = lib.types.attrsOf lib.types.anything;
@@ -276,11 +267,11 @@ in
       example = lib.literalExpression ''
         {
           whatsapp = { };
-          discord.credentials.token = "/run/secrets/discord-token";
+          discord = { };
           signal.package = inputs.mandate-signal.packages.''${system}.default;
         }
       '';
-      description = "Connectors by name. Each runs as its own user with its own credentials.";
+      description = "Connectors by name. Each runs as its own user and is linked on the console's Connections page.";
     };
   };
 

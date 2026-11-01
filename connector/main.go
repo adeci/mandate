@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -24,8 +25,7 @@ type Env struct {
 	StateDir string
 	Log      *slog.Logger
 
-	credDir string
-	fail    context.CancelCauseFunc
+	fail context.CancelCauseFunc
 }
 
 func (e *Env) DataPath() string { return filepath.Join(e.StateDir, "data.db") }
@@ -33,20 +33,50 @@ func (e *Env) DataPath() string { return filepath.Join(e.StateDir, "data.db") }
 // PrivateDir exists with mode 0700.
 func (e *Env) PrivateDir() string { return filepath.Join(e.StateDir, "private") }
 
-// Credential reads $CREDENTIALS_DIRECTORY/name with surrounding whitespace
-// trimmed. Errors never include the contents.
-func (e *Env) Credential(name string) ([]byte, error) {
-	if name == "" || name == "." || name == ".." || filepath.Base(name) != name {
-		return nil, fmt.Errorf("credential name %q must be a plain file name", name)
+// Secret is the file PrivateDir/name, which name must be a plain file name.
+func (e *Env) Secret(name string) Secret { return Secret{path: filepath.Join(e.PrivateDir(), name)} }
+
+// Secret holds a value the owner gives Setup, such as an API token, in a
+// file only the connector can read.
+type Secret struct{ path string }
+
+// Load returns the stored value, or nil if there is none.
+func (s Secret) Load() ([]byte, error) {
+	b, err := os.ReadFile(s.path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
 	}
-	if e.credDir == "" {
-		return nil, fmt.Errorf("credential %s: $CREDENTIALS_DIRECTORY is not set", name)
-	}
-	b, err := os.ReadFile(filepath.Join(e.credDir, name))
+	return b, err
+}
+
+// Store replaces the value with b, mode 0600 as CreateTemp makes it, so a
+// crash leaves the old or the new value and never a mix.
+func (s Secret) Store(b []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(s.path), "."+filepath.Base(s.path)+"-*")
 	if err != nil {
-		return nil, fmt.Errorf("credential %s: %w", name, err)
+		return err
 	}
-	return bytes.TrimSpace(b), nil
+	defer os.Remove(f.Name())
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), s.path)
+}
+
+// Delete forgets the value; there being none is not an error.
+func (s Secret) Delete() error {
+	if err := os.Remove(s.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // Fail stops the connector after a fault only a restart can clear; Main
@@ -67,7 +97,7 @@ func (e *Env) Fail(err error) { e.fail(err) }
 func Main[C any](start func(ctx context.Context, env *Env, cfg C) (Connector, error)) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	err := run(ctx, filepath.Base(os.Args[0]), os.Args[1:], os.Getenv("CREDENTIALS_DIRECTORY"), start)
+	err := run(ctx, filepath.Base(os.Args[0]), os.Args[1:], start)
 	stop()
 	switch {
 	case errors.Is(err, flag.ErrHelp):
@@ -78,7 +108,7 @@ func Main[C any](start func(ctx context.Context, env *Env, cfg C) (Connector, er
 	}
 }
 
-func run[C any](ctx context.Context, name string, args []string, credDir string, start func(context.Context, *Env, C) (Connector, error)) (err error) {
+func run[C any](ctx context.Context, name string, args []string, start func(context.Context, *Env, C) (Connector, error)) (err error) {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	socket := flags.String("socket", "", "serve the connector protocol on this Unix socket (required)")
 	stateDir := flags.String("state", "", "state directory (required)")
@@ -106,7 +136,7 @@ func run[C any](ctx context.Context, name string, args []string, credDir string,
 	if err != nil {
 		return err
 	}
-	env := &Env{StateDir: *stateDir, Log: slog.Default(), credDir: credDir}
+	env := &Env{StateDir: *stateDir, Log: slog.Default()}
 	if err := os.MkdirAll(env.PrivateDir(), 0o700); err != nil {
 		return err
 	}

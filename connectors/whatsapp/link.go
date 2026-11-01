@@ -36,6 +36,7 @@ type waClient interface {
 	PairPhone(ctx context.Context, phone string, showPushNotification bool, clientType whatsmeow.PairClientType, clientDisplayName string) (string, error)
 	ConnectContext(ctx context.Context) error
 	Disconnect()
+	Logout(ctx context.Context) error
 }
 
 type waConnector struct {
@@ -48,8 +49,7 @@ type waConnector struct {
 	newClient func(dev *wastore.Device, onEvent func(evt any)) waClient
 
 	mu sync.Mutex
-	// Replaced after a logout: whatsmeow deletes a logged-out device, and a
-	// deleted device cannot pair again.
+	// Replaced after a logout or unlink: a deleted device cannot pair again.
 	cli waClient
 	dev *wastore.Device
 	// linked is tracked here rather than read from dev.ID, which whatsmeow
@@ -148,10 +148,43 @@ func (c *waConnector) event(cli waClient, evt any) {
 	}
 }
 
+// Unlink removes the device from the phone and forgets the session.
+func (c *waConnector) Unlink(ctx context.Context) error {
+	cli, dev, linked := c.current()
+	if linked {
+		if err := c.forget(ctx, cli, dev); err != nil {
+			return err
+		}
+	}
+	c.mu.Lock()
+	old := c.cli
+	c.linked, c.loggedOut, c.failure, c.pairing = false, false, "", nil
+	c.use(c.newDevice())
+	c.mu.Unlock()
+	old.Disconnect()
+	c.log.Info("unlinked")
+	return nil
+}
+
+// forget logs dev out, best effort, and deletes its session.
+func (c *waConnector) forget(ctx context.Context, cli waClient, dev *wastore.Device) error {
+	// Offline the phone keeps listing the device until it expires; the
+	// session is forgotten either way.
+	if err := cli.Logout(ctx); err != nil {
+		c.log.Warn("logout from whatsapp failed; forgetting the session anyway", "err", err)
+	}
+	cli.Disconnect()
+	if err := dev.Delete(ctx); err != nil {
+		return fmt.Errorf("delete session: %w", err)
+	}
+	return nil
+}
+
 // pairing is one QR session: WhatsApp rotates its codes until one is
 // scanned or they run out.
 type pairing struct {
 	cli   waClient
+	dev   *wastore.Device
 	ready chan struct{} // closed at the first code or at the end
 
 	// Guarded by waConnector.mu.
@@ -228,7 +261,7 @@ func (c *waConnector) pairingFor() (*pairing, connector.SetupStep, error) {
 	case p != nil && !p.expired:
 		return p, connector.SetupStep{}, nil
 	}
-	p = &pairing{cli: c.cli, ready: make(chan struct{})}
+	p = &pairing{cli: c.cli, dev: c.dev, ready: make(chan struct{})}
 	c.pairing = p
 	go c.pair(p)
 	return p, connector.SetupStep{}, nil
@@ -258,12 +291,21 @@ func (c *waConnector) pair(p *pairing) {
 			continue
 		case whatsmeow.QRChannelSuccess.Event:
 			c.mu.Lock()
-			c.linked, c.loggedOut, c.failure = true, false, ""
-			p.done = true
+			// Unlink drops the pairing in progress.
+			current := c.pairing == p
+			if current {
+				c.linked, c.loggedOut, c.failure = true, false, ""
+				p.done = true
+			}
 			c.mu.Unlock()
-			c.log.Info("linked")
-			c.endPairing(p, nil)
-			return
+			if current {
+				c.log.Info("linked")
+				c.endPairing(p, nil)
+				return
+			}
+			if err := c.forget(c.ctx, p.cli, p.dev); err != nil {
+				c.log.Error("forget the device of a dropped pairing", "err", err)
+			}
 		case whatsmeow.QRChannelTimeout.Event:
 			// The codes ran out: expired, and the next Setup starts again.
 		case whatsmeow.QRChannelClientOutdated.Event:

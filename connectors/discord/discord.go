@@ -61,14 +61,6 @@ func main() {
 		if err != nil {
 			return nil, err
 		}
-		raw, err := env.Credential("token")
-		if err != nil {
-			return nil, err
-		}
-		token, err := checkToken(string(raw))
-		if err != nil {
-			return nil, err
-		}
 		st, err := store.Open(ctx, env.DataPath())
 		if err != nil {
 			return nil, fmt.Errorf("open store: %w", err)
@@ -81,7 +73,7 @@ func main() {
 		w, err := start(ctx, config{
 			store:     st,
 			statePath: filepath.Join(env.PrivateDir(), "state.json"),
-			token:     token,
+			token:     env.Secret("token"),
 			timezone:  tz,
 			hours:     hours,
 			transport: client,
@@ -131,11 +123,11 @@ func checkToken(token string) (string, error) {
 	token = strings.TrimSpace(token)
 	switch {
 	case token == "":
-		return "", errors.New("the token credential is empty")
+		return "", errors.New("the token is empty")
 	case strings.HasPrefix(token, "Bot ") || strings.HasPrefix(token, "Bearer "):
-		return "", errors.New("the token credential must hold a bare user token (no Bot/Bearer prefix)")
+		return "", errors.New("paste a bare user token, without Bot or Bearer")
 	case strings.ContainsAny(token, " \t\r\n"):
-		return "", errors.New("the token credential holds more than one token")
+		return "", errors.New("that is more than one token")
 	}
 	return token, nil
 }
@@ -143,7 +135,7 @@ func checkToken(token string) (string, error) {
 type config struct {
 	store            *store.Store
 	statePath        string
-	token            string
+	token            connector.Secret
 	timezone         string
 	hours            activeHours
 	transport        transport
@@ -167,10 +159,20 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 	if err := st.save(cfg.statePath); err != nil {
 		return nil, err
 	}
+	raw, err := cfg.token.Load()
+	if err != nil {
+		return nil, fmt.Errorf("load token: %w", err)
+	}
+	var token string
+	if raw != nil {
+		if token, err = checkToken(string(raw)); err != nil {
+			return nil, fmt.Errorf("stored token: %w", err)
+		}
+	}
 	up := &upstream{
 		tr:        cfg.transport,
 		jar:       cfg.jar,
-		token:     cfg.token,
+		token:     token,
 		timezone:  cfg.timezone,
 		apiBase:   cfg.apiBase,
 		webBase:   cfg.webBase,
@@ -191,6 +193,7 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 	// holding up the exit.
 	w := &worker{
 		svc:   newService(cfg.store, up, cfg.clock),
+		token: cfg.token,
 		clock: cfg.clock,
 		ctx:   ctx,
 		jobs:  make(chan *job),
@@ -203,7 +206,7 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 		defer close(w.done)
 		w.loop()
 	}()
-	cfg.log.Info("started", "timezone", cfg.timezone,
+	cfg.log.Info("started", "linked", token != "", "timezone", cfg.timezone,
 		"active_hours", fmt.Sprintf("%02d-%02d", cfg.hours.start, cfg.hours.end))
 	return w, nil
 }
@@ -217,8 +220,10 @@ func (w *worker) Close() error {
 type job struct {
 	ctx      context.Context
 	deadline time.Time // latest acceptable upstream slot
-	run      func(ctx context.Context, dl time.Time) (connector.ReadResult, error)
-	done     chan jobResult
+	// link jobs set up or drop the token; they run even when reads may not.
+	link bool
+	run  func(ctx context.Context, dl time.Time) (connector.ReadResult, error)
+	done chan jobResult
 }
 
 type jobResult struct {
@@ -229,19 +234,22 @@ type jobResult struct {
 // worker runs calls one at a time, so every upstream request is strictly
 // serialized on its goroutine.
 type worker struct {
-	svc     *service
-	clock   clock
-	ctx     context.Context // canceled when the service stops
-	jobs    chan *job
-	fail    func(error) // for stop conditions a restart may clear
-	stopped error       // set after a stop condition; later calls fail fast
-	done    chan struct{}
-	log     *slog.Logger
+	svc      *service
+	token    connector.Secret
+	clock    clock
+	ctx      context.Context // canceled when the service stops
+	jobs     chan *job
+	fail     func(error) // for stop conditions a restart may clear
+	stopped  error       // set after a stop condition; later calls fail fast
+	rejected *ownerStop  // why Discord refused the last token
+	done     chan struct{}
+	log      *slog.Logger
 
 	// What Health reads; the pacer and state belong to the worker goroutine.
-	mu    sync.Mutex
-	pace  state
-	owner string // what the owner must do, after an owner stop
+	mu     sync.Mutex
+	pace   state
+	linked bool
+	owner  string // what the owner must do, after an owner stop
 }
 
 // snapshot runs on the worker goroutine, or before it starts.
@@ -250,17 +258,25 @@ func (w *worker) snapshot() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.pace = state{CooldownUntil: st.CooldownUntil, BreakUntil: st.BreakUntil, Requests: slices.Clone(st.Requests)}
+	w.linked = w.svc.up.token != ""
+	w.owner = ""
 	var stop *ownerStop
-	if errors.As(w.stopped, &stop) {
+	switch {
+	case errors.As(w.stopped, &stop):
 		w.owner = stop.Error()
+	case !w.linked && w.rejected != nil:
+		w.owner = w.rejected.Error()
 	}
 }
 
 func (w *worker) Health(context.Context) connector.Health {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.owner != "" {
+	switch {
+	case w.owner != "":
 		return connector.Health{State: connector.NeedsSetup, Detail: w.owner}
+	case !w.linked:
+		return connector.Health{State: connector.NeedsSetup, Detail: fixLink}
 	}
 	p := &pacer{st: &w.pace, hours: w.svc.up.pace.hours}
 	if until, why := p.rest(w.clock.Now()); !until.IsZero() {
@@ -275,8 +291,13 @@ func (w *worker) loop() {
 		case <-w.ctx.Done():
 			return
 		case j := <-w.jobs:
-			if w.stopped != nil {
+			switch {
+			case j.link:
+			case w.stopped != nil:
 				j.done <- jobResult{err: w.stopped}
+				continue
+			case w.svc.up.token == "":
+				j.done <- jobResult{err: errNotLinked}
 				continue
 			}
 			ctx, cancel := context.WithCancel(j.ctx)
@@ -284,23 +305,123 @@ func (w *worker) loop() {
 			v, err := j.run(ctx, j.deadline)
 			stop()
 			cancel()
-			if f := w.svc.up.fatal; f != nil {
-				w.stopped = f
-				var stop *ownerStop
-				if !errors.As(f, &stop) {
-					w.fail(f)
-				}
-			}
+			w.check()
 			w.snapshot()
 			j.done <- jobResult{v: v, err: err}
 		}
 	}
 }
 
+// check acts on what upstream ran into. A rejected token is discarded so the
+// owner can paste a new one; other owner stops hold every read until a
+// restart or unlink.
+func (w *worker) check() {
+	f := w.svc.up.fatal
+	var stop *ownerStop
+	switch {
+	case f == nil:
+	case errors.As(f, &stop) && stop.action == fixToken:
+		w.svc.up.fatal = nil
+		w.rejected = stop
+		w.log.Warn("discord rejected the token; discarded it", "reason", stop.reason)
+		if err := w.forget(); err != nil {
+			w.stopped = err
+			w.fail(err)
+		}
+	case errors.As(f, &stop):
+		w.stopped = f
+	default:
+		w.stopped = f
+		w.fail(f)
+	}
+}
+
+// forget drops the token and everything learned with it. It runs on the
+// worker goroutine.
+func (w *worker) forget() error {
+	up := w.svc.up
+	up.token = ""
+	up.st.SelfID, up.st.SelfCheckedAt = "", time.Time{}
+	up.st.Denied = nil
+	w.svc.forget()
+	if err := up.saveState(); err != nil {
+		return err
+	}
+	if err := w.token.Delete(); err != nil {
+		return fmt.Errorf("delete token: %w", err)
+	}
+	return nil
+}
+
+// Setup checks the token the way reads learn the account's own ID, then
+// keeps it.
+func (w *worker) Setup(ctx context.Context, args map[string]string) (connector.SetupStep, error) {
+	for k := range args {
+		if k != "token" {
+			return connector.SetupStep{}, connector.Invalid("unknown arg %q", k)
+		}
+	}
+	token, err := checkToken(args["token"])
+	if err != nil {
+		return connector.SetupStep{}, connector.Invalid("%v", err)
+	}
+	_, err = w.submit(ctx, "setup", true, func(ctx context.Context, dl time.Time) (connector.ReadResult, error) {
+		return connector.ReadResult{}, w.link(ctx, dl, token)
+	})
+	if err != nil {
+		return connector.SetupStep{}, err
+	}
+	return connector.SetupStep{Done: true}, nil
+}
+
+// link runs on the worker goroutine.
+func (w *worker) link(ctx context.Context, dl time.Time, token string) error {
+	up := w.svc.up
+	if up.token != "" {
+		return &connector.Error{Status: http.StatusConflict, Message: "already linked"}
+	}
+	// Whatever was learned before belongs to the last token, maybe another account.
+	if err := w.forget(); err != nil {
+		return err
+	}
+	up.token = token
+	if _, err := w.svc.selfID(ctx, dl); err != nil {
+		up.token = ""
+		var stop *ownerStop
+		if errors.As(up.fatal, &stop) {
+			up.fatal = nil
+		}
+		return err
+	}
+	if err := w.token.Store([]byte(token)); err != nil {
+		up.token = ""
+		return fmt.Errorf("store token: %w", err)
+	}
+	w.rejected = nil
+	w.log.Info("linked")
+	return nil
+}
+
+func (w *worker) Unlink(ctx context.Context) error {
+	_, err := w.submit(ctx, "unlink", true, func(context.Context, time.Time) (connector.ReadResult, error) {
+		var stop *ownerStop
+		if errors.As(w.stopped, &stop) {
+			w.stopped, w.svc.up.fatal = nil, nil
+		}
+		w.rejected = nil
+		return connector.ReadResult{}, w.forget()
+	})
+	return err
+}
+
 var spec = connector.Spec{
 	Name: "discord",
 	Doc: "sync, fetch and guild-search ask Discord and store what they get; chats, messages and search read only what is stored.\n" +
 		"Discord calls are paced like a person and may take a while. Start with sync, then sync guild_id=ID for a server's channels.",
+	Setup: []connector.Param{{
+		Name: "token", Required: true, Secret: true,
+		Doc: "the Authorization header of any discord.com/api request in your browser's devtools",
+	}},
 	Ops: []connector.Op{
 		{
 			Name: "sync", Kind: connector.Read,
@@ -373,7 +494,7 @@ func (w *worker) Read(ctx context.Context, op string, args map[string]string) (j
 	default:
 		return nil, connector.ErrUnknownOp
 	}
-	res, err := w.submit(ctx, op, run)
+	res, err := w.submit(ctx, op, false, run)
 	if err != nil {
 		return nil, err
 	}
@@ -381,16 +502,20 @@ func (w *worker) Read(ctx context.Context, op string, args map[string]string) (j
 }
 
 // submit hands a call to the worker, waiting at most maxSlotWait for it to be
-// picked up.
-func (w *worker) submit(ctx context.Context, op string, run func(ctx context.Context, dl time.Time) (connector.ReadResult, error)) (connector.ReadResult, error) {
-	j := &job{ctx: ctx, deadline: w.clock.Now().Add(maxSlotWait), run: run, done: make(chan jobResult, 1)}
-	wait := time.NewTimer(maxSlotWait)
+// picked up and for its upstream slots. Link calls wait at most linkSlotWait.
+func (w *worker) submit(ctx context.Context, op string, link bool, run func(ctx context.Context, dl time.Time) (connector.ReadResult, error)) (connector.ReadResult, error) {
+	limit := maxSlotWait
+	if link {
+		limit = linkSlotWait
+	}
+	j := &job{ctx: ctx, deadline: w.clock.Now().Add(limit), link: link, run: run, done: make(chan jobResult, 1)}
+	wait := time.NewTimer(limit)
 	defer wait.Stop()
 	select {
 	case w.jobs <- j:
 	case <-wait.C:
 		return connector.ReadResult{}, &connector.Error{
-			Status: http.StatusTooManyRequests, Message: "discord service busy with another call", RetryAfter: retrySeconds(maxSlotWait),
+			Status: http.StatusTooManyRequests, Message: "discord service busy with another call", RetryAfter: retrySeconds(limit),
 		}
 	case <-w.ctx.Done():
 		return connector.ReadResult{}, &connector.Error{Status: http.StatusServiceUnavailable, Message: "discord service stopping"}
@@ -419,8 +544,11 @@ func toConnectorError(err error) *connector.Error {
 		bad      *badRequestError
 		up       *upstreamError
 		stop     *ownerStop
+		ce       *connector.Error
 	)
 	switch {
+	case errors.As(err, &ce):
+		return ce
 	case errors.As(err, &paced):
 		return &connector.Error{Status: http.StatusTooManyRequests, Message: paced.Error(), RetryAfter: retrySeconds(paced.retryAfter)}
 	case errors.As(err, &denied):

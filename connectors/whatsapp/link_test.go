@@ -198,6 +198,68 @@ func TestLoggedOutFromPhone(t *testing.T) {
 	wantHealth(t, f.c, connector.Broken)
 }
 
+func TestUnlink(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, logoutErr := range []error{nil, errors.New("offline")} {
+		f := newFixture(t)
+		f.cli.logoutErr = logoutErr
+		if err := f.c.Unlink(ctx); err != nil {
+			t.Fatalf("logout error %v: %v", logoutErr, err)
+		}
+		if f.cli.logouts != 1 || f.cli.IsConnected() {
+			t.Fatalf("logouts %d, connected %v", f.cli.logouts, f.cli.IsConnected())
+		}
+		if devs, err := f.container.GetAllDevices(ctx); err != nil || len(devs) != 0 {
+			t.Fatalf("session kept: %d devices, %v", len(devs), err)
+		}
+		if h := f.c.Health(ctx); h.State != connector.NeedsSetup || h.Detail != "not linked" {
+			t.Fatalf("health %+v", h)
+		}
+		step, err := f.c.Setup(ctx, nil)
+		if err != nil || step.QR != "qr-1-1" || f.client(1).sessions() != 1 {
+			t.Fatalf("relink: %+v, %v", step, err)
+		}
+	}
+}
+
+func TestUnlinkWhilePairing(t *testing.T) {
+	t.Parallel()
+	f := newUnlinkedFixture(t)
+	ctx := context.Background()
+	if _, err := f.c.Setup(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, dev, _ := f.c.current()
+	if err := f.c.Unlink(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// A scan of the dropped code links nothing, and its device is forgotten.
+	f.pair(t, dev)
+	f.cli.qr(whatsmeow.QRChannelSuccess)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		devs, err := f.container.GetAllDevices(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(devs) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("dropped pairing's session kept")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	f.cli.mu.Lock()
+	logouts := f.cli.logouts
+	f.cli.mu.Unlock()
+	wantHealth(t, f.c, connector.NeedsSetup)
+	if step, err := f.c.Setup(ctx, nil); err != nil || step.QR != "qr-1-1" || logouts != 1 {
+		t.Fatalf("relink: %+v, %v, %d logouts", step, err, logouts)
+	}
+}
+
 func TestHealthDown(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)

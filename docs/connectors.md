@@ -8,7 +8,8 @@ its spec.
 |---|---|
 | `GET /spec` | name, protocol version, operations and their parameters |
 | `GET /health` | `ok`, `setup` (needs the owner), `resting`, or `down` |
-| `POST /setup` | linking driven from the console, e.g. a QR code |
+| `POST /setup` | linking driven from the console, e.g. a QR code or a pasted token |
+| `POST /unlink` | forget the link, for an `Unlinker` |
 | `POST /read` | read operations, run without approval |
 | `POST /prepare` | normalize a write and render what the owner will see |
 | `POST /execute` | run a write the owner approved |
@@ -30,6 +31,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/adeci/mandate/approval"
 	"github.com/adeci/mandate/connector"
@@ -47,15 +49,58 @@ func (c config) Validate() error {
 }
 
 type webhook struct {
-	url   string
-	token []byte
+	url    string
+	secret connector.Secret
+	mu     sync.Mutex
+	token  []byte // nil until linked
 }
 
 func (w *webhook) Spec() connector.Spec {
-	return connector.Spec{Name: "webhook", Ops: []connector.Op{{
-		Name: "post", Kind: connector.Write, Summary: "Post a message to the team channel",
-		Params: []connector.Param{{Name: "text", Required: true, Editable: true}},
-	}}}
+	return connector.Spec{
+		Name:  "webhook",
+		Setup: []connector.Param{{Name: "token", Doc: "the hook's bearer token", Required: true, Secret: true}},
+		Ops: []connector.Op{{
+			Name: "post", Kind: connector.Write, Summary: "Post a message to the team channel",
+			Params: []connector.Param{{Name: "text", Required: true, Editable: true}},
+		}},
+	}
+}
+
+func (w *webhook) current() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.token
+}
+
+func (w *webhook) Health(context.Context) connector.Health {
+	if w.current() == nil {
+		return connector.Health{State: connector.NeedsSetup, Detail: "paste the token in the console"}
+	}
+	return connector.Health{State: connector.Healthy}
+}
+
+func (w *webhook) Setup(_ context.Context, args map[string]string) (connector.SetupStep, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.token != nil {
+		return connector.SetupStep{}, &connector.Error{Status: http.StatusConflict, Message: "already linked"}
+	}
+	token := strings.TrimSpace(args["token"])
+	if token == "" {
+		return connector.SetupStep{}, connector.Invalid("token is required")
+	}
+	if err := w.secret.Store([]byte(token)); err != nil {
+		return connector.SetupStep{}, err
+	}
+	w.token = []byte(token)
+	return connector.SetupStep{Done: true}, nil
+}
+
+func (w *webhook) Unlink(context.Context) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.token = nil
+	return w.secret.Delete()
 }
 
 func (w *webhook) Prepare(_ context.Context, _ string, args map[string]string) (connector.Prepared, error) {
@@ -70,11 +115,15 @@ func (w *webhook) Prepare(_ context.Context, _ string, args map[string]string) (
 }
 
 func (w *webhook) Execute(ctx context.Context, rec approval.Record) connector.Result {
+	token := w.current()
+	if token == nil {
+		return connector.Result{Status: connector.Failed, Detail: "not linked"}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.url, strings.NewReader(rec.Args["text"]))
 	if err != nil {
 		return connector.Result{Status: connector.Failed, Detail: err.Error()}
 	}
-	req.Header.Set("Authorization", "Bearer "+string(w.token))
+	req.Header.Set("Authorization", "Bearer "+string(token))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return connector.Result{Status: connector.Unknown, Detail: err.Error()}
@@ -88,11 +137,12 @@ func (w *webhook) Execute(ctx context.Context, rec approval.Record) connector.Re
 
 func main() {
 	connector.Main(func(_ context.Context, env *connector.Env, cfg config) (connector.Connector, error) {
-		token, err := env.Credential("token")
+		secret := env.Secret("token")
+		token, err := secret.Load()
 		if err != nil {
 			return nil, err
 		}
-		return &webhook{url: cfg.URL, token: token}, nil
+		return &webhook{url: cfg.URL, secret: secret, token: token}, nil
 	})
 }
 ```
@@ -113,10 +163,12 @@ func main() {
   login-code redaction applied.
 - **Chats**: mark a param `Container` and the gateway refuses the op unless
   it names a stored, visible chat.
-- **Health and linking** are optional: `connector.Checker` and
-  `connector.Setupper`, with linking inputs declared in `Spec.Setup`.
-- **Credentials** come only from `env.Credential`; settings only from the
-  typed config, which `Main` decodes strictly and the build checks with
+- **Health and linking** are optional: `connector.Checker`,
+  `connector.Setupper` with its inputs declared in `Spec.Setup`, and
+  `connector.Unlinker`, which lets the owner unlink and relink.
+- **Secrets** such as API tokens come from the owner through `Setup`: mark
+  the input `Secret` and keep it with `env.Secret`. Settings come only from
+  the typed config, which `Main` decodes strictly and the build checks with
   `--check-config`.
 - **Tests**: `approval/approvaltest` is a software passkey, so you can test
   approved writes end to end through `connector.Server`.
@@ -127,12 +179,11 @@ func main() {
 services.mandate.connectors.webhook = {
   package = inputs.mandate-webhook.packages.${system}.default; # meta.mainProgram must be set
   settings.url = "https://hooks.example.com/team";
-  credentials.token = "/run/secrets/webhook-token";
 };
 ```
 
-It runs as its own user (`mandate-webhook`) with only that token, and shows up
-in `mandate --help` and the console on the next deploy.
+It runs as its own user (`mandate-webhook`), shows up in `mandate --help` and
+the console on the next deploy, and asks for its token on the Connections page.
 
 The module starts it as
 
@@ -140,7 +191,6 @@ The module starts it as
 mandate-webhook --socket PATH --state DIR --config FILE --rp-id HOST --origin URL
 ```
 
-with credentials as files in `$CREDENTIALS_DIRECTORY`, and checks the
-settings at build time with `mandate-webhook --check-config FILE`.
-`connector.Main` handles both. Secrets belong in `DIR/private`; the gateway
-can read the rest of `DIR`.
+and checks the settings at build time with `mandate-webhook --check-config
+FILE`. `connector.Main` handles both. Secrets belong in `DIR/private`; the
+gateway can read the rest of `DIR`.

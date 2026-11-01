@@ -3,10 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
-	"os"
 	"strings"
 	"testing"
 )
@@ -83,7 +81,7 @@ func TestConfig(t *testing.T) {
 	}
 }
 
-func TestNewRefusesBadTokens(t *testing.T) {
+func TestNewRefusesBadStoredTokens(t *testing.T) {
 	t.Parallel()
 	cfg, err := parse([]byte(services(`"github"`, svc("", "", "", ""))))
 	if err != nil {
@@ -95,14 +93,12 @@ func TestNewRefusesBadTokens(t *testing.T) {
 		"newline": "abcdefghij\nklmnopqrst",
 		"huge":    strings.Repeat("a", maxToken+1),
 	} {
-		cred := func(string) ([]byte, error) { return []byte(content), nil }
-		if _, err := New(cfg, cred, log); err == nil {
+		env := newEnv(t)
+		if err := env.Secret("github").Store([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := New(cfg, env.Secret, log); err == nil {
 			t.Errorf("%s: New accepted the token", name)
 		}
-	}
-	var asked string
-	missing := func(name string) ([]byte, error) { asked = name; return nil, os.ErrNotExist }
-	if _, err := New(cfg, missing, log); !errors.Is(err, os.ErrNotExist) || asked != "github" {
-		t.Errorf("missing credential: asked %q, err %v", asked, err)
 	}
 }

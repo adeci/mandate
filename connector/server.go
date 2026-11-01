@@ -33,6 +33,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /spec", s.spec)
 	mux.HandleFunc("GET /health", s.health)
 	mux.HandleFunc("POST /setup", s.setup)
+	mux.HandleFunc("POST /unlink", s.unlink)
 	mux.HandleFunc("POST /read", s.read)
 	mux.HandleFunc("POST /prepare", s.prepare)
 	mux.HandleFunc("POST /execute", s.execute)
@@ -111,6 +112,7 @@ func (s *Server) spec(w http.ResponseWriter, _ *http.Request) {
 	spec := s.Connector.Spec()
 	spec.Protocol = ProtocolVersion
 	_, spec.Forward = s.Connector.(Forwarder)
+	_, spec.Unlink = s.Connector.(Unlinker)
 	WriteJSON(w, http.StatusOK, spec)
 }
 
@@ -147,6 +149,20 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	WriteJSON(w, http.StatusOK, step)
+}
+
+func (s *Server) unlink(w http.ResponseWriter, r *http.Request) {
+	c, ok := s.Connector.(Unlinker)
+	if !ok {
+		WriteError(w, &Error{Status: http.StatusNotFound, Message: "this connector cannot be unlinked"})
+		return
+	}
+	if err := c.Unlink(r.Context()); err != nil {
+		WriteError(w, err)
+		return
+	}
+	s.Log.Info("unlinked")
+	WriteJSON(w, http.StatusOK, struct{}{})
 }
 
 func (s *Server) read(w http.ResponseWriter, r *http.Request) {

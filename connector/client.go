@@ -79,6 +79,10 @@ func (c *Client) Setup(ctx context.Context, args map[string]string) (SetupStep, 
 	return s, err
 }
 
+func (c *Client) Unlink(ctx context.Context) error {
+	return c.Do(ctx, http.MethodPost, "/unlink", nil, &struct{}{})
+}
+
 func (c *Client) Read(ctx context.Context, op string, args map[string]string) (json.RawMessage, error) {
 	var out json.RawMessage
 	err := c.Do(ctx, http.MethodPost, "/read", opRequest{Op: op, Args: args}, &out)

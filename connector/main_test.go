@@ -65,7 +65,7 @@ type launched struct {
 
 // launch runs Main's body with args plus --socket and --state in a temp dir
 // and waits until it serves.
-func launch(t *testing.T, state, credDir string, args ...string) *launched {
+func launch(t *testing.T, state string, args ...string) *launched {
 	t.Helper()
 	sock := filepath.Join(t.TempDir(), "c.sock")
 	l := &launched{echo: &echo{}, done: make(chan error, 1), client: Dial(sock, 5*time.Second)}
@@ -74,7 +74,7 @@ func launch(t *testing.T, state, credDir string, args ...string) *launched {
 	l.cancel = cancel
 	args = append([]string{"--socket", sock, "--state", state}, args...)
 	go func() {
-		l.done <- run(ctx, "mandate-echo", args, credDir, func(_ context.Context, env *Env, cfg testConfig) (Connector, error) {
+		l.done <- run(ctx, "mandate-echo", args, func(_ context.Context, env *Env, cfg testConfig) (Connector, error) {
 			l.echo.env, l.echo.cfg = env, cfg
 			close(started)
 			return l.echo, nil
@@ -125,7 +125,7 @@ func writeFile(t *testing.T, name, content string) string {
 }
 
 func runOnce(args []string) error {
-	return run(context.Background(), "mandate-echo", args, "", func(context.Context, *Env, testConfig) (Connector, error) {
+	return run(context.Background(), "mandate-echo", args, func(context.Context, *Env, testConfig) (Connector, error) {
 		return nil, errors.New("start must not run")
 	})
 }
@@ -143,16 +143,12 @@ func approve(t *testing.T, key *approvaltest.Authenticator) approval.Approval {
 	return key.Approve(b, time.Now())
 }
 
-func TestMainServesWithConfigKeysAndCredentials(t *testing.T) {
+func TestMainServesWithConfigKeysAndSecrets(t *testing.T) {
 	t.Parallel()
 	state := t.TempDir()
-	creds := t.TempDir()
-	if err := os.WriteFile(filepath.Join(creds, "token"), []byte("  s3cret\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	key := approvaltest.New(t, testRPID, testOrigin)
 	args := []string{"--config", writeFile(t, "config.json", `{"greeting":"hello"}`), "--rp-id", testRPID, "--origin", testOrigin}
-	l := launch(t, state, creds, args...)
+	l := launch(t, state, args...)
 
 	if l.echo.cfg.Greeting != "hello" {
 		t.Errorf("config = %+v", l.echo.cfg)
@@ -164,13 +160,15 @@ func TestMainServesWithConfigKeysAndCredentials(t *testing.T) {
 	if err != nil || fi.Mode().Perm() != 0o700 {
 		t.Fatalf("private dir: %v %v", fi, err)
 	}
-	if tok, err := l.echo.env.Credential("token"); err != nil || string(tok) != "s3cret" {
-		t.Errorf("Credential = %q, %v", tok, err)
+	secret := l.echo.env.Secret("token")
+	if b, err := secret.Load(); b != nil || err != nil {
+		t.Errorf("unset secret = %q, %v", b, err)
 	}
-	for _, name := range []string{"missing", "../token", "."} {
-		if _, err := l.echo.env.Credential(name); err == nil {
-			t.Errorf("Credential(%q) succeeded", name)
-		}
+	if err := secret.Store([]byte("s3cret")); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(filepath.Join(state, "private", "token")); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("secret file: %v %v", fi, err)
 	}
 
 	spec, err := l.client.Spec(context.Background())
@@ -195,8 +193,17 @@ func TestMainServesWithConfigKeysAndCredentials(t *testing.T) {
 		t.Fatalf("sent %d, closed %v", l.echo.sent, l.echo.closed)
 	}
 
-	// The keys survive a restart, and only an extension replaces them.
-	l = launch(t, state, creds, args...)
+	// Keys and secrets survive a restart, and only an extension replaces the keys.
+	l = launch(t, state, args...)
+	if b, err := l.echo.env.Secret("token").Load(); string(b) != "s3cret" || err != nil {
+		t.Errorf("secret after restart = %q, %v", b, err)
+	}
+	if err := l.echo.env.Secret("token").Delete(); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := l.echo.env.Secret("token").Load(); b != nil || err != nil {
+		t.Errorf("deleted secret = %q, %v", b, err)
+	}
 	if h, err := l.client.Keys(context.Background()); err != nil || h.Length != len(log) {
 		t.Fatalf("keys after restart = %+v, %v", h, err)
 	}
@@ -217,13 +224,10 @@ func TestMainWithoutKeysRefusesWrites(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			l := launch(t, t.TempDir(), "", args...)
+			l := launch(t, t.TempDir(), args...)
 			_, err := l.client.Execute(context.Background(), approve(t, key))
 			if e, ok := errors.AsType[*Error](err); !ok || e.Status != http.StatusForbidden {
 				t.Fatalf("execute: %v", err)
-			}
-			if _, err := l.echo.env.Credential("token"); err == nil || !strings.Contains(err.Error(), "CREDENTIALS_DIRECTORY") {
-				t.Errorf("Credential without a credentials dir: %v", err)
 			}
 			if l.echo.sent != 0 {
 				t.Fatal("write ran without trusted keys")
@@ -301,7 +305,7 @@ func TestCheckConfigTouchesNothing(t *testing.T) {
 
 func TestFailExitsWithItsError(t *testing.T) {
 	t.Parallel()
-	l := launch(t, t.TempDir(), "")
+	l := launch(t, t.TempDir())
 	fault := errors.New("cannot persist state")
 	l.echo.env.Fail(fault)
 	if err := <-l.done; !errors.Is(err, fault) {

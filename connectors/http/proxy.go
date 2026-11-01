@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -35,45 +36,142 @@ const (
 type Proxy struct {
 	services map[string]*service
 	names    []string
-	// secrets are every token in each form an upstream might echo it.
-	secrets [][]byte
-	read    *http.Client
-	write   *http.Client
-	log     *slog.Logger
+	secret   func(name string) connector.Secret
+	read     *http.Client
+	write    *http.Client
+	log      *slog.Logger
+
+	// mu guards tokens and serializes Setup and Unlink.
+	mu     sync.Mutex
+	tokens *tokens
 }
 
-func New(cfg Config, credential func(name string) ([]byte, error), log *slog.Logger) (*Proxy, error) {
+// tokens are the tokens in use. Setup and Unlink replace them whole, so a
+// request keeps the set it started with.
+type tokens struct {
+	// values are prefix + token by service name.
+	values map[string]string
+	// secrets are every token in each form an upstream might echo it.
+	secrets [][]byte
+}
+
+var errNotLinked = &connector.Error{Status: http.StatusServiceUnavailable, Message: "http is not linked: set the API tokens in the console"}
+
+func New(cfg Config, secret func(name string) connector.Secret, log *slog.Logger) (*Proxy, error) {
 	p := &Proxy{
 		services: map[string]*service{},
+		secret:   secret,
 		read:     newClient(true),
 		// A fresh connection per write: the transport only retries requests
 		// on reused connections, and an approved write must never be resent.
 		write: newClient(false),
 		log:   log,
 	}
+	stored := map[string]string{}
 	for _, name := range slices.Sorted(maps.Keys(cfg.Services)) {
 		svc, err := compile(name, cfg.Services[name])
 		if err != nil {
 			return nil, err
 		}
-		raw, err := credential(name)
+		p.services[name] = svc
+		p.names = append(p.names, name)
+		raw, err := secret(name).Load()
 		if err != nil {
 			return nil, fmt.Errorf("service %s: %w", name, err)
+		}
+		if raw == nil {
+			continue
 		}
 		token, err := checkToken(string(raw))
 		if err != nil {
-			return nil, fmt.Errorf("service %s: %w", name, err)
+			return nil, fmt.Errorf("service %s: stored %w", name, err)
 		}
-		svc.value = svc.prefix + token
-		p.services[name] = svc
-		p.names = append(p.names, name)
+		stored[name] = token
+	}
+	p.use(stored)
+	return p, nil
+}
+
+// use switches to tokens by service name; the caller holds mu or owns p.
+func (p *Proxy) use(byName map[string]string) {
+	t := &tokens{values: map[string]string{}}
+	for _, name := range p.names {
+		token, ok := byName[name]
+		if !ok {
+			continue
+		}
+		t.values[name] = p.services[name].prefix + token
 		for _, form := range []string{token, url.QueryEscape(token), jsonEscape(token)} {
-			if !slices.ContainsFunc(p.secrets, func(b []byte) bool { return string(b) == form }) {
-				p.secrets = append(p.secrets, []byte(form))
+			if !slices.ContainsFunc(t.secrets, func(b []byte) bool { return string(b) == form }) {
+				t.secrets = append(t.secrets, []byte(form))
 			}
 		}
 	}
-	return p, nil
+	p.tokens = t
+}
+
+func (p *Proxy) current() *tokens {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.tokens
+}
+
+// linked is whether every service has a token; the caller holds mu.
+func (p *Proxy) linked() bool { return len(p.tokens.values) == len(p.services) }
+
+func (p *Proxy) Health(context.Context) connector.Health {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.linked() {
+		return connector.Health{State: connector.NeedsSetup, Detail: "set the API tokens in the console"}
+	}
+	return connector.Health{State: connector.Healthy}
+}
+
+// Setup takes a token for every service, checks them all, then stores them.
+func (p *Proxy) Setup(_ context.Context, args map[string]string) (connector.SetupStep, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.linked() {
+		return connector.SetupStep{}, &connector.Error{Status: http.StatusConflict, Message: "already linked"}
+	}
+	for k := range args {
+		if _, ok := p.services[k]; !ok {
+			return connector.SetupStep{}, connector.Invalid("unknown arg %q", k)
+		}
+	}
+	byName := map[string]string{}
+	for _, name := range p.names {
+		raw, ok := args[name]
+		if !ok {
+			return connector.SetupStep{}, connector.Invalid("service %s: token missing", name)
+		}
+		token, err := checkToken(raw)
+		if err != nil {
+			return connector.SetupStep{}, connector.Invalid("service %s: %v", name, err)
+		}
+		byName[name] = token
+	}
+	for _, name := range p.names {
+		if err := p.secret(name).Store([]byte(byName[name])); err != nil {
+			return connector.SetupStep{}, fmt.Errorf("service %s: %w", name, err)
+		}
+	}
+	p.use(byName)
+	return connector.SetupStep{Done: true}, nil
+}
+
+func (p *Proxy) Unlink(context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.use(nil)
+	var errs []error
+	for _, name := range p.names {
+		if err := p.secret(name).Delete(); err != nil {
+			errs = append(errs, fmt.Errorf("service %s: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func checkToken(token string) (string, error) {
@@ -110,14 +208,14 @@ func newClient(keepAlive bool) *http.Client {
 	}
 }
 
-func (p *Proxy) scrub(b []byte) []byte {
-	for _, s := range p.secrets {
+func (t *tokens) scrub(b []byte) []byte {
+	for _, s := range t.secrets {
 		b = bytes.ReplaceAll(b, s, []byte(redacted))
 	}
 	return b
 }
 
-func (p *Proxy) scrubString(s string) string { return string(p.scrub([]byte(s))) }
+func (t *tokens) scrubString(s string) string { return string(t.scrub([]byte(s))) }
 
 func (s *service) target(path string, segs []string, rawQuery string) string {
 	u := *s.base
@@ -143,6 +241,12 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, rest string) {
 		connector.WriteError(w, &connector.Error{Status: http.StatusNotFound, Message: fmt.Sprintf("unknown service %q", name)})
 		return
 	}
+	t := p.current()
+	value, ok := t.values[name]
+	if !ok {
+		connector.WriteError(w, errNotLinked)
+		return
+	}
 	canon, segs, err := normalize("/" + path)
 	if err != nil {
 		connector.WriteError(w, &connector.Error{Status: http.StatusBadRequest, Message: err.Error()})
@@ -164,12 +268,12 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, rest string) {
 			req.Header[h] = v
 		}
 	}
-	req.Header.Set(svc.header, svc.value)
+	req.Header.Set(svc.header, value)
 
 	log := p.log.With("service", svc.name, "method", r.Method, "path", canon)
 	resp, err := p.read.Do(req)
 	if err != nil {
-		msg := p.scrubString(err.Error())
+		msg := t.scrubString(err.Error())
 		log.Warn("forward failed", "err", msg)
 		connector.WriteError(w, &connector.Error{Status: http.StatusBadGateway, Message: msg})
 		return
@@ -183,20 +287,20 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, rest string) {
 	}
 	out, err := io.ReadAll(io.LimitReader(resp.Body, maxResponse+1))
 	if err != nil {
-		connector.WriteError(w, &connector.Error{Status: http.StatusBadGateway, Message: p.scrubString(err.Error())})
+		connector.WriteError(w, &connector.Error{Status: http.StatusBadGateway, Message: t.scrubString(err.Error())})
 		return
 	}
 	if len(out) > maxResponse {
 		connector.WriteError(w, &connector.Error{Status: http.StatusBadGateway, Message: fmt.Sprintf("upstream response exceeds %d bytes", maxResponse)})
 		return
 	}
-	out = p.scrub(out)
+	out = t.scrub(out)
 	for k, vs := range resp.Header {
 		if !passHeader(k) {
 			continue
 		}
 		for _, v := range vs {
-			w.Header().Add(k, p.scrubString(v))
+			w.Header().Add(k, t.scrubString(v))
 		}
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(out)))
@@ -208,7 +312,11 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, rest string) {
 const opRequest = "request"
 
 func (p *Proxy) Spec() connector.Spec {
-	return connector.Spec{Name: "http", Doc: p.doc(), Ops: []connector.Op{{
+	setup := make([]connector.Param, 0, len(p.names))
+	for _, name := range p.names {
+		setup = append(setup, connector.Param{Name: name, Doc: "token for " + p.services[name].base.Host, Required: true, Secret: true})
+	}
+	return connector.Spec{Name: "http", Doc: p.doc(), Setup: setup, Ops: []connector.Op{{
 		Name:    opRequest,
 		Kind:    connector.Write,
 		Summary: "Send an HTTP request to a configured API with its stored token",
@@ -250,6 +358,8 @@ type write struct {
 	path   string
 	segs   []string
 	body   string
+	tokens *tokens
+	value  string
 }
 
 func (p *Proxy) resolve(op string, args map[string]string) (write, error) {
@@ -265,6 +375,11 @@ func (p *Proxy) resolve(op string, args map[string]string) (write, error) {
 	if !ok {
 		return write{}, connector.Invalid("unknown service %q", args["service"])
 	}
+	t := p.current()
+	value, ok := t.values[svc.name]
+	if !ok {
+		return write{}, errNotLinked
+	}
 	method := strings.ToUpper(args["method"])
 	if !isToken(method) {
 		return write{}, connector.Invalid("invalid method %q", args["method"])
@@ -279,7 +394,7 @@ func (p *Proxy) resolve(op string, args map[string]string) (write, error) {
 			Message: fmt.Sprintf("%s %s is not an allowed write for %s", method, path, svc.name),
 		}
 	}
-	return write{svc: svc, method: method, path: path, segs: segs, body: args["body"]}, nil
+	return write{svc: svc, method: method, path: path, segs: segs, body: args["body"], tokens: t, value: value}, nil
 }
 
 func (p *Proxy) Prepare(_ context.Context, op string, args map[string]string) (connector.Prepared, error) {
@@ -332,7 +447,7 @@ func (p *Proxy) Execute(ctx context.Context, rec approval.Record) connector.Resu
 	}
 	req, err := http.NewRequestWithContext(ctx, w.method, w.svc.target(w.path, w.segs, ""), body)
 	if err != nil {
-		return connector.Result{Status: connector.Failed, Detail: p.scrubString(err.Error())}
+		return connector.Result{Status: connector.Failed, Detail: w.tokens.scrubString(err.Error())}
 	}
 	if w.body != "" {
 		ct := "text/plain; charset=utf-8"
@@ -341,7 +456,7 @@ func (p *Proxy) Execute(ctx context.Context, rec approval.Record) connector.Resu
 		}
 		req.Header.Set("Content-Type", ct)
 	}
-	req.Header.Set(w.svc.header, w.svc.value)
+	req.Header.Set(w.svc.header, w.value)
 
 	resp, err := p.write.Do(req)
 	if err != nil {
@@ -349,7 +464,7 @@ func (p *Proxy) Execute(ctx context.Context, rec approval.Record) connector.Resu
 		if connected.Load() {
 			status = connector.Unknown
 		}
-		msg := p.scrubString(err.Error())
+		msg := w.tokens.scrubString(err.Error())
 		log.Warn("write failed", "status", status, "err", msg)
 		return connector.Result{Status: status, Detail: msg}
 	}
@@ -368,8 +483,8 @@ func (p *Proxy) Execute(ctx context.Context, rec approval.Record) connector.Resu
 	return connector.Result{
 		Status: status,
 		Ref:    strconv.Itoa(resp.StatusCode),
-		Detail: p.scrubString(resp.Status),
-		Output: truncate(string(p.scrub(out)), maxOutput),
+		Detail: w.tokens.scrubString(resp.Status),
+		Output: truncate(string(w.tokens.scrub(out)), maxOutput),
 	}
 }
 

@@ -10,8 +10,8 @@ import (
 	"strings"
 )
 
-// Config is the connector's --config. Each service's token is the credential
-// of the same name.
+// Config is the connector's --config. Each service's token is set in the
+// console.
 type Config struct {
 	Services map[string]Service `json:"services"`
 }
@@ -76,15 +76,13 @@ type service struct {
 	base   *url.URL
 	header string
 	prefix string
-	// value is prefix + token.
-	value  string
 	reads  []pattern
 	writes []pattern
 	rules  Service
 }
 
 func compile(name string, s Service) (*service, error) {
-	// The name is also the token's credential file name.
+	// The name is also the file name the token is stored under.
 	if !serviceName.MatchString(name) {
 		return nil, fmt.Errorf("service name %q must match %s", name, serviceName)
 	}

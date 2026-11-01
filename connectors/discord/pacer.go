@@ -33,7 +33,8 @@ const (
 	dailyBudget  = 150 // upstream requests per rolling budgetWindow
 	budgetWindow = 24 * time.Hour
 
-	maxSlotWait = 90 * time.Second // longest a gateway call waits for a slot
+	maxSlotWait  = 90 * time.Second // longest a gateway call waits for a slot
+	linkSlotWait = 15 * time.Second // well inside the console's setup timeout
 
 	rateLimitWindow    = time.Hour
 	rateLimitTrips     = 3                 // 429s within rateLimitWindow that trigger a cooldown

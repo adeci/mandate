@@ -137,6 +137,7 @@ type harness struct {
 	srv       *httptest.Server
 	st        *store.Store
 	statePath string
+	token     connector.Secret
 	socket    string
 	hours     activeHours
 	logs      *syncBuffer
@@ -187,13 +188,20 @@ var (
 func newHarness(t *testing.T, seed func(*state)) *harness {
 	t.Helper()
 	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "private"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	h := &harness{
 		t:         t,
 		clock:     &fakeClock{now: noon},
-		statePath: filepath.Join(dir, "state.json"),
+		statePath: filepath.Join(dir, "private", "state.json"),
+		token:     (&connector.Env{StateDir: dir}).Secret("token"),
 		socket:    filepath.Join(dir, "s.sock"),
 		hours:     activeHours{start: 8, end: 24, loc: newYork},
 		logs:      &syncBuffer{},
+	}
+	if err := h.token.Store([]byte(testToken)); err != nil {
+		t.Fatal(err)
 	}
 	h.discord = &fakeDiscord{clock: h.clock, handlers: make(map[string]func(http.ResponseWriter, *http.Request, int))}
 	h.discord.reply(api("/users/@me"), 200, map[string]any{"id": selfUser, "username": "me"})
@@ -246,7 +254,7 @@ func (h *harness) start() {
 	cfg := config{
 		store:     h.st,
 		statePath: h.statePath,
-		token:     testToken,
+		token:     h.token,
 		timezone:  "America/New_York",
 		hours:     h.hours,
 		transport: &fhttp.Client{},
@@ -742,7 +750,6 @@ func TestOwnerStopConditions(t *testing.T) {
 		body   any
 		fix    string
 	}{
-		{"401", 401, map[string]any{"message": "401: Unauthorized", "code": 0}, fixToken},
 		{"captcha", 400, map[string]any{"captcha_key": []string{"captcha-required"}, "captcha_sitekey": "a9b5fb07", "captcha_service": "hcaptcha"}, fixVerify},
 		{"account verification", 403, map[string]any{"message": "You need to verify your account in order to perform this action.", "code": 40002}, fixVerify},
 		{"anti-abuse block", 403, map[string]any{"message": "Unknown Message", "code": 10008}, fixAccount},
@@ -776,6 +783,164 @@ func TestOwnerStopConditions(t *testing.T) {
 				t.Errorf("stop: %v", err)
 			}
 		})
+	}
+}
+
+func (h *harness) setup(token string) error {
+	h.t.Helper()
+	step, err := h.client.Setup(context.Background(), map[string]string{"token": token})
+	if err == nil && !step.Done {
+		h.t.Fatalf("setup step %+v, want done", step)
+	}
+	return err
+}
+
+func (h *harness) health() connector.Health {
+	h.t.Helper()
+	health, err := h.client.Health(context.Background())
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return health
+}
+
+func (h *harness) storedToken() string {
+	h.t.Helper()
+	b, err := h.token.Load()
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return string(b)
+}
+
+func errStatus(err error) int {
+	if e, ok := errors.AsType[*connector.Error](err); ok {
+		return e.Status
+	}
+	return 0
+}
+
+func TestLinkUnlinkRelink(t *testing.T) {
+	h := newHarness(t, nil)
+	if err := h.token.Delete(); err != nil {
+		t.Fatal(err)
+	}
+	h.start()
+	if got := h.health(); got.State != connector.NeedsSetup || got.Detail != fixLink {
+		t.Errorf("unlinked health = %+v", got)
+	}
+	if e := h.callErr("sync", map[string]string{}, http.StatusServiceUnavailable); !strings.Contains(e.Message, "console") {
+		t.Errorf("unlinked read: %q", e.Message)
+	}
+	if n := len(h.discord.all()); n != 0 {
+		t.Fatalf("%d requests while unlinked", n)
+	}
+
+	const fresh = "fresh-token.abc.def"
+	if err := h.setup(" " + fresh + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	me := h.discord.to(api("/users/@me"))
+	if len(me) != 1 || me[0].header.Get("Authorization") != fresh {
+		t.Fatalf("setup checked the token with %d requests", len(me))
+	}
+	if h.storedToken() != fresh || h.health().State != connector.Healthy {
+		t.Fatalf("after setup: health %+v", h.health())
+	}
+	if fi, err := os.Stat(filepath.Join(filepath.Dir(h.statePath), "token")); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("token file: %v %v", fi, err)
+	}
+	if err := h.setup("other-token.abc.def"); errStatus(err) != http.StatusConflict {
+		t.Fatalf("setup while linked: %v", err)
+	}
+	if h.storedToken() != fresh {
+		t.Fatal("a refused setup replaced the token")
+	}
+
+	h.restart()
+	h.callOK("sync", map[string]string{}, &connector.ReadResult{})
+	guilds := h.discord.to(api("/users/@me/guilds"))
+	if len(guilds) != 1 || guilds[0].header.Get("Authorization") != fresh {
+		t.Fatal("the stored token was not used after a restart")
+	}
+
+	if err := h.client.Unlink(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if h.storedToken() != "" || h.health().State != connector.NeedsSetup {
+		t.Fatalf("after unlink: health %+v", h.health())
+	}
+	before := len(h.discord.all())
+	h.callErr("sync", map[string]string{}, http.StatusServiceUnavailable)
+	if n := len(h.discord.all()) - before; n != 0 {
+		t.Fatalf("%d requests after unlink", n)
+	}
+	if row := h.queryRow(`SELECT count(*) FROM containers`); row[0] == int64(0) {
+		t.Error("unlink dropped stored data")
+	}
+	if err := h.setup(fresh); err != nil {
+		t.Fatalf("relink: %v", err)
+	}
+	if h.health().State != connector.Healthy {
+		t.Fatalf("after relink: health %+v", h.health())
+	}
+}
+
+func TestSetupRefusesBadToken(t *testing.T) {
+	h := newHarness(t, nil)
+	if err := h.token.Delete(); err != nil {
+		t.Fatal(err)
+	}
+	h.discord.reply(api("/users/@me"), 401, map[string]any{"message": "401: Unauthorized", "code": 0})
+	h.start()
+	if err := h.setup("Bot abc.def"); errStatus(err) != http.StatusBadRequest {
+		t.Fatalf("setup with a bot token: %v", err)
+	}
+	if n := len(h.discord.all()); n != 0 {
+		t.Fatal("a malformed token reached Discord")
+	}
+	err := h.setup("bad-token.abc.def")
+	if e, ok := errors.AsType[*connector.Error](err); !ok || !strings.Contains(e.Message, "401") {
+		t.Fatalf("setup with a rejected token: %v", err)
+	}
+	if h.storedToken() != "" || h.health().State != connector.NeedsSetup {
+		t.Fatalf("a rejected token was kept: health %+v", h.health())
+	}
+	h.discord.reply(api("/users/@me"), 200, map[string]any{"id": selfUser, "username": "me"})
+	if err := h.setup("good-token.abc.def"); err != nil {
+		t.Fatalf("setup after a rejected token: %v", err)
+	}
+}
+
+// A token Discord later rejects is discarded, and nothing reaches Discord
+// until the owner pastes a new one.
+func TestRejectedTokenIsDiscarded(t *testing.T) {
+	path := api("/channels/" + dmID + "/messages")
+	h := newHarness(t, nil)
+	h.discord.reply(path, 401, map[string]any{"message": "401: Unauthorized", "code": 0})
+	h.start()
+	e := h.callErr("fetch", map[string]string{"channel_id": dmID}, http.StatusServiceUnavailable)
+	if !strings.HasSuffix(e.Message, fixToken) {
+		t.Errorf("refusal %q does not say what to do", e.Message)
+	}
+	if got := h.health(); got.State != connector.NeedsSetup || got.Detail != e.Message {
+		t.Errorf("health = %+v", got)
+	}
+	if h.storedToken() != "" {
+		t.Error("the rejected token is still stored")
+	}
+	before := len(h.discord.all())
+	if again := h.callErr("sync", map[string]string{}, http.StatusServiceUnavailable); !strings.Contains(again.Message, "console") {
+		t.Errorf("later refusal %q", again.Message)
+	}
+	if n := len(h.discord.all()) - before; n != 0 {
+		t.Errorf("%d requests after the token was rejected", n)
+	}
+	if err := h.setup("new-token.abc.def"); err != nil {
+		t.Fatalf("setup after rejection: %v", err)
+	}
+	if got := h.health(); got.State != connector.Healthy {
+		t.Errorf("health after relink = %+v", got)
 	}
 }
 

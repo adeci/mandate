@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Recompute nix/vendor-hashes.json after any go.mod/go.sum change.
+# Recompute nix/vendor-hashes.json after any go.mod/go.sum change, and after
+# changing the root module's packages, which the connectors vendor.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 file=nix/vendor-hashes.json

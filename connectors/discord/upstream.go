@@ -33,10 +33,13 @@ type transport interface {
 }
 
 const (
-	fixToken   = "put a fresh user token in the token file, then restart mandate-discord"
+	fixLink    = "paste a Discord token in the console"
+	fixToken   = "paste a new token in the console"
 	fixVerify  = "log in to Discord in a browser and complete verification, then restart mandate-discord"
 	fixAccount = "log in to Discord in a browser and resolve what it shows, then restart mandate-discord"
 )
+
+var errNotLinked = &ownerStop{"not linked", fixLink}
 
 // ownerCodes are JSON error codes that mean the account needs manual action
 // (https://docs.discord.food/topics/errors and the datamined code list).
@@ -51,8 +54,9 @@ var ownerCodes = map[int]ownerStop{
 	70007: {"phone verification required", fixVerify},
 }
 
-// ownerStop is a condition only the owner can clear. Every later read is
-// refused until the service restarts, so nothing probes the account meanwhile.
+// ownerStop is a condition only the owner can clear. A rejected token is
+// discarded; any other stop refuses every later read until the service
+// restarts or is unlinked, so nothing probes the account meanwhile.
 type ownerStop struct {
 	reason string
 	action string // what the owner must do
@@ -161,7 +165,7 @@ func (u *upstream) get(ctx context.Context, dl time.Time, r route, out any) erro
 		now := u.clock.Now()
 		if stop := ownerProblem(resp.StatusCode, body); stop != nil {
 			u.fatal = stop
-			u.log.Error("discord account needs manual action; refusing reads until restarted",
+			u.log.Error("discord account needs manual action",
 				"reason", stop.reason, "status", resp.StatusCode, "route", r.template)
 			return stop
 		}

@@ -51,6 +51,8 @@ type fakeClient struct {
 	qrs         []chan whatsmeow.QRChannelItem
 	phones      []string
 	disconnects int
+	logouts     int
+	logoutErr   error
 }
 
 func (f *fakeClient) IsConnected() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.connected }
@@ -95,6 +97,13 @@ func (f *fakeClient) Disconnect() {
 	defer f.mu.Unlock()
 	f.connected = false
 	f.disconnects++
+}
+
+func (f *fakeClient) Logout(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.logouts++
+	return f.logoutErr
 }
 
 func (f *fakeClient) calls() []sent {

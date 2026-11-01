@@ -14,6 +14,6 @@ import (
 
 func main() {
 	connector.Main(func(_ context.Context, env *connector.Env, cfg Config) (connector.Connector, error) {
-		return New(cfg, env.Credential, env.Log)
+		return New(cfg, env.Secret, env.Log)
 	})
 }
