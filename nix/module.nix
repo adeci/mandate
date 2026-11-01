@@ -143,6 +143,10 @@ let
           cfg.hostname
           "--origin"
           origin
+          "--console-user"
+          "mandate-console"
+          "--gateway-user"
+          "mandate-gateway"
         ];
         RestartSec = "30s";
       }

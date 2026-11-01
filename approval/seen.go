@@ -14,17 +14,20 @@ import (
 
 var ErrReplay = errors.New("approval was already used")
 
-// Seen records used nonces on disk so an approval runs at most once, across
-// restarts too. A nonce is recorded before execution starts.
+// Seen records used nonces and request IDs on disk so an approval, and the
+// request it approves, runs at most once, across restarts too. Both are
+// recorded before execution starts.
 type Seen struct {
 	path string
 	now  func() time.Time
 
-	mu   sync.Mutex
+	mu sync.Mutex
+	// used holds hex nonces and "id:"-prefixed request IDs, each until it
+	// could no longer verify anyway.
 	used map[string]time.Time
 }
 
-// OpenSeen loads the nonce log at path, creating it on first use.
+// OpenSeen loads the log at path, creating it on first use.
 func OpenSeen(path string) (*Seen, error) {
 	s := &Seen{path: path, now: time.Now, used: map[string]time.Time{}}
 	b, err := os.ReadFile(path)
@@ -40,9 +43,9 @@ func OpenSeen(path string) (*Seen, error) {
 	return s, nil
 }
 
-// Use marks nonce as spent until the approval it belongs to could no longer
-// verify anyway. It fails if the nonce was already spent.
-func (s *Seen) Use(nonce []byte, issuedAt time.Time) error {
+// Use spends a's nonce and the ID of rec, the record a approves. It fails
+// if either was spent already, so a request approved twice runs once.
+func (s *Seen) Use(a Approval, rec Record) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -52,13 +55,18 @@ func (s *Seen) Use(nonce []byte, issuedAt time.Time) error {
 			delete(s.used, k)
 		}
 	}
-	key := hex.EncodeToString(nonce)
-	if _, ok := s.used[key]; ok {
+	nonce, id := hex.EncodeToString(a.Nonce), "id:"+rec.ID
+	if _, ok := s.used[nonce]; ok {
 		return ErrReplay
 	}
-	s.used[key] = issuedAt.Add(MaxAge + skew)
+	if _, ok := s.used[id]; ok {
+		return fmt.Errorf("%w: request %s already ran", ErrReplay, rec.ID)
+	}
+	s.used[nonce] = a.IssuedAt.Add(MaxAge + skew)
+	s.used[id] = rec.ExpiresAt.Add(skew)
 	if err := s.save(); err != nil {
-		delete(s.used, key)
+		delete(s.used, nonce)
+		delete(s.used, id)
 		return err
 	}
 	return nil

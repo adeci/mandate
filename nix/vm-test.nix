@@ -139,8 +139,12 @@ pkgs.testers.runNixOSTest {
         return curl(f"-X {method} -b {jar} -c {jar} --cacert /var/lib/acme/${host}/chain.pem "
                     f"--resolve ${host}:443:127.0.0.1 https://${host}{path}", body)
 
+    # Run as the gateway, which may read a connector's health and key head.
+    def connector_get(name, path):
+        return f"sudo -u mandate-gateway curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/{path}"
+
     def connector_keys(name):
-        return json.loads(machine.succeed(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/keys"))
+        return json.loads(machine.succeed(connector_get(name, "keys")))
 
     def recorded():
         lines = machine.succeed("cat /var/lib/recorder/log.jsonl 2>/dev/null || true").splitlines()
@@ -202,10 +206,10 @@ pkgs.testers.runNixOSTest {
     with subtest("unlinked WhatsApp, Discord, Signal, Matrix, Fastmail and Google Messages ask for the owner"):
         code, out = gw("POST", "/v1/whatsapp/send", {"args": {"chat": "fam@g.us", "text": "hi"}})
         assert code == 503 and "https://${host}/connections" in out["error"], (code, out)
-        health = json.loads(machine.succeed("curl -s --unix-socket /run/mandate-discord/connector.sock http://connector/health"))
+        health = json.loads(machine.succeed(connector_get("discord", "health")))
         assert health == {"state": "setup", "detail": "needs a token"}, health
         for name in ["signal", "matrix", "fastmail", "gmessages"]:
-            health = json.loads(machine.succeed(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/health"))
+            health = json.loads(machine.succeed(connector_get(name, "health")))
             assert health == {"state": "setup", "detail": "not linked"}, (name, health)
 
     with subtest("the owner sets the API token in the console, which never shows it"):
@@ -264,25 +268,24 @@ pkgs.testers.runNixOSTest {
         code, out = console("POST", "/keys", registration(options))
         assert code == 200 and out["trusted"], (code, out)
         for name in ["whatsapp", "discord", "http"]:
-            machine.wait_until_succeeds(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/keys | grep -q '\"length\":1'")
+            machine.wait_until_succeeds(connector_get(name, "keys") + " | grep -q '\"length\":1'")
 
     with subtest("the gateway can reach a connector but cannot make it act or change its keys"):
         forged = {"record": base64.b64encode(b"{}").decode(), "nonce": base64.b64encode(b"0123456789abcdef").decode(),
                   "issued_at": "2026-10-31T00:00:00Z",
                   "assertion": {"id": "eA", "rawId": "eA", "type": "public-key", "response": {}}}
         data = base64.b64encode(json.dumps(forged).encode()).decode()
-        code = machine.succeed(
-            f"echo {data} | base64 -d | sudo -u mandate-gateway curl -s -o /dev/null -w '%{{http_code}}' "
-            "--unix-socket /run/mandate-http/connector.sock --data-binary @- http://connector/execute"
-        )
-        assert code == "403", code
-        code = machine.succeed(
-            "echo '[]' | sudo -u mandate-gateway curl -s -o /dev/null -w '%{http_code}' -X PUT "
-            "--unix-socket /run/mandate-http/connector.sock --data-binary @- http://connector/keys"
-        )
-        assert code == "409", code
+        for method, path, body in [("POST", "execute", data), ("PUT", "keys", base64.b64encode(b"[]").decode()),
+                                   ("POST", "setup", base64.b64encode(b"{}").decode()), ("POST", "unlink", "")]:
+            code = machine.succeed(
+                f"echo {body} | base64 -d | sudo -u mandate-gateway curl -s -o /dev/null -w '%{{http_code}}' -X {method} "
+                f"--unix-socket /run/mandate-http/connector.sock --data-binary @- http://connector/{path}"
+            )
+            assert code == "403", (path, code)
         assert connector_keys("http")["length"] == 1
         assert len(recorded()) == 1
+        code = machine.succeed("sudo -u mandate-gateway curl -s -o /dev/null -w '%{http_code}' --unix-socket /run/mandate-http/connector.sock http://connector/health")
+        assert code == "200", code
 
     with subtest("the owner edits and approves with the key; the API gets exactly that, once"):
         code, ch = console("POST", f"/r/{pid}/challenge", {"edits": {"body": "{\"text\": \"edited\"}"}})
@@ -304,7 +307,7 @@ pkgs.testers.runNixOSTest {
         assert code == 409, code
         machine.succeed("systemctl restart mandate-gateway.service mandate-console.service mandate-http.service")
         machine.wait_for_open_port(443)
-        machine.wait_until_succeeds("curl -s --unix-socket /run/mandate-http/connector.sock http://connector/keys | grep -q '\"length\":1'")
+        machine.wait_until_succeeds(connector_get("http", "keys") + " | grep -q '\"length\":1'")
         code, _ = console("POST", f"/r/{pid}/approve", approved)
         assert code == 409, code
         assert len(recorded()) == 2
@@ -414,7 +417,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed("mandate-reset-keys")
         machine.wait_for_open_port(443)
         for name in ["whatsapp", "discord", "http"]:
-            machine.wait_until_succeeds(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/keys | grep -q '\"length\":0'")
+            machine.wait_until_succeeds(connector_get(name, "keys") + " | grep -q '\"length\":0'")
 
     with subtest("outsider cannot reach the gateway or the console"):
         machine.succeed("curl -sf http://127.0.0.1:8780/healthz")

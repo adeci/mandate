@@ -259,6 +259,7 @@ func TestMainStartupErrors(t *testing.T) {
 		"broken key log": {[]string{"--socket", sock, "--state", broken, "--rp-id", testRPID, "--origin", testOrigin}, "open key log"},
 		"invalid config": {append(base, "--config", writeFile(t, "c.json", `{"greeting":"bad"}`)), "greeting must not be bad"},
 		"missing config": {append(base, "--config", filepath.Join(state, "nope.json")), "read config"},
+		"unknown user":   {append(base, "--console-user", "mandate-no-such-user"), "--console-user"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

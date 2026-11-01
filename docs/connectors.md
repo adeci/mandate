@@ -20,7 +20,13 @@ its spec.
 signature over the exact record against the connector's own key list (or,
 in an unlock window, the passkey's delegation to a session key and that key's
 signature over the record), re-runs `Prepare` and refuses if anything
-changed, spends the nonce, and only then calls your `Execute`.
+changed, spends the nonce and the request's ID, and only then calls your
+`Execute`. A request approved twice runs once.
+
+The gateway and the console both reach the socket. `Main` checks the
+caller's uid on every request: `/setup`, `/unlink`, `/execute` and
+`PUT /keys` answer only the console's user, and the gateway's user gets the
+rest.
 
 ## A webhook connector
 
@@ -192,7 +198,8 @@ the console on the next deploy, and asks for its token on the Connections page.
 The module starts it as
 
 ```
-mandate-webhook --socket PATH --state DIR --config FILE --rp-id HOST --origin URL
+mandate-webhook --socket PATH --state DIR --config FILE --rp-id HOST --origin URL \
+  --console-user mandate-console --gateway-user mandate-gateway
 ```
 
 and checks the settings at build time with `mandate-webhook --check-config

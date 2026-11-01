@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -72,9 +73,10 @@ type harness struct {
 	fake   *fake
 	client *connector.Client
 	key    *approvaltest.Authenticator
+	keys   *approval.Keys
 }
 
-func start(t *testing.T) *harness {
+func start(t *testing.T, peers *connector.Peers) *harness {
 	t.Helper()
 	dir := t.TempDir()
 	key := approvaltest.New(t, rpID, origin)
@@ -83,10 +85,12 @@ func start(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	f := &fake{contacts: map[string]string{"Farid": "id-farid", "Mallory": "id-mallory"}}
+	keys := approvaltest.Keys(t, key)
 	srv := &connector.Server{
 		Connector: f,
-		Keys:      approvaltest.Keys(t, key),
+		Keys:      keys,
 		Seen:      seen,
+		Peers:     peers,
 		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	sock := filepath.Join(dir, "c.sock")
@@ -96,14 +100,15 @@ func start(t *testing.T) *harness {
 	t.Cleanup(func() { cancel(); <-done })
 	c := connector.Dial(sock, 5*time.Second)
 	for i := 0; ; i++ {
-		if _, err := c.Spec(context.Background()); err == nil {
+		// Any answer, a refusal too, means it serves.
+		if _, err := c.Spec(context.Background()); err == nil || status(err) != 0 {
 			break
 		} else if i == 100 {
 			t.Fatal(err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return &harness{fake: f, client: c, key: key}
+	return &harness{fake: f, client: c, key: key, keys: keys}
 }
 
 // approved prepares args and signs the resulting record, as the console does.
@@ -137,7 +142,7 @@ func status(err error) int {
 
 func TestExecuteRunsApprovedWriteExactlyOnce(t *testing.T) {
 	t.Parallel()
-	h := start(t)
+	h := start(t, nil)
 	a := h.approved(t, nil)
 	res, err := h.client.Execute(context.Background(), a)
 	if err != nil || res.Status != connector.Done {
@@ -146,14 +151,58 @@ func TestExecuteRunsApprovedWriteExactlyOnce(t *testing.T) {
 	if _, err := h.client.Execute(context.Background(), a); status(err) != http.StatusConflict {
 		t.Fatalf("replay: %v", err)
 	}
+	if _, err := h.client.Execute(context.Background(), h.approved(t, nil)); status(err) != http.StatusConflict {
+		t.Fatalf("second approval of the same request: %v", err)
+	}
 	if n := h.fake.sent.Load(); n != 1 {
 		t.Fatalf("sent %d times", n)
 	}
 }
 
+func TestControlRoutesOnlyFromConsole(t *testing.T) {
+	t.Parallel()
+	self := uint32(os.Getuid())
+	ctx := context.Background()
+
+	// The test is the gateway here: it reads and prepares, nothing more.
+	h := start(t, &connector.Peers{Console: self + 1, Gateway: self})
+	if _, err := h.client.Prepare(ctx, "send", map[string]string{"to": "Farid", "text": "hi"}); err != nil {
+		t.Fatalf("gateway prepare: %v", err)
+	}
+	if _, err := h.client.Keys(ctx); err != nil {
+		t.Fatalf("gateway keys: %v", err)
+	}
+	for name, call := range map[string]func() error{
+		"execute":  func() error { _, err := h.client.Execute(ctx, h.approved(t, nil)); return err },
+		"setup":    func() error { _, err := h.client.Setup(ctx, nil); return err },
+		"unlink":   func() error { return h.client.Unlink(ctx) },
+		"put keys": func() error { _, err := h.client.PutKeys(ctx, h.keys.Log()); return err },
+	} {
+		if err := call(); status(err) != http.StatusForbidden || !strings.Contains(err.Error(), "may not use") {
+			t.Errorf("gateway %s: %v", name, err)
+		}
+	}
+	if n := h.fake.sent.Load(); n != 0 {
+		t.Fatalf("the gateway sent %d messages", n)
+	}
+
+	h = start(t, &connector.Peers{Console: self, Gateway: self + 1})
+	if _, err := h.client.PutKeys(ctx, h.keys.Log()); err != nil {
+		t.Fatalf("console put keys: %v", err)
+	}
+	if res, err := h.client.Execute(ctx, h.approved(t, nil)); err != nil || res.Status != connector.Done {
+		t.Fatalf("console execute: %+v %v", res, err)
+	}
+
+	h = start(t, &connector.Peers{Console: self + 1, Gateway: self + 2})
+	if _, err := h.client.Prepare(ctx, "send", map[string]string{"to": "Farid", "text": "hi"}); status(err) != http.StatusForbidden {
+		t.Fatalf("stranger prepare: %v", err)
+	}
+}
+
 func TestExecuteRunsSessionKeyApprovalOnce(t *testing.T) {
 	t.Parallel()
-	h := start(t)
+	h := start(t, nil)
 	rec := h.approved(t, nil).Record
 	a := h.key.Unlock(time.Now().Add(approval.UnlockWindow), nil).Approve(rec, time.Now())
 	res, err := h.client.Execute(context.Background(), a)
@@ -174,7 +223,7 @@ func TestExecuteRunsSessionKeyApprovalOnce(t *testing.T) {
 
 func TestExecuteRefusesWithoutRunning(t *testing.T) {
 	t.Parallel()
-	h := start(t)
+	h := start(t, nil)
 	other := approvaltest.New(t, rpID, origin)
 
 	for name, tc := range map[string]struct {
@@ -203,7 +252,7 @@ func TestExecuteRefusesWithoutRunning(t *testing.T) {
 
 func TestPrepareAndReadRelayErrors(t *testing.T) {
 	t.Parallel()
-	h := start(t)
+	h := start(t, nil)
 	_, err := h.client.Prepare(context.Background(), "send", map[string]string{"to": "Nobody"})
 	if status(err) != http.StatusBadRequest || !strings.Contains(err.Error(), `no contact "Nobody"`) {
 		t.Fatalf("prepare unknown contact: %v", err)

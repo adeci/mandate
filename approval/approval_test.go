@@ -124,19 +124,28 @@ func TestSeenRejectsReplayAcrossRestarts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	nonce := []byte("0123456789abcdef")
-	if err := s.Use(nonce, time.Now()); err != nil {
+	p1 := approval.Record{ID: "p1", ExpiresAt: time.Now().Add(time.Hour)}
+	use := func(s *approval.Seen, nonce string, rec approval.Record) error {
+		return s.Use(approval.Approval{Nonce: []byte(nonce), IssuedAt: time.Now()}, rec)
+	}
+	if err := use(s, "nonce-0123456789", p1); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Use(nonce, time.Now()); !errors.Is(err, approval.ErrReplay) {
-		t.Fatalf("second use: %v", err)
+	if err := use(s, "nonce-0123456789", approval.Record{ID: "p2", ExpiresAt: p1.ExpiresAt}); !errors.Is(err, approval.ErrReplay) {
+		t.Fatalf("second use of a nonce: %v", err)
 	}
 	reopened, err := approval.OpenSeen(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reopened.Use(nonce, time.Now()); !errors.Is(err, approval.ErrReplay) {
+	if err := use(reopened, "nonce-0123456789", p1); !errors.Is(err, approval.ErrReplay) {
 		t.Fatalf("use after restart: %v", err)
+	}
+	if err := use(reopened, "nonce-abcdefghij", p1); !errors.Is(err, approval.ErrReplay) {
+		t.Fatalf("second approval of one request: %v", err)
+	}
+	if err := use(reopened, "nonce-abcdefghij", approval.Record{ID: "p2", ExpiresAt: p1.ExpiresAt}); err != nil {
+		t.Fatalf("a refused use spent its nonce: %v", err)
 	}
 }
 

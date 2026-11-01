@@ -12,6 +12,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/adeci/mandate/approval"
@@ -25,33 +26,39 @@ type Server struct {
 	Connector Connector
 	Keys      *approval.Keys
 	Seen      *approval.Seen
-	Log       *slog.Logger
+	// Peers limits who may call; nil lets anyone who can open the socket
+	// call every route.
+	Peers *Peers
+	Log   *slog.Logger
+}
+
+// Peers names the uids that may call a Server over its socket. The console
+// may call every route; the gateway, which agents talk to, everything but
+// setup, unlink, execute and replacing the keys.
+type Peers struct {
+	Console, Gateway uint32
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /spec", s.spec)
-	mux.HandleFunc("GET /health", s.health)
-	mux.HandleFunc("POST /setup", s.setup)
-	mux.HandleFunc("POST /unlink", s.unlink)
-	mux.HandleFunc("POST /read", s.read)
-	mux.HandleFunc("POST /prepare", s.prepare)
-	mux.HandleFunc("POST /execute", s.execute)
-	mux.HandleFunc("GET /keys", s.keysHead)
-	mux.HandleFunc("PUT /keys", s.putKeys)
+	mux.HandleFunc("GET /spec", s.allow(false, s.spec))
+	mux.HandleFunc("GET /health", s.allow(false, s.health))
+	mux.HandleFunc("POST /setup", s.allow(true, s.setup))
+	mux.HandleFunc("POST /unlink", s.allow(true, s.unlink))
+	mux.HandleFunc("POST /read", s.allow(false, s.read))
+	mux.HandleFunc("POST /prepare", s.allow(false, s.prepare))
+	mux.HandleFunc("POST /execute", s.allow(true, s.execute))
+	mux.HandleFunc("GET /keys", s.allow(false, s.keysHead))
+	mux.HandleFunc("PUT /keys", s.allow(true, s.putKeys))
 	f, ok := s.Connector.(Forwarder)
 	if !ok {
 		return mux
 	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	forward := s.allow(false, func(w http.ResponseWriter, r *http.Request) {
 		// Route on the raw request target: ServeMux would clean "..", "//"
 		// and redirect instead of refusing, and the decoded URL loses %2F.
 		raw, _, _ := strings.Cut(r.RequestURI, "?")
-		rest, ok := strings.CutPrefix(raw, "/forward/")
-		if !ok {
-			mux.ServeHTTP(w, r)
-			return
-		}
+		rest, _ := strings.CutPrefix(raw, "/forward/")
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
 			WriteError(w, &Error{Status: http.StatusMethodNotAllowed, Message: "raw reads are GET or HEAD"})
@@ -59,19 +66,79 @@ func (s *Server) Handler() http.Handler {
 		}
 		f.Forward(w, r, rest)
 	})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.RequestURI, "/forward/") {
+			forward(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+// allow lets the console call h, and the gateway too unless h is a control
+// route.
+func (s *Server) allow(control bool, h http.HandlerFunc) http.HandlerFunc {
+	if s.Peers == nil {
+		return h
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid, ok := r.Context().Value(peerKey{}).(uint32)
+		if !ok || uid != s.Peers.Console && (control || uid != s.Peers.Gateway) {
+			s.Log.Warn("caller refused", "uid", uid, "known", ok, "method", r.Method, "path", r.URL.Path)
+			WriteError(w, &Error{Status: http.StatusForbidden, Message: "this caller may not use " + r.Method + " " + r.URL.Path})
+			return
+		}
+		h(w, r)
+	}
+}
+
+type peerKey struct{}
+
+// peerUID is the uid of the process at the other end of a Unix socket, as
+// the kernel recorded it at connect.
+func peerUID(c net.Conn) (uint32, error) {
+	uc, ok := c.(*net.UnixConn)
+	if !ok {
+		return 0, fmt.Errorf("%T is not a Unix socket", c)
+	}
+	raw, err := uc.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var cred *syscall.Ucred
+	var credErr error
+	if err := raw.Control(func(fd uintptr) {
+		cred, credErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
+	}); err != nil {
+		return 0, err
+	}
+	if credErr != nil {
+		return 0, credErr
+	}
+	return cred.Uid, nil
 }
 
 func (s *Server) Serve(ctx context.Context, path string) error {
 	return ServeUnix(ctx, path, s.Handler())
 }
 
-// ServeUnix serves h on a Unix socket at path until ctx is done.
+// ServeUnix serves h on a Unix socket at path until ctx is done. Requests
+// carry the caller's uid for Server's Peers.
 func ServeUnix(ctx context.Context, path string, h http.Handler) error {
 	ln, err := ListenUnix(path)
 	if err != nil {
 		return err
 	}
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if uid, err := peerUID(c); err == nil {
+				return context.WithValue(ctx, peerKey{}, uid)
+			}
+			return ctx
+		},
+	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	select {
@@ -231,7 +298,7 @@ func (s *Server) execute(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, &Error{Status: http.StatusConflict, Message: "approved record no longer matches what would run; propose again"})
 		return
 	}
-	if err := s.Seen.Use(a.Nonce, a.IssuedAt); err != nil {
+	if err := s.Seen.Use(a, rec); err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, approval.ErrReplay) {
 			status = http.StatusConflict
