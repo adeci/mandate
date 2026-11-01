@@ -537,7 +537,6 @@ func TestGatewayStoresLiveMessages(t *testing.T) {
 		"id": groupID, "type": channelGroupDM, "last_message_id": msg3,
 		"recipients": []map[string]any{{"id": aliceUser, "username": "alice"}, {"id": "1000000000000000003", "username": "bob"}},
 	})
-	c.dispatch("CHANNEL_CREATE", map[string]any{"id": otherChan, "type": 0, "guild_id": guildID, "name": "skipped"})
 	eventually(t, "group stored", func() bool {
 		var n int
 		_ = h.st.DB().QueryRowContext(ctx, `SELECT count(*) FROM containers WHERE id = ?`, groupID).Scan(&n)
@@ -552,9 +551,6 @@ func TestGatewayStoresLiveMessages(t *testing.T) {
 	if row := h.queryRow(`SELECT kind, name FROM containers WHERE id = ?`, groupID); row[0] != kindGroup || row[1] != "alice, bob" {
 		t.Errorf("group %v", row)
 	}
-	if row := h.queryRow(`SELECT count(*) FROM containers WHERE id = ?`, otherChan); row[0] != int64(0) {
-		t.Error("guild channel created from CHANNEL_CREATE")
-	}
 	if n := len(h.discord.all()); n != 0 {
 		t.Errorf("%d REST requests", n)
 	}
@@ -563,6 +559,79 @@ func TestGatewayStoresLiveMessages(t *testing.T) {
 func snowflakeTimeString(id string) string {
 	at, _ := snowflakeTime(id)
 	return at.UTC().Format("2006-01-02T15:04:05.000Z")
+}
+
+// READY carries every guild with its channels; storing them names and dates
+// the chats live messages land in, with no sync.
+func TestGatewayReadyNamesGuildChats(t *testing.T) {
+	const (
+		category  = "1100000000000000010"
+		newGuild  = "1200000000000000001"
+		newChan   = "1200000000000000002"
+		newThread = "1200000000000000003"
+	)
+	h := newHarness(t, nil)
+	ready := h.gw.ready
+	h.gw.ready = func() map[string]any {
+		r := ready()
+		r["guilds"] = []map[string]any{{
+			"id": guildID, "data_mode": "full", "properties": map[string]any{"id": guildID, "name": "Club"},
+			"channels": []map[string]any{
+				{"id": category, "type": 4, "name": "Text"},
+				{"id": chanGeneral, "type": 0, "name": "general", "parent_id": category, "last_message_id": msg3},
+			},
+			"threads": []map[string]any{{"id": threadID, "type": 11, "guild_id": guildID, "parent_id": chanGeneral, "name": "rig thread"}},
+		}}
+		return r
+	}
+	h.start()
+	c := h.gw.conn(t)
+	c.ops(t, 5)
+	ctx := context.Background()
+	stored := func(id string) bool {
+		var n int
+		_ = h.st.DB().QueryRowContext(ctx, `SELECT count(*) FROM containers WHERE id = ?`, id).Scan(&n)
+		return n == 1
+	}
+	eventually(t, "READY guilds stored", func() bool { return stored(threadID) })
+	chat := func(id string) []any {
+		return h.queryRow(`SELECT c.kind, COALESCE(p.name, '') || ' / ' || c.name, c.last_message_at
+FROM containers AS c LEFT JOIN containers AS p ON p.id = c.parent_id WHERE c.id = ?`, id)
+	}
+	if row := chat(chanGeneral); row[0] != kindChannel || row[1] != "Club / #general" || row[2] != snowflakeTimeString(msg3) {
+		t.Errorf("channel %v", row)
+	}
+	if row := chat(threadID); row[0] != kindThread || row[1] != "Club / rig thread" {
+		t.Errorf("thread %v", row)
+	}
+	if stored(category) {
+		t.Error("category stored")
+	}
+
+	c.dispatch("MESSAGE_CREATE", map[string]any{
+		"id": msg4, "channel_id": chanGeneral, "guild_id": guildID, "channel_type": 0, "type": 0, "content": "hi",
+		"timestamp": "2026-10-29T16:00:00.000000+00:00", "author": map[string]any{"id": aliceUser, "username": "alice"},
+	})
+	// Guilds and channels that appear later arrive as events.
+	c.dispatch("GUILD_CREATE", map[string]any{
+		"id": newGuild, "properties": map[string]any{"name": "Other"},
+		"channels": []map[string]any{{"id": newChan, "type": 0, "name": "lobby"}},
+	})
+	c.dispatch("THREAD_CREATE", map[string]any{"id": newThread, "type": 11, "guild_id": newGuild, "parent_id": newChan, "name": "plans"})
+	c.dispatch("CHANNEL_UPDATE", map[string]any{"id": chanGeneral, "type": 0, "guild_id": guildID, "name": "general-chat"})
+	eventually(t, "events stored", func() bool { return stored(newThread) })
+	if row := chat(chanGeneral); row[1] != "Club / #general-chat" || row[2] != snowflakeTimeString(msg4) {
+		t.Errorf("channel after a message and a rename %v", row)
+	}
+	if row := chat(newChan); row[1] != "Other / #lobby" {
+		t.Errorf("new guild channel %v", row)
+	}
+	if row := chat(newThread); row[1] != "Other / plans" {
+		t.Errorf("new thread %v", row)
+	}
+	if n := len(h.discord.all()); n != 0 {
+		t.Errorf("%d REST requests", n)
+	}
 }
 
 func TestGatewayOpensDMBeforeFetching(t *testing.T) {

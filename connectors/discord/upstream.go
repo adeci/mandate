@@ -455,12 +455,12 @@ func (u *upstream) openApp(ctx context.Context, dl time.Time) error {
 		return u.fatal
 	}
 	u.st.BuildCheckedAt = u.clock.Now()
+	u.relaunched = true // the tab reloaded, whatever the page held
 	if err != nil || resp.StatusCode != fhttp.StatusOK {
 		u.log.Warn("loading the app page failed; keeping the last build number", "status", statusOf(resp), "err", err, "build_number", u.st.buildNumber())
 		return u.saveState()
 	}
 	u.st.newLaunch()
-	u.relaunched = true
 	found, ok := extractBuildNumber(buildNumberHTMLRe, html)
 	if js, jsOK := webJSPath(html); jsOK {
 		script := route{template: scriptTemplate, path: js, referer: u.webBase + appPath, follow: true}
