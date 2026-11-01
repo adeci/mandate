@@ -397,11 +397,11 @@ func tone(status any) string {
 	switch fmt.Sprint(status) {
 	case "done", "ok":
 		return "ok"
-	case "pending", "executing":
+	case "pending", "executing", "setup":
 		return "wait"
 	case "rejected", "expired", "resting":
 		return "muted"
-	case "failed", "unknown", "down", "setup":
+	case "failed", "unknown", "down":
 		return "alert"
 	}
 	return ""

@@ -123,7 +123,7 @@ func (p *Proxy) Health(context.Context) connector.Health {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.linked() {
-		return connector.Health{State: connector.NeedsSetup, Detail: "set the API tokens in the console"}
+		return connector.Health{State: connector.NeedsSetup, Detail: "needs API tokens"}
 	}
 	return connector.Health{State: connector.Healthy}
 }

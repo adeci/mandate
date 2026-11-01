@@ -265,6 +265,9 @@ async function unlinkConnection(panel) {
 async function relink(panel) {
   await unlinkConnection(panel);
   $("[data-linked]", panel).hidden = true;
+  const status = $("header .status", panel);
+  status.textContent = "setup";
+  status.dataset.tone = "wait";
   if ($("[data-link]", panel)) return linkConnection(panel, {});
   const controls = $("[data-link-controls]", panel);
   controls.hidden = false;

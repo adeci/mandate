@@ -196,13 +196,13 @@ pkgs.testers.runNixOSTest {
         code, out = gw("POST", "/v1/whatsapp/send", {"args": {"chat": "fam@g.us", "text": "hi"}})
         assert code == 503 and "https://${host}/connections" in out["error"], (code, out)
         health = json.loads(machine.succeed("curl -s --unix-socket /run/mandate-discord/connector.sock http://connector/health"))
-        assert health["state"] == "setup" and "console" in health["detail"], health
+        assert health == {"state": "setup", "detail": "needs a token"}, health
 
     with subtest("the owner sets the API token in the console, which never shows it"):
         code, _ = console("POST", "/connections/http/setup", {"args": {"api": "${apiToken}"}}, jar="/tmp/linkjar")
         assert code == 401, code
         code, out = gw("GET", "/v1/forward/http/api/items")
-        assert code == 503 and "console" in out["error"], (code, out)
+        assert code == 503 and "https://${host}/connections" in out["error"], (code, out)
         code, out = console("POST", "/login", {"password": admin_password}, jar="/tmp/linkjar")
         assert code == 200, (code, out)
         code, out = console("POST", "/connections/http/setup", {"args": {"api": "${apiToken}"}}, jar="/tmp/linkjar")
