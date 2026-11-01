@@ -4,7 +4,8 @@
 //
 // Account integrity comes first: every request looks like Chrome on Linux and
 // is paced like a person. Reads are GETs, a send is a typing indicator and one
-// POST, and nothing but the gateway connection goes out at startup.
+// POST, and at startup it loads the app page and connects, as a browser
+// restoring the tab does.
 package main
 
 import (
@@ -219,7 +220,9 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 		log:   cfg.log,
 	}
 	w.snapshot()
-	w.syncGateway()
+	if token != "" {
+		gw.setStatus("live updates connecting") // until the app page has loaded
+	}
 	go func() {
 		defer close(w.done)
 		w.loop()
@@ -308,6 +311,7 @@ func (w *worker) Health(context.Context) connector.Health {
 func (w *worker) loop() {
 	// A tab being closed.
 	defer w.svc.gw.stop(websocket.CloseGoingAway)
+	w.syncGateway()
 	for {
 		select {
 		case <-w.ctx.Done():
@@ -337,20 +341,33 @@ func (w *worker) loop() {
 			cancel()
 			w.check()
 			w.snapshot()
-			w.syncGateway()
 			j.done <- jobResult{v: v, err: err}
+			w.syncGateway()
 		}
 	}
 }
 
 // syncGateway keeps the gateway connection open while the account is linked
-// and usable, for the tab the REST calls come from. It runs on the worker
-// goroutine, or before it starts.
+// and usable, for the tab the REST calls come from. A tab that opens loads
+// the app page first, as a browser restoring it does. It runs on the worker
+// goroutine.
 func (w *worker) syncGateway() {
 	up := w.svc.up
 	if up.token == "" || w.stopped != nil {
 		w.svc.gw.stop(closeNone)
 		return
+	}
+	if !up.relaunched && !w.svc.gw.running() {
+		err := up.openApp(w.ctx, w.clock.Now().Add(maxSlotWait))
+		var pe *pacedError
+		if errors.As(err, &pe) || w.ctx.Err() != nil || up.fatal != nil {
+			// Nothing loaded; the next call tries again.
+			w.log.Info("not opening the app yet", "err", err)
+			w.svc.gw.setStatus("")
+			w.check()
+			w.snapshot()
+			return
+		}
 	}
 	st := up.st
 	// The web client reports an analytics session on connecting, starting

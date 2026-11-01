@@ -268,6 +268,11 @@ func TestGatewayIdentifiesAsAnIdleTab(t *testing.T) {
 		s.HeartbeatSessionID, s.HeartbeatStartedAt, s.HeartbeatUsedAt = "1ed19025-eebd-4af4-8e95-fdd543da0fd8", noon.Add(-time.Minute), noon.Add(-time.Minute)
 	})
 	h.start()
+	// Like a browser restoring the tab: the app page, after the app-open
+	// delay, then the gateway.
+	if len(h.startup) != 1 || h.startup[0].path != "/channels/@me" || !h.startup[0].at.Equal(noon.Add(2*time.Second)) {
+		t.Errorf("startup requests %+v", h.startup)
+	}
 	c := h.gw.conn(t)
 	if c.query != gatewayQuery {
 		t.Errorf("query %q", c.query)

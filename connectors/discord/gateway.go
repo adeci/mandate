@@ -173,6 +173,12 @@ func (g *gateway) health() string {
 	return g.status
 }
 
+func (g *gateway) running() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.cancel != nil
+}
+
 func (g *gateway) setStatus(s string) {
 	g.mu.Lock()
 	g.status = s

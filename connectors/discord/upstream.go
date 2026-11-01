@@ -429,13 +429,21 @@ func (u *upstream) touchHeartbeat(now time.Time) {
 	u.st.HeartbeatUsedAt = now
 }
 
-// ensureBuildNumber loads the app page and its main bundle at most once per
-// 24 h, like opening Discord in the browser, to learn the client build
-// number. A page that loads starts a new client launch. Failures keep the
-// last known number.
+// ensureBuildNumber opens the app at most once per 24 h to learn the client
+// build number.
 func (u *upstream) ensureBuildNumber(ctx context.Context, dl time.Time) error {
 	if u.clock.Now().Sub(u.st.BuildCheckedAt) < buildRefresh {
 		return nil
+	}
+	return u.openApp(ctx, dl)
+}
+
+// openApp loads the app page and its main bundle, like opening Discord in
+// the browser, and learns the client build number. A page that loads starts
+// a new client launch. Failures keep the last known number.
+func (u *upstream) openApp(ctx context.Context, dl time.Time) error {
+	if u.fatal != nil {
+		return u.fatal
 	}
 	page := route{template: appPath, path: appPath}
 	resp, html, err := u.send(ctx, dl, kindAPI, page, time.Time{})
@@ -491,6 +499,9 @@ func (u *upstream) ensureBuildNumber(ctx context.Context, dl time.Time) error {
 func (u *upstream) ensureInstallation(ctx context.Context, dl time.Time) error {
 	if u.st.InstallationID != "" {
 		return nil
+	}
+	if err := u.openApp(ctx, dl); err != nil {
+		return err
 	}
 	defer func() { u.fingerprint = "" }()
 	steps := []route{

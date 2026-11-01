@@ -135,6 +135,7 @@ type harness struct {
 	clock     *fakeClock
 	discord   *fakeDiscord
 	gw        *fakeGateway
+	startup   []hit // what start sent before the gateway connected
 	srv       *httptest.Server
 	st        *store.Store
 	statePath string
@@ -263,6 +264,7 @@ func (h *harness) start() {
 	h.t.Helper()
 	ctx, cancel := context.WithCancelCause(context.Background())
 	h.done = make(chan error, 1)
+	mark := len(h.discord.all())
 	cfg := config{
 		store:       h.st,
 		statePath:   h.statePath,
@@ -305,8 +307,13 @@ func (h *harness) start() {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	// A linked service is up once its gateway session is.
+	// A linked service is up once it opened the app and its gateway session
+	// is; tests count the requests after that.
 	eventually(h.t, "the gateway session", func() bool { return w.svc.gw.health() == "" })
+	h.discord.mu.Lock()
+	h.startup = slices.Clone(h.discord.hits[mark:])
+	h.discord.hits = h.discord.hits[:mark]
+	h.discord.mu.Unlock()
 }
 
 func (h *harness) stop() error {
@@ -471,8 +478,8 @@ func TestSearchUpsertsAndCaches(t *testing.T) {
 	if n := len(h.discord.to(api("/guilds/" + guildID + "/messages/search"))); n != 3 {
 		t.Errorf("search requests after expiry: %d", n)
 	}
-	if n := len(h.state().Requests); n != 6 {
-		t.Errorf("budget counted %d requests, want 6", n)
+	if n := len(h.state().Requests); n != 7 { // with the page load at startup
+		t.Errorf("budget counted %d requests, want 7", n)
 	}
 }
 
@@ -649,14 +656,22 @@ func TestPageLoadBuildNumber(t *testing.T) {
 		io.WriteString(w, `x={releaseChannel:"stable",buildNumber:"700001",versionHash:"0"}`)
 	})
 	h.start()
+	// The service opens the app before it connects, as a browser restoring
+	// the tab does; the gateway identifies with what the page reported.
+	startup := h.startup
+	if len(startup) != 2 || startup[0].path != "/channels/@me" || startup[1].path != "/assets/web.b2b84438f3c83e84.js" {
+		t.Fatalf("startup requests %+v", startup)
+	}
+	if identify := h.gw.conn(t).next(t); !strings.Contains(identify.raw, `"client_build_number":700001`) {
+		t.Errorf("identify %s", identify.raw)
+	}
 	var resp connector.ReadResult
 	h.callOK("sync", map[string]string{}, &resp)
-	want := []string{"/channels/@me", "/assets/web.b2b84438f3c83e84.js", api("/users/@me/guilds"), api("/users/@me/channels")}
+	want := []string{api("/users/@me/guilds"), api("/users/@me/channels")}
 	if got := h.discord.paths(); strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("requests\n got %v\nwant %v", got, want)
 	}
-	hits := h.discord.all()
-	doc, js, first := hits[0], hits[1], hits[2]
+	doc, js, first := startup[0], startup[1], h.discord.all()[0]
 	if doc.header.Get("Sec-Fetch-Dest") != "document" || doc.header.Get("Authorization") != "" ||
 		doc.header.Get("X-Super-Properties") != "" || doc.header.Get("Referer") != "" {
 		t.Errorf("document headers %v", doc.header)
@@ -681,16 +696,18 @@ func TestPageLoadBuildNumber(t *testing.T) {
 		t.Errorf("page load not counted: %d requests", len(s.Requests))
 	}
 
-	// Same identity after a restart; no second page load within 24 h.
+	// A restart loads the page again, a new launch of the same profile.
 	h.restart()
+	if len(h.startup) != 2 {
+		t.Errorf("restart sent %d requests before connecting", len(h.startup))
+	}
 	h.clock.Advance(2 * time.Hour)
 	h.callOK("fetch", map[string]string{"channel_id": dmID}, &connector.ReadResult{})
-	if n := len(h.discord.to("/channels/@me")); n != 1 {
-		t.Errorf("page loaded %d times", n)
-	}
 	last := h.discord.all()[len(h.discord.all())-1]
-	if sp := superProps(t, last.header); sp["client_launch_id"] != s.LaunchID || sp["launch_signature"] != s.LaunchSignature {
-		t.Errorf("identity changed across restart: %v", sp)
+	restarted := h.state()
+	if sp := superProps(t, last.header); sp["client_launch_id"] == s.LaunchID || sp["client_launch_id"] != restarted.LaunchID ||
+		len(restarted.Cookies) != 1 {
+		t.Errorf("launch after restart: %v", sp)
 	}
 	// After 30 idle minutes the heartbeat session rotates.
 	if sp := superProps(t, last.header); sp["client_heartbeat_session_id"] == s.HeartbeatSessionID {
@@ -703,8 +720,8 @@ func TestPageLoadBuildNumber(t *testing.T) {
 	h.callOK("sync", map[string]string{}, &resp)
 	h.clock.Advance(time.Hour)
 	h.callOK("guild-search", map[string]string{"guild_id": guildID, "content": "x"}, &connector.ReadResult{})
-	if n := len(h.discord.to("/channels/@me")); n != 2 {
-		t.Errorf("page loaded %d times, want 2", n)
+	if n := len(h.discord.to("/channels/@me")); n != 1 {
+		t.Errorf("page loaded %d times after the restart, want 1", n)
 	}
 	if s := h.state(); s.BuildNumber != 700001 {
 		t.Errorf("build number %d after failed refresh", s.BuildNumber)
@@ -836,8 +853,8 @@ func TestSearchNotReadyRetries(t *testing.T) {
 	if d := hits[1].at.Sub(hits[0].at); d < 3*time.Second {
 		t.Errorf("retried after %v", d)
 	}
-	if n := len(h.state().Requests); n != 5 {
-		t.Errorf("budget counted %d requests, want 5 (both searches)", n)
+	if n := len(h.state().Requests); n != 6 {
+		t.Errorf("budget counted %d requests, want 6 (startup page and both searches)", n)
 	}
 
 	// Still not ready after the retry: 503 with a retry hint, no third try.
@@ -1015,12 +1032,12 @@ func TestLinkStartsLoggedOut(t *testing.T) {
 	if err := h.setup(testToken); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{api("/experiments"), api("/apex/experiments"), api("/users/@me")}
+	want := []string{"/channels/@me", api("/experiments"), api("/apex/experiments"), api("/users/@me")}
 	if got := h.discord.paths(); !slices.Equal(got, want) {
 		t.Fatalf("requests\n got %v\nwant %v", got, want)
 	}
 	hits := h.discord.all()
-	exp, apex, me := hits[0], hits[1], hits[2]
+	exp, apex, me := hits[1], hits[2], hits[3]
 	if exp.header.Get("Authorization") != "" || exp.header.Get("X-Installation-Id") != "" ||
 		exp.header.Get("X-Context-Properties") != base64.StdEncoding.EncodeToString([]byte(`{"location":"Login"}`)) ||
 		exp.query.Get("with_guild_experiments") != "true" || exp.header.Get("Referer") != "https://discord.com/login" {
@@ -1268,10 +1285,11 @@ func TestSlotWaitCap(t *testing.T) {
 			}
 			h.start()
 			if tt.served {
-				h.callOK("fetch", map[string]string{"channel_id": dmID}, &connector.ReadResult{})
-				if hits := h.discord.all(); len(hits) != 1 || !hits[0].at.Equal(noon.Add(89*time.Second)) {
-					t.Errorf("hits %v", h.discord.paths())
+				// Opening the app at startup is the first request to wait.
+				if len(h.startup) != 1 || !h.startup[0].at.Equal(noon.Add(89*time.Second)) {
+					t.Errorf("startup %+v", h.startup)
 				}
+				h.callOK("fetch", map[string]string{"channel_id": dmID}, &connector.ReadResult{})
 				return
 			}
 			e := h.callErr("fetch", map[string]string{"channel_id": dmID}, http.StatusTooManyRequests)
