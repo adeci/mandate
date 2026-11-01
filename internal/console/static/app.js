@@ -290,14 +290,16 @@ function busy(el, action) {
   };
 }
 
+// The owner is in the middle of something a reload would lose.
+const engaged = () =>
+  pending !== null ||
+  $("#review:not([hidden]), .linking:not([hidden]), button:disabled, input:focus, textarea:focus, select:focus") ||
+  $$("input:not([type=hidden]), textarea").some((el) => el.value !== el.defaultValue);
+
 // Reloads after something changed elsewhere, e.g. a key approved on another
 // device, once the owner isn't in the middle of something here.
 function watch(version) {
   let stale = false;
-  const engaged = () =>
-    pending !== null ||
-    $("#review:not([hidden]), .linking:not([hidden]), button:disabled, input:focus, textarea:focus, select:focus") ||
-    $$("textarea[data-param]").some((ta) => ta.value !== ta.defaultValue);
   const check = async () => {
     if (document.hidden) return;
     if (!stale) {
@@ -310,9 +312,26 @@ function watch(version) {
   document.addEventListener("visibilitychange", check);
 }
 
+// Counts down to a resting connector's next try, then reloads to show it.
+function countdown(el) {
+  const until = Date.parse(el.dataset.until);
+  // Only a countdown that ends while the page is open reloads it.
+  const live = until > Date.now();
+  const pad = (n) => String(n).padStart(2, "0");
+  const tick = () => {
+    const s = Math.max(0, Math.ceil((until - Date.now()) / 1000));
+    const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, sec = s % 60;
+    el.textContent = "in " + (h ? `${h}h ${pad(m)}m ${pad(sec)}s` : m ? `${m}m ${pad(sec)}s` : `${sec}s`);
+    if (s === 0 && live && !engaged()) location.reload();
+  };
+  tick();
+  setInterval(tick, 1000);
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   if (document.body.dataset.version) watch(document.body.dataset.version);
   $("[data-theme-toggle]").addEventListener("click", toggleTheme);
+  for (const el of $$("[data-until]")) countdown(el);
 
   const loginButton = $("[data-login]");
   if (loginButton) loginButton.addEventListener("click", busy(loginButton, () => login(loginButton)));

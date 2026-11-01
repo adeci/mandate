@@ -29,37 +29,15 @@ import (
 	"github.com/adeci/mandate/store"
 )
 
-type Config struct {
-	// ActiveHours are the local hours HH-HH in which requests may be sent.
-	ActiveHours string `json:"active_hours"`
-}
-
-const defaultActiveHours = "08-24"
-
-func (c Config) hours(loc *time.Location) (activeHours, error) {
-	if c.ActiveHours == "" {
-		return parseActiveHours(defaultActiveHours, loc)
-	}
-	return parseActiveHours(c.ActiveHours, loc)
-}
-
-func (c Config) Validate() error {
-	_, err := c.hours(time.UTC)
-	return err
-}
+type Config struct{}
 
 func main() {
 	connector.Main(func(ctx context.Context, env *connector.Env, c Config) (connector.Connector, error) {
 		// Sent as X-Discord-Timezone, so it must be a name a browser reports;
 		// unset means UTC, as everywhere else on Unix.
 		tz := cmp.Or(os.Getenv("TZ"), "UTC")
-		loc, err := time.LoadLocation(tz)
-		if strings.HasPrefix(tz, ":") || err != nil {
+		if _, err := time.LoadLocation(tz); strings.HasPrefix(tz, ":") || err != nil {
 			return nil, fmt.Errorf("TZ must name an IANA time zone such as Europe/Berlin, got %q", tz)
-		}
-		hours, err := c.hours(loc)
-		if err != nil {
-			return nil, err
 		}
 		st, err := store.Open(ctx, env.DataPath())
 		if err != nil {
@@ -75,7 +53,6 @@ func main() {
 			statePath: filepath.Join(env.PrivateDir(), "state.json"),
 			token:     env.Secret("token"),
 			timezone:  tz,
-			hours:     hours,
 			transport: client,
 			jar:       jar,
 			apiBase:   defaultAPIBase,
@@ -137,7 +114,6 @@ type config struct {
 	statePath        string
 	token            connector.Secret
 	timezone         string
-	hours            activeHours
 	transport        transport
 	jar              fhttp.CookieJar // nil in tests
 	apiBase, webBase string
@@ -177,7 +153,7 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 		apiBase:   cfg.apiBase,
 		webBase:   cfg.webBase,
 		clock:     cfg.clock,
-		pace:      newPacer(st, cfg.rng, cfg.hours),
+		pace:      newPacer(st, cfg.rng),
 		st:        st,
 		statePath: cfg.statePath,
 		log:       cfg.log,
@@ -206,8 +182,7 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 		defer close(w.done)
 		w.loop()
 	}()
-	cfg.log.Info("started", "linked", token != "", "timezone", cfg.timezone,
-		"active_hours", fmt.Sprintf("%02d-%02d", cfg.hours.start, cfg.hours.end))
+	cfg.log.Info("started", "linked", token != "", "timezone", cfg.timezone)
 	return w, nil
 }
 
@@ -278,7 +253,7 @@ func (w *worker) Health(context.Context) connector.Health {
 	case !w.linked:
 		return connector.Health{State: connector.NeedsSetup, Detail: "needs a token"}
 	}
-	p := &pacer{st: &w.pace, hours: w.svc.up.pace.hours}
+	p := &pacer{st: &w.pace}
 	if until, why := p.rest(w.clock.Now()); !until.IsZero() {
 		return connector.Health{State: connector.Resting, Detail: why, Until: until}
 	}
@@ -385,9 +360,7 @@ func (w *worker) link(ctx context.Context, dl time.Time, token string) error {
 		return err
 	}
 	up.token = token
-	up.pace.atKeyboard = true
 	_, err := w.svc.selfID(ctx, dl)
-	up.pace.atKeyboard = false
 	if err != nil {
 		up.token = ""
 		var stop *ownerStop

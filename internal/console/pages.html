@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
-<meta name="theme-color" content="#fdfdfd" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#e9ebee" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#0b0e12" media="(prefers-color-scheme: dark)">
 <title>{{.Title}} · mandate</title>
 <link rel="manifest" href="/manifest.webmanifest">
@@ -238,7 +238,7 @@
   {{if or .Health.Detail (not .Health.Until.IsZero)}}
   <dl class="kv">
     {{with .Health.Detail}}<div><dt>detail</dt><dd class="message">{{.}}</dd></div>{{end}}
-    {{if not .Health.Until.IsZero}}<div><dt>until</dt><dd>{{when .Health.Until}}</dd></div>{{end}}
+    {{if not .Health.Until.IsZero}}<div><dt>until</dt><dd>{{when .Health.Until}} <span class="muted" data-until="{{.Health.Until.UTC.Format "2006-01-02T15:04:05Z07:00"}}"></span></dd></div>{{end}}
   </dl>
   {{end}}
   {{with .Keys}}<p class="flash" data-kind="error">Keys out of sync: {{.}}</p>{{end}}

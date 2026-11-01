@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"math/rand/v2"
 	"strconv"
 	"strings"
@@ -25,12 +24,12 @@ const (
 	subresourceMin = 200 * time.Millisecond
 	subresourceMax = 800 * time.Millisecond
 
-	sessionRequests = 20 // a session ends after this many requests ...
-	sessionLength   = 15 * time.Minute
-	breakMin        = 10 * time.Minute // ... and is followed by a break
-	breakMax        = 25 * time.Minute
+	sessionRequests = 40 // a session ends after this many requests ...
+	sessionLength   = 20 * time.Minute
+	breakMin        = 5 * time.Minute // ... and is followed by a break
+	breakMax        = 15 * time.Minute
 
-	dailyBudget  = 150 // upstream requests per rolling budgetWindow
+	dailyBudget  = 1000 // upstream requests per rolling budgetWindow
 	budgetWindow = 24 * time.Hour
 
 	maxSlotWait  = 90 * time.Second // longest a gateway call waits for a slot
@@ -79,61 +78,22 @@ type globalRand struct{}
 
 func (globalRand) Float64() float64 { return rand.Float64() }
 
-// [start, end) in local hours; start > end wraps past midnight.
-type activeHours struct {
-	start, end int
-	loc        *time.Location
-}
-
-func parseActiveHours(s string, loc *time.Location) (activeHours, error) {
-	a, b, ok := strings.Cut(s, "-")
-	start, err1 := strconv.Atoi(a)
-	end, err2 := strconv.Atoi(b)
-	if !ok || err1 != nil || err2 != nil || start < 0 || start > 23 || end < 1 || end > 24 || start == end {
-		return activeHours{}, fmt.Errorf("invalid active_hours %q: want HH-HH with 0 <= start <= 23, 1 <= end <= 24, start != end", s)
-	}
-	return activeHours{start: start, end: end, loc: loc}, nil
-}
-
-func (h activeHours) active(t time.Time) bool {
-	hr := t.In(h.loc).Hour()
-	if h.start < h.end {
-		return hr >= h.start && hr < h.end
-	}
-	return hr >= h.start || hr < h.end
-}
-
-func (h activeHours) next(t time.Time) time.Time {
-	lt := t.In(h.loc)
-	c := time.Date(lt.Year(), lt.Month(), lt.Day(), h.start, 0, 0, 0, h.loc)
-	if !c.After(lt) {
-		c = time.Date(lt.Year(), lt.Month(), lt.Day()+1, h.start, 0, 0, 0, h.loc)
-	}
-	return c
-}
-
 // Delays are rolled once after each request, so a refused call is told an
 // honest, stable wait. Used only by the single upstream worker goroutine.
 type pacer struct {
-	st    *state
-	rng   rng
-	hours activeHours
+	st  *state
+	rng rng
 
 	gap, open, subresource time.Duration // pre-rolled delays for the next request
-
-	// atKeyboard is set while the owner links from the console, which is
-	// human activity at any hour, so active hours don't apply.
-	atKeyboard bool
 
 	routeBuckets map[string]string    // route key -> X-RateLimit-Bucket
 	exhausted    map[string]time.Time // bucket -> reset time while Remaining is 0
 }
 
-func newPacer(st *state, r rng, hours activeHours) *pacer {
+func newPacer(st *state, r rng) *pacer {
 	p := &pacer{
 		st:           st,
 		rng:          r,
-		hours:        hours,
 		routeBuckets: make(map[string]string),
 		exhausted:    make(map[string]time.Time),
 	}
@@ -202,9 +162,6 @@ func (p *pacer) blocker(t time.Time, route string) (time.Time, string, bool) {
 	if w := since(p.st.Requests, t.Add(-budgetWindow)); len(w) >= dailyBudget {
 		// Wait until enough old requests leave the window.
 		return w[len(w)-dailyBudget].Add(budgetWindow + time.Millisecond), "daily budget", true
-	}
-	if !p.atKeyboard && !p.hours.active(t) {
-		return p.hours.next(t), "outside active hours", true
 	}
 	if until, ok := p.exhausted[p.bucket(route)]; ok && until.After(t) {
 		return until, "rate limit bucket", false

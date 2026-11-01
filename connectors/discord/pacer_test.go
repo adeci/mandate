@@ -52,10 +52,8 @@ func mustLoc(name string) *time.Location {
 
 var noon = time.Date(2026, 10, 29, 12, 0, 0, 0, newYork)
 
-func allDay() activeHours { return activeHours{start: 0, end: 24, loc: newYork} }
-
 func TestGapBounds(t *testing.T) {
-	p := newPacer(&state{}, rand.New(rand.NewPCG(1, 2)), allDay())
+	p := newPacer(&state{}, rand.New(rand.NewPCG(1, 2)))
 	var plain, paused int
 	at := noon
 	for range 2000 {
@@ -82,7 +80,7 @@ func TestGapBounds(t *testing.T) {
 
 func TestAppOpenAfterIdle(t *testing.T) {
 	for _, r := range []float64{0, 0.5, 0.999} {
-		p := newPacer(&state{}, fixedRand(r), allDay())
+		p := newPacer(&state{}, fixedRand(r))
 		p.record(noon)
 		now := noon.Add(idleAfter + time.Second)
 		slot, reason := p.slot(now, kindAPI, "r", time.Time{})
@@ -90,7 +88,7 @@ func TestAppOpenAfterIdle(t *testing.T) {
 			t.Errorf("rng %v: idle wait %v (%s), want 1-3 s app open", r, d, reason)
 		}
 	}
-	p := newPacer(&state{}, fixedRand(0.5), allDay())
+	p := newPacer(&state{}, fixedRand(0.5))
 	if slot, _ := p.slot(noon, kindAPI, "r", time.Time{}); slot.Sub(noon) != 2*time.Second {
 		t.Errorf("first request waits %v, want 2s", slot.Sub(noon))
 	}
@@ -101,8 +99,8 @@ func TestAppOpenAfterIdle(t *testing.T) {
 }
 
 func TestSessionBreak(t *testing.T) {
-	t.Run("after 20 requests", func(t *testing.T) {
-		p := newPacer(&state{}, fixedRand(0.5), allDay())
+	t.Run("after a session's requests", func(t *testing.T) {
+		p := newPacer(&state{}, fixedRand(0.5))
 		at := noon
 		for i := range sessionRequests {
 			if !p.st.BreakUntil.IsZero() {
@@ -120,23 +118,24 @@ func TestSessionBreak(t *testing.T) {
 			t.Errorf("slot %v (%s) before break end %v", slot, reason, p.st.BreakUntil)
 		}
 	})
-	t.Run("after 15 minutes", func(t *testing.T) {
-		p := newPacer(&state{}, fixedRand(0.5), allDay())
-		for i := range 16 {
+	t.Run("after a session's length", func(t *testing.T) {
+		p := newPacer(&state{}, fixedRand(0.5))
+		minutes := int(sessionLength / time.Minute)
+		for i := range minutes + 1 {
 			p.record(noon.Add(time.Duration(i) * time.Minute))
-			if i < 15 && !p.st.BreakUntil.IsZero() {
+			if i < minutes && !p.st.BreakUntil.IsZero() {
 				t.Fatalf("break after %d min", i)
 			}
 		}
 		if p.st.BreakUntil.IsZero() {
-			t.Fatal("no break after 15 minutes of activity")
+			t.Fatalf("no break after %v of activity", sessionLength)
 		}
 		if p.st.SessionCount != 0 {
 			t.Errorf("session not reset: %d", p.st.SessionCount)
 		}
 	})
 	t.Run("idle starts a new session", func(t *testing.T) {
-		p := newPacer(&state{}, fixedRand(0.5), allDay())
+		p := newPacer(&state{}, fixedRand(0.5))
 		for i := range 10 {
 			p.record(noon.Add(time.Duration(i) * time.Minute))
 		}
@@ -149,10 +148,11 @@ func TestSessionBreak(t *testing.T) {
 
 func TestDailyBudget(t *testing.T) {
 	st := &state{}
-	p := newPacer(st, fixedRand(0.5), allDay())
+	p := newPacer(st, fixedRand(0.5))
 	start := noon
+	const step = time.Minute // dailyBudget of these fit in budgetWindow
 	for i := range dailyBudget {
-		st.Requests = append(st.Requests, start.Add(time.Duration(i)*5*time.Minute))
+		st.Requests = append(st.Requests, start.Add(time.Duration(i)*step))
 	}
 	st.LastRequest = st.Requests[len(st.Requests)-1]
 	now := st.LastRequest.Add(time.Hour)
@@ -167,59 +167,15 @@ func TestDailyBudget(t *testing.T) {
 	if n := len(st.Requests); n != dailyBudget {
 		t.Fatalf("window holds %d requests, want %d", n, dailyBudget)
 	}
-	next, reason := p.slot(slot.Add(time.Minute), kindAPI, "r", time.Time{})
-	if reason != "daily budget" || next.Before(start.Add(5*time.Minute+budgetWindow)) {
+	next, reason := p.slot(slot.Add(time.Second), kindAPI, "r", time.Time{})
+	if reason != "daily budget" || next.Before(start.Add(step+budgetWindow)) {
 		t.Errorf("second slot %v (%s)", next, reason)
-	}
-}
-
-func TestActiveHours(t *testing.T) {
-	h, err := parseActiveHours("08-24", newYork)
-	if err != nil {
-		t.Fatal(err)
-	}
-	day := func(hh, mm int) time.Time { return time.Date(2026, 10, 29, hh, mm, 0, 0, newYork) }
-	tests := []struct {
-		at     time.Time
-		active bool
-		next   time.Time
-	}{
-		{day(7, 59), false, day(8, 0)},
-		{day(8, 0), true, time.Time{}},
-		{day(23, 59), true, time.Time{}},
-		{day(2, 0), false, day(8, 0)},
-		{day(0, 0), false, day(8, 0)},
-	}
-	for _, tt := range tests {
-		if got := h.active(tt.at); got != tt.active {
-			t.Errorf("active(%v) = %v", tt.at, got)
-		}
-		if !tt.active {
-			if got := h.next(tt.at); !got.Equal(tt.next) {
-				t.Errorf("next(%v) = %v, want %v", tt.at, got, tt.next)
-			}
-		}
-	}
-	wrap, err := parseActiveHours("22-06", newYork)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !wrap.active(day(23, 0)) || !wrap.active(day(3, 0)) || wrap.active(day(12, 0)) {
-		t.Error("wrapping window wrong")
-	}
-	if got := wrap.next(day(12, 0)); !got.Equal(day(22, 0)) {
-		t.Errorf("wrap next = %v", got)
-	}
-	for _, bad := range []string{"8", "08-08", "24-08", "08-25"} {
-		if _, err := parseActiveHours(bad, newYork); err == nil {
-			t.Errorf("parseActiveHours(%q) accepted", bad)
-		}
 	}
 }
 
 func TestCooldownAndBuckets(t *testing.T) {
 	st := &state{CooldownUntil: noon.Add(time.Hour)}
-	p := newPacer(st, fixedRand(0.5), allDay())
+	p := newPacer(st, fixedRand(0.5))
 	if slot, reason := p.slot(noon, kindAPI, "r", time.Time{}); reason != "cooldown" || !slot.Equal(noon.Add(time.Hour+2*time.Second)) {
 		t.Errorf("cooldown slot %v (%s)", slot, reason)
 	}

@@ -139,7 +139,6 @@ type harness struct {
 	statePath string
 	token     connector.Secret
 	socket    string
-	hours     activeHours
 	logs      *syncBuffer
 	cancel    context.CancelFunc
 	done      chan error
@@ -197,7 +196,6 @@ func newHarness(t *testing.T, seed func(*state)) *harness {
 		statePath: filepath.Join(dir, "private", "state.json"),
 		token:     (&connector.Env{StateDir: dir}).Secret("token"),
 		socket:    filepath.Join(dir, "s.sock"),
-		hours:     activeHours{start: 8, end: 24, loc: newYork},
 		logs:      &syncBuffer{},
 	}
 	if err := h.token.Store([]byte(testToken)); err != nil {
@@ -256,7 +254,6 @@ func (h *harness) start() {
 		statePath: h.statePath,
 		token:     h.token,
 		timezone:  "America/New_York",
-		hours:     h.hours,
 		transport: &fhttp.Client{},
 		apiBase:   h.srv.URL + "/api/v9",
 		webBase:   h.srv.URL,
@@ -886,26 +883,6 @@ func TestLinkUnlinkRelink(t *testing.T) {
 	}
 }
 
-// The owner pasting a token is at the keyboard, so setup ignores active
-// hours; reads still wait for them.
-func TestSetupAtNight(t *testing.T) {
-	h := newHarness(t, nil)
-	if err := h.token.Delete(); err != nil {
-		t.Fatal(err)
-	}
-	h.clock.now = noon.Add(-10 * time.Hour)
-	h.start()
-	if err := h.setup("night-token.abc.def"); err != nil {
-		t.Fatalf("setup outside active hours: %v", err)
-	}
-	if h.storedToken() != "night-token.abc.def" {
-		t.Fatal("token not stored")
-	}
-	if e := h.callErr("sync", map[string]string{}, http.StatusTooManyRequests); !strings.Contains(e.Message, "outside active hours") {
-		t.Errorf("read at night: %q", e.Message)
-	}
-}
-
 func TestSetupRefusesBadToken(t *testing.T) {
 	h := newHarness(t, nil)
 	if err := h.token.Delete(); err != nil {
@@ -979,12 +956,7 @@ func TestHealthResting(t *testing.T) {
 	}{
 		{name: "ok", at: noon},
 		{name: "cooldown", seed: func(s *state) { s.CooldownUntil = noon.Add(3 * time.Hour) }, at: noon, until: noon.Add(3 * time.Hour), reason: "cooldown"},
-		{name: "outside active hours", at: noon.Add(-10 * time.Hour), until: noon.Add(-4 * time.Hour), reason: "outside active hours"},
 		{name: "daily budget", seed: budget, at: noon, until: noon.Add(time.Hour + time.Millisecond), reason: "daily budget"},
-		{
-			name: "cooldown ending at night", seed: func(s *state) { s.CooldownUntil = noon.Add(13 * time.Hour) },
-			at: noon, until: noon.Add(20 * time.Hour), reason: "cooldown",
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1124,16 +1096,17 @@ func TestIsSnowflake(t *testing.T) {
 	}
 }
 
-func TestActiveHoursRefusal(t *testing.T) {
-	h := newHarness(t, nil)
-	h.clock.now = time.Date(2026, 10, 29, 2, 0, 0, 0, newYork)
+// A long block is refused at once with an honest wait, not slept through.
+func TestPacedRefusal(t *testing.T) {
+	h := newHarness(t, func(s *state) { s.CooldownUntil = noon.Add(2 * time.Hour) })
+	h.clock.now = noon
 	h.start()
 	e := h.callErr("fetch", map[string]string{"channel_id": dmID}, http.StatusTooManyRequests)
-	// 08:00 local plus the 2 s app-open delay.
-	if want := 6*3600 + 2; e.RetryAfter != want {
+	// The cooldown plus the 2 s app-open delay.
+	if want := 2*3600 + 2; e.RetryAfter != want {
 		t.Errorf("retry_after_seconds = %d, want %d", e.RetryAfter, want)
 	}
-	if len(h.discord.all()) != 0 || !h.clock.Now().Equal(time.Date(2026, 10, 29, 2, 0, 0, 0, newYork)) {
+	if len(h.discord.all()) != 0 || !h.clock.Now().Equal(noon) {
 		t.Error("refusal waited or sent a request")
 	}
 }
