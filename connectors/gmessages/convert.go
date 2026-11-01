@@ -172,21 +172,23 @@ func convert(m *gmproto.Message, conv *gmproto.Conversation) (op, bool) {
 	case m.GetTimestamp() <= 0:
 		return op{}, false
 	}
-	body, media := content(m)
-	if body == "" && media == "" {
-		if !awaitingDownload(status) {
-			return op{}, false
-		}
-		media = "attachment"
-	}
+	body, files := content(m)
 	msg := store.Message{
 		ID:          m.GetMessageID(),
 		ContainerID: m.GetConversationID(),
 		SentAt:      time.UnixMicro(m.GetTimestamp()).UTC(),
 		IsFromMe:    isOutgoing(status),
 		Body:        body,
-		MediaType:   media,
 		ReplyToID:   m.GetReplyMessage().GetMessageID(),
+	}
+	switch {
+	case len(files) > 0:
+		msg.Media = files
+	case body != "":
+	case awaitingDownload(status):
+		msg.MediaType = "attachment"
+	default:
+		return op{}, false
 	}
 	if msg.IsFromMe {
 		if p := me(conv); p != nil {
@@ -207,9 +209,8 @@ func convert(m *gmproto.Message, conv *gmproto.Conversation) (op, bool) {
 	return op{kind: opUpsert, msg: msg}, true
 }
 
-// content is the subject and text parts, and the kind of the first
-// attachment.
-func content(m *gmproto.Message) (body, media string) {
+// content is the subject and text parts, and the files.
+func content(m *gmproto.Message) (body string, files []store.Media) {
 	var parts []string
 	if s := m.GetSubject(); s != "" {
 		parts = append(parts, s)
@@ -218,34 +219,9 @@ func content(m *gmproto.Message) (body, media string) {
 		if t := info.GetMessageContent().GetContent(); t != "" {
 			parts = append(parts, t)
 		}
-		if mc := info.GetMediaContent(); mc != nil && media == "" {
-			media = mediaType(mc)
+		if mc := info.GetMediaContent(); mc != nil {
+			files = append(files, attachment(mc))
 		}
 	}
-	return strings.Join(parts, "\n"), media
-}
-
-func mediaType(mc *gmproto.MediaContent) string {
-	f := mc.GetFormat()
-	switch {
-	case f >= gmproto.MediaFormats_IMAGE_JPEG && f <= gmproto.MediaFormats_IMAGE_UNSPECIFIED:
-		return "image"
-	case f >= gmproto.MediaFormats_VIDEO_MP4 && f <= gmproto.MediaFormats_VIDEO_UNSPECIFIED:
-		return "video"
-	case f >= gmproto.MediaFormats_AUDIO_AAC && f <= gmproto.MediaFormats_AUDIO_UNSPECIFIED:
-		return "audio"
-	case f == gmproto.MediaFormats_TEXT_VCARD:
-		return "contact"
-	}
-	switch mime := mc.GetMimeType(); {
-	case strings.HasPrefix(mime, "image/"):
-		return "image"
-	case strings.HasPrefix(mime, "video/"):
-		return "video"
-	case strings.HasPrefix(mime, "audio/"):
-		return "audio"
-	case strings.Contains(mime, "vcard"):
-		return "contact"
-	}
-	return "document"
+	return strings.Join(parts, "\n"), files
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -54,6 +55,7 @@ type gmClient interface {
 	FetchMessages(ctx context.Context, conversationID string, count int64, cursor *gmproto.Cursor) (*gmproto.ListMessagesResponse, error)
 	GetConversation(ctx context.Context, conversationID string) (*gmproto.Conversation, error)
 	SendMessage(ctx context.Context, req *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error)
+	DownloadMedia(mediaID string, key []byte) (io.ReadCloser, error)
 }
 
 // pairClient is the part of *libgm.Client that pairs, by QR code or through
