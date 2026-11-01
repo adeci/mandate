@@ -152,15 +152,14 @@
 
 {{define "field"}}<div><dt>{{.Label}}</dt><dd>
   {{- if eq .Param ""}}<span class="message">{{.Value}}</span>
-  {{- else}}<pre class="message">{{.Value}}</pre>
-    {{- if .Hidden}}<p class="hint">! contains invisible characters, shown as U+ codes</p>{{end}}
-    {{- if .Edit}}
+  {{- else}}<pre class="message">{{.Value}}</pre>{{end}}
+  {{- with .Hidden}}<p class="hint">! {{.}} hidden character{{if ne . 1}}s{{end}}, shown as U+ codes</p>{{end}}
+  {{- if .Edit}}
     <details>
       <summary>edit<span data-edited-hint="{{.Param}}"></span></summary>
       <textarea id="edit-{{.Param}}" data-param="{{.Param}}" rows="6" aria-label="Edit {{.Label}}">
 {{.Raw}}</textarea>
     </details>
-    {{- end}}
   {{- end}}</dd></div>
 {{end}}
 

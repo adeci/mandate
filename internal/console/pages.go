@@ -9,6 +9,7 @@ import (
 	"html"
 	"html/template"
 	"io/fs"
+	"iter"
 	"maps"
 	"net/http"
 	"strconv"
@@ -94,6 +95,7 @@ func securityHeaders(h http.Handler) http.Handler {
 		hd.Set("X-Content-Type-Options", "nosniff")
 		hd.Set("X-Frame-Options", "DENY")
 		hd.Set("Referrer-Policy", "no-referrer")
+		hd.Set("Strict-Transport-Security", "max-age=63072000")
 		hd.Set("Cache-Control", "no-store")
 		h.ServeHTTP(w, r)
 	})
@@ -301,7 +303,8 @@ type fieldView struct {
 	Value        template.HTML
 	Raw          string
 	Edit         bool
-	Hidden       bool
+	// Hidden counts the characters Value marks, or the edit box hides.
+	Hidden int
 }
 
 // fieldViews renders display fields; params named in editable become
@@ -309,10 +312,10 @@ type fieldView struct {
 func fieldViews(display []approval.Field, args map[string]string, editable map[string]bool) []fieldView {
 	out := make([]fieldView, 0, len(display))
 	for _, f := range display {
-		v := fieldView{Label: f.Label, Param: f.Param, Value: visible(f.Value), Raw: f.Value, Hidden: hasHidden(f.Value)}
+		v := fieldView{Label: f.Label, Param: f.Param, Value: visible(f.Value), Raw: f.Value, Hidden: countHidden(f.Value)}
 		if f.Param != "" && editable[f.Param] {
 			v.Edit, v.Raw = true, args[f.Param]
-			v.Hidden = v.Hidden || hasHidden(v.Raw)
+			v.Hidden = max(v.Hidden, countHidden(v.Raw))
 		}
 		out = append(out, v)
 	}
@@ -370,28 +373,80 @@ func (s *Server) connectionsPage(w http.ResponseWriter, r *http.Request, sess se
 	s.owner(w, r, sess, "connections", "Connections", "connections", s.connections(r.Context()))
 }
 
-// hidden reports runes that render as nothing or reorder text around them:
-// controls, format characters such as zero-width spaces and bidi overrides,
-// line and paragraph separators, and other default-ignorable code points.
-func hidden(r rune) bool {
-	if r == '\n' || r == '\t' {
-		return false
+// maxMarks is how many combining marks in a row pass unmarked: enough for
+// accented letters; longer runs stack over text or carry a payload.
+const maxMarks = 2
+
+// hiddenRunes yields the runes that render as nothing, look like a plain
+// space, or reorder text around them, with their byte offsets: controls,
+// format characters such as zero-width spaces and bidi overrides, every
+// separator but the space, the braille blank, variation selectors other
+// than an emoji's own, other default-ignorable code points, and runs of more
+// than maxMarks combining marks.
+func hiddenRunes(s string) iter.Seq2[int, rune] {
+	return func(yield func(int, rune) bool) {
+		var prev rune
+		// run counts down the rest of an overlong run of marks.
+		run := 0
+		for i, r := range s {
+			if run == 0 && unicode.Is(unicode.M, r) {
+				if n := leadingMarks(s[i:]); n > maxMarks {
+					run = n
+				}
+			}
+			mark := run > 0 || hidden(r, prev)
+			run = max(run-1, 0)
+			if mark && !yield(i, r) {
+				return
+			}
+			prev = r
+		}
 	}
-	return unicode.IsControl(r) ||
-		unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp, unicode.Other_Default_Ignorable_Code_Point)
 }
 
-func hasHidden(s string) bool { return strings.IndexFunc(s, hidden) >= 0 }
+func hidden(r, prev rune) bool {
+	switch {
+	case r == '\n' || r == '\t' || r == ' ':
+		return false
+	case unicode.Is(unicode.Variation_Selector, r):
+		// VS1-VS16 pick an emoji's text or emoji style; one may follow it.
+		return r < 0xFE00 || r > 0xFE0F || !emoji(prev)
+	}
+	return r == '\u2800' || unicode.IsControl(r) ||
+		unicode.In(r, unicode.Cf, unicode.Z, unicode.Other_Default_Ignorable_Code_Point)
+}
+
+// emoji approximates the characters a variation selector may style:
+// symbols, and the digits, # and * of keycaps.
+func emoji(r rune) bool {
+	return unicode.Is(unicode.So, r) || '0' <= r && r <= '9' || r == '#' || r == '*'
+}
+
+func leadingMarks(s string) int {
+	n := 0
+	for _, r := range s {
+		if !unicode.Is(unicode.M, r) {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+func countHidden(s string) int {
+	n := 0
+	for range hiddenRunes(s) {
+		n++
+	}
+	return n
+}
 
 // visible escapes s and shows each hidden rune as a marked code point, so the
 // owner sees every character that will be sent.
 func visible(s string) template.HTML {
 	var b strings.Builder
 	start := 0
-	for i, r := range s {
-		if !hidden(r) {
-			continue
-		}
+	for i, r := range hiddenRunes(s) {
 		b.WriteString(html.EscapeString(s[start:i]))
 		fmt.Fprintf(&b, `<span class="cp">U+%04X</span>`, r)
 		start = i + utf8.RuneLen(r)
