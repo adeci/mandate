@@ -56,29 +56,22 @@
 <p><a href="/">← inbox</a></p>
 {{template "bottom" .}}{{end}}
 
-{{define "password"}}
-<form id="password-login" data-next="{{.Next}}">
-  <label for="password">Password</label>
-  <div class="row">
-    <input id="password" name="password" type="password" required autocomplete="current-password">
-    <button type="submit">Sign in</button>
-  </div>
-</form>
-{{end}}
-
 {{define "login"}}{{template "top" .}}
 <h1>Sign in</h1>
 {{if .Data.Passkeys}}
 <div class="actions">
   <button type="button" class="primary big" data-login="{{.Data.Next}}">Sign in with a passkey →</button>
 </div>
-<details id="password-fallback">
-  <summary>use the admin password</summary>
-  {{template "password" .Data}}
-</details>
+<p class="hint">Lost your passkeys? <code>sudo mandate-reset-keys</code> on the server lets the admin password add a first one again.</p>
 {{else}}
 <p class="muted">No passkeys yet. Sign in with the admin password, then add one under Keys.</p>
-{{template "password" .Data}}
+<form id="password-login" data-next="{{.Data.Next}}">
+  <label for="password">Password</label>
+  <div class="row">
+    <input id="password" name="password" type="password" required autocomplete="current-password">
+    <button type="submit">Sign in</button>
+  </div>
+</form>
 {{end}}
 <p id="msg" class="msg" role="status"></p>
 {{template "bottom" .}}{{end}}
@@ -332,7 +325,7 @@
   </tbody>
 </table>
 {{else}}
-<div class="empty"><p>No keys yet.<br><span class="muted">The first key you add is trusted at once.</span></p></div>
+<div class="empty"><p>No keys yet.<br><span class="muted">The first key you add is trusted at once, and from then on the admin password no longer signs in.</span></p></div>
 {{end}}
 </section>
 
@@ -342,11 +335,22 @@
 {{range .}}
 <section class="panel dashed" data-change="{{.ID}}">
   <header><h3>{{if eq .Op "add"}}Add{{else}}Remove{{end}} {{.Name}}</h3><span class="status" data-tone="wait">{{.Left}}</span></header>
-  <p class="muted">Approve with any trusted key, from any device.</p>
+  <dl class="kv">
+    <div><dt>fingerprint</dt><dd><code>{{.Fingerprint}}</code></dd></div>
+    {{if .AAGUID}}<div><dt>AAGUID</dt><dd>{{.AAGUID}}{{with .Authenticator}} · {{.}}{{end}}</dd></div>{{end}}
+    <div><dt>kind</dt><dd>{{if .Synced}}synced passkey{{else}}single-device key{{end}}</dd></div>
+  </dl>
+  {{if .Approved}}
+  <p>Approved. To trust it, run on the server:</p>
+  <pre>sudo mandate-confirm-key {{.Fingerprint}}</pre>
+  <form method="post" action="/keys/changes/{{.ID}}/discard" class="actions"><button type="submit">Discard</button></form>
+  {{else}}
+  <p class="muted">Approve with any trusted key, from any device.{{if eq .Op "add"}} Then confirm it on the server.{{end}}</p>
   <div class="actions two">
     <button type="button" class="primary" data-approve-key>Approve with passkey →</button>
     <form method="post" action="/keys/changes/{{.ID}}/discard"><button type="submit">Discard</button></form>
   </div>
+  {{end}}
   <p class="msg" role="status"></p>
 </section>
 {{end}}
@@ -361,7 +365,7 @@
     <input id="key-name" name="name" required maxlength="64" pattern="[\p{L}\p{N} ._\-]+" placeholder="phone" autocomplete="off">
     <button type="submit">+ Add key</button>
   </div>
-  {{if .Data.Keys}}<p class="hint">It waits until a trusted key approves it.</p>{{end}}
+  {{if .Data.Keys}}<p class="hint">It waits until a trusted key approves it and you confirm it on the server.</p>{{end}}
 </form>
 <p id="msg" class="msg" role="status"></p>
 </section>

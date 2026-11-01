@@ -49,7 +49,8 @@ let
   # paths are appended after escapeSystemdExecArgs, which would turn it into %%d.
   credential = flag: name: " ${flag} %d/${name}";
 
-  # Deletes every key so the admin password can add a first one again.
+  # Deletes every key so the admin password can sign in and add a first one
+  # again.
   resetKeys = pkgs.writeShellApplication {
     name = "mandate-reset-keys";
     text = ''
@@ -60,6 +61,13 @@ let
       }
       systemctl start "''${units[@]}"
     '';
+  };
+
+  # Trusts a key addition a passkey approved in the console, through a
+  # socket in the console's state directory, which only root can reach.
+  confirmKey = pkgs.writeShellApplication {
+    name = "mandate-confirm-key";
+    text = ''exec ${exe} confirm-key --state ${state "console"} "$@"'';
   };
 
   hardening = {
@@ -298,6 +306,7 @@ in
     environment.systemPackages = [
       cfg.package
       resetKeys
+      confirmKey
     ];
     system.checks = lib.mapAttrsToList (
       name: c:

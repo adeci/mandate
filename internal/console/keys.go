@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"slices"
@@ -100,6 +103,10 @@ func (s *Server) registerOptions(w http.ResponseWriter, r *http.Request, sess se
 		connector.WriteError(w, err)
 		return
 	}
+	if s.nameTaken(pending, req.Name) {
+		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: errNameTaken.Error()})
+		return
+	}
 	challenge, userID := make([]byte, 32), make([]byte, 16)
 	rand.Read(challenge)
 	rand.Read(userID)
@@ -136,8 +143,22 @@ type addKeyResponse struct {
 	Trusted bool `json:"trusted"`
 }
 
+// nameTaken reports whether a trusted key or a waiting addition is called
+// name.
+func (s *Server) nameTaken(pending []keyChange, name string) bool {
+	for _, k := range s.keys.Trusted() {
+		if strings.EqualFold(k.Name, name) {
+			return true
+		}
+	}
+	return slices.ContainsFunc(pending, func(c keyChange) bool {
+		return c.Op == approval.OpAdd && strings.EqualFold(c.Key.Name, name)
+	})
+}
+
 // addKey finishes a registration. The first key is trusted at once; any
-// later one waits for a trusted key to approve it.
+// later one waits for a trusted key to approve it and then for the owner to
+// confirm it on the server.
 func (s *Server) addKey(w http.ResponseWriter, r *http.Request, sess session) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
@@ -182,15 +203,23 @@ func (s *Server) addKey(w http.ResponseWriter, r *http.Request, sess session) {
 			return
 		}
 		s.cfg.Log.Info("first key trusted", "key", k.Name, "by", sess.who())
+		// Deleted rather than refused, so they stay ended after a key reset.
+		if err := s.db.deletePasswordSessions(r.Context()); err != nil {
+			s.cfg.Log.Error("end password sessions", "err", err)
+		}
 		s.syncKeys(r.Context())
 		connector.WriteJSON(w, http.StatusOK, addKeyResponse{Trusted: true})
 		return
 	}
-	if err := s.requestChange(r.Context(), approval.OpAdd, k); err != nil {
+	if s.nameTaken(nil, k.Name) {
+		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: errNameTaken.Error()})
+		return
+	}
+	if err := s.requestChange(r.Context(), approval.OpAdd, k, auth.AttData.AAGUID); err != nil {
 		connector.WriteError(w, err)
 		return
 	}
-	s.cfg.Log.Info("key waiting for approval", "op", approval.OpAdd, "key", k.Name, "by", sess.who())
+	s.cfg.Log.Info("key waiting for approval", "op", approval.OpAdd, "key", k.Name, "fingerprint", fingerprint(k), "by", sess.who())
 	connector.WriteJSON(w, http.StatusOK, addKeyResponse{})
 }
 
@@ -201,7 +230,7 @@ func (s *Server) removeKey(w http.ResponseWriter, r *http.Request, sess session)
 		s.errorPage(w, http.StatusNotFound, "No such key.")
 		return
 	}
-	if err := s.requestChange(r.Context(), approval.OpRemove, k); err != nil {
+	if err := s.requestChange(r.Context(), approval.OpRemove, k, nil); err != nil {
 		e := asError(err)
 		s.errorPage(w, e.Status, e.Message)
 		return
@@ -211,14 +240,16 @@ func (s *Server) removeKey(w http.ResponseWriter, r *http.Request, sess session)
 }
 
 // requestChange holds op on k until a trusted key approves it.
-func (s *Server) requestChange(ctx context.Context, op string, k approval.Key) error {
+func (s *Server) requestChange(ctx context.Context, op string, k approval.Key, aaguid []byte) error {
 	now := s.now()
 	if _, err := s.keys.Next(op, k, now); err != nil {
 		return &connector.Error{Status: http.StatusConflict, Message: err.Error()}
 	}
-	err := s.db.addKeyChange(ctx, keyChange{ID: rand.Text(), Op: op, Key: k, CreatedAt: now, ExpiresAt: now.Add(keyChangeTTL)}, maxKeyChanges)
+	err := s.db.addKeyChange(ctx, keyChange{
+		ID: rand.Text(), Op: op, Key: k, AAGUID: aaguid, CreatedAt: now, ExpiresAt: now.Add(keyChangeTTL),
+	}, maxKeyChanges)
 	switch {
-	case errors.Is(err, errKeyPending):
+	case errors.Is(err, errKeyPending), errors.Is(err, errNameTaken):
 		return &connector.Error{Status: http.StatusConflict, Message: err.Error()}
 	case errors.Is(err, errTooMany):
 		return &connector.Error{Status: http.StatusTooManyRequests, Message: "too many key changes are waiting"}
@@ -249,6 +280,10 @@ func (s *Server) keyChallenge(w http.ResponseWriter, r *http.Request, _ session)
 	c, err := s.db.keyChange(r.Context(), r.PathValue("id"), s.now())
 	if err != nil {
 		connector.WriteError(w, notFound(err))
+		return
+	}
+	if c.Approved != nil {
+		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: "already approved; confirm it on the server"})
 		return
 	}
 	change, err := s.keys.Next(c.Op, c.Key, s.now())
@@ -293,7 +328,14 @@ func (s *Server) approveKeyChange(w http.ResponseWriter, r *http.Request, sess s
 		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: "this is not the change that is waiting"})
 		return
 	}
-	err = s.keys.Apply(approval.SignedChange{Change: change, Signer: b64(assertionRawID(req.Assertion)), Assertion: req.Assertion})
+	sc := approval.SignedChange{Change: change, Signer: b64(assertionRawID(req.Assertion)), Assertion: req.Assertion}
+	// An addition also waits for the owner on the server: script on this
+	// origin could get one touch to sign the addition of its own key.
+	if c.Op == approval.OpAdd {
+		err = s.keys.Check(sc)
+	} else {
+		err = s.keys.Apply(sc)
+	}
 	if errors.Is(err, approval.ErrOutOfOrder) {
 		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: "the keys changed meanwhile; start again"})
 		return
@@ -303,12 +345,107 @@ func (s *Server) approveKeyChange(w http.ResponseWriter, r *http.Request, sess s
 		connector.WriteError(w, forbidden(err))
 		return
 	}
+	if c.Op == approval.OpAdd {
+		if err := s.db.approveKeyChange(ctx, id, &sc, s.now()); err != nil {
+			connector.WriteError(w, notFound(err))
+			return
+		}
+		s.cfg.Log.Info("key addition waiting for the server", "key", c.Key.Name, "fingerprint", fingerprint(c.Key), "session", sess.who())
+		connector.WriteJSON(w, http.StatusOK, struct{}{})
+		return
+	}
 	if err := s.db.deleteKeyChange(ctx, id); err != nil {
 		s.cfg.Log.Error("delete applied key change", "id", id, "err", err)
 	}
 	s.cfg.Log.Info("key change applied", "op", c.Op, "key", c.Key.Name, "seq", c.Seq, "session", sess.who())
 	s.syncKeys(ctx)
 	connector.WriteJSON(w, http.StatusOK, struct{}{})
+}
+
+type confirmRequest struct {
+	Fingerprint string `json:"fingerprint"`
+}
+
+type confirmResponse struct {
+	Name string `json:"name"`
+}
+
+// confirmKey applies the approved addition of the key with the given
+// fingerprint. It is served only on the admin socket.
+func (s *Server) confirmKey(w http.ResponseWriter, r *http.Request) {
+	var req confirmRequest
+	if !connector.DecodeJSON(w, r, &req, maxBody) {
+		return
+	}
+	ctx := r.Context()
+	changes, err := s.db.keyChanges(ctx, s.now())
+	if err != nil {
+		connector.WriteError(w, err)
+		return
+	}
+	i := slices.IndexFunc(changes, func(c keyChange) bool {
+		return c.Op == approval.OpAdd && fingerprint(c.Key) == req.Fingerprint
+	})
+	if i < 0 {
+		connector.WriteError(w, &connector.Error{Status: http.StatusNotFound, Message: fmt.Sprintf("no key with fingerprint %q is waiting to be added", req.Fingerprint)})
+		return
+	}
+	c := changes[i]
+	if c.Approved == nil {
+		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: fmt.Sprintf("approve adding %q with a trusted passkey in the console first", c.Key.Name)})
+		return
+	}
+	err = s.keys.Apply(*c.Approved)
+	if errors.Is(err, approval.ErrOutOfOrder) {
+		if err := s.db.approveKeyChange(ctx, c.ID, nil, s.now()); err != nil {
+			s.cfg.Log.Error("clear stale key approval", "id", c.ID, "err", err)
+		}
+		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: fmt.Sprintf("the keys changed since adding %q was approved; approve it again in the console", c.Key.Name)})
+		return
+	}
+	if err != nil {
+		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: err.Error()})
+		return
+	}
+	if err := s.db.deleteKeyChange(ctx, c.ID); err != nil {
+		s.cfg.Log.Error("delete applied key change", "id", c.ID, "err", err)
+	}
+	s.cfg.Log.Info("key change applied", "op", approval.OpAdd, "key", c.Key.Name, "by", "the server")
+	s.syncKeys(ctx)
+	connector.WriteJSON(w, http.StatusOK, confirmResponse{Name: c.Key.Name})
+}
+
+// fingerprint is a short hash of a credential for the owner to compare and
+// type on the server.
+func fingerprint(k approval.Key) string {
+	h := sha256.Sum256([]byte(k.CredentialID + "." + k.PublicKey))
+	x := hex.EncodeToString(h[:8])
+	return x[:4] + "-" + x[4:8] + "-" + x[8:12] + "-" + x[12:]
+}
+
+// authenticators names common passkey providers by AAGUID, from
+// github.com/passkeydeveloper/passkey-authenticator-aaguids.
+var authenticators = map[string]string{
+	"ea9b8d66-4d01-1d21-3ce4-b6b48cb575d4": "Google Password Manager",
+	"fbfc3007-154e-4ecc-8c0b-6e020557d7bd": "Apple Passwords",
+	"dd4ec289-e01d-41c9-bb89-70fa845d4bf2": "iCloud Keychain (Managed)",
+	"adce0002-35bc-c60a-648b-0b25f1f05503": "Chrome on Mac",
+	"08987058-cadc-4b81-b6e1-30de50dcbe96": "Windows Hello",
+	"9ddd1817-af5a-4672-a2b9-3e3dd95000a9": "Windows Hello",
+	"6028b017-b1d4-4c02-b4b3-afcdafc96bb2": "Windows Hello",
+	"bada5566-a7aa-401f-bd96-45619a55120d": "1Password",
+	"d548826e-79b4-db40-a3d8-11116f7e8349": "Bitwarden",
+	"531126d6-e717-415c-9320-3d9aa6981239": "Dashlane",
+	"53414d53-554e-4700-0000-000000000000": "Samsung Pass",
+	"50726f74-6f6e-5061-7373-50726f746f6e": "Proton Pass",
+	"fdb141b2-5d84-443e-8a35-4698c205a502": "KeePassXC",
+}
+
+func formatAAGUID(b []byte) string {
+	if len(b) != 16 {
+		return ""
+	}
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
 // syncKeys pushes the log to every connector whose head differs from ours.
@@ -356,7 +493,9 @@ type keyView struct {
 }
 
 type keyChangeView struct {
-	ID, Op, Name, Left string
+	ID, Op, Name, Left                 string
+	Fingerprint, AAGUID, Authenticator string
+	Synced, Approved                   bool
 }
 
 type keysView struct {
@@ -391,7 +530,12 @@ func (s *Server) keysPage(w http.ResponseWriter, r *http.Request, sess session) 
 		v.Keys = append(v.Keys, keyView{Key: k, Added: added[k.CredentialID], Current: k.CredentialID == sess.key.CredentialID})
 	}
 	for _, c := range changes {
-		v.Changes = append(v.Changes, keyChangeView{ID: c.ID, Op: c.Op, Name: c.Key.Name, Left: left(c.ExpiresAt.Sub(now))})
+		aaguid := formatAAGUID(c.AAGUID)
+		v.Changes = append(v.Changes, keyChangeView{
+			ID: c.ID, Op: c.Op, Name: c.Key.Name, Left: left(c.ExpiresAt.Sub(now)),
+			Fingerprint: fingerprint(c.Key), AAGUID: aaguid, Authenticator: authenticators[aaguid],
+			Synced: c.Key.Synced, Approved: c.Approved != nil,
+		})
 	}
 	v.Problems = s.keysProblems()
 	s.owner(w, r, sess, "keys", "Keys", "keys", v)

@@ -265,7 +265,7 @@ func bare(t *testing.T, edit func(cfg *Config, dir string)) *harness {
 		Origin:       origin,
 		PasswordHash: hash,
 		Connectors:   map[string]string{"fake": connSock},
-		StateDir:     t.TempDir(),
+		StateDir:     shortDir(t),
 		Log:          discard,
 		Now:          clk.now,
 	}
@@ -280,6 +280,7 @@ func bare(t *testing.T, edit func(cfg *Config, dir string)) *harness {
 
 	apiSock := filepath.Join(sockets, "api.sock")
 	serveSocket(t, apiSock, srv.ProposalHandler())
+	serveSocket(t, adminSocket(cfg.StateDir), srv.AdminHandler())
 	pages := httptest.NewServer(srv.Handler())
 	t.Cleanup(pages.Close)
 
@@ -883,7 +884,8 @@ func TestVersionMoves(t *testing.T) {
 	h.submit(t, "three")
 	moved("a proposal arrived")
 
-	if h.addKey(t, h.session, approvaltest.New(t, rpID, origin), "phone") {
+	laptop := approvaltest.New(t, rpID, origin)
+	if h.addKey(t, h.session, laptop, "laptop") {
 		t.Fatal("second key trusted without approval")
 	}
 	moved("a key change was requested")
@@ -891,6 +893,10 @@ func TestVersionMoves(t *testing.T) {
 		t.Fatalf("approve key = %d", status)
 	}
 	moved("a key change was approved")
+	if err := h.confirm(fingerprint(laptop.Key(""))); err != nil {
+		t.Fatal(err)
+	}
+	moved("a key addition was confirmed")
 	h.clock.advance(proposalTTL + time.Minute)
 	moved("a proposal expired")
 }

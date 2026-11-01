@@ -26,6 +26,7 @@ var (
 	errTooMany     = errors.New("too many pending requests")
 	errNoKeyChange = errors.New("no such key change, or it expired")
 	errKeyPending  = errors.New("a change to this key is already waiting")
+	errNameTaken   = errors.New("a key by that name is already trusted or waiting")
 )
 
 type row struct {
@@ -45,13 +46,17 @@ type challenge struct {
 	Session  []byte
 }
 
-// keyChange is a key change waiting for approval.
+// keyChange is a key change waiting for approval, or an approved addition
+// waiting for the owner on the server.
 type keyChange struct {
 	ID        string
 	Op        string
 	Key       approval.Key
+	AAGUID    []byte
 	CreatedAt time.Time
 	ExpiresAt time.Time
+	// Approved is the signed log entry of an approved addition.
+	Approved *approval.SignedChange
 }
 
 type db struct {
@@ -202,8 +207,8 @@ func (d *db) version(ctx context.Context, now time.Time) (string, error) {
 		SELECT (SELECT count(*) || '.' || coalesce(max(created_at), 0) || '.' ||
 		               coalesce(sum(status = 'pending' AND expires_at > ?1), 0) || '.' || count(result)
 		        FROM proposals) || '.' ||
-		       (SELECT count(*) || '.' || coalesce(max(created_at), 0)
-		        FROM key_changes WHERE expires_at > ?1)`, ms(now)).Scan(&v)
+		       (SELECT count(*) || '.' || coalesce(max(created_at), 0) || '.' || count(change)
+		        FROM key_requests WHERE expires_at > ?1)`, ms(now)).Scan(&v)
 	return v, err
 }
 
@@ -399,7 +404,7 @@ func (d *db) sweep(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	if _, err = d.sql.ExecContext(ctx, `DELETE FROM key_changes WHERE expires_at <= ?`, ms(now)); err != nil {
+	if _, err = d.sql.ExecContext(ctx, `DELETE FROM key_requests WHERE expires_at <= ?`, ms(now)); err != nil {
 		return err
 	}
 	_, err = d.sql.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at <= ?`, ms(now))
@@ -453,25 +458,35 @@ func (d *db) deleteSession(ctx context.Context, hash []byte) error {
 	return err
 }
 
-// addKeyChange stores c unless limit changes are waiting or one already
-// names its key.
+func (d *db) deletePasswordSessions(ctx context.Context) error {
+	_, err := d.sql.ExecContext(ctx, `DELETE FROM sessions WHERE credential_id = ''`)
+	return err
+}
+
+// addKeyChange stores c unless limit changes are waiting, one already names
+// its key, or c adds a key under the name of one waiting to be added.
 func (d *db) addKeyChange(ctx context.Context, c keyChange, limit int) error {
 	return d.tx(ctx, func(tx *sql.Tx) error {
-		var n int
-		err := tx.QueryRowContext(ctx, `SELECT count(*) FROM key_changes WHERE expires_at > ?`, ms(c.CreatedAt)).Scan(&n)
+		var n, named int
+		err := tx.QueryRowContext(ctx, `
+			SELECT count(*), coalesce(sum(op = 'add' AND name = ?2 COLLATE NOCASE), 0)
+			FROM key_requests WHERE expires_at > ?1`, ms(c.CreatedAt), c.Key.Name).Scan(&n, &named)
 		if err != nil {
 			return err
 		}
 		if n >= limit {
 			return errTooMany
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM key_changes WHERE expires_at <= ?`, ms(c.CreatedAt)); err != nil {
+		if c.Op == approval.OpAdd && named > 0 {
+			return errNameTaken
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM key_requests WHERE expires_at <= ?`, ms(c.CreatedAt)); err != nil {
 			return err
 		}
 		res, err := tx.ExecContext(ctx, `
-			INSERT INTO key_changes (id, op, name, credential_id, public_key, synced, created_at, expires_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (credential_id) DO NOTHING`,
-			c.ID, c.Op, c.Key.Name, c.Key.CredentialID, c.Key.PublicKey, c.Key.Synced, ms(c.CreatedAt), ms(c.ExpiresAt))
+			INSERT INTO key_requests (id, op, name, credential_id, public_key, synced, aaguid, created_at, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (credential_id) DO NOTHING`,
+			c.ID, c.Op, c.Key.Name, c.Key.CredentialID, c.Key.PublicKey, c.Key.Synced, c.AAGUID, ms(c.CreatedAt), ms(c.ExpiresAt))
 		if err != nil {
 			return err
 		}
@@ -494,8 +509,25 @@ func (d *db) keyChange(ctx context.Context, id string, now time.Time) (keyChange
 	return cs[0], nil
 }
 
+// approveKeyChange stores sc, or clears it when nil, as the approval of a
+// waiting addition.
+func (d *db) approveKeyChange(ctx context.Context, id string, sc *approval.SignedChange, now time.Time) error {
+	var change, assertion []byte
+	var signer *string
+	if sc != nil {
+		change, signer, assertion = sc.Change, &sc.Signer, sc.Assertion
+	}
+	res, err := d.sql.ExecContext(ctx,
+		`UPDATE key_requests SET change = ?, signer = ?, assertion = ? WHERE id = ? AND op = 'add' AND expires_at > ?`,
+		change, signer, assertion, id, ms(now))
+	if err != nil {
+		return err
+	}
+	return oneRow(res, errNoKeyChange)
+}
+
 func (d *db) deleteKeyChange(ctx context.Context, id string) error {
-	res, err := d.sql.ExecContext(ctx, `DELETE FROM key_changes WHERE id = ?`, id)
+	res, err := d.sql.ExecContext(ctx, `DELETE FROM key_requests WHERE id = ?`, id)
 	if err != nil {
 		return err
 	}
@@ -503,8 +535,9 @@ func (d *db) deleteKeyChange(ctx context.Context, id string) error {
 }
 
 func (d *db) queryKeyChanges(ctx context.Context, where string, args ...any) ([]keyChange, error) {
-	rs, err := d.sql.QueryContext(ctx,
-		`SELECT id, op, name, credential_id, public_key, synced, created_at, expires_at FROM key_changes `+where, args...)
+	rs, err := d.sql.QueryContext(ctx, `
+		SELECT id, op, name, credential_id, public_key, synced, aaguid, created_at, expires_at, change, signer, assertion
+		FROM key_requests `+where, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -512,13 +545,19 @@ func (d *db) queryKeyChanges(ctx context.Context, where string, args ...any) ([]
 	var out []keyChange
 	for rs.Next() {
 		var (
-			c                keyChange
-			created, expires int64
+			c                 keyChange
+			created, expires  int64
+			change, assertion []byte
+			signer            sql.NullString
 		)
-		if err := rs.Scan(&c.ID, &c.Op, &c.Key.Name, &c.Key.CredentialID, &c.Key.PublicKey, &c.Key.Synced, &created, &expires); err != nil {
+		if err := rs.Scan(&c.ID, &c.Op, &c.Key.Name, &c.Key.CredentialID, &c.Key.PublicKey, &c.Key.Synced, &c.AAGUID,
+			&created, &expires, &change, &signer, &assertion); err != nil {
 			return nil, err
 		}
 		c.CreatedAt, c.ExpiresAt = fromMS(created), fromMS(expires)
+		if change != nil {
+			c.Approved = &approval.SignedChange{Change: change, Signer: signer.String, Assertion: assertion}
+		}
 		out = append(out, c)
 	}
 	return out, rs.Err()

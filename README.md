@@ -27,7 +27,8 @@ After deploying:
 2. Link your accounts under Connections.
 3. Give agents the token in `/var/lib/mandate/token`.
 
-The gateway (port 8780) and the console (443) listen on `tailscale0` only.
+The gateway (port 8780) and the console (443) listen on all addresses, and
+the firewall opens them on `tailscale0` only (`openFirewallOn`).
 Set `tokenFile` and `adminPasswordHashFile` to manage those secrets yourself.
 
 ## Agents
@@ -42,8 +43,11 @@ mandate whatsapp send 15551234567@s.whatsapp.net "running 10 late" --wait 10m
 
 Writes wait in the console's inbox. Approving with a passkey unlocks the tab
 for 10 minutes, so further approvals need no touch; lock or close the tab to
-end it sooner. Adding or removing passkeys needs a trusted one. Lost them all?
-`sudo mandate-reset-keys` lets the admin password add a first key again.
+end it sooner. Adding or removing passkeys needs a trusted one; an added
+passkey then waits until you run the `sudo mandate-confirm-key` command the
+console shows. Once a passkey is trusted, the admin password no longer signs
+in. Lost them all? `sudo mandate-reset-keys` lets the admin password sign in
+and add a first key again.
 
 To hide a chat from agents, list it in
 `/var/lib/mandate-gateway/exposure.toml`:
