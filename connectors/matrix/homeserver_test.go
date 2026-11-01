@@ -71,6 +71,7 @@ type homeserver struct {
 
 	history map[id.RoomID][]map[string]any // newest first, for /messages
 	members map[id.RoomID][]map[string]any // lazy-loaded members for /messages
+	media   map[string][]byte              // by mxc:// URI
 
 	sends    []sentEvent
 	sendMode string // "", "forbidden", "hangup"
@@ -90,6 +91,7 @@ func newHomeserver(t *testing.T) *homeserver {
 		inbox:       map[id.DeviceID][]map[string]any{},
 		history:     map[id.RoomID][]map[string]any{},
 		members:     map[id.RoomID][]map[string]any{},
+		media:       map[string][]byte{},
 	}
 	mux := http.NewServeMux()
 	open := map[string]http.HandlerFunc{
@@ -111,6 +113,8 @@ func newHomeserver(t *testing.T) *homeserver {
 		"GET /_matrix/client/v3/sync":                            h.sync,
 		"GET /_matrix/client/v3/rooms/{room}/messages":           h.messages,
 		"GET /_matrix/client/v3/rooms/{room}/context/{event}":    h.context,
+		"GET /_matrix/client/v3/rooms/{room}/event/{event}":      h.event,
+		"GET /_matrix/client/v1/media/download/{server}/{file}":  h.download,
 		"PUT /_matrix/client/v3/rooms/{room}/send/{type}/{txn}":  h.send,
 	}
 	for pattern, f := range open {
@@ -448,6 +452,29 @@ func (h *homeserver) context(w http.ResponseWriter, r *http.Request, _ device) {
 		}
 	}
 	matrixError(w, http.StatusNotFound, "M_NOT_FOUND")
+}
+
+func (h *homeserver) event(w http.ResponseWriter, r *http.Request, _ device) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, evt := range h.history[id.RoomID(r.PathValue("room"))] {
+		if evt["event_id"] == r.PathValue("event") {
+			writeJSON(w, http.StatusOK, evt)
+			return
+		}
+	}
+	matrixError(w, http.StatusNotFound, "M_NOT_FOUND")
+}
+
+func (h *homeserver) download(w http.ResponseWriter, r *http.Request, _ device) {
+	h.mu.Lock()
+	data, ok := h.media["mxc://"+r.PathValue("server")+"/"+r.PathValue("file")]
+	h.mu.Unlock()
+	if !ok {
+		matrixError(w, http.StatusNotFound, "M_NOT_FOUND")
+		return
+	}
+	w.Write(data)
 }
 
 func (h *homeserver) send(w http.ResponseWriter, r *http.Request, _ device) {

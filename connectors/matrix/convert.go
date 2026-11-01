@@ -92,6 +92,9 @@ func (c *mxConnector) apply(ctx context.Context, a *account, evt *event.Event, n
 	}
 	msg.Body, msg.MediaType = messageBody(evt.Type, content)
 	msg.Body = mark + msg.Body
+	if file, ok := attachmentOf(evt.Type, content); ok {
+		msg.Media, msg.MediaType = []store.Media{file}, ""
+	}
 	// The server bundles the latest edit with the original, which matters
 	// when history is read backwards and the edit comes first.
 	var editedAt time.Time
