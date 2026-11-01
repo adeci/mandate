@@ -147,3 +147,62 @@ func TestValidation(t *testing.T) {
 		}
 	}
 }
+
+func lastMessageAt(t *testing.T, s *Store, id string) string {
+	t.Helper()
+	var at sql.NullString
+	must(t, s.DB().QueryRowContext(t.Context(), `SELECT last_message_at FROM containers WHERE id = ?`, id).Scan(&at))
+	return at.String
+}
+
+func TestLastMessageAtOnlyMovesForward(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	ctx := t.Context()
+	at := time.Date(2026, 10, 30, 18, 40, 0, 0, time.UTC)
+	must(t, s.UpsertContainer(ctx, Container{ID: "c", Kind: "dm", LastMessageAt: at}))
+	must(t, s.UpsertContainer(ctx, Container{ID: "c", Kind: "dm", LastMessageAt: at.Add(-time.Hour)}))
+	must(t, s.UpsertContainer(ctx, Container{ID: "c", Kind: "dm"}))
+	if got := lastMessageAt(t, s, "c"); got != formatTime(at) {
+		t.Fatalf("last_message_at = %q, want %q", got, formatTime(at))
+	}
+	must(t, s.UpsertContainer(ctx, Container{ID: "c", Kind: "dm", LastMessageAt: at.Add(time.Minute)}))
+	if got := lastMessageAt(t, s, "c"); got != formatTime(at.Add(time.Minute)) {
+		t.Fatalf("last_message_at = %q after a newer time", got)
+	}
+}
+
+// The schema before last_message_at, as on databases in use.
+const schemaV0 = `CREATE TABLE containers (
+    id                TEXT PRIMARY KEY,
+    kind              TEXT NOT NULL,
+    parent_id         TEXT,
+    name              TEXT,
+    is_group          INTEGER NOT NULL DEFAULT 0,
+    participants_json TEXT NOT NULL DEFAULT '[]',
+    updated_at        TEXT NOT NULL
+);
+INSERT INTO containers (id, kind, name, updated_at) VALUES ('old', 'dm', 'Farid', '2026-10-01T00:00:00.000Z');`
+
+func TestOpenMigratesOldDatabase(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "data.db")
+	db, err := sql.Open("sqlite3", "file:"+path)
+	must(t, err)
+	_, err = db.ExecContext(t.Context(), schemaV0)
+	must(t, err)
+	must(t, db.Close())
+
+	for range 2 {
+		s, err := Open(t.Context(), path)
+		must(t, err)
+		at := time.Date(2026, 10, 30, 18, 40, 0, 0, time.UTC)
+		must(t, s.UpsertContainer(t.Context(), Container{ID: "old", Kind: "dm", LastMessageAt: at}))
+		var name string
+		must(t, s.DB().QueryRowContext(t.Context(), `SELECT name FROM containers WHERE id = 'old'`).Scan(&name))
+		if got := lastMessageAt(t, s, "old"); name != "Farid" || got != formatTime(at) {
+			t.Fatalf("after migration: name %q, last_message_at %q", name, got)
+		}
+		must(t, s.Close())
+	}
+}

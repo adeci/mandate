@@ -24,12 +24,13 @@ const filter = `WITH
 hidden_chat(id) AS (SELECT value FROM json_each(?1)),
 hidden_sender(id) AS (SELECT value FROM json_each(?2)),
 chats AS (
-  SELECT id, kind, parent_id, name FROM containers
+  SELECT id, kind, parent_id, name, last_message_at FROM containers
   WHERE id NOT IN (SELECT id FROM hidden_chat)
     AND id NOT IN (SELECT id FROM hidden_sender)
     AND COALESCE(parent_id, '') NOT IN (SELECT id FROM hidden_chat)),
 named AS (
-  SELECT c.id, c.kind, CASE WHEN p.name IS NULL THEN c.name ELSE p.name || ' / ' || COALESCE(c.name, c.id) END AS name
+  SELECT c.id, c.kind, c.last_message_at,
+         CASE WHEN p.name IS NULL THEN c.name ELSE p.name || ' / ' || COALESCE(c.name, c.id) END AS name
   FROM chats AS c LEFT JOIN chats AS p ON p.id = c.parent_id),
 visible AS (
   SELECT m.*, is_auth(m.sender_id, m.body) AS auth
@@ -188,12 +189,16 @@ var (
 // replyTo is the seq of the visible message m replies to.
 const replyTo = `(SELECT r.seq FROM msgs AS r WHERE r.id = m.reply_to_id)`
 
+// last_message is the later of the newest visible message and the activity
+// the connector reported for the chat.
 func (s *source) chats(search string, limit int64) (*table, error) {
-	rows, err := s.query(`SELECT c.id, c.kind, c.name,
-  strftime('%Y-%m-%d %H:%M', (SELECT max(sent_at) FROM msgs WHERE container_id = c.id)) AS last
-FROM named AS c
-WHERE ?3 = '' OR instr(lower(COALESCE(c.name, '')), lower(?3)) OR instr(lower(c.id), lower(?3))
-ORDER BY last DESC NULLS LAST, c.id LIMIT ?4`, search, limit+1)
+	rows, err := s.query(`SELECT id, kind, name, strftime('%Y-%m-%d %H:%M', at) FROM (
+  SELECT c.id, c.kind, c.name, NULLIF(max(
+    COALESCE((SELECT max(sent_at) FROM msgs WHERE container_id = c.id), ''),
+    COALESCE(c.last_message_at, '')), '') AS at
+  FROM named AS c
+  WHERE ?3 = '' OR instr(lower(COALESCE(c.name, '')), lower(?3)) OR instr(lower(c.id), lower(?3)))
+ORDER BY at DESC NULLS LAST, id LIMIT ?4`, search, limit+1)
 	if err != nil {
 		return nil, err
 	}

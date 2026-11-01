@@ -31,6 +31,9 @@ type Container struct {
 	Name         string
 	IsGroup      bool
 	Participants []Participant
+	// LastMessageAt is the newest activity the service reports, which may be
+	// newer than any stored message. Zero or an older time keeps the stored value.
+	LastMessageAt time.Time
 }
 
 // Body holds raw text; the gateway, not the store, decides what clients may see.
@@ -66,7 +69,32 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	if err := migrate(ctx, db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// migrate adds what schema.sql's CREATE TABLE IF NOT EXISTS cannot add to a
+// database created by an older version.
+func migrate(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var n int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT count(*) FROM pragma_table_info('containers') WHERE name = 'last_message_at'`).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE containers ADD COLUMN last_message_at TEXT`); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -86,17 +114,22 @@ func (s *Store) UpsertContainer(ctx context.Context, c Container) error {
 		}
 		participants = string(b)
 	}
+	var lastMessageAt any
+	if !c.LastMessageAt.IsZero() {
+		lastMessageAt = formatTime(c.LastMessageAt)
+	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO containers (id, kind, parent_id, name, is_group, participants_json, updated_at)
-VALUES (?1, ?2, NULLIF(?3, ''), NULLIF(?4, ''), ?5, COALESCE(?6, '[]'), ?7)
+INSERT INTO containers (id, kind, parent_id, name, is_group, participants_json, updated_at, last_message_at)
+VALUES (?1, ?2, NULLIF(?3, ''), NULLIF(?4, ''), ?5, COALESCE(?6, '[]'), ?7, ?8)
 ON CONFLICT(id) DO UPDATE SET
     kind              = excluded.kind,
     parent_id         = COALESCE(excluded.parent_id, containers.parent_id),
     name              = COALESCE(excluded.name, containers.name),
     is_group          = excluded.is_group,
     participants_json = COALESCE(?6, containers.participants_json),
-    updated_at        = excluded.updated_at`,
-		c.ID, c.Kind, c.ParentID, c.Name, c.IsGroup, participants, now())
+    updated_at        = excluded.updated_at,
+    last_message_at   = NULLIF(max(COALESCE(?8, ''), COALESCE(containers.last_message_at, '')), '')`,
+		c.ID, c.Kind, c.ParentID, c.Name, c.IsGroup, participants, now(), lastMessageAt)
 	return err
 }
 

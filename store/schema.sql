@@ -6,7 +6,8 @@ CREATE TABLE IF NOT EXISTS containers (
     name              TEXT,
     is_group          INTEGER NOT NULL DEFAULT 0,
     participants_json TEXT NOT NULL DEFAULT '[]',
-    updated_at        TEXT NOT NULL
+    updated_at        TEXT NOT NULL,
+    last_message_at   TEXT             -- last activity the service reported
 );
 
 CREATE TABLE IF NOT EXISTS messages (
