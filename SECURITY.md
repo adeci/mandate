@@ -36,7 +36,7 @@ What each part is trusted with:
 - Read recipients by their ID. A name starting with `~` was chosen by that
   person or a group member, not by you.
 - Back up `/var/lib/mandate-*` encrypted. The databases hold your full message
-  history in plain text.
+  history in plain text, and the keys to fetch its photos and files.
 
 ## Known limits
 

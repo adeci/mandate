@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +24,8 @@ import (
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"go.mau.fi/whatsmeow/util/cbcutil"
+	"go.mau.fi/whatsmeow/util/hkdfutil"
 
 	"github.com/adeci/mandate/approval"
 	"github.com/adeci/mandate/approval/approvaltest"
@@ -55,6 +60,7 @@ type fakeClient struct {
 	disconnects int
 	logouts     int
 	logoutErr   error
+	blobs       map[string][]byte // direct path -> encrypted file
 }
 
 func (f *fakeClient) IsConnected() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.connected }
@@ -68,6 +74,36 @@ func (f *fakeClient) SendMessage(_ context.Context, to types.JID, msg *waE2E.Mes
 		return whatsmeow.SendResponse{}, f.err
 	}
 	return whatsmeow.SendResponse{ID: "3EB0AA", Timestamp: time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC)}, nil
+}
+
+// Download decrypts the file at msg's direct path as whatsmeow does.
+func (f *fakeClient) Download(_ context.Context, msg whatsmeow.DownloadableMessage) ([]byte, error) {
+	f.mu.Lock()
+	blob, ok := f.blobs[msg.GetDirectPath()]
+	f.mu.Unlock()
+	if !ok {
+		return nil, whatsmeow.ErrMediaDownloadFailedWith404
+	}
+	if sum := sha256.Sum256(blob); !bytes.Equal(sum[:], msg.GetFileEncSHA256()) {
+		return nil, whatsmeow.ErrInvalidMediaEncSHA256
+	}
+	keys := hkdfutil.SHA256(msg.GetMediaKey(), nil, []byte(whatsmeow.GetMediaType(msg)), 112)
+	iv, cipherKey, macKey := keys[:16], keys[16:48], keys[48:80]
+	ciphertext, mac := blob[:len(blob)-10], blob[len(blob)-10:]
+	h := hmac.New(sha256.New, macKey)
+	h.Write(iv)
+	h.Write(ciphertext)
+	if !hmac.Equal(h.Sum(nil)[:10], mac) {
+		return nil, whatsmeow.ErrInvalidMediaHMAC
+	}
+	plain, err := cbcutil.Decrypt(cipherKey, iv, ciphertext)
+	if err != nil {
+		return nil, err
+	}
+	if sum := sha256.Sum256(plain); !bytes.Equal(sum[:], msg.GetFileSHA256()) {
+		return nil, whatsmeow.ErrInvalidMediaSHA256
+	}
+	return plain, nil
 }
 
 // GetQRChannel opens a QR session whose first code is "qr-<session>-1".

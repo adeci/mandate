@@ -37,6 +37,7 @@ Set `tokenFile` and `adminPasswordHashFile` to manage those secrets yourself.
 export MANDATE_URL=http://box:8780 MANDATE_TOKEN_FILE=~/.config/mandate/token
 mandate --help
 mandate whatsapp send 15551234567@s.whatsapp.net "running 10 late" --wait 10m
+mandate whatsapp media 15551234567@s.whatsapp.net 812   # save that message's photo
 ```
 
 On a machine without Nix, download the CLI from the

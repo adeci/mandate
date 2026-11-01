@@ -37,6 +37,8 @@ type Config struct {
 	// ConsoleURL is where the owner fixes connectors; it goes into errors
 	// that ask the agent to fetch them.
 	ConsoleURL string
+	// MaxMedia is the largest file agents may fetch, in bytes.
+	MaxMedia int64
 }
 
 // The name keys the source's exposure.toml section.
@@ -96,6 +98,7 @@ func Command(ctx context.Context, args []string) error {
 	fs.Var(connectorFlag(cfg.Connectors), "connector", "connector socket as name=path (repeatable; a source of the same name filters it)")
 	fs.StringVar(&cfg.ConsoleSocket, "console-socket", "", "console proposal socket (enables write ops)")
 	fs.StringVar(&cfg.ConsoleURL, "console-url", "", "console base URL, shown to agents when a connector needs the owner")
+	fs.Int64Var(&cfg.MaxMedia, "max-media", 100<<20, "largest media file agents may fetch, in bytes")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

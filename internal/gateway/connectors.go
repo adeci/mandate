@@ -23,10 +23,11 @@ import (
 
 const (
 	// Paced reads may wait up to 90 s for a slot before answering 429.
-	readTimeout = 120 * time.Second
-	callTimeout = 30 * time.Second
-	specTimeout = 3 * time.Second
-	specTTL     = 30 * time.Second
+	readTimeout  = 120 * time.Second
+	mediaTimeout = 10 * time.Minute
+	callTimeout  = 30 * time.Second
+	specTimeout  = 3 * time.Second
+	specTTL      = 30 * time.Second
 
 	maxWait      = 900 * time.Second
 	pollInterval = time.Second
@@ -35,8 +36,9 @@ const (
 )
 
 type connectors struct {
-	// calls serves spec and prepare; reads get their own longer timeout.
-	calls, reads map[string]*connector.Client
+	// calls serves spec and prepare; reads and media get their own longer
+	// timeouts.
+	calls, reads, media map[string]*connector.Client
 
 	mu    sync.Mutex
 	cache map[string]cachedSpec
@@ -51,11 +53,13 @@ func newConnectors(sockets map[string]string) *connectors {
 	c := &connectors{
 		calls: map[string]*connector.Client{},
 		reads: map[string]*connector.Client{},
+		media: map[string]*connector.Client{},
 		cache: map[string]cachedSpec{},
 	}
 	for name, socket := range sockets {
 		c.calls[name] = connector.Dial(socket, callTimeout)
 		c.reads[name] = connector.Dial(socket, readTimeout)
+		c.media[name] = connector.Dial(socket, mediaTimeout)
 	}
 	return c
 }
@@ -245,6 +249,10 @@ func (h *handler) verb(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if verb == "media" {
+		h.media(w, r, name)
+		return
+	}
 	q := r.URL.Query()
 	var chat string
 	var run func(*source) (*table, error)
@@ -378,6 +386,9 @@ func (h *handler) op(w http.ResponseWriter, r *http.Request) {
 		var cmds []string
 		if _, ok := h.cfg.Sources[name]; ok {
 			cmds = append(cmds, "chats", "messages", "search")
+			if spec.Media {
+				cmds = append(cmds, "media")
+			}
 		}
 		for _, op := range spec.Ops {
 			cmds = append(cmds, op.Name)

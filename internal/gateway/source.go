@@ -30,7 +30,9 @@ import (
 // recursive walk on every query.
 //
 // msgs.text is the body as agents see it: login codes replaced, deletions and
-// media marked in brackets. Search matches body, not the markers.
+// media marked in brackets. Search matches body, not the markers. A message's
+// files are marked by type and name, and numbered for media --index when
+// there are several; a message without stored files keeps its media_type.
 const filter = `WITH
 hidden_sender(id) AS (SELECT value FROM json_each(?2)),
 hidden(id) AS (
@@ -63,7 +65,11 @@ msgs AS (
          sender_id, CASE WHEN is_from_me THEN 'me' ELSE sender_name END AS sender,
          CASE WHEN auth THEN NULL ELSE body END AS body,
          CASE WHEN auth THEN '[login code hidden]'
-              ELSE rtrim(iif(deleted, '[deleted] ', '') || COALESCE('[' || media_type || '] ', '') || COALESCE(body, ''), ' ')
+              ELSE rtrim(iif(deleted, '[deleted] ', '') || COALESCE(
+                (SELECT iif(count(*) = 1, '[' || type || COALESCE(' ' || name, '') || '] ',
+                            group_concat('[#' || idx || ' ' || type || COALESCE(' ' || name, '') || ']', ' ' ORDER BY idx) || ' ')
+                 FROM media WHERE message_id = visible.id),
+                '[' || media_type || '] ', '') || COALESCE(body, ''), ' ')
          END AS text
   FROM visible)
 `
@@ -121,19 +127,26 @@ func (h *handler) openSource(ctx context.Context, name string) (_ *source, err e
 		}); err != nil {
 		return nil, err
 	}
-	// Connectors built before last_message_at existed have no such column; a
-	// temp view, which shadows the table, adds it as unknown.
-	stmt, _, err := db.Prepare(`SELECT count(*) FROM pragma_table_info('containers') WHERE name = 'last_message_at'`)
+	// Connectors built before last_message_at or media existed lack them;
+	// temporary ones, which shadow the tables, stand in.
+	stmt, _, err := db.Prepare(`SELECT
+  (SELECT count(*) FROM pragma_table_info('containers') WHERE name = 'last_message_at'),
+  (SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'media')`)
 	if err != nil {
 		return nil, err
 	}
 	stmt.Step()
-	missing := stmt.ColumnInt(0) == 0
+	noLastMessage, noMedia := stmt.ColumnInt(0) == 0, stmt.ColumnInt(1) == 0
 	if err := stmt.Close(); err != nil {
 		return nil, err
 	}
-	if missing {
+	if noLastMessage {
 		if err := db.Exec(`CREATE TEMP VIEW containers AS SELECT *, NULL AS last_message_at FROM main.containers`); err != nil {
+			return nil, err
+		}
+	}
+	if noMedia {
+		if err := db.Exec(`CREATE TEMP TABLE media (message_id TEXT, idx INTEGER, type TEXT, name TEXT, size INTEGER)`); err != nil {
 			return nil, err
 		}
 	}
@@ -298,4 +311,35 @@ JOIN chats AS c ON c.id = m.container_id ORDER BY j.key`, string(b))
 		return nil, err
 	}
 	return &table{Columns: searchColumns, Rows: rows}, nil
+}
+
+// mediaMessage is what the gateway knows of a visible message whose file an
+// agent asks for.
+type mediaMessage struct {
+	id            string
+	auth, deleted bool
+	marked        bool  // media_type is set
+	items         int64 // stored files
+	size          int64 // of the file asked for; 0 if unknown or not stored
+}
+
+// mediaMessage looks up message seq in chat through the filter; nil if the
+// agent may not see it.
+func (s *source) mediaMessage(chat string, seq, index int64) (*mediaMessage, error) {
+	rows, err := s.query(`SELECT id, auth, deleted, media_type IS NOT NULL,
+  (SELECT count(*) FROM media WHERE message_id = m.id),
+  (SELECT size FROM media WHERE message_id = m.id AND idx = ?5)
+FROM visible AS m WHERE container_id = ?3 AND seq = ?4`, chat, seq, index)
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	r := rows[0]
+	id, _ := r[0].(string)
+	auth, _ := r[1].(int64)
+	deleted, _ := r[2].(int64)
+	marked, _ := r[3].(int64)
+	m := &mediaMessage{id: id, auth: auth != 0, deleted: deleted != 0, marked: marked != 0}
+	m.items, _ = r[4].(int64)
+	m.size, _ = r[5].(int64)
+	return m, nil
 }

@@ -1,16 +1,20 @@
 package connector
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"maps"
+	"mime"
 	"net"
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -50,6 +54,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /execute", s.allow(true, s.execute))
 	mux.HandleFunc("GET /keys", s.allow(false, s.keysHead))
 	mux.HandleFunc("PUT /keys", s.allow(true, s.putKeys))
+	mux.HandleFunc("POST /media", s.allow(false, s.media))
 	f, ok := s.Connector.(Forwarder)
 	if !ok {
 		return mux
@@ -180,6 +185,7 @@ func (s *Server) spec(w http.ResponseWriter, _ *http.Request) {
 	spec.Protocol = ProtocolVersion
 	_, spec.Forward = s.Connector.(Forwarder)
 	_, spec.Unlink = s.Connector.(Unlinker)
+	_, spec.Media = s.Connector.(MediaFetcher)
 	WriteJSON(w, http.StatusOK, spec)
 }
 
@@ -250,6 +256,42 @@ func (s *Server) read(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(out)
+}
+
+type mediaRequest struct {
+	Message string `json:"message"`
+	Index   int    `json:"index"`
+}
+
+func (s *Server) media(w http.ResponseWriter, r *http.Request) {
+	var req mediaRequest
+	if !DecodeJSON(w, r, &req, maxBody) {
+		return
+	}
+	m, ok := s.Connector.(MediaFetcher)
+	if !ok {
+		WriteError(w, &Error{Status: http.StatusNotFound, Message: "this connector serves no media"})
+		return
+	}
+	if req.Message == "" || req.Index < 0 {
+		WriteError(w, Invalid("a message and an index from 0 are required"))
+		return
+	}
+	f, err := m.Media(r.Context(), req.Message, req.Index)
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	defer f.Body.Close()
+	h := w.Header()
+	h.Set("Content-Type", cmp.Or(f.Type, "application/octet-stream"))
+	h.Set("Content-Length", strconv.FormatInt(f.Size, 10))
+	if d := mime.FormatMediaType("attachment", map[string]string{"filename": f.Name}); f.Name != "" && d != "" {
+		h.Set("Content-Disposition", d)
+	}
+	if _, err := io.Copy(w, f.Body); err != nil {
+		s.Log.Warn("send media", "message", req.Message, "index", req.Index, "err", err)
+	}
 }
 
 func (s *Server) prepare(w http.ResponseWriter, r *http.Request) {

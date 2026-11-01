@@ -14,6 +14,7 @@ its spec.
 | `POST /prepare` | normalize a write and render what the owner will see |
 | `POST /execute` | run a write the owner approved |
 | `GET /forward/…` | relay agents' GETs to an API, for a `Forwarder` |
+| `POST /media` | stream a stored message's file, for a `MediaFetcher` |
 | `GET`, `PUT /keys` | the owner's trusted keys, kept in sync by the console |
 
 `connector.Main` serves all of it. `/execute` checks the owner's passkey
@@ -179,6 +180,7 @@ func main() {
   messages to `env.DataPath()` with the `store` package and agents get
   `chats`, `messages` and `search` over them, with the owner's hide rules and
   login-code redaction applied.
+- **Media** is optional; see below.
 - **Chats**: mark a param `Container` and the gateway refuses the op unless
   it names a stored, visible chat.
 - **Health and linking** are optional: `connector.Checker`,
@@ -193,6 +195,67 @@ func main() {
   `--check-config`.
 - **Tests**: `approval/approvaltest` is a software passkey, so you can test
   approved writes end to end through `connector.Server`.
+
+## Media
+
+Agents fetch a message's files with `mandate NAME media CHAT_ID SEQ
+[--index N]`. A file is fetched from the service when an agent asks for it;
+the connector stores only what it needs to fetch it later.
+
+On ingest, give `store.Message` its files in the service's order; the first
+is index 0:
+
+```go
+msg.Media = []store.Media{{
+	Type: "image/jpeg",   // MIME type, application/octet-stream if unknown
+	Name: "IMG_2041.jpg", // the file name, if the sender gave one
+	Size: 48213,          // bytes, 0 if unknown
+	Ref:  ref,            // opaque: an attachment ID or URL, a decryption key
+}}
+```
+
+Agents see `[image/jpeg IMG_2041.jpg] caption`, and for several files
+`[#0 image/png] [#1 application/pdf plan.pdf]`. Keep `MediaType` for content
+without files, such as `poll` or `location`; a message with `Media` is marked
+by its files instead. Redelivery with `Media: nil` keeps the stored files, an
+empty slice removes them, and `DeleteMessage` drops them. `Ref` stays out of
+agents' answers, but the gateway's user can read `data.db`.
+
+Then implement `connector.MediaFetcher`:
+
+```go
+func (c *chat) Media(ctx context.Context, message string, index int) (connector.MediaFile, error) {
+	item, err := c.st.Media(ctx, message, index) // store.ErrNoMedia if none
+	if errors.Is(err, store.ErrNoMedia) {
+		return connector.MediaFile{}, &connector.Error{Status: http.StatusNotFound, Message: "no such file"}
+	}
+	if err != nil {
+		return connector.MediaFile{}, err
+	}
+	body, size, err := c.download(ctx, item.Ref)
+	if err != nil {
+		return connector.MediaFile{}, err
+	}
+	return connector.MediaFile{Type: item.Type, Name: item.Name, Size: size, Body: body}, nil
+}
+```
+
+`message` is the stored message ID. Use the stored reference, or look the
+message up again by its ID where the service allows, which serves messages
+stored without `Media` too. `Body` must yield exactly `Size` bytes; when the
+service doesn't say how large a file is, read it first. Refuse with a
+`*connector.Error` whose message tells the agent why: 404 for a file that is
+gone or was never stored, 503 while not connected.
+
+`Server` then sets `Spec.Media`, so `mandate NAME --help` lists the command,
+and serves `POST /media` to the gateway's user: a JSON body
+`{"message": ID, "index": N}` answered with the file and its
+`Content-Type`, `Content-Length` and `Content-Disposition`. The gateway
+finds the message by chat and seq through the owner's hide rules and refuses
+the files of hidden chats and senders, of deleted messages and of messages
+with a login code. It asks the connector only for a message with stored
+files or a `MediaType`, and refuses files over 100 MiB, by their stored size
+and again by the size the connector answers.
 
 ## Running it
 

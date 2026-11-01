@@ -29,3 +29,15 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_container_sent ON messages(container_id, sent_at);
 CREATE INDEX IF NOT EXISTS messages_sent ON messages(sent_at);
 CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender_id);
+
+-- A message's files, fetched from the service only when an agent asks. ref is
+-- what the connector needs to fetch one, such as an ID or a decryption key.
+CREATE TABLE IF NOT EXISTS media (
+    message_id TEXT NOT NULL REFERENCES messages(id),
+    idx        INTEGER NOT NULL,
+    type       TEXT NOT NULL,   -- MIME type
+    name       TEXT,
+    size       INTEGER,
+    ref        BLOB,
+    PRIMARY KEY (message_id, idx)
+);
