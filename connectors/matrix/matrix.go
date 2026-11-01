@@ -52,9 +52,9 @@ type mxConnector struct {
 	log     *slog.Logger
 	zl      zerolog.Logger
 	http    *http.Client
-	// How long the owner has to verify, and the other device to share the
-	// key backup key.
-	verifyTimeout, backupWait time.Duration
+	// How long the owner has to verify, when mandate asks them and asks
+	// again, and how long another device has to share the key backup key.
+	verifyTimeout, requestDelay, resendEvery, backupWait time.Duration
 
 	setup sync.Mutex // held while linking, unlinking, or forgetting a logged-out device
 
@@ -67,7 +67,8 @@ type mxConnector struct {
 func newConnector(ctx context.Context, st *store.Store, env *connector.Env, zl zerolog.Logger, hc *http.Client) *mxConnector {
 	return &mxConnector{
 		ctx: ctx, st: st, dir: env.PrivateDir(), session: env.Secret("session.json"),
-		log: env.Log, zl: zl, http: hc, verifyTimeout: verifyTimeout, backupWait: backupWait,
+		log: env.Log, zl: zl, http: hc,
+		verifyTimeout: verifyTimeout, requestDelay: requestDelay, resendEvery: resendEvery, backupWait: backupWait,
 	}
 }
 

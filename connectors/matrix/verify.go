@@ -22,6 +22,12 @@ import (
 const (
 	verifyTimeout = 10 * time.Minute
 	backupWait    = time.Minute
+	// Other clients learn of a new device from their next sync, and
+	// matrix-rust-sdk (Element) drops verification requests from devices it
+	// does not know yet. So the first request waits, and is sent again while
+	// nobody has acted on it.
+	requestDelay = 10 * time.Second
+	resendEvery  = 2 * time.Minute
 	// Only to-device messages matter while verifying; rooms wait until linked.
 	verifyFilter = `{"presence":{"not_types":["*"]},"account_data":{"not_types":["*"]},"room":{"rooms":[]}}`
 )
@@ -39,11 +45,14 @@ const (
 // verifying is a link waiting for the owner to verify the new device from
 // another of theirs with emoji (SAS). mandate never holds the cross-signing
 // keys: the other device signs this one, then shares the key backup key.
+//
+// mandate sends requests to the owner's devices and accepts the owner's
+// requests to it; the first the owner acts on is followed and the others
+// are cancelled.
 type verifying struct {
-	c   *mxConnector
-	a   *account
-	vh  *verificationhelper.VerificationHelper
-	txn id.VerificationTransactionID
+	c  *mxConnector
+	a  *account
+	vh *verificationhelper.VerificationHelper
 
 	verified chan struct{}      // closed when both sides confirmed
 	failed   chan verifyFailure // why it stops, first reason wins
@@ -51,11 +60,13 @@ type verifying struct {
 	once     sync.Once
 
 	// Guarded by mxConnector.mu.
-	state  verifyState
-	emoji  []rune
-	names  []string
-	ended  bool
-	result error // why it ended without linking
+	txn     id.VerificationTransactionID // mandate's latest request, or the one followed
+	adopted bool                         // the owner acted on txn
+	state   verifyState
+	emoji   []rune
+	names   []string
+	ended   bool
+	result  error // why it ended without linking
 }
 
 // verifyFailure ends a verification. cancel, if set, is sent to the other
@@ -72,8 +83,8 @@ func (v *verifying) fail(f verifyFailure) {
 	}
 }
 
-// startVerifying asks the owner's other devices to verify a, then follows
-// the verification in the background.
+// startVerifying prepares to verify a from another of the owner's devices,
+// then follows the verification in the background.
 func (c *mxConnector) startVerifying(ctx context.Context, a *account) (connector.SetupStep, error) {
 	user := a.sess.UserID
 	devices, err := a.mach.FetchKeys(ctx, []id.UserID{user}, true)
@@ -97,9 +108,6 @@ func (c *mxConnector) startVerifying(ctx context.Context, a *account) (connector
 	if err := v.vh.Init(ctx); err != nil {
 		return connector.SetupStep{}, fmt.Errorf("start verification: %w", err)
 	}
-	if v.txn, err = v.vh.StartVerification(ctx, user); err != nil {
-		return connector.SetupStep{}, upstream("send the verification request", err)
-	}
 	syncCtx, stopSync := context.WithCancel(c.ctx)
 	synced := make(chan struct{})
 	go func() {
@@ -111,8 +119,72 @@ func (c *mxConnector) startVerifying(ctx context.Context, a *account) (connector
 	step := v.step()
 	c.mu.Unlock()
 	go c.follow(v, func() { stopSync(); <-synced })
-	c.log.Info("verification requested", "device", a.sess.DeviceID)
 	return step, nil
+}
+
+// request sends a verification request to the owner's other devices,
+// replacing mandate's earlier one, until the owner acts on one.
+func (c *mxConnector) request(v *verifying) {
+	c.mu.Lock()
+	old, adopted := v.txn, v.adopted
+	if !adopted {
+		v.txn = ""
+	}
+	c.mu.Unlock()
+	if adopted {
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.ctx, time.Minute)
+	defer cancel()
+	if old != "" {
+		v.cancel(ctx, old, event.VerificationCancelCodeTimeout, "replaced by a new request")
+	}
+	txn, err := v.vh.StartVerification(ctx, v.a.sess.UserID)
+	if err != nil {
+		c.log.Warn("send verification request", "err", err)
+		return
+	}
+	c.mu.Lock()
+	adopted = v.adopted
+	if !adopted {
+		v.txn = txn
+	}
+	c.mu.Unlock()
+	if adopted {
+		v.cancel(ctx, txn, event.VerificationCancelCodeUser, "verifying with another request")
+		return
+	}
+	c.log.Info("verification requested", "device", v.a.sess.DeviceID)
+}
+
+func (v *verifying) cancel(ctx context.Context, txn id.VerificationTransactionID, code event.VerificationCancelCode, reason string) {
+	if err := v.vh.CancelVerification(ctx, txn, code, reason); err != nil {
+		v.c.log.Info("cancel verification", "err", err)
+	}
+}
+
+// adopt makes txn the verification followed once the owner acted on it, and
+// returns mandate's request it replaces. It reports false if another one is
+// followed already.
+func (v *verifying) adopt(txn id.VerificationTransactionID) (id.VerificationTransactionID, bool) {
+	v.c.mu.Lock()
+	defer v.c.mu.Unlock()
+	if v.adopted {
+		return "", v.txn == txn
+	}
+	old := v.txn
+	v.txn, v.adopted, v.state = txn, true, stateAccepted
+	if old == txn {
+		old = ""
+	}
+	return old, true
+}
+
+// current reports whether txn is the verification followed.
+func (v *verifying) current(txn id.VerificationTransactionID) bool {
+	v.c.mu.Lock()
+	defer v.c.mu.Unlock()
+	return txn != "" && txn == v.txn
 }
 
 // follow waits for the verification to end, then links a, or logs it out
@@ -142,23 +214,35 @@ func (c *mxConnector) follow(v *verifying, stopSync func()) {
 }
 
 func (c *mxConnector) awaitVerified(v *verifying) error {
-	timer := time.NewTimer(c.verifyTimeout)
-	defer timer.Stop()
+	timeout := time.NewTimer(c.verifyTimeout)
+	defer timeout.Stop()
+	request := time.NewTimer(c.requestDelay)
+	defer request.Stop()
 	var f verifyFailure
-	select {
-	case <-v.verified:
-		return nil
-	case f = <-v.failed:
-	case <-timer.C:
-		f = verifyFailure{msg: "verification timed out; link again", cancel: event.VerificationCancelCodeTimeout}
-	case <-c.ctx.Done():
-		f = verifyFailure{msg: "mandate-matrix stopped", cancel: event.VerificationCancelCodeUser}
-	}
-	if f.cancel != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := v.vh.CancelVerification(ctx, v.txn, f.cancel, f.msg); err != nil {
-			c.log.Warn("cancel verification", "err", err)
+wait:
+	for {
+		select {
+		case <-v.verified:
+			return nil
+		case f = <-v.failed:
+			break wait
+		case <-request.C:
+			c.request(v)
+			request.Reset(c.resendEvery)
+		case <-timeout.C:
+			f = verifyFailure{msg: "verification timed out; link again", cancel: event.VerificationCancelCodeTimeout}
+			break wait
+		case <-c.ctx.Done():
+			f = verifyFailure{msg: "mandate-matrix stopped", cancel: event.VerificationCancelCodeUser}
+			break wait
 		}
+	}
+	c.mu.Lock()
+	txn := v.txn
+	c.mu.Unlock()
+	if f.cancel != "" && txn != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		v.cancel(ctx, txn, f.cancel, f.msg)
 		cancel()
 	}
 	return errors.New(f.msg)
@@ -226,7 +310,7 @@ func (v *verifying) step() connector.SetupStep {
 	case stateBackup:
 		return connector.SetupStep{Instructions: "Verified. Waiting for Element to share the key backup…"}
 	}
-	return connector.SetupStep{Instructions: "Accept the request from mandate in Element on another device"}
+	return connector.SetupStep{Instructions: "In Element, accept mandate's verification request, or open Settings → Sessions → mandate → Verify"}
 }
 
 // verifyingStep reports the verification in progress, or how it ended.
@@ -252,13 +336,17 @@ func (c *mxConnector) answer(ctx context.Context, answer string) (connector.Setu
 	c.mu.Lock()
 	v := c.verifying
 	comparing := v != nil && !v.ended && v.state == stateCompare
+	var txn id.VerificationTransactionID
+	if comparing {
+		txn = v.txn
+	}
 	c.mu.Unlock()
 	if !comparing {
 		return connector.SetupStep{}, &connector.Error{Status: http.StatusConflict, Message: "nothing to confirm"}
 	}
 	switch answer {
 	case "yes":
-		if err := v.vh.ConfirmSAS(ctx, v.txn); err != nil {
+		if err := v.vh.ConfirmSAS(ctx, txn); err != nil {
 			return connector.SetupStep{}, fmt.Errorf("confirm verification: %w", err)
 		}
 		c.setVerifyState(v, stateConfirmed)
@@ -338,44 +426,77 @@ func backupKey(secret string, pub id.Ed25519) *backup.MegolmBackupKey {
 
 // The verificationhelper callbacks run on the verification sync goroutine.
 
-func (v *verifying) VerificationRequested(context.Context, id.VerificationTransactionID, id.UserID, id.DeviceID) {
+// VerificationRequested accepts a request from another of the owner's
+// devices, unless the owner already acted on another one.
+func (v *verifying) VerificationRequested(ctx context.Context, txn id.VerificationTransactionID, from id.UserID, dev id.DeviceID) {
+	if from != v.a.sess.UserID {
+		v.cancel(ctx, txn, event.VerificationCancelCodeUser, "mandate verifies only its owner's devices")
+		return
+	}
+	v.c.mu.Lock()
+	adopted := v.adopted
+	v.c.mu.Unlock()
+	if adopted {
+		v.cancel(ctx, txn, event.VerificationCancelCodeUser, "verifying with another request")
+		return
+	}
+	v.c.log.Info("verification request received", "from_device", dev)
+	// Accepting calls VerificationReady, which follows it.
+	if err := v.vh.AcceptVerification(ctx, txn); err != nil {
+		v.c.log.Warn("accept verification request", "from_device", dev, "err", err)
+	}
 }
 
+// VerificationReady is called when the owner accepted mandate's request, or
+// mandate accepted theirs.
 func (v *verifying) VerificationReady(ctx context.Context, txn id.VerificationTransactionID, _ id.DeviceID, sas, _ bool, _ *verificationhelper.QRCode) {
-	if txn != v.txn {
+	// The helper holds its lock during this callback, and saves the
+	// transaction as ready after it returns; the requests below wait for it.
+	ctx = context.WithoutCancel(ctx)
+	old, ok := v.adopt(txn)
+	if !ok {
+		go v.cancel(ctx, txn, event.VerificationCancelCodeUser, "verifying with another request")
 		return
+	}
+	if old != "" {
+		go v.cancel(ctx, old, event.VerificationCancelCodeUser, "verifying with another request")
 	}
 	if !sas {
 		v.fail(verifyFailure{msg: "the other device offered no emoji verification", cancel: event.VerificationCancelCodeUnknownMethod})
 		return
 	}
-	v.c.setVerifyState(v, stateAccepted)
-	// The helper holds its lock during callbacks and saves the transaction
-	// as ready after this returns.
 	go func() {
-		if err := v.vh.StartSAS(context.WithoutCancel(ctx), txn); err != nil {
+		if err := v.vh.StartSAS(ctx, txn); err != nil {
 			v.c.log.Info("start emoji verification", "err", err)
 		}
 	}()
 }
 
 func (v *verifying) ShowSAS(_ context.Context, txn id.VerificationTransactionID, emoji []rune, names []string, _ []int) {
-	if txn != v.txn {
-		return
-	}
 	v.c.mu.Lock()
-	v.state, v.emoji, v.names = stateCompare, emoji, names
-	v.c.mu.Unlock()
+	defer v.c.mu.Unlock()
+	if txn == v.txn && v.adopted {
+		v.state, v.emoji, v.names = stateCompare, emoji, names
+	}
 }
 
+// VerificationCancelled ends linking only for the verification followed. A
+// request of mandate's the owner declined is sent again later, so they can
+// still verify from Settings.
 func (v *verifying) VerificationCancelled(_ context.Context, txn id.VerificationTransactionID, _ event.VerificationCancelCode, reason string) {
-	if txn == v.txn {
+	v.c.mu.Lock()
+	followed := txn == v.txn && v.adopted
+	if txn == v.txn && !v.adopted {
+		v.txn = ""
+	}
+	v.c.mu.Unlock()
+	if followed {
 		v.fail(verifyFailure{msg: "verification was cancelled: " + reason})
 	}
 }
 
 func (v *verifying) VerificationDone(_ context.Context, txn id.VerificationTransactionID, _ event.VerificationMethod) {
-	if txn == v.txn {
+	if v.current(txn) {
 		v.once.Do(func() { close(v.verified) })
 	}
 }

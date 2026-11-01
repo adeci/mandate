@@ -21,41 +21,46 @@ import (
 )
 
 // elementVerifier is the owner tapping through verification in Element: it
-// accepts the request and shows the emoji; the test confirms them.
+// accepts mandate's request unless ignore is set, and shows the emoji; the
+// test confirms them.
 type elementVerifier struct {
-	vh *verificationhelper.VerificationHelper
+	vh     *verificationhelper.VerificationHelper
+	ignore bool // leave mandate's requests alone
 
 	mu        sync.Mutex
-	txn       id.VerificationTransactionID
+	requested id.VerificationTransactionID // mandate's latest request
+	sasTxn    id.VerificationTransactionID
 	emoji     string
 	done      bool
-	cancelled bool
+	cancelled map[id.VerificationTransactionID]bool
 }
 
 func (e *elementVerifier) VerificationRequested(ctx context.Context, txn id.VerificationTransactionID, _ id.UserID, _ id.DeviceID) {
 	e.mu.Lock()
-	e.txn = txn
+	e.requested = txn
 	e.mu.Unlock()
-	// The helper holds its lock during callbacks.
-	go e.vh.AcceptVerification(context.WithoutCancel(ctx), txn)
+	if !e.ignore {
+		// The helper holds its lock during callbacks.
+		go e.vh.AcceptVerification(context.WithoutCancel(ctx), txn)
+	}
 }
 
 func (e *elementVerifier) VerificationReady(context.Context, id.VerificationTransactionID, id.DeviceID, bool, bool, *verificationhelper.QRCode) {
 }
 
-func (e *elementVerifier) ShowSAS(_ context.Context, _ id.VerificationTransactionID, emoji []rune, _ []string, _ []int) {
+func (e *elementVerifier) ShowSAS(_ context.Context, txn id.VerificationTransactionID, emoji []rune, _ []string, _ []int) {
 	parts := make([]string, len(emoji))
 	for i, r := range emoji {
 		parts[i] = string(r)
 	}
 	e.mu.Lock()
-	e.emoji = strings.Join(parts, " ")
+	e.sasTxn, e.emoji = txn, strings.Join(parts, " ")
 	e.mu.Unlock()
 }
 
-func (e *elementVerifier) VerificationCancelled(context.Context, id.VerificationTransactionID, event.VerificationCancelCode, string) {
+func (e *elementVerifier) VerificationCancelled(_ context.Context, txn id.VerificationTransactionID, _ event.VerificationCancelCode, _ string) {
 	e.mu.Lock()
-	e.cancelled = true
+	e.cancelled[txn] = true
 	e.mu.Unlock()
 }
 
@@ -65,16 +70,22 @@ func (e *elementVerifier) VerificationDone(context.Context, id.VerificationTrans
 	e.mu.Unlock()
 }
 
-func (e *elementVerifier) state() (emoji string, done, cancelled bool) {
+func (e *elementVerifier) state() (emoji string, done bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.emoji, e.done, e.cancelled
+	return e.emoji, e.done
+}
+
+func (e *elementVerifier) wasCancelled(txn id.VerificationTransactionID) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cancelled[txn]
 }
 
 func (e *elementVerifier) confirm(t *testing.T) {
 	t.Helper()
 	e.mu.Lock()
-	txn := e.txn
+	txn := e.sasTxn
 	e.mu.Unlock()
 	if err := e.vh.ConfirmSAS(context.Background(), txn); err != nil {
 		t.Fatal(err)
@@ -83,10 +94,10 @@ func (e *elementVerifier) confirm(t *testing.T) {
 
 // verifier runs Element's side of verification and secret sharing,
 // receiving its to-device messages until the test ends.
-func (f *fixture) verifier() *elementVerifier {
+func (f *fixture) verifier(ignore bool) *elementVerifier {
 	f.t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	e := &elementVerifier{}
+	e := &elementVerifier{ignore: ignore, cancelled: map[id.VerificationTransactionID]bool{}}
 	e.vh = verificationhelper.NewVerificationHelper(f.element.cli, f.element.mach, nil, e, false, false, true)
 	if err := e.vh.Init(ctx); err != nil {
 		f.t.Fatal(err)
@@ -151,38 +162,47 @@ func (f *fixture) untilConfirm() connector.SetupStep {
 	return step
 }
 
+// compareAndLink checks mandate and Element show the same emoji, confirms on
+// both, and waits until mandate has linked.
+func (f *fixture) compareAndLink(element *elementVerifier) {
+	f.t.Helper()
+	ctx := context.Background()
+	step := f.untilConfirm()
+	emoji, _ := element.state()
+	if step.Code != emoji || len(strings.Fields(step.Code)) != 7 || len(strings.Split(step.Instructions, ", ")) != 7 {
+		f.t.Fatalf("mandate shows %q (%s), Element %q", step.Code, step.Instructions, emoji)
+	}
+	element.confirm(f.t)
+	step, err := f.c.Setup(ctx, map[string]string{connector.SetupConfirm: "yes"})
+	if err != nil || step.Confirm != "" {
+		f.t.Fatalf("confirm: %+v %v", step, err)
+	}
+	eventually(f.t, "linking finishes", func() bool {
+		step, err := f.c.Setup(ctx, f.verifyArgs())
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		return step.Done
+	})
+	if _, done := element.state(); !done {
+		f.t.Fatal("Element did not finish verifying")
+	}
+}
+
 func TestVerifyLink(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	old, enc := f.encrypt(vaultRoom, "$old", "the old plan", 1000)
 	f.backUp(vaultRoom, enc)
 	f.shareBackupKey()
-	element := f.verifier()
+	element := f.verifier(false)
 	ctx := context.Background()
 
 	step, err := f.c.Setup(ctx, f.verifyArgs())
-	if err != nil || !strings.Contains(step.Instructions, "Accept the request") {
+	if err != nil || !strings.Contains(step.Instructions, "accept mandate's verification request") {
 		t.Fatalf("setup: %+v %v", step, err)
 	}
-	step = f.untilConfirm()
-	emoji, _, _ := element.state()
-	if step.Code != emoji || len(strings.Fields(step.Code)) != 7 || len(strings.Split(step.Instructions, ", ")) != 7 {
-		t.Fatalf("mandate shows %q (%s), Element %q", step.Code, step.Instructions, emoji)
-	}
-	element.confirm(t)
-	if step, err = f.c.Setup(ctx, map[string]string{connector.SetupConfirm: "yes"}); err != nil || step.Confirm != "" {
-		t.Fatalf("confirm: %+v %v", step, err)
-	}
-	eventually(t, "linking finishes", func() bool {
-		step, err := f.c.Setup(ctx, f.verifyArgs())
-		if err != nil {
-			t.Fatal(err)
-		}
-		return step.Done
-	})
-	if _, done, _ := element.state(); !done {
-		t.Fatal("Element did not finish verifying")
-	}
+	f.compareAndLink(element)
 	if h := f.c.Health(ctx); h.State != connector.Healthy || h.Detail != "" {
 		t.Fatalf("health = %+v", h)
 	}
@@ -229,7 +249,7 @@ func TestVerifyLink(t *testing.T) {
 func TestVerifyMismatch(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
-	element := f.verifier()
+	element := f.verifier(false)
 	ctx := context.Background()
 	if _, err := f.c.Setup(ctx, f.verifyArgs()); err != nil {
 		t.Fatal(err)
@@ -249,7 +269,11 @@ func TestVerifyMismatch(t *testing.T) {
 	if h := f.c.Health(ctx); h.State != connector.NeedsSetup || h.Detail != "not linked" {
 		t.Fatalf("health = %+v", h)
 	}
-	eventually(t, "Element learns of the cancellation", func() bool { _, _, cancelled := element.state(); return cancelled })
+	eventually(t, "Element learns of the cancellation", func() bool {
+		element.mu.Lock()
+		defer element.mu.Unlock()
+		return element.cancelled[element.sasTxn]
+	})
 	if _, err := f.c.Setup(ctx, map[string]string{connector.SetupConfirm: "yes"}); !errors.As(err, &ce) || ce.Status != http.StatusConflict {
 		t.Fatalf("confirm after cancelling: %v", err)
 	}
@@ -259,26 +283,72 @@ func TestVerifyWithoutBackupKey(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	f.c.backupWait = 300 * time.Millisecond
-	element := f.verifier()
+	element := f.verifier(false)
 	ctx := context.Background()
 	if _, err := f.c.Setup(ctx, f.verifyArgs()); err != nil {
 		t.Fatal(err)
 	}
-	f.untilConfirm()
-	element.confirm(t)
-	if _, err := f.c.Setup(ctx, map[string]string{connector.SetupConfirm: "yes"}); err != nil {
-		t.Fatal(err)
-	}
-	eventually(t, "linking finishes", func() bool {
-		step, err := f.c.Setup(ctx, f.verifyArgs())
-		if err != nil {
-			t.Fatal(err)
-		}
-		return step.Done
-	})
+	f.compareAndLink(element)
 	if h := f.c.Health(ctx); h.State != connector.Healthy || h.Detail != noBackupDetail {
 		t.Fatalf("health = %+v", h)
 	}
+}
+
+// The owner ignores mandate's request and verifies from Element's session
+// list instead.
+func TestVerifyFromElement(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	f.shareBackupKey()
+	element := f.verifier(true)
+	ctx := context.Background()
+	if _, err := f.c.Setup(ctx, f.verifyArgs()); err != nil {
+		t.Fatal(err)
+	}
+	var stale id.VerificationTransactionID
+	eventually(t, "mandate's request reaches Element", func() bool {
+		element.mu.Lock()
+		defer element.mu.Unlock()
+		stale = element.requested
+		return stale != ""
+	})
+	// Element learns of the new device from sync.
+	if _, err := f.element.mach.FetchKeys(ctx, []id.UserID{owner}, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := element.vh.StartVerification(ctx, owner); err != nil {
+		t.Fatal(err)
+	}
+	f.compareAndLink(element)
+	if !element.wasCancelled(stale) {
+		t.Fatal("mandate's own request was not cancelled")
+	}
+	if h := f.c.Health(ctx); h.State != connector.Healthy || h.Detail != "" {
+		t.Fatalf("health = %+v", h)
+	}
+}
+
+// mandate asks again until the owner acts.
+func TestVerifyRequestsAgain(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	f.c.resendEvery = 50 * time.Millisecond
+	element := f.verifier(true)
+	if _, err := f.c.Setup(context.Background(), f.verifyArgs()); err != nil {
+		t.Fatal(err)
+	}
+	var first id.VerificationTransactionID
+	eventually(t, "a first request", func() bool {
+		element.mu.Lock()
+		defer element.mu.Unlock()
+		first = element.requested
+		return first != ""
+	})
+	eventually(t, "the first request is replaced", func() bool {
+		element.mu.Lock()
+		defer element.mu.Unlock()
+		return element.requested != first && element.cancelled[first]
+	})
 }
 
 func TestVerifyTimesOut(t *testing.T) {

@@ -96,6 +96,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	f.c = newConnector(ctx, f.st, f.env, zerolog.Nop(), f.hs.srv.Client())
+	f.c.requestDelay = 0
 	t.Cleanup(func() { f.c.Close() })
 	return f
 }
