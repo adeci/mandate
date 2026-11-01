@@ -254,8 +254,8 @@ func (c *fmConnector) getEmails(ctx context.Context, a *account, cn *conn, ids, 
 	return g.List, err
 }
 
-// mark marks a stored email deleted while it is skipped, and restores it
-// when it comes back. It reports whether e is stored.
+// mark marks a stored email deleted while it is skipped, keeping its body,
+// and restores it when it comes back. It reports whether e is stored.
 func (c *fmConnector) mark(ctx context.Context, cn *conn, e email) (bool, error) {
 	var deleted bool
 	err := c.st.DB().QueryRowContext(ctx, `SELECT deleted FROM messages WHERE id = ?1`, e.ID).Scan(&deleted)
@@ -266,7 +266,7 @@ func (c *fmConnector) mark(ctx context.Context, cn *conn, e email) (bool, error)
 	}
 	switch skip := cn.skipped(e); {
 	case skip && !deleted:
-		err = c.st.DeleteMessage(ctx, e.ID)
+		_, err = c.st.DB().ExecContext(ctx, `UPDATE messages SET deleted = 1 WHERE id = ?1`, e.ID)
 	case !skip && deleted:
 		_, err = c.st.DB().ExecContext(ctx, `UPDATE messages SET deleted = 0 WHERE id = ?1`, e.ID)
 	}

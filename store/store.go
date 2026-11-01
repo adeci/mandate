@@ -147,7 +147,7 @@ ON CONFLICT(id) DO UPDATE SET
 }
 
 // Identical redelivery is a no-op; changed content sets edited_at. The seq of
-// an existing message never changes.
+// an existing message never changes, and a deleted message stays deleted.
 func (s *Store) UpsertMessage(ctx context.Context, m Message) error {
 	if m.ID == "" || m.ContainerID == "" {
 		return errors.New("store: message id and container id are required")
@@ -164,23 +164,24 @@ ON CONFLICT(id) DO UPDATE SET
     sender_name = COALESCE(excluded.sender_name, messages.sender_name),
     media_type  = COALESCE(excluded.media_type, messages.media_type),
     edited_at   = CASE WHEN excluded.body IS NOT messages.body THEN ?10 ELSE messages.edited_at END,
-    body        = excluded.body`,
+    body        = excluded.body
+WHERE NOT messages.deleted`,
 		m.ID, m.ContainerID, m.SenderID, m.SenderName, formatTime(m.SentAt), m.IsFromMe,
 		m.Body, m.MediaType, m.ReplyToID, ts)
 	return err
 }
 
-// Unknown IDs are ignored.
+// Unknown and deleted IDs are ignored.
 func (s *Store) EditMessage(ctx context.Context, id, body string, at time.Time) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE messages SET body = ?2, edited_at = ?3 WHERE id = ?1`,
+		`UPDATE messages SET body = ?2, edited_at = ?3 WHERE id = ?1 AND NOT deleted`,
 		id, body, formatTime(at))
 	return err
 }
 
-// The body is kept on disk; the gateway exposes the flag.
+// DeleteMessage flags the message and clears its body.
 func (s *Store) DeleteMessage(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE messages SET deleted = 1 WHERE id = ?1`, id)
+	_, err := s.db.ExecContext(ctx, `UPDATE messages SET deleted = 1, body = NULL WHERE id = ?1`, id)
 	return err
 }
 

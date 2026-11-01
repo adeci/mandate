@@ -93,7 +93,7 @@ type storedMessage struct {
 func (f *fixture) message(id string) storedMessage {
 	f.t.Helper()
 	var m storedMessage
-	err := f.c.st.DB().QueryRow(`SELECT container_id, COALESCE(sender_id, ''), COALESCE(sender_name, ''), body,
+	err := f.c.st.DB().QueryRow(`SELECT container_id, COALESCE(sender_id, ''), COALESCE(sender_name, ''), COALESCE(body, ''),
 COALESCE(reply_to_id, ''), is_from_me, deleted FROM messages WHERE id = ?1`, id).
 		Scan(&m.Chat, &m.SenderID, &m.Sender, &m.Body, &m.ReplyTo, &m.FromMe, &m.Deleted)
 	if err != nil {

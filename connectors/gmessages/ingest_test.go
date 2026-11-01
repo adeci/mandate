@@ -137,7 +137,7 @@ func TestLiveEvents(t *testing.T) {
 	got := messages(t, f)
 	want := []row{
 		{ID: "m1", Chat: "1", Sender: "+15551230001", Name: "Farid Haddad", Body: "dinner at 7?"},
-		{ID: "m4", Chat: "3", Sender: "+15551230003", Name: "Mina", Body: "hi all", Deleted: true},
+		{ID: "m4", Chat: "3", Sender: "+15551230003", Name: "Mina", Deleted: true},
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("messages\n got %+v\nwant %+v", got, want)

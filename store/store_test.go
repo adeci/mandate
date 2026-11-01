@@ -91,8 +91,14 @@ func TestUpsertMessageLifecycle(t *testing.T) {
 	}
 
 	must(t, s.DeleteMessage(ctx, "m1"))
-	if r := get(t, s, "m1"); r.deleted != 1 || r.body.String != "final" {
-		t.Fatalf("DeleteMessage must flag and keep the body: %+v", r)
+	if r := get(t, s, "m1"); r.deleted != 1 || r.body.Valid {
+		t.Fatalf("DeleteMessage must flag and clear the body: %+v", r)
+	}
+	// Neither a late edit nor a redelivery brings the text back.
+	must(t, s.EditMessage(ctx, "m1", "again", editAt.Add(time.Minute)))
+	must(t, s.UpsertMessage(ctx, msg))
+	if r := get(t, s, "m1"); r.deleted != 1 || r.body.Valid {
+		t.Fatalf("deleted message restored: %+v", r)
 	}
 }
 
