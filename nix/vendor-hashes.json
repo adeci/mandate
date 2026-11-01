@@ -1,10 +1,10 @@
 {
   "mandate": "sha256-Qmvz4eVjMRhHVGRd4QAaLHnu622UjreOwY4vPIMHx+I=",
-  "mandate-discord": "sha256-DpPdwakjEsctKMXrPEHo0cz9WXNxfrZHNbvFp8dmBII=",
-  "mandate-fastmail": "sha256-ZDbIsXnOSbsHNaStAolSMy8h0MVM0tnlGCJ2QuCZ0XI=",
-  "mandate-gmessages": "sha256-rDNemVT3fRPJy8tpe/uzlBKMHj4AJDkkgs4J+Zhksi4=",
+  "mandate-discord": "sha256-47xfHvn+TwDZ0XI5teX3U0LXm40DR9DM5LLXcVG66Eg=",
+  "mandate-fastmail": "sha256-bpv6Ag6ZA3JC1Q+M3cqcvnkrLOXK7rzhhASSdGeELx0=",
+  "mandate-gmessages": "sha256-vdeED5262g+yl780s+YS7azrPrRkh8q6qaK8ZSZTgG4=",
   "mandate-http": "sha256-QiLgspu9BaarELHxo0Y31pKcK7MuuE5bNn2zQuKJKwI=",
-  "mandate-matrix": "sha256-6utkAvXizRkhjj28Ssh7VcbVGxTTOmkZq20pENOyyXo=",
-  "mandate-signal": "sha256-TC5jhdAC0hM7DL52UrfZIY+QKziG7Fqap8S/lkqKur0=",
-  "mandate-whatsapp": "sha256-7HUo5Hixe6aedE8sUvOtpRywyluYYYKgll3EmNA48t4="
+  "mandate-matrix": "sha256-Qfsb0ZuM29/frx/2UjORfg6HlUP7ZJytbecQIV8GleM=",
+  "mandate-signal": "sha256-2dC/IqGnLKwwgY67NB46VxLCteTjUATUUnJ+rivsDGQ=",
+  "mandate-whatsapp": "sha256-onKBsMcPkQCib7Z3d0WO0zc73DsHJINKlbQpPX4NXJc="
 }
