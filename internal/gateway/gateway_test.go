@@ -199,6 +199,10 @@ func TestVerbsOrderBySentTimeAcrossIngestOrder(t *testing.T) {
 	}{{"evening", 18*time.Hour + 40*time.Minute}, {"morning", 9*time.Hour + 12*time.Minute}, {"noon-a", 12 * time.Hour}, {"noon-b", 12 * time.Hour}} {
 		mustDo(t, st.UpsertMessage(context.Background(), store.Message{ID: m.id, ContainerID: "c1", SenderID: "u1", Body: "x " + m.id, SentAt: day.Add(m.at)}))
 	}
+	// Stored after c1 but last active before it; c3 never had a message.
+	mustDo(t, st.UpsertContainer(context.Background(), store.Container{ID: "c2", Kind: "dm"}))
+	mustDo(t, st.UpsertMessage(context.Background(), store.Message{ID: "late", ContainerID: "c2", SenderID: "u2", Body: "late", SentAt: day.Add(10 * time.Hour)}))
+	mustDo(t, st.UpsertContainer(context.Background(), store.Container{ID: "c3", Kind: "dm"}))
 	mustDo(t, st.Close())
 	h := newHandler(Config{Sources: map[string]string{"wa": path}, ExposureFile: filepath.Join(dir, "exposure.toml"), Timeout: 2 * time.Second}, testToken)
 
@@ -217,6 +221,14 @@ func TestVerbsOrderBySentTimeAcrossIngestOrder(t *testing.T) {
 		if !slices.Equal(got, want) {
 			t.Errorf("%s pages = %v, want %v", verb, got, want)
 		}
+	}
+
+	_, res, _ := getTable(t, h, "/v1/wa/chats")
+	if got, want := column(t, res, "id"), []any{"c1", "c2", "c3"}; !slices.Equal(got, want) {
+		t.Errorf("chats = %v, want %v", got, want)
+	}
+	if got := column(t, res, "last_message")[0]; got != "2026-10-30T18:40:00Z" {
+		t.Errorf("last_message = %v", got)
 	}
 }
 

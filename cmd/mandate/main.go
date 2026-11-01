@@ -18,10 +18,7 @@ import (
 )
 
 const hostUsage = `
-on the host:
-  gateway                 serve the gateway
-  console                 serve the owner's console and the proposal API
-  list [--senders] DB     list chat and sender IDs for exposure.toml
+host commands (for the owner): gateway, console, list
 `
 
 func main() {

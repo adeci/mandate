@@ -26,7 +26,8 @@ chats AS (
     AND id NOT IN (SELECT id FROM hidden_sender)
     AND COALESCE(parent_id, '') NOT IN (SELECT id FROM hidden_chat)),
 msgs AS (
-  SELECT m.seq, m.id, m.container_id, m.sent_at, COALESCE(m.sender_name, m.sender_id) AS sender,
+  SELECT m.seq, m.id, m.container_id, m.sent_at, strftime('%Y-%m-%dT%H:%M:%SZ', m.sent_at) AS at,
+         COALESCE(m.sender_name, m.sender_id) AS sender,
          CASE WHEN is_auth(m.sender_id, m.body) THEN NULL ELSE m.body END AS body
   FROM messages AS m JOIN chats AS c ON c.id = m.container_id
   WHERE COALESCE(m.sender_id, '') NOT IN (SELECT id FROM hidden_sender))
@@ -167,15 +168,16 @@ func page(t *table, rows [][]any, limit int64, seqCol int) *table {
 }
 
 var (
-	chatColumns    = []string{"id", "kind", "name", "updated_at"}
+	chatColumns    = []string{"id", "kind", "name", "last_message"}
 	messageColumns = []string{"seq", "sent_at", "sender", "body"}
 	searchColumns  = []string{"seq", "sent_at", "chat", "sender", "body"}
 )
 
 func (s *source) chats(search string, limit int64) (*table, error) {
-	rows, err := s.query(`SELECT id, kind, name, updated_at FROM chats
-WHERE ?3 = '' OR instr(lower(COALESCE(name, '')), lower(?3)) OR instr(lower(id), lower(?3))
-ORDER BY updated_at DESC, id LIMIT ?4`, search, limit+1)
+	rows, err := s.query(`SELECT c.id, c.kind, c.name, (SELECT max(at) FROM msgs WHERE container_id = c.id) AS last
+FROM chats AS c
+WHERE ?3 = '' OR instr(lower(COALESCE(c.name, '')), lower(?3)) OR instr(lower(c.id), lower(?3))
+ORDER BY last DESC NULLS LAST, c.id LIMIT ?4`, search, limit+1)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +187,7 @@ ORDER BY updated_at DESC, id LIMIT ?4`, search, limit+1)
 // before is the seq of the last message seen; the page continues after it in
 // (sent_at, seq) order, since seq follows ingestion, not sending.
 func (s *source) messages(chat string, before, limit int64) (*table, error) {
-	rows, err := s.query(`SELECT seq, sent_at, sender, body FROM msgs
+	rows, err := s.query(`SELECT seq, at, sender, body FROM msgs
 WHERE container_id = ?3 AND (?4 = 0 OR (sent_at, seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?4))
 ORDER BY sent_at DESC, seq DESC LIMIT ?5`, chat, before, limit+1)
 	if err != nil {
@@ -196,7 +198,7 @@ ORDER BY sent_at DESC, seq DESC LIMIT ?5`, chat, before, limit+1)
 
 // Matches the filtered body, where login codes are blank. before as in messages.
 func (s *source) search(text, chat, since string, before, limit int64) (*table, error) {
-	rows, err := s.query(`SELECT seq, sent_at, container_id, sender, body FROM msgs
+	rows, err := s.query(`SELECT seq, at, container_id, sender, body FROM msgs
 WHERE instr(lower(body), lower(?3)) AND (?4 = '' OR container_id = ?4) AND sent_at >= ?5
   AND (?6 = 0 OR (sent_at, seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?6))
 ORDER BY sent_at DESC, seq DESC LIMIT ?7`, text, chat, since, before, limit+1)
@@ -212,7 +214,7 @@ func (s *source) byID(ids []string) (*table, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.query(`SELECT m.seq, m.sent_at, m.container_id, m.sender, m.body
+	rows, err := s.query(`SELECT m.seq, m.at, m.container_id, m.sender, m.body
 FROM json_each(?3) AS j JOIN msgs AS m ON m.id = j.value ORDER BY j.key`, string(b))
 	if err != nil {
 		return nil, err

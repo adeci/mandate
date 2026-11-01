@@ -23,11 +23,12 @@ type connectorInfo struct {
 // Help prints the agent commands, with the connectors the gateway serves when
 // it can reach one.
 func Help(ctx context.Context, w io.Writer) {
-	fmt.Fprint(w, `usage: mandate <connector> <command> [args]   (needs MANDATE_URL and MANDATE_TOKEN)
-       mandate status ID [--wait DUR]
+	fmt.Fprint(w, `mandate reads the owner's accounts. Anything that writes is a proposal the
+owner approves first.
 
-Reads run at once. Writes become proposals: tell the owner one is waiting;
-they approve it in the console.
+usage:
+  mandate <connector> <command> [args]
+  mandate status ID [--wait DUR]
 
 `)
 	c, err := fromEnv(os.Getenv, w, w, false)
@@ -46,9 +47,16 @@ they approve it in the console.
 		_ = tw.Flush()
 	}
 	fmt.Fprint(w, `
-mandate <connector> --help lists its commands.
-Output: TSV with a header when piped, a table on a terminal, --json for JSON.
-Exit: 0 done, 75 pending, paced or timed out, 1 rejected, expired, failed, unknown or error, 2 usage.
+Run mandate <connector> --help for its commands.
+
+After proposing, tell the owner it is waiting, then run mandate status ID --wait 15m.
+Output is TSV with a header line, a table on a terminal; add --json for JSON.
+
+exit codes:
+  0   done
+  75  not yet: pending, rate limited, or --wait ran out
+  1   rejected, expired, failed, or unknown (it may have been sent; don't resend)
+  2   usage
 `)
 }
 
@@ -97,14 +105,15 @@ func writeConnectorHelp(w io.Writer, ci connectorInfo) {
 	}
 	fmt.Fprintln(w)
 	if ci.Source {
-		fmt.Fprintf(w, "  "+chatsUsage+"\n      id kind name updated_at\n", ci.Name)
+		fmt.Fprintf(w, "  "+chatsUsage+"\n      id kind name last_message, most recent first\n", ci.Name)
 		fmt.Fprintf(w, "  "+messagesUsage+"\n      seq sent_at sender body, newest first\n", ci.Name)
 		fmt.Fprintf(w, "  "+searchUsage+"\n      seq sent_at chat sender body, newest first\n", ci.Name)
 	}
+	writes := false
 	for _, op := range ci.Ops {
 		kind := "read"
 		if op.Kind == connector.Write {
-			kind = "proposal"
+			kind, writes = "proposal", true
 		}
 		if op.Name == "send" {
 			fmt.Fprintf(w, "  "+sendUsage+"\n      %s (%s)\n", ci.Name, op.Summary, kind)
@@ -129,7 +138,15 @@ func writeConnectorHelp(w io.Writer, ci connectorInfo) {
 	if ci.Forward {
 		fmt.Fprintf(w, "  "+getUsage+"\n      raw read; PATH may carry a ?query\n", ci.Name)
 	}
-	fmt.Fprintln(w, "\nEvery command takes --json.")
+	fmt.Fprintln(w)
+	if ci.Source {
+		fmt.Fprintln(w, "Chats are addressed by id: find one with chats --search, then pass its id.")
+		fmt.Fprintln(w, "When more rows exist, stderr gives the --before value for the next page.")
+	}
+	if writes {
+		fmt.Fprintln(w, "--note is shown to the owner with the proposal.")
+	}
+	fmt.Fprintln(w, "Every command takes --json.")
 }
 
 func paramTags(p connector.Param) string {
@@ -148,7 +165,7 @@ func paramTags(p connector.Param) string {
 
 func health(h *connector.Health) string {
 	if h == nil {
-		return "stored chats only"
+		return "stored messages only"
 	}
 	s := string(h.State)
 	switch h.State {

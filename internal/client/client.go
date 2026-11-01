@@ -400,5 +400,5 @@ func (c *client) do(ctx context.Context, timeout time.Duration, method, path str
 	case http.StatusUnauthorized:
 		return 0, nil, nil, errors.New("the gateway refused the token; ask the owner to check MANDATE_TOKEN")
 	}
-	return 0, nil, nil, fmt.Errorf("%s (HTTP %d)", e.Error, resp.StatusCode)
+	return 0, nil, nil, errors.New(e.Error)
 }
