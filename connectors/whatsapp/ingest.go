@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -66,8 +67,14 @@ func (in *ingester) handle(ctx context.Context, evt any) bool {
 		if err := in.st.UpsertContainer(ctx, groupContainer(&e.GroupInfo, in.pn, in.nameFunc(ctx))); err != nil {
 			in.log.Error("store group", "chat", e.JID.String(), "err", err)
 		}
+	case *events.AppStateSyncComplete:
+		// A full sync stores contacts without a Contact event per contact.
+		if e.Name == appstate.WAPatchCriticalUnblockLow {
+			in.nameDMs(ctx)
+		}
 	case *events.Connected:
 		in.log.Info("connected")
+		in.nameDMs(ctx)
 	case *events.Disconnected:
 		in.log.Warn("disconnected; whatsmeow will reconnect")
 	}
@@ -109,42 +116,55 @@ func (in *ingester) pn(j types.JID) types.JID {
 	return j
 }
 
-func (in *ingester) contactName(ctx context.Context, j types.JID) string {
-	if own := in.cli.Store.GetJID(); !own.IsEmpty() && j.User == own.User && j.Server == own.Server {
-		return in.cli.Store.PushName
-	}
-	c, err := in.cli.Store.Contacts.GetContact(ctx, j)
-	if err != nil || !c.Found {
-		return ""
-	}
-	for _, n := range []string{c.FullName, c.FirstName, c.PushName, c.BusinessName} {
-		if n != "" {
-			return n
+// contactName is an address-book name under any of ids, else a self-chosen
+// push or business name marked with "~" as WhatsApp does, since anyone can
+// pick those.
+func (in *ingester) contactName(ctx context.Context, ids ...types.JID) string {
+	own := in.cli.Store.GetJID()
+	for _, j := range ids {
+		if !own.IsEmpty() && j.User == own.User && j.Server == own.Server {
+			return in.cli.Store.PushName
 		}
 	}
-	return ""
+	var chosen string
+	for _, j := range ids {
+		c, err := in.cli.Store.Contacts.GetContact(ctx, j)
+		if err != nil || !c.Found {
+			continue
+		}
+		switch {
+		case c.FullName != "":
+			return c.FullName
+		case c.FirstName != "":
+			return c.FirstName
+		case chosen == "" && c.PushName != "":
+			chosen = "~" + c.PushName
+		case chosen == "" && c.BusinessName != "":
+			chosen = "~" + c.BusinessName
+		}
+	}
+	return chosen
 }
 
 func (in *ingester) nameFunc(ctx context.Context) func(types.JID) string {
 	return func(j types.JID) string { return in.contactName(ctx, j) }
 }
 
+// enrichSender names the sender as contactName does; the message's own push
+// name is the fallback.
 func (in *ingester) enrichSender(ctx context.Context, o *op) {
-	if o.sender.IsEmpty() {
+	if o.sender.IsEmpty() || o.msg.IsFromMe {
 		return
 	}
 	c, err := in.cli.Store.Contacts.GetContact(ctx, o.sender)
-	if err == nil && c.Found {
-		if c.FullName != "" {
-			o.msg.SenderName = c.FullName
-			return
-		}
-		if c.FirstName != "" {
-			o.msg.SenderName = c.FirstName
-			return
-		}
-	}
-	if o.msg.SenderName == "" {
+	switch {
+	case err == nil && c.FullName != "":
+		o.msg.SenderName = c.FullName
+	case err == nil && c.FirstName != "":
+		o.msg.SenderName = c.FirstName
+	case o.msg.SenderName != "":
+		o.msg.SenderName = "~" + o.msg.SenderName
+	default:
 		o.msg.SenderName = in.contactName(ctx, o.sender)
 	}
 }
@@ -200,6 +220,43 @@ func (in *ingester) renameDM(ctx context.Context, j types.JID) {
 	}
 	if err := in.st.UpsertContainer(ctx, store.Container{ID: chat.String(), Kind: "dm", Name: name}); err != nil {
 		in.log.Error("store dm name", "chat", chat.String(), "err", err)
+	}
+}
+
+// nameDMs names every stored DM from the contact store.
+func (in *ingester) nameDMs(ctx context.Context) {
+	rows, err := in.st.DB().QueryContext(ctx, `SELECT id, COALESCE(name, '') FROM containers WHERE kind = 'dm'`)
+	if err != nil {
+		in.log.Error("list dms", "err", err)
+		return
+	}
+	type dm struct{ id, name string }
+	var dms []dm
+	for rows.Next() {
+		var d dm
+		if err := rows.Scan(&d.id, &d.name); err == nil {
+			dms = append(dms, d)
+		}
+	}
+	rows.Close()
+	named := 0
+	for _, d := range dms {
+		j, err := types.ParseJID(d.id)
+		if err != nil {
+			continue
+		}
+		name := in.contactName(ctx, in.pn(j), j)
+		if name == "" || name == d.name {
+			continue
+		}
+		if err := in.st.UpsertContainer(ctx, store.Container{ID: d.id, Kind: "dm", Name: name}); err != nil {
+			in.log.Error("store dm name", "chat", d.id, "err", err)
+			continue
+		}
+		named++
+	}
+	if named > 0 {
+		in.log.Info("named direct chats", "count", named)
 	}
 }
 
