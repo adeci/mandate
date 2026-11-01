@@ -164,7 +164,7 @@ let
           default =
             self.packages.${system}."mandate-${name}"
               or (throw "services.mandate.connectors.${name}.package must be set: ${name} isn't a built-in connector");
-          defaultText = lib.literalMD "the built-in connector of that name (`whatsapp`, `discord`, `http`)";
+          defaultText = lib.literalMD "the built-in connector of that name (`whatsapp`, `signal`, `discord`, `http`)";
           description = "The connector program.";
         };
         settings = lib.mkOption {
@@ -268,7 +268,7 @@ in
         {
           whatsapp = { };
           discord = { };
-          signal.package = inputs.mandate-signal.packages.''${system}.default;
+          webhook.package = inputs.mandate-webhook.packages.''${system}.default;
         }
       '';
       description = "Connectors by name. Each runs as its own user and is linked on the console's Connections page.";

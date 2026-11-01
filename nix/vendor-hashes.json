@@ -2,5 +2,6 @@
   "mandate": "sha256-Qmvz4eVjMRhHVGRd4QAaLHnu622UjreOwY4vPIMHx+I=",
   "mandate-discord": "sha256-1/1n+G8/i++2xMOiOs0/2weYW+SIP8q0nqXY31ZOY2M=",
   "mandate-http": "sha256-YZKOU0s7kRYwLizIPFTEPa4XJ1rn65qvG3aZoApZR9g=",
+  "mandate-signal": "sha256-A2dKmy4gPqow+3uxP9v4zyiNk6vsFphB+fzRO2cN/qY=",
   "mandate-whatsapp": "sha256-Ca7moPTawUCGPpHnVTtV8D3hCjbDZpsgxTBrbTkLqUE="
 }
