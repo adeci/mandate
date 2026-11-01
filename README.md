@@ -55,14 +55,15 @@ hide_containers = ["15551234567@s.whatsapp.net"]
 
 ## Connectors
 
-`whatsapp`, `signal`, `matrix`, `discord` and `http` (any token API behind an
-allowlist) are included. Each runs as its own user with only its own login.
-To write one, see [docs/connectors.md](docs/connectors.md).
+`whatsapp`, `signal`, `matrix`, `discord`, `gmessages` (Google Messages, for
+SMS and RCS), `fastmail` and `http` (any token API behind an allowlist) are
+included. Each runs as its own user with only its own login. To write one,
+see [docs/connectors.md](docs/connectors.md).
 
 ## License
 
-[AGPL-3.0](LICENSE). The WhatsApp, Signal and Discord connectors are
-unofficial clients: using them may break those services' terms and get an
-account limited or banned. mandate comes with no warranty, and its authors
-are not liable for what happens to your accounts (sections 15 and 16 of the
-license).
+[AGPL-3.0](LICENSE). The WhatsApp, Signal, Discord and Google Messages
+connectors are unofficial clients: using them may break those services' terms
+and get an account limited or banned. mandate comes with no warranty, and its
+authors are not liable for what happens to your accounts (sections 15 and 16
+of the license).
