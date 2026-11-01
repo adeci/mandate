@@ -89,8 +89,14 @@ func message(id, conv, pid string, status gmproto.MessageStatusType, at int64, t
 	return m
 }
 
-func withMedia(m *gmproto.Message, f gmproto.MediaFormats) *gmproto.Message {
-	m.MessageInfo = append(m.MessageInfo, &gmproto.MessageInfo{Data: &gmproto.MessageInfo_MediaContent{MediaContent: &gmproto.MediaContent{Format: f}}})
+// withMedia attaches a file; an empty id is one the phone has not
+// downloaded. The fake phone decrypts a file with key-ID.
+func withMedia(m *gmproto.Message, f gmproto.MediaFormats, id, name string) *gmproto.Message {
+	mc := &gmproto.MediaContent{Format: f, MediaName: name}
+	if id != "" {
+		mc.MediaID, mc.DecryptionKey, mc.Size = id, []byte("key-"+id), 1234
+	}
+	m.MessageInfo = append(m.MessageInfo, &gmproto.MessageInfo{Data: &gmproto.MessageInfo_MediaContent{MediaContent: mc}})
 	return m
 }
 
@@ -136,11 +142,13 @@ func TestConvert(t *testing.T) {
 		{"sender not in the conversation", family(), unknownSender, op{kind: opUpsert, msg: store.Message{
 			ID: "m7", ContainerID: "3", SenderID: "+15557770099", SenderName: "(555) 777-0099", SentAt: t0.Add(7 * time.Minute), Body: "who am i",
 		}}, true},
-		{"photo with caption", faridDM(), withMedia(message("m8", "1", "11", incoming, ts(8), "look"), gmproto.MediaFormats_IMAGE_JPEG), op{kind: opUpsert, msg: store.Message{
-			ID: "m8", ContainerID: "1", SenderID: "+15551230001", SenderName: "Farid Haddad", SentAt: t0.Add(8 * time.Minute), Body: "look", MediaType: "image",
+		{"photo with caption", faridDM(), withMedia(message("m8", "1", "11", incoming, ts(8), "look"), gmproto.MediaFormats_IMAGE_JPEG, "md1", "IMG_1.jpg"), op{kind: opUpsert, msg: store.Message{
+			ID: "m8", ContainerID: "1", SenderID: "+15551230001", SenderName: "Farid Haddad", SentAt: t0.Add(8 * time.Minute), Body: "look",
+			Media: []store.Media{{Type: "image/jpeg", Name: "IMG_1.jpg", Size: 1234, Ref: []byte(`{"id":"md1","key":"a2V5LW1kMQ=="}`)}},
 		}}, true},
-		{"voice note", faridDM(), withMedia(message("m9", "1", "11", incoming, ts(9), ""), gmproto.MediaFormats_AUDIO_AMR), op{kind: opUpsert, msg: store.Message{
-			ID: "m9", ContainerID: "1", SenderID: "+15551230001", SenderName: "Farid Haddad", SentAt: t0.Add(9 * time.Minute), MediaType: "audio",
+		{"voice note not downloaded", faridDM(), withMedia(message("m9", "1", "11", gmproto.MessageStatusType_INCOMING_AUTO_DOWNLOADING, ts(9), ""), gmproto.MediaFormats_AUDIO_AMR, "", ""), op{kind: opUpsert, msg: store.Message{
+			ID: "m9", ContainerID: "1", SenderID: "+15551230001", SenderName: "Farid Haddad", SentAt: t0.Add(9 * time.Minute),
+			Media: []store.Media{{Type: "audio/amr", Ref: []byte(`{}`)}},
 		}}, true},
 		{"MMS not downloaded", faridDM(), message("m10", "1", "11", gmproto.MessageStatusType_INCOMING_YET_TO_MANUAL_DOWNLOAD, ts(10), ""), op{kind: opUpsert, msg: store.Message{
 			ID: "m10", ContainerID: "1", SenderID: "+15551230001", SenderName: "Farid Haddad", SentAt: t0.Add(10 * time.Minute), MediaType: "attachment",

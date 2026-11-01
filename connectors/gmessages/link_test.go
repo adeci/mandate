@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -39,6 +40,7 @@ type phone struct {
 	// cookies are signed out.
 	account string
 	gaiaErr error
+	files   map[string][]byte // by media ID
 }
 
 func (p *phone) set(f func(p *phone)) {
@@ -132,17 +134,39 @@ func (f *fakeClient) ListConversations(context.Context, *gmproto.ListConversatio
 	return &gmproto.ListConversationsResponse{Conversations: f.p.convs}, nil
 }
 
-func (f *fakeClient) FetchMessages(_ context.Context, id string, count int64, _ *gmproto.Cursor) (*gmproto.ListMessagesResponse, error) {
+// FetchMessages answers a cursor with the messages sent before it, as the
+// phone does.
+func (f *fakeClient) FetchMessages(_ context.Context, id string, count int64, cursor *gmproto.Cursor) (*gmproto.ListMessagesResponse, error) {
 	f.p.mu.Lock()
 	defer f.p.mu.Unlock()
 	f.p.fetches = append(f.p.fetches, id)
 	if err := f.p.fetchErr[id]; err != nil {
 		return nil, err
 	}
-	if count != syncMessages {
+	if cursor == nil && count == syncMessages {
+		return &gmproto.ListMessagesResponse{Messages: f.p.msgs[id]}, nil
+	}
+	if cursor == nil || count != refetchMessages {
 		return nil, fmt.Errorf("fetched %d messages", count)
 	}
-	return &gmproto.ListMessagesResponse{Messages: f.p.msgs[id]}, nil
+	var before []*gmproto.Message
+	for _, m := range f.p.msgs[id] {
+		if m.GetTimestamp()/1000 < cursor.GetLastItemTimestamp() {
+			before = append(before, m)
+		}
+	}
+	return &gmproto.ListMessagesResponse{Messages: before}, nil
+}
+
+// DownloadMedia serves files the fake phone holds, decrypted with key-ID.
+func (f *fakeClient) DownloadMedia(id string, key []byte) (io.ReadCloser, error) {
+	f.p.mu.Lock()
+	defer f.p.mu.Unlock()
+	data, ok := f.p.files[id]
+	if !ok || string(key) != "key-"+id {
+		return nil, errors.New("http 404")
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
 func (f *fakeClient) GetConversation(_ context.Context, id string) (*gmproto.Conversation, error) {
@@ -290,6 +314,7 @@ func newFixture(t *testing.T, linked bool) *fixture {
 			msgs:      make(map[string][]*gmproto.Message),
 			fetchErr:  make(map[string]error),
 			connected: make(map[*fakeClient]bool),
+			files:     make(map[string][]byte),
 			sendResp:  &gmproto.SendMessageResponse{Status: gmproto.SendMessageResponse_SUCCESS},
 			account:   "owner@example.com",
 		},
