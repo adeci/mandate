@@ -4,6 +4,7 @@ use (
 	.
 	./connectors/discord
 	./connectors/fastmail
+	./connectors/gmessages
 	./connectors/http
 	./connectors/matrix
 	./connectors/signal

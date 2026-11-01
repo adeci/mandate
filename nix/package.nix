@@ -85,6 +85,7 @@ in
   mandate-discord = connector "discord" "Discord connector for mandate";
   mandate-http = connector "http" "HTTP API connector for mandate";
   mandate-fastmail = connector "fastmail" "Fastmail connector for mandate";
+  mandate-gmessages = connector "gmessages" "Google Messages connector for mandate";
   # libsignal-ffi must be the version mautrix-signal's libsignalgo is built for.
   mandate-signal = connectorWith {
     buildInputs = [
