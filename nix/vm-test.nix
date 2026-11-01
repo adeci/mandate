@@ -102,6 +102,7 @@ pkgs.testers.runNixOSTest {
     import base64
     import hashlib
     import json
+    import re
     import time
 
     import cbor2
@@ -159,22 +160,22 @@ pkgs.testers.runNixOSTest {
         return json.dumps({"type": kind, "challenge": challenge, "origin": origin, "crossOrigin": False}).encode()
 
     # Answers navigator.credentials.create the way a security key would.
-    def registration(options):
-        n = passkey.public_key().public_numbers()
+    def registration(options, key=passkey, cred=credential):
+        n = key.public_key().public_numbers()
         cose = cbor2.dumps({1: 2, 3: -7, -1: 1, -2: n.x.to_bytes(32, "big"), -3: n.y.to_bytes(32, "big")})
         auth = (hashlib.sha256(options["rp"]["id"].encode()).digest() + bytes([0x45]) + (0).to_bytes(4, "big")
-                + bytes(16) + len(credential).to_bytes(2, "big") + credential + cose)
+                + bytes(16) + len(cred).to_bytes(2, "big") + cred + cose)
         attestation = cbor2.dumps({"fmt": "none", "attStmt": {}, "authData": auth})
-        return {"id": b64(credential), "rawId": b64(credential), "type": "public-key",
+        return {"id": b64(cred), "rawId": b64(cred), "type": "public-key",
                 "response": {"clientDataJSON": b64(client_data("webauthn.create", options["challenge"])),
                              "attestationObject": b64(attestation)}}
 
     # Answers navigator.credentials.get.
-    def assertion(options, flags=0x05):
+    def assertion(options, flags=0x05, key=passkey, cred=credential):
         cd = client_data("webauthn.get", options["challenge"])
         auth = hashlib.sha256(options["rpId"].encode()).digest() + bytes([flags]) + (1).to_bytes(4, "big")
-        sig = passkey.sign(auth + hashlib.sha256(cd).digest(), ec.ECDSA(hashes.SHA256()))
-        return {"id": b64(credential), "rawId": b64(credential), "type": "public-key",
+        sig = key.sign(auth + hashlib.sha256(cd).digest(), ec.ECDSA(hashes.SHA256()))
+        return {"id": b64(cred), "rawId": b64(cred), "type": "public-key",
                 "response": {"authenticatorData": b64(auth), "clientDataJSON": b64(cd), "signature": b64(sig)}}
 
     with subtest("reads are per connector, filtered, and refuse names"):
@@ -258,13 +259,20 @@ pkgs.testers.runNixOSTest {
         assert code == 403, (code, out)
         assert len(recorded()) == 1
 
-    with subtest("the first key is trusted at once and reaches every connector"):
+    with subtest("the first key is trusted at once and reaches every connector; the password is off"):
         code, options = console("POST", "/keys/options", {"name": "yubikey"})
         assert code == 200, (code, options)
         code, out = console("POST", "/keys", registration(options))
         assert code == 200 and out["trusted"], (code, out)
         for name in ["whatsapp", "discord", "http"]:
             machine.wait_until_succeeds(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/keys | grep -q '\"length\":1'")
+        code, _ = console("GET", "/session")
+        assert code == 401, code
+        code, _ = console("POST", "/login", {"password": admin_password})
+        assert code == 403, code
+        code, options = console("POST", "/login/options", {})
+        code, out = console("POST", "/login", {"assertion": assertion(options)})
+        assert code == 200, (code, out)
 
     with subtest("the gateway can reach a connector but cannot make it act or change its keys"):
         forged = {"record": base64.b64encode(b"{}").decode(), "nonce": base64.b64encode(b"0123456789abcdef").decode(),
@@ -410,11 +418,40 @@ pkgs.testers.runNixOSTest {
         sent = [json.loads(r["body"]) for r in recorded()[2:]]
         assert sent == [{"text": "first"}, {"text": "second"}], sent
 
-    with subtest("mandate-reset-keys clears every key list"):
+    with subtest("a key a passkey approved waits for mandate-confirm-key on the server"):
+        laptop, laptop_cred = ec.generate_private_key(ec.SECP256R1()), b"mandate-vm-test-laptop"
+        code, options = console("POST", "/keys/options", {"name": "laptop"}, jar="/tmp/keyjar")
+        assert code == 200, (code, options)
+        code, out = console("POST", "/keys", registration(options, laptop, laptop_cred), jar="/tmp/keyjar")
+        assert code == 200 and not out["trusted"], (code, out)
+        code, page = console("GET", "/keys", jar="/tmp/keyjar")
+        [change] = re.findall(r'data-change="([^"]+)"', page)
+        code, ch = console("POST", f"/keys/changes/{change}/challenge", jar="/tmp/keyjar")
+        assert code == 200, (code, ch)
+        code, out = console("POST", f"/keys/changes/{change}/approve",
+                            {"change": ch["change"], "assertion": assertion(ch["options"])}, jar="/tmp/keyjar")
+        assert code == 200, (code, out)
+        code, page = console("GET", "/keys", jar="/tmp/keyjar")
+        [fingerprint] = re.findall(r"sudo mandate-confirm-key ([0-9a-f-]+)", page)
+        assert connector_keys("http")["length"] == 1
+        code, options = console("POST", "/login/options", {}, jar="/tmp/laptopjar")
+        code, _ = console("POST", "/login", {"assertion": assertion(options, key=laptop, cred=laptop_cred)}, jar="/tmp/laptopjar")
+        assert code == 403, code
+        machine.fail(f"sudo -u mandate-gateway mandate-confirm-key {fingerprint}")
+        assert "laptop is trusted" in machine.succeed(f"mandate-confirm-key {fingerprint}")
+        for name in ["whatsapp", "discord", "http"]:
+            machine.wait_until_succeeds(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/keys | grep -q '\"length\":2'")
+        code, options = console("POST", "/login/options", {}, jar="/tmp/laptopjar")
+        code, out = console("POST", "/login", {"assertion": assertion(options, key=laptop, cred=laptop_cred)}, jar="/tmp/laptopjar")
+        assert code == 200, (code, out)
+
+    with subtest("mandate-reset-keys clears every key list and turns the password back on"):
         machine.succeed("mandate-reset-keys")
         machine.wait_for_open_port(443)
         for name in ["whatsapp", "discord", "http"]:
             machine.wait_until_succeeds(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/keys | grep -q '\"length\":0'")
+        code, out = console("POST", "/login", {"password": admin_password}, jar="/tmp/resetjar")
+        assert code == 200, (code, out)
 
     with subtest("outsider cannot reach the gateway or the console"):
         machine.succeed("curl -sf http://127.0.0.1:8780/healthz")

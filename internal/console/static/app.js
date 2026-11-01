@@ -517,14 +517,15 @@ function bind() {
   if (lockButton) lockButton.addEventListener("click", lock);
 
   const loginButton = $("[data-login]");
-  if (loginButton) loginButton.addEventListener("click", busy(loginButton, () => login(loginButton)));
+  if (loginButton) {
+    resumeSession(loginButton.dataset.login);
+    loginButton.addEventListener("click", busy(loginButton, () => login(loginButton)));
+  }
   const passwordForm = $("#password-login");
   if (passwordForm) {
     resumeSession(passwordForm.dataset.next);
     passwordForm.addEventListener("submit", busy(passwordForm, () => passwordLogin(passwordForm)));
   }
-  const fallback = $("#password-fallback");
-  if (fallback) fallback.addEventListener("toggle", () => fallback.open && $("#password").focus());
 
   const reviewButton = $("[data-review]");
   if (reviewButton) reviewButton.addEventListener("click", busy(reviewButton, review));
@@ -543,8 +544,8 @@ function bind() {
 
   const add = $("#add-key");
   if (add) add.addEventListener("submit", busy(add, () => addKey(add)));
-  for (const panel of $$("[data-change]")) {
-    const button = $("[data-approve-key]", panel);
+  for (const button of $$("[data-approve-key]")) {
+    const panel = button.closest("[data-change]");
     button.addEventListener("click", busy(button, () => approveKey(panel)));
   }
 

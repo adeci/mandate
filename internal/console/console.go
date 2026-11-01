@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -99,17 +100,44 @@ func Command(ctx context.Context, args []string) error {
 	defer cancel()
 	go srv.Sweep(ctx, 30*time.Second)
 
-	errc := make(chan error, 2)
+	errc := make(chan error, 3)
 	go func() { errc <- wrap("proposal socket", connector.ServeUnix(ctx, *socket, srv.ProposalHandler())) }()
+	go func() {
+		errc <- wrap("admin socket", connector.ServeUnix(ctx, adminSocket(*stateDir), srv.AdminHandler()))
+	}()
 	go func() { errc <- wrap("https", serveTLS(ctx, *listen, srv.Handler(), cert)) }()
 	n, _ := srv.keys.Head()
 	log.Info("console listening", "origin", origin, "socket", *socket, "connectors", len(conns), "key_log", n)
 
-	// Every server returns nil on shutdown; the first to stop takes the other
-	// down with it.
+	// Every server returns nil on shutdown; the first to stop takes the
+	// others down with it.
 	err = <-errc
 	cancel()
-	return errors.Join(err, <-errc)
+	return errors.Join(err, <-errc, <-errc)
+}
+
+// adminSocket is where host commands reach the console. The state
+// directory is the console user's alone, so only it and root can connect.
+func adminSocket(stateDir string) string { return filepath.Join(stateDir, "admin.sock") }
+
+// ConfirmKey trusts a key addition a passkey approved in the console.
+func ConfirmKey(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("confirm-key", flag.ContinueOnError)
+	stateDir := flags.String("state", "", "the console's state directory (required)")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *stateDir == "" || flags.NArg() != 1 {
+		return errors.New("usage: mandate confirm-key --state DIR FINGERPRINT")
+	}
+	var res confirmResponse
+	err := connector.Dial(adminSocket(*stateDir), time.Minute).
+		Do(ctx, http.MethodPost, "/keys/confirm", confirmRequest{Fingerprint: flags.Arg(0)}, &res)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s is trusted\n", res.Name)
+	return nil
 }
 
 func loadPasswordHash(path string) ([]byte, error) {

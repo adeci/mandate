@@ -48,7 +48,8 @@ func tokenHash(token string) []byte {
 	return h[:]
 }
 
-// A passkey session ends once its key is no longer trusted.
+// A passkey session ends once its key is no longer trusted, a password
+// session once any key is.
 func (s *Server) session(r *http.Request) (session, bool) {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil || c.Value == "" {
@@ -63,6 +64,9 @@ func (s *Server) session(r *http.Request) (session, bool) {
 		return session{}, false
 	}
 	if id == "" {
+		if len(s.keys.Trusted()) > 0 {
+			return session{}, false
+		}
 		return session{hash: hash}, true
 	}
 	k, ok := s.keys.Find(id)
@@ -194,6 +198,8 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		k, err = s.unlockLogin(req.Assertion, *req.Unlock)
 	case req.Assertion != nil:
 		k, err = s.verifyLogin(req.Assertion)
+	case len(s.keys.Trusted()) > 0:
+		err = forbidden(errors.New("sign in with a passkey; the password works again after sudo mandate-reset-keys on the server"))
 	default:
 		err = s.checkPassword(req.Password)
 	}

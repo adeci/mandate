@@ -5,7 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -155,43 +158,43 @@ func TestPasswordSignIn(t *testing.T) {
 	}
 }
 
-func TestPasswordSessionCannotApprove(t *testing.T) {
-	h := start(t)
-	pw := h.passwordLogin(t)
-	stranger := approvaltest.New(t, rpID, origin)
-
-	p := h.submit(t, "running late")
-	status, body := h.call(t, http.MethodPost, "/r/"+p.ID+"/challenge", pw, challengeRequest{})
-	var ch challengeResponse
-	if status != http.StatusOK || json.Unmarshal(body, &ch) != nil {
-		t.Fatalf("challenge = %d %s", status, body)
+func TestPasswordOffOncePasskeyTrusted(t *testing.T) {
+	h := bare(t, nil)
+	pw := h.session
+	if !h.addKey(t, pw, h.key, "phone") {
+		t.Fatal("first key is not trusted")
 	}
-	c, _ := base64.RawURLEncoding.DecodeString(ch.Options.Challenge)
-	for name, assertion := range map[string]json.RawMessage{"none": nil, "untrusted key": stranger.Assert(c)} {
-		if status, _ := h.call(t, http.MethodPost, "/r/"+p.ID+"/approve", pw, approveRequest{Nonce: ch.Nonce, Assertion: assertion}); status != http.StatusForbidden {
-			t.Errorf("approve with %s = %d, want 403", name, status)
-		}
+	if status, _ := h.call(t, http.MethodGet, "/session", pw, nil); status != http.StatusUnauthorized {
+		t.Fatalf("password session after the first key = %d", status)
+	}
+	if status, body := h.call(t, http.MethodPost, "/login", "", loginRequest{Password: password}); status != http.StatusForbidden {
+		t.Fatalf("password login with a key trusted = %d %s", status, body)
+	}
+	if _, body := h.call(t, http.MethodGet, "/login", "", nil); strings.Contains(string(body), `type="password"`) {
+		t.Fatal("login page offers the password")
 	}
 
-	laptop := approvaltest.New(t, rpID, origin)
-	if h.addKey(t, pw, laptop, "laptop") {
-		t.Fatal("second key trusted without approval")
+	// mandate-reset-keys deletes the key log while the console is stopped.
+	h.srv.Close()
+	if err := os.Remove(filepath.Join(h.cfg.StateDir, "keys.json")); err != nil {
+		t.Fatal(err)
 	}
-	id := h.waiting(t)
-	if status := h.approveChange(t, pw, id, stranger); status != http.StatusForbidden {
-		t.Fatalf("key change approved by an untrusted key = %d", status)
+	srv, err := New(context.Background(), h.cfg)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, ok := h.srv.keys.Find(laptop.Key("").CredentialID); ok || len(h.fake.sent()) != 0 {
-		t.Fatal("password session changed keys or ran a write")
+	t.Cleanup(func() { srv.Close() })
+	h.pages = httptest.NewServer(srv.Handler())
+	t.Cleanup(h.pages.Close)
+	if status, _ := h.call(t, http.MethodGet, "/session", pw, nil); status != http.StatusUnauthorized {
+		t.Fatalf("password session from before the first key after a reset = %d", status)
 	}
+	h.passwordLogin(t)
+}
 
-	// A trusted key's assertion is what counts, whatever the session.
-	if status := h.approveChange(t, pw, id, h.key); status != http.StatusOK {
-		t.Fatalf("key change approved by the trusted key = %d", status)
-	}
-	if status, _ := h.call(t, http.MethodPost, "/r/"+p.ID+"/approve", pw, approveRequest{Nonce: ch.Nonce, Assertion: h.key.Assert(c)}); status != http.StatusOK {
-		t.Fatalf("approve with the trusted key = %d", status)
-	}
+// confirm runs mandate confirm-key as the owner would on the server.
+func (h *harness) confirm(fp string) error {
+	return ConfirmKey(context.Background(), []string{"--state", h.cfg.StateDir, fp})
 }
 
 func TestKeyChanges(t *testing.T) {
@@ -203,8 +206,14 @@ func TestKeyChanges(t *testing.T) {
 	if h.addKey(t, h.session, laptop, "laptop") {
 		t.Fatal("second key trusted without approval")
 	}
-	if status := h.loginStatus(t, laptop); status != http.StatusForbidden {
-		t.Fatalf("waiting key signs in = %d", status)
+	for _, name := range []string{"Phone", "laptop"} {
+		if status, _ := h.post(t, "/keys/options", registerRequest{Name: name}); status != http.StatusConflict {
+			t.Fatalf("adding a second %q = %d", name, status)
+		}
+	}
+	fp := fingerprint(laptop.Key("laptop"))
+	if err := h.confirm(fp); err == nil {
+		t.Fatal("confirmed before a trusted key approved")
 	}
 	id := h.waiting(t)
 	if status := h.approveChange(t, h.session, id, laptop); status != http.StatusForbidden {
@@ -213,12 +222,32 @@ func TestKeyChanges(t *testing.T) {
 	if status := h.approveChange(t, h.session, id, h.key); status != http.StatusOK {
 		t.Fatalf("approve = %d", status)
 	}
+
+	// Approved, the key waits for the owner on the server.
+	if _, ok := h.srv.keys.Find(laptop.Key("").CredentialID); ok {
+		t.Fatal("approved key trusted before the server confirmed it")
+	}
+	if status := h.loginStatus(t, laptop); status != http.StatusForbidden {
+		t.Fatalf("unconfirmed key signs in = %d", status)
+	}
+	if n, _ := h.connKeys.Head(); n != 1 {
+		t.Fatalf("connector key log has %d entries before the server confirmed", n)
+	}
+	if _, body := h.page(t, "/keys"); !strings.Contains(body, "sudo mandate-confirm-key "+fp) {
+		t.Fatalf("keys page lacks the command:\n%s", body)
+	}
+	if err := h.confirm("0000-0000-0000-0000"); err == nil {
+		t.Fatal("confirmed an unknown fingerprint")
+	}
+	if err := h.confirm(fp); err != nil {
+		t.Fatal(err)
+	}
 	if k, ok := h.srv.keys.Find(laptop.Key("").CredentialID); !ok || !k.Synced || k.Name != "laptop" {
 		t.Fatalf("laptop = %+v, %v", k, ok)
 	}
 	h.synced(t)
-	if status := h.approveChange(t, h.session, id, h.key); status != http.StatusNotFound {
-		t.Fatalf("approving again = %d", status)
+	if err := h.confirm(fp); err == nil {
+		t.Fatal("confirmed twice")
 	}
 	laptopSession := h.login(t, laptop)
 
@@ -243,9 +272,47 @@ func TestKeyChanges(t *testing.T) {
 	}
 	id = h.waiting(t)
 	h.clock.advance(keyChangeTTL + time.Minute)
-	if status := h.approveChange(t, h.passwordLogin(t), id, laptop); status != http.StatusNotFound {
+	laptopSession = h.login(t, laptop)
+	if status := h.approveChange(t, laptopSession, id, laptop); status != http.StatusNotFound {
 		t.Fatalf("approving an expired change = %d", status)
 	}
+}
+
+func TestConfirmAfterKeysChanged(t *testing.T) {
+	h := start(t)
+	tablet, laptop := approvaltest.New(t, rpID, origin), approvaltest.New(t, rpID, origin)
+	h.trust(t, tablet, "tablet")
+	h.addKey(t, h.session, laptop, "laptop")
+	add := h.waiting(t)
+	if status := h.approveChange(t, h.session, add, h.key); status != http.StatusOK {
+		t.Fatalf("approve = %d", status)
+	}
+	// The approval signed a log the removal moves past.
+	if status := h.postForm(t, "/keys/remove", h.session, url.Values{"credential_id": {tablet.Key("").CredentialID}}); status != http.StatusSeeOther {
+		t.Fatalf("remove = %d", status)
+	}
+	cs, err := h.srv.db.keyChanges(context.Background(), h.srv.now())
+	if err != nil || len(cs) != 2 {
+		t.Fatalf("waiting = %+v, %v", cs, err)
+	}
+	remove := cs[0].ID
+	if remove == add {
+		remove = cs[1].ID
+	}
+	if status := h.approveChange(t, h.session, remove, h.key); status != http.StatusOK {
+		t.Fatalf("approve removal = %d", status)
+	}
+	fp := fingerprint(laptop.Key(""))
+	if err := h.confirm(fp); err == nil {
+		t.Fatal("confirmed an approval of an older log")
+	}
+	if status := h.approveChange(t, h.session, add, h.key); status != http.StatusOK {
+		t.Fatalf("approve again = %d", status)
+	}
+	if err := h.confirm(fp); err != nil {
+		t.Fatal(err)
+	}
+	h.synced(t)
 }
 
 func TestConnectorKeyLogs(t *testing.T) {

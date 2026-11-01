@@ -71,23 +71,6 @@ func TestUnlockWindowApprovesWithoutPasskey(t *testing.T) {
 	}
 }
 
-func TestPasswordSessionCannotUnlock(t *testing.T) {
-	h := start(t)
-	p := h.submit(t, "one")
-	h.session = h.passwordLogin(t)
-	nonce, c, _ := h.challenge(t, p.ID, nil)
-	s := h.key.Unlock(h.clock.now().Add(approval.UnlockWindow), c)
-	if status := h.approveIn(t, p.ID, nonce, s, c); status != http.StatusForbidden {
-		t.Fatalf("approve in a password session = %d, want 403", status)
-	}
-	if n := len(h.fake.sent()); n != 0 {
-		t.Fatalf("executed %d times", n)
-	}
-	if status, _ := h.approve(t, p.ID, nonce, h.key.Assert(c)); status != http.StatusOK {
-		t.Fatalf("approve with passkey = %d", status)
-	}
-}
-
 func TestSigningInOpensWindow(t *testing.T) {
 	h := start(t)
 	s := h.key.Unlock(h.clock.now().Add(approval.UnlockWindow), h.loginChallenge(t))
