@@ -11,42 +11,55 @@ let
   system = pkgs.stdenv.hostPlatform.system;
   exe = lib.getExe cfg.package;
   json = pkgs.formats.json { };
+  names = lib.attrNames cfg.connectors;
+  connectorGroups = map (n: "mandate-${n}") names;
+  accounts = [
+    "mandate-gateway"
+    "mandate-console"
+  ]
+  ++ connectorGroups;
   state = name: "/var/lib/mandate-${name}";
   socket = name: "/run/mandate-${name}/connector.sock";
   proposalSocket = "/run/mandate-console/proposals.sock";
+  connectorArgs = lib.concatMap (n: [
+    "--connector"
+    "${n}=${socket n}"
+  ]) names;
+
+  generated = "/var/lib/mandate";
+  tokenFile = if cfg.tokenFile != null then cfg.tokenFile else "${generated}/token";
+  hashFile =
+    if cfg.adminPasswordHashFile != null then
+      cfg.adminPasswordHashFile
+    else
+      "${generated}/admin-password-hash";
+  secretsUnit = lib.optional (
+    cfg.tokenFile == null || cfg.adminPasswordHashFile == null
+  ) "mandate-secrets.service";
+  acmeUnit = lib.optional (cfg.useACMEHost != null) "acme-${cfg.useACMEHost}.service";
+  acmeDir = config.security.acme.certs.${cfg.useACMEHost}.directory;
+  connectorUnits = map (g: "${g}.service") connectorGroups;
+
+  # Browsers omit the default port from the origin a passkey signs.
+  origin =
+    "https://${cfg.hostname}"
+    + lib.optionalString (cfg.consolePort != 443) ":${toString cfg.consolePort}";
 
   # %d (the credentials directory) must reach systemd unescaped, so credential
   # paths are appended after escapeSystemdExecArgs, which would turn it into %%d.
   credential = flag: name: " ${flag} %d/${name}";
 
-  # Browsers omit the default port from the origin a passkey signs.
-  origin =
-    "https://${cfg.console.hostname}"
-    + lib.optionalString (cfg.console.port != 443) ":${toString cfg.console.port}";
-
   # Deletes every key so the admin password can add a first one again.
   resetKeys = pkgs.writeShellApplication {
     name = "mandate-reset-keys";
     text = ''
-      units=(mandate-console ${
-        lib.concatMapStringsSep " " (n: "mandate-${n}") (lib.attrNames connectors)
-      })
+      units=(mandate-console ${toString connectorGroups})
       systemctl stop "''${units[@]}"
       rm -f ${state "console"}/keys.json ${
-        lib.concatMapStringsSep " " (n: "${state n}/private/keys.json") (lib.attrNames connectors)
+        lib.concatMapStringsSep " " (n: "${state n}/private/keys.json") names
       }
       systemctl start "''${units[@]}"
     '';
-  };
-
-  # Only the tailnet and localhost may connect.
-  tailnetOnly = {
-    IPAddressAllow = [
-      "localhost"
-      "100.64.0.0/10"
-      "fd7a:115c:a1e0::/48"
-    ];
-    IPAddressDeny = "any";
   };
 
   hardening = {
@@ -83,71 +96,65 @@ let
     UMask = "0027";
   };
 
-  systemUser = name: extraGroups: {
-    isSystemUser = true;
-    group = name;
-    inherit extraGroups;
-  };
-
-  connectors = cfg.connectors;
-  connectorGroups = map (name: "mandate-${name}") (lib.attrNames connectors);
-  connectorUnits = map (name: "mandate-${name}.service") (lib.attrNames connectors);
-  connectorArgs = lib.concatMap (name: [
-    "--connector"
-    "${name}=${socket name}"
-  ]) (lib.attrNames connectors);
-
-  configFile = name: c: json.generate "mandate-${name}.json" c.settings;
-
-  # Checks connector settings at build time.
-  configCheck =
-    name: c:
-    pkgs.runCommand "mandate-${name}-config-check" { } ''
-      ${lib.getExe c.package} --check-config ${configFile name c}
-      touch $out
-    '';
-
-  connectorService = name: c: {
-    description = "mandate ${name} connector";
-    after = [ "network-online.target" ];
-    wants = [ "network-online.target" ];
+  service = name: serviceConfig: {
+    description = "mandate ${name}";
     wantedBy = [ "multi-user.target" ];
-    startLimitIntervalSec = 0;
-    environment = lib.optionalAttrs (config.time.timeZone != null) { TZ = config.time.timeZone; };
     serviceConfig =
       hardening
       // {
         User = "mandate-${name}";
         Group = "mandate-${name}";
-        # The gateway's group can read data.db; sessions stay in private/.
+        # The gateway's group can read a connector's data.db; sessions stay in private/.
         StateDirectory = "mandate-${name}";
         StateDirectoryMode = "0750";
         RuntimeDirectory = "mandate-${name}";
         RuntimeDirectoryMode = "0750";
-        LoadCredential = lib.mapAttrsToList (cred: path: "${cred}:${path}") c.credentials;
-        ExecStart = utils.escapeSystemdExecArgs (
-          [
-            (lib.getExe c.package)
-            "--socket"
-            (socket name)
-            "--state"
-            (state name)
-            "--config"
-            (configFile name c)
-          ]
-          # Lets connectors verify approvals.
-          ++ lib.optionals cfg.console.enable [
-            "--rp-id"
-            cfg.console.hostname
-            "--origin"
-            origin
-          ]
-        );
         Restart = "always";
+        RestartSec = "5s";
+      }
+      // serviceConfig;
+  };
+
+  # Only the tailnet and localhost may connect.
+  tailnetOnly = {
+    IPAddressAllow = [
+      "localhost"
+      "100.64.0.0/10"
+      "fd7a:115c:a1e0::/48"
+    ];
+    IPAddressDeny = "any";
+  };
+
+  configFile = name: c: json.generate "mandate-${name}.json" c.settings;
+
+  connectorService =
+    name: c:
+    service name (
+      {
+        LoadCredential = lib.mapAttrsToList (cred: path: "${cred}:${path}") c.credentials;
+        ExecStart = utils.escapeSystemdExecArgs [
+          (lib.getExe c.package)
+          "--socket"
+          (socket name)
+          "--state"
+          (state name)
+          "--config"
+          (configFile name c)
+          "--rp-id"
+          cfg.hostname
+          "--origin"
+          origin
+        ];
         RestartSec = "30s";
       }
-      // c.serviceConfig;
-  };
+      // c.serviceConfig
+    )
+    // {
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      startLimitIntervalSec = 0;
+      environment = lib.optionalAttrs (config.time.timeZone != null) { TZ = config.time.timeZone; };
+    };
 
   connectorOptions =
     { name, ... }:
@@ -172,7 +179,7 @@ let
           example = {
             token = "/run/secrets/discord-token";
           };
-          description = "Secrets the connector reads by name, as files outside the Nix store. Loaded via LoadCredential.";
+          description = "Secret files the connector reads by name, loaded with LoadCredential.";
         };
         serviceConfig = lib.mkOption {
           type = lib.types.attrsOf lib.types.anything;
@@ -184,7 +191,7 @@ let
 in
 {
   options.services.mandate = {
-    enable = lib.mkEnableOption "mandate: the gateway, the console and the connectors below";
+    enable = lib.mkEnableOption "mandate";
 
     package = lib.mkOption {
       type = lib.types.package;
@@ -193,19 +200,68 @@ in
       description = "The mandate package (gateway, console and agent CLI).";
     };
 
-    tokenFile = lib.mkOption {
+    hostname = lib.mkOption {
+      type = lib.types.str;
+      example = "mandate.example.com";
+      description = "Hostname of the console, where you link connectors and approve writes. Passkeys are bound to it.";
+    };
+
+    useACMEHost = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "mandate.example.com";
+      description = ''
+        Name of a {option}`security.acme.certs` entry to serve the console
+        with. The console restarts when it renews.
+      '';
+    };
+
+    tlsCertFile = lib.mkOption {
       type = lib.types.externalPath;
+      description = ''
+        TLS certificate chain for the hostname. Defaults to the one of
+        {option}`services.mandate.useACMEHost`. Read at start, so restart
+        mandate-console after renewing it.
+      '';
+    };
+
+    tlsKeyFile = lib.mkOption {
+      type = lib.types.externalPath;
+      description = "TLS key for the hostname. Defaults to the one of {option}`services.mandate.useACMEHost`.";
+    };
+
+    tokenFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.externalPath;
+      default = null;
       example = "/run/secrets/mandate-token";
       description = ''
-        Bearer token for the gateway (at least 32 characters), outside the
-        Nix store. Loaded via LoadCredential.
+        File with the bearer token agents use, at least 32 characters.
+        If null, one is generated on first start; read it with
+        `sudo cat ${generated}/token`.
+      '';
+    };
+
+    adminPasswordHashFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.externalPath;
+      default = null;
+      example = "/run/secrets/mandate-admin-password-hash";
+      description = ''
+        bcrypt hash of the console's admin password, which signs in to add
+        the first passkey. If null, a password is generated on first start;
+        read it with `sudo cat ${generated}/admin-password`.
       '';
     };
 
     port = lib.mkOption {
       type = lib.types.port;
       default = 8780;
-      description = "Gateway port.";
+      description = "Gateway port, for agents.";
+    };
+
+    consolePort = lib.mkOption {
+      type = lib.types.port;
+      default = 443;
+      description = "Console port (HTTPS).";
     };
 
     openFirewallOn = lib.mkOption {
@@ -224,151 +280,104 @@ in
           signal.package = inputs.mandate-signal.packages.''${system}.default;
         }
       '';
-      description = ''
-        Connectors by name. Each runs as its own user with its own credentials.
-      '';
-    };
-
-    console = {
-      enable = lib.mkEnableOption "the console, where you link connectors and approve writes";
-
-      hostname = lib.mkOption {
-        type = lib.types.str;
-        example = "mandate.example.com";
-        description = ''
-          Console hostname. Passkeys are bound to it.
-        '';
-      };
-
-      port = lib.mkOption {
-        type = lib.types.port;
-        default = 443;
-        description = "Console port (HTTPS).";
-      };
-
-      tlsCertFile = lib.mkOption {
-        type = lib.types.externalPath;
-        description = "TLS certificate for the hostname. Loaded via LoadCredential; restart mandate-console after renewing it.";
-      };
-
-      tlsKeyFile = lib.mkOption {
-        type = lib.types.externalPath;
-        description = "TLS key for the hostname. Loaded via LoadCredential.";
-      };
-
-      adminPasswordHashFile = lib.mkOption {
-        type = lib.types.externalPath;
-        example = "/run/secrets/mandate-admin-password-hash";
-        description = "bcrypt hash of the admin password. Loaded via LoadCredential.";
-      };
+      description = "Connectors by name. Each runs as its own user with its own credentials.";
     };
   };
 
-  config = lib.mkIf cfg.enable (
-    lib.mkMerge [
+  config = lib.mkIf cfg.enable {
+    assertions = map (name: {
+      assertion =
+        builtins.match "[a-z][a-z0-9-]*" name != null
+        && !lib.elem name [
+          "gateway"
+          "console"
+          "secrets"
+        ];
+      message = "services.mandate.connectors.${name}: names are lowercase letters, digits and dashes, and not gateway, console or secrets";
+    }) names;
+
+    services.mandate = lib.mkIf (cfg.useACMEHost != null) {
+      tlsCertFile = lib.mkDefault "${acmeDir}/fullchain.pem";
+      tlsKeyFile = lib.mkDefault "${acmeDir}/key.pem";
+    };
+    security.acme.certs = lib.mkIf (cfg.useACMEHost != null) {
+      ${cfg.useACMEHost}.reloadServices = [ "mandate-console.service" ];
+    };
+
+    environment.systemPackages = [
+      cfg.package
+      resetKeys
+    ];
+    system.checks = lib.mapAttrsToList (
+      name: c:
+      pkgs.runCommand "mandate-${name}-config-check" { } ''
+        ${lib.getExe c.package} --check-config ${configFile name c}
+        touch $out
+      ''
+    ) cfg.connectors;
+
+    users.users = lib.mkMerge [
+      (lib.genAttrs accounts (user: {
+        isSystemUser = true;
+        group = user;
+      }))
+      (lib.mapAttrs' (n: _: lib.nameValuePair "mandate-${n}" { home = state n; }) cfg.connectors)
+      # Connector groups grant read access to each data.db (0640) and socket (0660).
       {
-        assertions = map (name: {
-          assertion = builtins.match "[a-z][a-z0-9-]*" name != null;
-          message = "services.mandate.connectors.${name}: names are lowercase letters, digits and dashes";
-        }) (lib.attrNames connectors);
-
-        environment.systemPackages = [ cfg.package ] ++ lib.optional cfg.console.enable resetKeys;
-        system.checks = lib.mapAttrsToList configCheck connectors;
-
-        users.users =
-          lib.mapAttrs' (
-            name: _:
-            lib.nameValuePair "mandate-${name}" (systemUser "mandate-${name}" [ ] // { home = state name; })
-          ) connectors
-          // {
-            # Group membership grants read access to each source's data.db (0640)
-            # and every connector socket (0660).
-            mandate-gateway = systemUser "mandate-gateway" (
-              connectorGroups ++ lib.optional cfg.console.enable "mandate-console"
-            );
-          };
-        users.groups = lib.mapAttrs' (name: _: lib.nameValuePair "mandate-${name}" { }) connectors // {
-          mandate-gateway = { };
-        };
-
-        systemd.services =
-          lib.mapAttrs' (name: c: lib.nameValuePair "mandate-${name}" (connectorService name c)) connectors
-          // {
-            mandate-gateway = {
-              description = "mandate gateway";
-              after = [ "network.target" ] ++ connectorUnits;
-              wantedBy = [ "multi-user.target" ];
-              serviceConfig =
-                hardening
-                // tailnetOnly
-                // {
-                  User = "mandate-gateway";
-                  Group = "mandate-gateway";
-                  StateDirectory = "mandate-gateway";
-                  StateDirectoryMode = "0750";
-                  LoadCredential = [ "token:${cfg.tokenFile}" ];
-                  ExecStart =
-                    utils.escapeSystemdExecArgs (
-                      [
-                        exe
-                        "gateway"
-                        "--listen"
-                        ":${toString cfg.port}"
-                        "--exposure"
-                        "${state "gateway"}/exposure.toml"
-                      ]
-                      # A connector is a source once it has written a data.db.
-                      ++ lib.concatMap (name: [
-                        "--source"
-                        "${name}=${state name}/data.db"
-                      ]) (lib.attrNames connectors)
-                      ++ connectorArgs
-                      ++ lib.optionals cfg.console.enable [
-                        "--console-socket"
-                        proposalSocket
-                        "--console-url"
-                        origin
-                      ]
-                    )
-                    + credential "--token-file" "token";
-                  Restart = "always";
-                  RestartSec = "5s";
-                };
-            };
-          };
-
-        networking.firewall.interfaces = lib.mkIf (cfg.openFirewallOn != null) {
-          ${cfg.openFirewallOn}.allowedTCPPorts = [
-            cfg.port
-          ]
-          ++ lib.optional cfg.console.enable cfg.console.port;
-        };
+        mandate-gateway.extraGroups = [ "mandate-console" ] ++ connectorGroups;
+        mandate-console.extraGroups = connectorGroups;
       }
+    ];
+    users.groups = lib.genAttrs accounts (_: { });
 
-      (lib.mkIf cfg.console.enable {
-        users.users.mandate-console = systemUser "mandate-console" connectorGroups;
-        users.groups.mandate-console = { };
-
-        systemd.services.mandate-console = {
-          description = "mandate console";
-          after = [ "network.target" ] ++ connectorUnits;
-          wantedBy = [ "multi-user.target" ];
-          serviceConfig =
-            hardening
-            // tailnetOnly
+    systemd.services =
+      lib.mapAttrs' (n: c: lib.nameValuePair "mandate-${n}" (connectorService n c)) cfg.connectors
+      // {
+        mandate-gateway =
+          service "gateway" (
+            tailnetOnly
             // {
-              User = "mandate-console";
-              Group = "mandate-console";
-              StateDirectory = "mandate-console";
+              LoadCredential = [ "token:${tokenFile}" ];
+              ExecStart =
+                utils.escapeSystemdExecArgs (
+                  [
+                    exe
+                    "gateway"
+                    "--listen"
+                    ":${toString cfg.port}"
+                    "--exposure"
+                    "${state "gateway"}/exposure.toml"
+                    "--console-socket"
+                    proposalSocket
+                    "--console-url"
+                    origin
+                  ]
+                  # A connector is a source once it has written a data.db.
+                  ++ lib.concatMap (n: [
+                    "--source"
+                    "${n}=${state n}/data.db"
+                  ]) names
+                  ++ connectorArgs
+                )
+                + credential "--token-file" "token";
+            }
+          )
+          // {
+            requires = secretsUnit;
+            after = [ "network.target" ] ++ secretsUnit ++ connectorUnits;
+          };
+
+        mandate-console =
+          service "console" (
+            tailnetOnly
+            // {
               StateDirectoryMode = "0700";
-              RuntimeDirectory = "mandate-console";
-              RuntimeDirectoryMode = "0750";
               AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
               CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
               LoadCredential = [
-                "tls-cert:${cfg.console.tlsCertFile}"
-                "tls-key:${cfg.console.tlsKeyFile}"
-                "admin-password-hash:${cfg.console.adminPasswordHashFile}"
+                "tls-cert:${cfg.tlsCertFile}"
+                "tls-key:${cfg.tlsKeyFile}"
+                "admin-password-hash:${hashFile}"
               ];
               ExecStart =
                 utils.escapeSystemdExecArgs (
@@ -376,9 +385,9 @@ in
                     exe
                     "console"
                     "--hostname"
-                    cfg.console.hostname
+                    cfg.hostname
                     "--listen"
-                    ":${toString cfg.console.port}"
+                    ":${toString cfg.consolePort}"
                     "--state"
                     (state "console")
                     "--socket"
@@ -389,11 +398,50 @@ in
                 + credential "--tls-cert" "tls-cert"
                 + credential "--tls-key" "tls-key"
                 + credential "--admin-password-hash-file" "admin-password-hash";
-              Restart = "always";
-              RestartSec = "5s";
-            };
+            }
+          )
+          // {
+            requires = secretsUnit;
+            wants = acmeUnit;
+            after = [ "network.target" ] ++ secretsUnit ++ acmeUnit ++ connectorUnits;
+          };
+
+        mandate-secrets = lib.mkIf (secretsUnit != [ ]) {
+          description = "mandate generated secrets";
+          path = [
+            pkgs.openssl
+            pkgs.mkpasswd
+          ];
+          script = ''
+            cd ${generated}
+            ${lib.optionalString (cfg.tokenFile == null) ''
+              if [ ! -e token ]; then
+                openssl rand -hex 32 > token.tmp
+                mv token.tmp token
+              fi
+            ''}
+            ${lib.optionalString (cfg.adminPasswordHashFile == null) ''
+              if [ ! -e admin-password-hash ]; then
+                openssl rand -hex 16 > admin-password
+                mkpasswd -m bcrypt -s < admin-password > admin-password-hash.tmp
+                mv admin-password-hash.tmp admin-password-hash
+              fi
+            ''}
+          '';
+          serviceConfig = hardening // {
+            Type = "oneshot";
+            StateDirectory = "mandate";
+            StateDirectoryMode = "0700";
+            UMask = "0077";
+          };
         };
-      })
-    ]
-  );
+      };
+
+    networking.firewall.interfaces = lib.mkIf (cfg.openFirewallOn != null) {
+      ${cfg.openFirewallOn}.allowedTCPPorts = [
+        cfg.port
+        cfg.consolePort
+      ];
+    };
+  };
 }

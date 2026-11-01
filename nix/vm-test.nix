@@ -1,19 +1,13 @@
 # Boots every unit under its real sandbox. WhatsApp is unlinked and Discord
 # has no network, so both are checked for wiring only. A recorder stands in
-# for an HTTP API, and the test driver plays the owner's passkey.
+# for an HTTP API, and the test driver plays the owner's passkey. The console
+# serves the ACME module's self-signed placeholder certificate, and the token
+# and admin password are generated on first start.
 { pkgs, self }:
 let
-  token = "0123456789abcdef0123456789abcdef0123456789abcdef";
   apiToken = "api-token-0123456789abcdef";
-  adminPassword = "correct horse battery staple";
   # Dotted: curl, like the public suffix list, refuses cookies for bare names.
   host = "mandate.example.com";
-
-  adminPasswordHash =
-    pkgs.runCommand "mandate-test-admin-hash" { nativeBuildInputs = [ pkgs.mkpasswd ]; }
-      ''
-        printf %s '${adminPassword}' | mkpasswd -m bcrypt -R 4 -s | tr -d '\n' > $out
-      '';
 
   fixture = pkgs.writeText "fixture.sql" ''
     INSERT INTO containers (id, kind, name, is_group, updated_at) VALUES
@@ -23,13 +17,6 @@ let
       ('fam@g.us/1', 'fam@g.us', '1555@s.whatsapp.net', '2026-10-01T12:00:00.000Z', 'dinner at 7?', '2026-10-01T12:00:00.000Z'),
       ('fam@g.us/2', 'fam@g.us', '1555@s.whatsapp.net', '2026-10-01T12:01:00.000Z', 'Your WhatsApp code: 482-913', '2026-10-01T12:01:00.000Z'),
       ('hidden@s.whatsapp.net/3', 'hidden@s.whatsapp.net', '1666@s.whatsapp.net', '2026-10-01T12:02:00.000Z', 'private', '2026-10-01T12:02:00.000Z');
-  '';
-
-  tls = pkgs.runCommand "mandate-test-tls" { nativeBuildInputs = [ pkgs.openssl ]; } ''
-    mkdir $out
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
-      -subj /CN=${host} -addext subjectAltName=DNS:${host} \
-      -keyout $out/key.pem -out $out/cert.pem
   '';
 
   # Logs every request to the stand-in API as a JSON line.
@@ -65,7 +52,8 @@ pkgs.testers.runNixOSTest {
     imports = [ self.nixosModules.default ];
     services.mandate = {
       enable = true;
-      tokenFile = "/etc/mandate-token";
+      hostname = host;
+      useACMEHost = host;
       openFirewallOn = "eth1";
       connectors = {
         whatsapp = { };
@@ -79,21 +67,17 @@ pkgs.testers.runNixOSTest {
           credentials.api = "/etc/api-token";
         };
       };
-      console = {
-        enable = true;
-        hostname = host;
-        tlsCertFile = "/etc/mandate-tls/cert.pem";
-        tlsKeyFile = "/etc/mandate-tls/key.pem";
-        adminPasswordHashFile = "/etc/mandate-admin-hash";
-      };
     };
+    # No ACME server answers, so the console keeps the self-signed placeholder.
+    security.acme = {
+      acceptTerms = true;
+      defaults.server = "https://127.0.0.1:1/directory";
+      certs.${host}.webroot = "/var/lib/acme/acme-challenge";
+    };
+    time.timeZone = "Europe/Berlin";
     environment.etc = {
-      "mandate-token".text = token;
       "discord-token".text = "not-a-real-token";
       "api-token".text = apiToken;
-      "mandate-admin-hash".source = adminPasswordHash;
-      "mandate-tls/cert.pem".source = "${tls}/cert.pem";
-      "mandate-tls/key.pem".source = "${tls}/key.pem";
     };
     systemd.services.recorder = {
       wantedBy = [ "multi-user.target" ];
@@ -129,6 +113,9 @@ pkgs.testers.runNixOSTest {
     for port in [8780, 443, 9000]:
         machine.wait_for_open_port(port)
 
+    token = machine.succeed("cat /var/lib/mandate/token").strip()
+    admin_password = machine.succeed("cat /var/lib/mandate/admin-password").strip()
+
     def curl(args, body=None):
         cmd = "curl -s -o /tmp/resp -w '%{http_code}' " + args
         if body is not None:
@@ -142,11 +129,11 @@ pkgs.testers.runNixOSTest {
             return code, out
 
     def gw(method, path, body=None):
-        return curl(f"-X {method} -H 'Authorization: Bearer ${token}' http://127.0.0.1:8780{path}", body)
+        return curl(f"-X {method} -H 'Authorization: Bearer {token}' http://127.0.0.1:8780{path}", body)
 
     # The console only admits localhost and the tailnet, so reach it over loopback.
     def console(method, path, body=None, jar="/tmp/jar"):
-        return curl(f"-X {method} -b {jar} -c {jar} --cacert /etc/mandate-tls/cert.pem "
+        return curl(f"-X {method} -b {jar} -c {jar} --cacert /var/lib/acme/${host}/chain.pem "
                     f"--resolve ${host}:443:127.0.0.1 https://${host}{path}", body)
 
     def connector_keys(name):
@@ -218,7 +205,7 @@ pkgs.testers.runNixOSTest {
         assert code == 200, (code, out)
         [req] = recorded()
         assert req["headers"]["Authorization"] == "Bearer ${apiToken}", req
-        assert "${token}" not in json.dumps(req), req
+        assert token not in json.dumps(req), req
         code, _ = gw("POST", "/v1/forward/http/api/items", {"text": "no approval"})
         assert code == 405, code
 
@@ -237,7 +224,7 @@ pkgs.testers.runNixOSTest {
         assert code == 303, code
         code, _ = console("POST", "/login", {"password": "wrong"}, jar="/tmp/nobody")
         assert code in (401, 403), code
-        code, out = console("POST", "/login", {"password": "${adminPassword}"})
+        code, out = console("POST", "/login", {"password": admin_password})
         assert code == 200, (code, out)
         code, page = console("GET", f"/r/{pid}")
         assert code == 200 and "filing it" in page, code
@@ -293,12 +280,20 @@ pkgs.testers.runNixOSTest {
     with subtest("replaying the approval does nothing, even after restarts"):
         code, _ = console("POST", f"/r/{pid}/approve", approved)
         assert code == 409, code
-        machine.succeed("systemctl restart mandate-console.service mandate-http.service")
+        machine.succeed("systemctl restart mandate-gateway.service mandate-console.service mandate-http.service")
         machine.wait_for_open_port(443)
         machine.wait_until_succeeds("curl -s --unix-socket /run/mandate-http/connector.sock http://connector/keys | grep -q '\"length\":1'")
         code, _ = console("POST", f"/r/{pid}/approve", approved)
         assert code == 409, code
         assert len(recorded()) == 2
+
+    with subtest("generated secrets survive restarts and stay root-only"):
+        machine.wait_for_open_port(8780)
+        code, _ = gw("GET", f"/v1/proposals/{pid}")
+        assert code == 200, code
+        assert machine.succeed("cat /var/lib/mandate/admin-password").strip() == admin_password
+        machine.fail("sudo -u mandate-gateway cat /var/lib/mandate/token")
+        machine.fail("sudo -u mandate-console cat /var/lib/mandate/admin-password")
 
     with subtest("signing in with the key works; nothing else reaches console state"):
         code, options = console("POST", "/login/options", {}, jar="/tmp/keyjar")
@@ -318,6 +313,13 @@ pkgs.testers.runNixOSTest {
         machine.succeed("curl -sf http://127.0.0.1:8780/healthz")
         outsider.fail("curl -sf --max-time 5 http://machine:8780/healthz")
         outsider.fail("curl -sk --max-time 5 https://machine/login")
+
+    with subtest("ACME renewals restart the console; connectors get the time zone"):
+        machine.succeed(
+            "systemctl show -p ExecStartPost --value acme-order-renew-${host}.service"
+            " | grep -o '/nix/store/[^ ;]*-acme-postrun' | xargs grep -q mandate-console.service"
+        )
+        machine.succeed("systemctl show -p Environment --value mandate-discord | grep -q TZ=Europe/Berlin")
 
     with subtest("hardened units"):
         for unit in ["mandate-gateway", "mandate-whatsapp", "mandate-discord", "mandate-console", "mandate-http"]:
