@@ -56,6 +56,8 @@ type sgConnector struct {
 	provision func(ctx context.Context) <-chan signalmeow.ProvisioningResponse
 	// newClient wires onEvent, then ingest, into a client for dev.
 	newClient func(dev *sgstore.Device, onEvent func(events.SignalEvent)) sgClient
+	// download fetches and decrypts an attachment from Signal's CDN.
+	download func(ctx context.Context, p *signalpb.AttachmentPointer) ([]byte, error)
 
 	mu sync.Mutex
 	// cli and dev are nil until linked.
@@ -73,7 +75,7 @@ func newConnector(ctx context.Context, st *store.Store, log *slog.Logger, sess *
 ) *sgConnector {
 	c := &sgConnector{
 		st: st, log: log, devices: sess.devices, timers: sess.timers, identities: sess.identities,
-		ctx: ctx, provision: provision, newClient: newClient,
+		ctx: ctx, provision: provision, newClient: newClient, download: download,
 	}
 	if dev != nil {
 		c.use(dev)

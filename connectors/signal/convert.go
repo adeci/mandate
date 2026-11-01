@@ -78,7 +78,19 @@ func convert(e *events.ChatEvent, chat string, own uuid.UUID, name func(uuid.UUI
 			SentAt:      time.UnixMilli(int64(ts)).UTC(),
 			IsFromMe:    sender == own,
 			Body:        body,
-			MediaType:   media,
+		}
+		for _, a := range m.Attachments {
+			if f, ok := attachment(a); ok {
+				msg.Media = append(msg.Media, f)
+			}
+		}
+		if len(m.Attachments) == 0 && m.Sticker != nil {
+			if f, ok := attachment(m.Sticker.GetData()); ok {
+				msg.Media = []store.Media{f}
+			}
+		}
+		if msg.Media == nil {
+			msg.MediaType = media
 		}
 		if q := m.GetQuote(); q.GetId() != 0 {
 			author, err := signalmeow.ParseStringOrBinaryUUID(q.GetAuthorAci(), q.GetAuthorAciBinary())
