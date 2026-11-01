@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -72,6 +75,8 @@ func (in *ingester) handle(ctx context.Context, evt any) bool {
 		if e.Name == appstate.WAPatchCriticalUnblockLow {
 			in.nameDMs(ctx)
 		}
+	case *events.IdentityChange:
+		in.identityChanged(ctx, e)
 	case *events.Connected:
 		in.log.Info("connected")
 		in.nameDMs(ctx)
@@ -89,12 +94,53 @@ func (in *ingester) apply(ctx context.Context, o op, nameHint string) error {
 		}
 		in.enrichSender(ctx, &o)
 		return in.st.UpsertMessage(ctx, o.msg)
-	case opEdit:
-		return in.st.EditMessage(ctx, o.target, o.body, o.at)
-	case opDelete:
+	case opEdit, opDelete:
+		ok, err := in.byAuthor(ctx, o)
+		if err != nil || !ok {
+			return err
+		}
+		if o.kind == opEdit {
+			return in.st.EditMessage(ctx, o.target, o.body, o.at)
+		}
 		return in.st.DeleteMessage(ctx, o.target)
 	}
 	return nil
+}
+
+// byAuthor reports whether the edit or delete o comes from the author of
+// its target, and an edit also from within whatsmeow.EditWindow, which
+// allows for delivery on top of the 15 minutes the apps give. Group admins
+// may delete others' messages for everyone; those deletes are not applied.
+func (in *ingester) byAuthor(ctx context.Context, o op) (bool, error) {
+	var author, sentAt string
+	var fromMe bool
+	err := in.st.DB().QueryRowContext(ctx,
+		`SELECT COALESCE(sender_id, ''), is_from_me, sent_at FROM messages WHERE id = ?1`, o.target).
+		Scan(&author, &fromMe, &sentAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	if fromMe != o.fromMe {
+		return false, nil
+	}
+	if !fromMe {
+		// Either side may name the user by LID. An unparsable author is
+		// empty and matches no one.
+		j, _ := types.ParseJID(author)
+		if j.IsEmpty() || o.sender.IsEmpty() || in.pn(j) != in.pn(o.sender) {
+			return false, nil
+		}
+	}
+	if o.kind == opEdit {
+		sent, err := time.Parse(time.RFC3339, sentAt)
+		if err != nil {
+			return false, fmt.Errorf("read sent time of %s: %w", o.target, err)
+		}
+		return o.at.Sub(sent) <= whatsmeow.EditWindow, nil
+	}
+	return true, nil
 }
 
 // Local lookups only (history-sync mappings, whatsmeow's LID store); no network.

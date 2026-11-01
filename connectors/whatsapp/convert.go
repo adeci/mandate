@@ -27,11 +27,12 @@ const (
 type op struct {
 	kind   opKind
 	chat   types.JID     // container JID (non-AD, phone number preferred)
-	sender types.JID     // opUpsert: sender JID (non-AD, phone number preferred)
+	sender types.JID     // author, editor or deleter (non-AD, phone number preferred)
+	fromMe bool          // opEdit, opDelete: sent by the owner
 	msg    store.Message // opUpsert
 	target string        // opEdit, opDelete: store message ID
 	body   string        // opEdit
-	at     time.Time     // opEdit
+	at     time.Time     // opEdit: server time of the edit
 }
 
 func messageID(chat types.JID, id types.MessageID) string {
@@ -140,11 +141,14 @@ func convert(evt *events.Message, pn pnResolver) (op, bool) {
 	if !ok || evt.Info.ID == "" {
 		return op{}, false
 	}
+	sender := preferPN(evt.Info.Sender, evt.Info.SenderAlt, pn)
+	change := op{chat: chat, sender: sender, fromMe: evt.Info.IsFromMe, at: evt.Info.Timestamp}
 	m := evt.Message
 	if m == nil {
 		// History sync keeps revoked messages as stubs without content.
 		if evt.SourceWebMsg.GetMessageStubType() == waWeb.WebMessageInfo_REVOKE {
-			return op{kind: opDelete, chat: chat, target: messageID(chat, evt.Info.ID)}, true
+			change.kind, change.target = opDelete, messageID(chat, evt.Info.ID)
+			return change, true
 		}
 		return op{}, false
 	}
@@ -153,16 +157,15 @@ func convert(evt *events.Message, pn pnResolver) (op, bool) {
 		if target == "" {
 			return op{}, false
 		}
+		change.target = messageID(chat, target)
 		switch p.GetType() {
 		case waE2E.ProtocolMessage_REVOKE:
-			return op{kind: opDelete, chat: chat, target: messageID(chat, target)}, true
+			change.kind = opDelete
+			return change, true
 		case waE2E.ProtocolMessage_MESSAGE_EDIT:
-			body, _, _ := content(p.GetEditedMessage())
-			at := evt.Info.Timestamp
-			if ms := p.GetTimestampMS(); ms > 0 {
-				at = time.UnixMilli(ms).UTC()
-			}
-			return op{kind: opEdit, chat: chat, target: messageID(chat, target), body: body, at: at}, true
+			change.kind = opEdit
+			change.body, _, _ = content(p.GetEditedMessage())
+			return change, true
 		}
 		return op{}, false
 	}
@@ -171,12 +174,12 @@ func convert(evt *events.Message, pn pnResolver) (op, bool) {
 		return op{}, false
 	}
 	if evt.IsEdit {
-		return op{kind: opEdit, chat: chat, target: messageID(chat, evt.Info.ID), body: body, at: evt.Info.Timestamp}, true
+		change.kind, change.target, change.body = opEdit, messageID(chat, evt.Info.ID), body
+		return change, true
 	}
 	if evt.Info.Timestamp.IsZero() {
 		return op{}, false
 	}
-	sender := preferPN(evt.Info.Sender, evt.Info.SenderAlt, pn)
 	msg := store.Message{
 		ID:          messageID(chat, evt.Info.ID),
 		ContainerID: chat.String(),
