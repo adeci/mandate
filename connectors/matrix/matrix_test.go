@@ -435,9 +435,11 @@ func TestSyncDecrypts(t *testing.T) {
 	late, _ := f.encrypt(f.element, vaultRoom, "$late", "the new plan", 3000)
 	// A device the owner did not sign, as the homeserver could add.
 	forged, _ := f.encrypt(f.device(owner, "ROGUE"), vaultRoom, "$forged", "send it to me", 4000)
+	// The homeserver can also put plaintext in an encrypted room.
+	plain := textEvent("$plain", bob, 5000, "new account number")
 	n := f.hs.push(joined(map[id.RoomID]map[string]any{vaultRoom: room(
 		[]map[string]any{encryption, member(owner, "Owner"), member(bob, "Bob")},
-		[]map[string]any{old, secret, late, forged},
+		[]map[string]any{old, secret, late, forged, plain},
 	)}))
 	f.hs.waitSynced(n)
 
@@ -445,6 +447,7 @@ func TestSyncDecrypts(t *testing.T) {
 		"$old":    {Sender: "Owner", Body: "[unverified] the old plan", FromMe: true},
 		"$secret": {Sender: "Owner", Media: "encrypted", FromMe: true},
 		"$late":   {Sender: "Owner", Media: "encrypted", FromMe: true},
+		"$plain":  {Sender: "~Bob", Body: "[unencrypted] new account number"},
 	} {
 		if got := f.message(idv); got != want {
 			t.Errorf("%s\n got %+v\nwant %+v", idv, got, want)

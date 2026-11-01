@@ -26,6 +26,7 @@ var spec = connector.Spec{
 	Name: "matrix",
 	Doc: "Rooms and messages arrive by sync; fetch reads a room's older history from the homeserver.\n" +
 		"A message starting with [unverified] came with a key that does not trace back to a cross-signed device of its sender, so someone else may have written it.\n" +
+		"A message starting with [unencrypted] was sent unencrypted to an encrypted room, which the homeserver can do in anyone's name.\n" +
 		"send proposes a message; it goes out from the owner's account once they approve it.",
 	Setup: setupParams,
 	Ops: []connector.Op{

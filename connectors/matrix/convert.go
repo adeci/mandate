@@ -70,8 +70,12 @@ func (c *mxConnector) apply(ctx context.Context, a *account, evt *event.Event, n
 		if content.NewContent == nil {
 			return false, nil
 		}
+		mark, err := a.mark(ctx, evt)
+		if err != nil {
+			return false, err
+		}
 		body, _ := messageBody(evt.Type, content.NewContent)
-		return false, c.edit(ctx, evt.RoomID, target, evt.Sender, unverified(evt, body), time.UnixMilli(evt.Timestamp))
+		return false, c.edit(ctx, evt.RoomID, target, evt.Sender, mark+body, time.UnixMilli(evt.Timestamp))
 	}
 	msg := store.Message{
 		ID:          evt.ID.String(),
@@ -82,14 +86,21 @@ func (c *mxConnector) apply(ctx context.Context, a *account, evt *event.Event, n
 		IsFromMe:    evt.Sender == a.sess.UserID,
 		ReplyToID:   content.RelatesTo.GetReplyTo().String(),
 	}
+	mark, err := a.mark(ctx, evt)
+	if err != nil {
+		return false, err
+	}
 	msg.Body, msg.MediaType = messageBody(evt.Type, content)
-	msg.Body = unverified(evt, msg.Body)
+	msg.Body = mark + msg.Body
 	// The server bundles the latest edit with the original, which matters
 	// when history is read backwards and the edit comes first.
 	var editedAt time.Time
 	if e := a.bundledEdit(ctx, evt); e != nil {
+		if mark, err = a.mark(ctx, e); err != nil {
+			return false, err
+		}
 		body, _ := messageBody(e.Type, e.Content.AsMessage().NewContent)
-		msg.Body = unverified(e, body)
+		msg.Body = mark + body
 		editedAt = time.UnixMilli(e.Timestamp)
 	}
 	if err := c.put(ctx, msg); err != nil {
@@ -147,14 +158,23 @@ func messageBody(t event.Type, content *event.MessageEventContent) (body, media 
 	return content.Body, ""
 }
 
-// unverified marks the body of a message whose room key does not trace back
-// to a cross-signed device of its sender: a device the homeserver may have
-// added, or a key from the backup, which the homeserver can write to.
-func unverified(evt *event.Event, body string) string {
-	if !evt.Mautrix.WasEncrypted || evt.Mautrix.TrustState >= id.TrustStateCrossSignedTOFU {
-		return body
+// mark is what goes before the body of evt when the room's encryption does
+// not vouch for its sender: its room key does not trace back to a
+// cross-signed device of the sender (a device the homeserver may have added,
+// or a key from the backup, which the homeserver can write to), or it was
+// sent unencrypted to an encrypted room, as the homeserver can.
+func (a *account) mark(ctx context.Context, evt *event.Event) (string, error) {
+	if evt.Mautrix.WasEncrypted {
+		if evt.Mautrix.TrustState < id.TrustStateCrossSignedTOFU {
+			return "[unverified] ", nil
+		}
+		return "", nil
 	}
-	return "[unverified] " + body
+	encrypted, err := a.state.IsEncrypted(ctx, evt.RoomID)
+	if err != nil || !encrypted {
+		return "", err
+	}
+	return "[unencrypted] ", nil
 }
 
 // name is user's display name in room, marked with "~" unless it is the
