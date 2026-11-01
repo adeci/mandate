@@ -39,6 +39,13 @@ mandate --help
 mandate whatsapp send 15551234567@s.whatsapp.net "running 10 late" --wait 10m
 ```
 
+On a machine without Nix, download the CLI from the
+[latest release](https://github.com/adeci/mandate/releases/latest)
+(`mandate-linux-amd64` or `mandate-linux-arm64`). `MANDATE_TOKEN` works in
+place of a token file. Give the agent
+[skills/mandate/SKILL.md](skills/mandate/SKILL.md) as a skill or in its
+instructions.
+
 ## Approving
 
 Writes wait in the console's inbox. Approving with a passkey unlocks the tab
@@ -67,7 +74,8 @@ has stored.
 `whatsapp`, `signal`, `matrix`, `discord`, `gmessages` (Google Messages, for
 SMS and RCS), `fastmail` and `http` (any token API behind an allowlist) are
 included. Each runs as its own user with only its own login. To write one,
-see [docs/connectors.md](docs/connectors.md).
+see [docs/connectors.md](docs/connectors.md); for what each part is trusted
+with, see [SECURITY.md](SECURITY.md).
 
 ## License
 
