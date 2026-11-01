@@ -13,25 +13,47 @@ import (
 	"github.com/ncruces/go-sqlite3"
 )
 
-// filter prefixes every query: chats leaves out hidden containers, their
-// children and DMs with hidden senders; named gives each chat its parent's
-// name as a prefix; msgs leaves out hidden senders and blanks login-code
-// bodies. ?1 and ?2 are the hidden container and sender IDs as JSON arrays.
+// filter prefixes every query: chats leaves out hidden containers, DMs with
+// hidden senders and everything under either, and gives each chat its
+// ancestors' names as a prefix; msgs leaves out hidden senders and blanks
+// login-code bodies. ?1 and ?2 are the hidden container and sender IDs as
+// JSON arrays.
+//
+// A DM's ID is not its other participant's ID everywhere (Discord channels,
+// Matrix rooms), so a DM is also matched by its stored participants and by
+// who wrote in it. The unary + stops SQLite from looking these up by kind or
+// container, so the hidden senders drive both lookups.
+//
+// A chat is followed up to three ancestors, more than any connector nests
+// (Discord: guild, channel, thread). A deeper chain or a cycle is left out,
+// so every ancestor is checked; joins by primary key cost far less than a
+// recursive walk on every query.
 //
 // msgs.text is the body as agents see it: login codes replaced, deletions and
 // media marked in brackets. Search matches body, not the markers.
 const filter = `WITH
-hidden_chat(id) AS (SELECT value FROM json_each(?1)),
 hidden_sender(id) AS (SELECT value FROM json_each(?2)),
+hidden(id) AS (
+  SELECT value FROM json_each(?1)
+  UNION SELECT id FROM hidden_sender
+  UNION SELECT c.id FROM hidden_sender AS s CROSS JOIN containers AS c CROSS JOIN json_each(c.participants_json) AS p
+    WHERE +c.kind = 'dm' AND p.value ->> 'id' = s.id
+  UNION SELECT container_id FROM messages
+    WHERE sender_id IN (SELECT id FROM hidden_sender) AND NOT is_from_me
+      AND +container_id IN (SELECT id FROM containers WHERE kind = 'dm')),
 chats AS (
-  SELECT id, kind, parent_id, name, last_message_at FROM containers
-  WHERE id NOT IN (SELECT id FROM hidden_chat)
-    AND id NOT IN (SELECT id FROM hidden_sender)
-    AND COALESCE(parent_id, '') NOT IN (SELECT id FROM hidden_chat)),
-named AS (
   SELECT c.id, c.kind, c.last_message_at,
-         CASE WHEN p.name IS NULL THEN c.name ELSE p.name || ' / ' || COALESCE(c.name, c.id) END AS name
-  FROM chats AS c LEFT JOIN chats AS p ON p.id = c.parent_id),
+         CASE WHEN COALESCE(p1.name, p2.name, p3.name) IS NULL THEN c.name
+              ELSE concat_ws(' / ', p3.name, p2.name, p1.name, COALESCE(c.name, c.id)) END AS name
+  FROM containers AS c
+  LEFT JOIN containers AS p1 ON p1.id = c.parent_id
+  LEFT JOIN containers AS p2 ON p2.id = p1.parent_id
+  LEFT JOIN containers AS p3 ON p3.id = p2.parent_id
+  WHERE p3.parent_id IS NULL
+    AND c.id NOT IN (SELECT id FROM hidden)
+    AND COALESCE(c.parent_id, '') NOT IN (SELECT id FROM hidden)
+    AND COALESCE(p1.parent_id, '') NOT IN (SELECT id FROM hidden)
+    AND COALESCE(p2.parent_id, '') NOT IN (SELECT id FROM hidden)),
 visible AS (
   SELECT m.*, is_auth(m.sender_id, m.body) AS auth
   FROM messages AS m JOIN chats AS c ON c.id = m.container_id
@@ -49,12 +71,12 @@ msgs AS (
 type table struct {
 	Columns []string `json:"columns"`
 	Rows    [][]any  `json:"rows"`
-	// NextBefore is the --before value for the next page of messages.
+	// More says another page follows; NextBefore is the --before value for
+	// the next page of messages.
 	More       bool  `json:"more,omitempty"`
 	NextBefore int64 `json:"next_before,omitempty"`
-	// Set by connector read ops.
-	TotalResults int `json:"total_results,omitempty"`
-	Containers   int `json:"containers,omitempty"`
+	// Containers counts the visible chats a connector's sync-style read stored.
+	Containers int `json:"containers,omitempty"`
 }
 
 // source is a source database opened for one request. db is nil until the
@@ -183,6 +205,23 @@ func (s *source) visible(id string) (bool, error) {
 	return len(rows) == 1, err
 }
 
+// visibleCount counts the visible chats among ids.
+func (s *source) visibleCount(ids []string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	b, err := json.Marshal(ids)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := s.query(`SELECT count(*) FROM chats WHERE id IN (SELECT value FROM json_each(?3))`, string(b))
+	if err != nil || len(rows) == 0 {
+		return 0, err
+	}
+	n, _ := rows[0][0].(int64)
+	return int(n), nil
+}
+
 // page trims the extra row queried past limit; seqCol is the seq column or -1.
 func page(t *table, rows [][]any, limit int64, seqCol int) *table {
 	if int64(len(rows)) > limit {
@@ -212,7 +251,7 @@ func (s *source) chats(search string, limit int64) (*table, error) {
   SELECT c.id, c.kind, c.name, NULLIF(max(
     COALESCE((SELECT max(sent_at) FROM msgs WHERE container_id = c.id), ''),
     COALESCE(c.last_message_at, '')), '') AS at
-  FROM named AS c
+  FROM chats AS c
   WHERE ?3 = '' OR instr(lower(COALESCE(c.name, '')), lower(?3)) OR instr(lower(c.id), lower(?3)))
 ORDER BY at DESC NULLS LAST, id LIMIT ?4`, search, limit+1)
 	if err != nil {
@@ -237,7 +276,7 @@ const searchSelect = `SELECT m.seq, m.at, m.container_id, c.name, m.sender_id, m
 
 // Matches the filtered body, where login codes are blank. before as in messages.
 func (s *source) search(text, chat, since string, before, limit int64) (*table, error) {
-	rows, err := s.query(searchSelect+` FROM msgs AS m JOIN named AS c ON c.id = m.container_id
+	rows, err := s.query(searchSelect+` FROM msgs AS m JOIN chats AS c ON c.id = m.container_id
 WHERE instr(lower(m.body), lower(?3)) AND (?4 = '' OR m.container_id = ?4) AND m.sent_at >= ?5
   AND (?6 = 0 OR (m.sent_at, m.seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?6))
 ORDER BY m.sent_at DESC, m.seq DESC LIMIT ?7`, text, chat, since, before, limit+1)
@@ -254,7 +293,7 @@ func (s *source) byID(ids []string) (*table, error) {
 		return nil, err
 	}
 	rows, err := s.query(searchSelect+` FROM json_each(?3) AS j JOIN msgs AS m ON m.id = j.value
-JOIN named AS c ON c.id = m.container_id ORDER BY j.key`, string(b))
+JOIN chats AS c ON c.id = m.container_id ORDER BY j.key`, string(b))
 	if err != nil {
 		return nil, err
 	}

@@ -211,9 +211,9 @@ type cachedList[T any] struct {
 func (c *cachedList[T]) fresh(now time.Time) bool { return !c.at.IsZero() && now.Sub(c.at) < listTTL }
 
 type cachedSearch struct {
-	at    time.Time
-	ids   []string
-	total int
+	at   time.Time
+	ids  []string
+	more bool
 }
 
 // Methods run only on the worker goroutine, so the caches need no locking.
@@ -338,35 +338,38 @@ func (s *service) joinedGuild(ctx context.Context, dl time.Time, guildID string)
 	return nil, &deniedError{status: 404, what: "guild " + guildID + ": the account has not joined it"}
 }
 
-func (s *service) upsertGuild(ctx context.Context, g *apiGuild, chans []apiChannel) (int, error) {
-	n := 0
+func (s *service) upsertGuild(ctx context.Context, g *apiGuild, chans []apiChannel) error {
 	if c, ok := guildContainer(g); ok {
 		if err := s.st.UpsertContainer(ctx, c); err != nil {
-			return n, err
+			return err
 		}
-		n++
 	}
 	for _, c := range guildChannelContainers(g.ID, chans) {
 		if err := s.st.UpsertContainer(ctx, c); err != nil {
-			return n, err
+			return err
 		}
-		n++
 	}
-	return n, nil
+	return nil
 }
 
 func (s *service) sync(ctx context.Context, dl time.Time, req syncRequest) (connector.ReadResult, error) {
 	var resp connector.ReadResult
+	upsert := func(c store.Container) error {
+		if err := s.st.UpsertContainer(ctx, c); err != nil {
+			return err
+		}
+		resp.ContainerIDs = append(resp.ContainerIDs, c.ID)
+		return nil
+	}
 	gs, err := s.loadGuilds(ctx, dl)
 	if err != nil {
 		return resp, err
 	}
 	for i := range gs {
 		if c, ok := guildContainer(&gs[i]); ok {
-			if err := s.st.UpsertContainer(ctx, c); err != nil {
+			if err := upsert(c); err != nil {
 				return resp, err
 			}
-			resp.Containers++
 		}
 	}
 	dms, err := s.loadDMs(ctx, dl)
@@ -375,10 +378,9 @@ func (s *service) sync(ctx context.Context, dl time.Time, req syncRequest) (conn
 	}
 	for i := range dms {
 		if c, ok := channelContainer(&dms[i]); ok {
-			if err := s.st.UpsertContainer(ctx, c); err != nil {
+			if err := upsert(c); err != nil {
 				return resp, err
 			}
-			resp.Containers++
 		}
 	}
 	if req.GuildID == "" {
@@ -393,10 +395,9 @@ func (s *service) sync(ctx context.Context, dl time.Time, req syncRequest) (conn
 		return resp, err
 	}
 	for _, c := range guildChannelContainers(g.ID, chans) {
-		if err := s.st.UpsertContainer(ctx, c); err != nil {
+		if err := upsert(c); err != nil {
 			return resp, err
 		}
-		resp.Containers++
 	}
 	return resp, nil
 }
@@ -418,7 +419,7 @@ func (s *service) search(ctx context.Context, dl time.Time, req searchRequest) (
 		}
 	}
 	if c, ok := s.searches[key]; ok && now.Sub(c.at) < searchTTL {
-		return connector.ReadResult{MessageIDs: slices.Clone(c.ids), TotalResults: c.total}, nil
+		return connector.ReadResult{MessageIDs: slices.Clone(c.ids), More: c.more}, nil
 	}
 	g, err := s.joinedGuild(ctx, dl, req.GuildID)
 	if err != nil {
@@ -428,7 +429,7 @@ func (s *service) search(ctx context.Context, dl time.Time, req searchRequest) (
 	if err != nil {
 		return connector.ReadResult{}, err
 	}
-	if _, err := s.upsertGuild(ctx, g, chans); err != nil {
+	if err := s.upsertGuild(ctx, g, chans); err != nil {
 		return connector.ReadResult{}, err
 	}
 	self, err := s.selfID(ctx, dl)
@@ -486,11 +487,7 @@ func (s *service) search(ctx context.Context, dl time.Time, req searchRequest) (
 			continue
 		}
 		if !stored[msg.ContainerID] {
-			c, ok := known[msg.ContainerID]
-			if !ok {
-				c = fallbackContainer(msg.ContainerID, g.ID)
-			}
-			if err := s.st.UpsertContainer(ctx, c); err != nil {
+			if err := s.storeHitChat(ctx, known, msg.ContainerID, g.ID); err != nil {
 				return connector.ReadResult{}, err
 			}
 			stored[msg.ContainerID] = true
@@ -505,8 +502,31 @@ func (s *service) search(ctx context.Context, dl time.Time, req searchRequest) (
 			delete(s.searches, k)
 		}
 	}
-	s.searches[key] = cachedSearch{at: s.clock.Now(), ids: ids, total: res.TotalResults}
-	return connector.ReadResult{MessageIDs: slices.Clone(ids), TotalResults: res.TotalResults}, nil
+	// The total counts hits in chats and from senders the owner hides, so
+	// only whether another page exists goes back.
+	more := req.Offset+len(res.Messages) < res.TotalResults && req.Offset+searchPageSize <= maxSearchOff
+	s.searches[key] = cachedSearch{at: s.clock.Now(), ids: ids, more: more}
+	return connector.ReadResult{MessageIDs: slices.Clone(ids), More: more}, nil
+}
+
+// storeHitChat stores the chat of a search hit. One the results did not
+// describe is filed under the guild, unless it is stored already.
+func (s *service) storeHitChat(ctx context.Context, known map[string]store.Container, id, guildID string) error {
+	c, ok := known[id]
+	if !ok {
+		stored, err := s.storedContainer(ctx, id)
+		if err != nil || stored.ID != "" {
+			return err
+		}
+		c = fallbackContainer(id, guildID)
+	}
+	if err := s.st.UpsertContainer(ctx, c); err != nil {
+		return err
+	}
+	if c.Kind == kindThread {
+		return adopt(ctx, s.st.DB(), id, guildID)
+	}
+	return nil
 }
 
 // searchReferer is the channel page a search would be typed on: the
@@ -576,6 +596,53 @@ func (s *service) storedContainer(ctx context.Context, id string) (store.Contain
 	return c, err
 }
 
+// guildOf is the guild a channel or thread is in. A thread hangs under its
+// channel, or under the guild while its channel is unknown.
+func (s *service) guildOf(ctx context.Context, c store.Container) (string, error) {
+	switch c.Kind {
+	case kindChannel:
+		return c.ParentID, nil
+	case kindThread:
+		var kind, parent string
+		err := s.st.DB().QueryRowContext(ctx, `SELECT kind, COALESCE(parent_id, '') FROM containers WHERE id = ?1`, c.ParentID).
+			Scan(&kind, &parent)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return "", nil
+		case err != nil:
+			return "", err
+		case kind == kindGuild:
+			return c.ParentID, nil
+		}
+		return parent, nil
+	}
+	return "", nil
+}
+
+// adopt files a stored chat that has no parent under guildID, for threads
+// Discord described without their channel, so hiding the guild hides them.
+func adopt(ctx context.Context, db *sql.DB, id, guildID string) error {
+	if guildID == "" {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, `UPDATE containers SET parent_id = ?2 WHERE id = ?1 AND parent_id IS NULL`, id, guildID)
+	return err
+}
+
+// reparentThreads moves threads stored under their guild by earlier versions
+// under their channel, where the thread's starter message says which one it
+// is: a thread started from a message shares the message's ID. The others
+// move when Discord next describes them.
+func reparentThreads(ctx context.Context, db *sql.DB) (int64, error) {
+	res, err := db.ExecContext(ctx, `UPDATE containers AS t SET parent_id = ch.id
+FROM messages AS m JOIN containers AS ch ON ch.id = m.container_id
+WHERE t.kind = 'thread' AND m.id = t.id AND ch.kind = 'channel' AND ch.parent_id = t.parent_id`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func (s *service) fetch(ctx context.Context, dl time.Time, req fetchRequest) (connector.ReadResult, error) {
 	if err := s.up.denied("channel:"+req.ChannelID, "channel "+req.ChannelID); err != nil {
 		return connector.ReadResult{}, err
@@ -597,9 +664,9 @@ func (s *service) fetch(ctx context.Context, dl time.Time, req fetchRequest) (co
 		return connector.ReadResult{}, err
 	}
 	limit := cmp.Or(req.Limit, defaultLimit)
-	guild := ""
-	if c.Kind == kindChannel || c.Kind == kindThread {
-		guild = c.ParentID
+	guild, err := s.guildOf(ctx, c)
+	if err != nil {
+		return connector.ReadResult{}, err
 	}
 	r := route{
 		template: "/channels/{channel_id}/messages",

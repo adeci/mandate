@@ -10,12 +10,10 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"maps"
 	"net"
 	"net/http"
 	"os"
 	"regexp"
-	"slices"
 	"strings"
 	"time"
 
@@ -117,6 +115,10 @@ func Serve(ctx context.Context, cfg Config) error {
 		return errors.New("token must be at least 32 characters")
 	}
 	h := newHandler(cfg, token)
+	// Loading now logs a broken file or hidden IDs that match nothing.
+	if _, err := h.policy.get(); err != nil {
+		slog.Error("exposure", "err", err)
+	}
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.Listen)
@@ -158,7 +160,7 @@ func newHandler(cfg Config, token string) *handler {
 	h := &handler{
 		cfg:        cfg,
 		tokenHash:  sha256.Sum256([]byte(token)),
-		policy:     &policyLoader{path: cfg.ExposureFile, sources: slices.Sorted(maps.Keys(cfg.Sources))},
+		policy:     &policyLoader{path: cfg.ExposureFile, sources: cfg.Sources},
 		mux:        http.NewServeMux(),
 		connectors: newConnectors(cfg.Connectors),
 	}

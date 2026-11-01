@@ -22,6 +22,9 @@ var schema string
 type Participant struct {
 	ID   string `json:"id"`
 	Name string `json:"name,omitempty"`
+	// Handle is the unique name the service shows for the account, where
+	// that is not the ID, such as a Discord username.
+	Handle string `json:"handle,omitempty"`
 }
 
 type Container struct {

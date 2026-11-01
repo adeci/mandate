@@ -171,7 +171,7 @@ var (
 		"recipients": []map[string]any{{"id": aliceUser, "username": "alice", "global_name": "Alice A"}},
 	}}
 	searchBody = map[string]any{
-		"total_results": 2,
+		"total_results": 30,
 		"messages": [][]map[string]any{
 			{{
 				"id": msg1, "channel_id": chanGeneral, "type": 0, "content": secretBody, "timestamp": "2026-10-28T10:00:00.000000+00:00",
@@ -417,7 +417,7 @@ func TestSearchUpsertsAndCaches(t *testing.T) {
 	h.start()
 	var resp connector.ReadResult
 	h.callOK("guild-search", map[string]string{"guild_id": guildID, "content": "rig"}, &resp)
-	if strings.Join(resp.MessageIDs, ",") != msg1+","+msg2 || resp.TotalResults != 2 {
+	if strings.Join(resp.MessageIDs, ",") != msg1+","+msg2 || !resp.More {
 		t.Errorf("response %+v", resp)
 	}
 	wantPaths := []string{
@@ -448,7 +448,7 @@ func TestSearchUpsertsAndCaches(t *testing.T) {
 	if row := h.queryRow(`SELECT kind, parent_id, name FROM containers WHERE id = ?`, chanGeneral); row[0] != "channel" || row[1] != guildID || row[2] != "#general" {
 		t.Errorf("channel row %v", row)
 	}
-	if row := h.queryRow(`SELECT kind, parent_id, name FROM containers WHERE id = ?`, threadID); row[0] != "thread" || row[1] != guildID || row[2] != "rig thread" {
+	if row := h.queryRow(`SELECT kind, parent_id, name FROM containers WHERE id = ?`, threadID); row[0] != "thread" || row[1] != chanGeneral || row[2] != "rig thread" {
 		t.Errorf("thread row %v", row)
 	}
 	if row := h.queryRow(`SELECT container_id, sender_name, is_from_me, body FROM messages WHERE id = ?`, msg1); row[0] != chanGeneral || row[1] != "Alice A" || row[2] != int64(0) || row[3] != secretBody {
@@ -464,7 +464,7 @@ func TestSearchUpsertsAndCaches(t *testing.T) {
 	if n := len(h.discord.all()); n != 4 {
 		t.Errorf("cache hit made upstream requests: %d total", n)
 	}
-	if strings.Join(again.MessageIDs, ",") != strings.Join(resp.MessageIDs, ",") || again.TotalResults != 2 {
+	if strings.Join(again.MessageIDs, ",") != strings.Join(resp.MessageIDs, ",") || !again.More {
 		t.Errorf("cached response %+v", again)
 	}
 	// The next page needs only the search itself; lists and self are cached.
@@ -488,16 +488,16 @@ func TestSyncCounts(t *testing.T) {
 	h.start()
 	var resp connector.ReadResult
 	h.callOK("sync", map[string]string{}, &resp)
-	if resp.Containers != 2 { // guild + DM
-		t.Errorf("sync upserted %d", resp.Containers)
+	if len(resp.ContainerIDs) != 2 { // guild + DM
+		t.Errorf("sync upserted %v", resp.ContainerIDs)
 	}
 	if row := h.queryRow(`SELECT kind, name, participants_json FROM containers WHERE id = ?`, dmID); row[0] != "dm" || row[1] != "Alice A" ||
 		!strings.Contains(fmt.Sprint(row[2]), aliceUser) {
 		t.Errorf("dm row %v", row)
 	}
 	h.callOK("sync", map[string]string{"guild_id": guildID}, &resp)
-	if resp.Containers != 4 { // guild + DM + two text channels (category skipped)
-		t.Errorf("guild sync upserted %d", resp.Containers)
+	if len(resp.ContainerIDs) != 4 { // guild + DM + two text channels (category skipped)
+		t.Errorf("guild sync upserted %v", resp.ContainerIDs)
 	}
 	// Chats are dated by last_message_id, so the gateway lists them most
 	// recent first before any message is fetched.
@@ -567,6 +567,43 @@ func TestFetchUpsertsMessages(t *testing.T) {
 	}
 	if q := hits[3].query; q.Get("before") != msg4 || q.Get("limit") != "10" {
 		t.Errorf("second fetch query %v", q)
+	}
+}
+
+// Earlier versions stored threads under their guild. At startup a thread
+// whose starter message is stored moves under that message's channel, and
+// requests for it name the guild as the web client does.
+func TestStartupMovesThreadsUnderTheirChannel(t *testing.T) {
+	const unstarted = "1100000000000000008"
+	h := newHarness(t, func(s *state) { s.SelfID, s.SelfCheckedAt = selfUser, noon })
+	ctx := context.Background()
+	for _, c := range []store.Container{
+		{ID: guildID, Kind: kindGuild, Name: "Club"},
+		{ID: chanGeneral, Kind: kindChannel, ParentID: guildID, Name: "#general"},
+		{ID: threadID, Kind: kindThread, ParentID: guildID, Name: "rig thread"},
+		{ID: unstarted, Kind: kindThread, ParentID: guildID, Name: "forum post"},
+	} {
+		if err := h.st.UpsertContainer(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.st.UpsertMessage(ctx, store.Message{ID: threadID, ContainerID: chanGeneral, SenderID: aliceUser, Body: "rig?", SentAt: noon}); err != nil {
+		t.Fatal(err)
+	}
+	path := api("/channels/" + threadID + "/messages")
+	h.discord.handle(path, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		connector.WriteJSON(w, http.StatusOK, []map[string]any{})
+	})
+	h.start()
+	if row := h.queryRow(`SELECT parent_id FROM containers WHERE id = ?`, threadID); row[0] != chanGeneral {
+		t.Errorf("started thread under %v, want its channel", row[0])
+	}
+	if row := h.queryRow(`SELECT parent_id FROM containers WHERE id = ?`, unstarted); row[0] != guildID {
+		t.Errorf("thread without a starter message under %v, want the guild still", row[0])
+	}
+	h.callOK("fetch", map[string]string{"channel_id": threadID}, &connector.ReadResult{})
+	if hits := h.discord.to(path); len(hits) != 1 || hits[0].header.Get("Referer") != "https://discord.com/channels/"+guildID+"/"+threadID {
+		t.Errorf("thread fetch requests %+v, want one with the guild in its referer", hits)
 	}
 }
 

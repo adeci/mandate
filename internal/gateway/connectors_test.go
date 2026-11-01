@@ -51,6 +51,10 @@ func (f *fakeDiscord) Health(context.Context) connector.Health { return f.health
 func (f *fakeDiscord) Spec() connector.Spec {
 	return connector.Spec{Name: "discord", Ops: []connector.Op{
 		{Name: "sync", Kind: connector.Read, Params: []connector.Param{{Name: "guild_id", Container: true}}},
+		{Name: "guild-search", Kind: connector.Read, Params: []connector.Param{
+			{Name: "guild_id", Required: true, Container: true},
+			{Name: "content"},
+		}},
 		{Name: "fetch", Kind: connector.Read, Params: []connector.Param{
 			{Name: "channel_id", Required: true, Container: true},
 			{Name: "limit"},
@@ -219,7 +223,7 @@ func TestReadOpRunsAndAnswersThroughFilter(t *testing.T) {
 			m.SentAt = at
 			mustDo(t, st.UpsertMessage(ctx, m))
 		}
-		return json.Marshal(connector.ReadResult{MessageIDs: []string{"d4", "d1", "d5", "d3", "d2"}, TotalResults: 40})
+		return json.Marshal(connector.ReadResult{MessageIDs: []string{"d4", "d1", "d5", "d3", "d2"}})
 	}
 
 	rec := call(r.h, http.MethodPost, "/v1/discord/fetch", `{"args":{"channel_id":"c-memes","limit":"50"}}`)
@@ -232,11 +236,69 @@ func TestReadOpRunsAndAnswersThroughFilter(t *testing.T) {
 	if got := column(t, res, "body"); !slices.Equal(got, want) {
 		t.Errorf("bodies = %v, want %v (connector order; hidden sender and hidden guild dropped, OTP replaced)", got, want)
 	}
-	if res.TotalResults != 40 {
-		t.Errorf("total_results = %d, want 40", res.TotalResults)
-	}
 	if n := r.console.calls.Load(); n != 0 {
 		t.Errorf("a read op reached the console %d times", n)
+	}
+}
+
+// A read op's answer gives away nothing about hidden chats: no upstream total
+// of hits, and a count of only the visible chats a sync stored.
+func TestReadOpCountsOnlyVisibleChats(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, nil)
+	r.discord.read = func(_ context.Context, op string, _ map[string]string) (json.RawMessage, error) {
+		if op == "sync" {
+			return json.Marshal(connector.ReadResult{ContainerIDs: []string{"g-fun", "g-work", "c-memes", "c-secret", "t-plans", "dm-known"}})
+		}
+		return json.Marshal(connector.ReadResult{MessageIDs: []string{"d2", "d7", "d9", "d1"}, More: true})
+	}
+
+	rec := call(r.h, http.MethodPost, "/v1/discord/guild-search", `{"args":{"guild_id":"g-fun","content":"x"}}`)
+	var raw map[string]json.RawMessage
+	mustDo(t, json.Unmarshal(rec.Body.Bytes(), &raw))
+	if keys := slices.Sorted(maps.Keys(raw)); rec.Code != http.StatusOK || !slices.Equal(keys, []string{"columns", "more", "rows"}) {
+		t.Fatalf("guild-search: %d %s, want columns, rows and more only", rec.Code, rec.Body)
+	}
+	var res table
+	mustDo(t, json.Unmarshal(rec.Body.Bytes(), &res))
+	if got := column(t, res, "body"); !slices.Equal(got, []any{"lol"}) || !res.More {
+		t.Errorf("guild-search bodies %v, more %v; want the one visible hit and more", got, res.More)
+	}
+
+	rec = call(r.h, http.MethodPost, "/v1/discord/sync", `{"args":{}}`)
+	res = table{}
+	mustDo(t, json.Unmarshal(rec.Body.Bytes(), &res))
+	if res.Containers != 2 {
+		t.Errorf("sync counted %d chats, want the 2 visible ones", res.Containers)
+	}
+}
+
+// Hiding reaches threads under a hidden channel or guild, and DMs whose ID is
+// not the hidden sender's, with the owner's own messages in them.
+func TestHidingReachesThreadsAndDMs(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, nil)
+	for _, chat := range []string{"t-plans", "t-standup", "dm-known", "dm-unknown"} {
+		if code, _, body := getTable(t, r.h, "/v1/discord/messages?chat="+chat); code != http.StatusNotFound {
+			t.Errorf("messages in %s: %d %s, want 404", chat, code, body)
+		}
+		if code, _, _ := getTable(t, r.h, "/v1/discord/search?text=e&chat="+chat); code != http.StatusNotFound {
+			t.Errorf("search in %s: %d, want 404", chat, code)
+		}
+		if rec := call(r.h, http.MethodPost, "/v1/discord/send", `{"args":{"chat":"`+chat+`","text":"hi"}}`); rec.Code != http.StatusNotFound {
+			t.Errorf("send to %s: %d %s, want 404", chat, rec.Code, rec.Body)
+		}
+	}
+	for _, text := range []string{"plans", "notes", "hey", "hi"} {
+		if _, res, _ := getTable(t, r.h, "/v1/discord/search?text="+text); len(res.Rows) != 0 {
+			t.Errorf("search %q found %v", text, res.Rows)
+		}
+	}
+	if code, _, body := getTable(t, r.h, "/v1/discord/messages?chat=t-cats"); code != http.StatusOK {
+		t.Errorf("messages in a visible thread: %d %s", code, body)
+	}
+	if n := r.discord.prepares.Load(); n != 0 {
+		t.Errorf("%d sends to hidden chats reached the connector", n)
 	}
 }
 
@@ -462,7 +524,7 @@ func TestConnectorsListsDownAndOtherProtocolAsBroken(t *testing.T) {
 	for _, c := range list {
 		got[c.Name] = c
 	}
-	if d := got["discord"]; len(d.Ops) != 3 || d.Health.State != connector.Healthy || !d.Source {
+	if d := got["discord"]; len(d.Ops) != 4 || d.Health.State != connector.Healthy || !d.Source {
 		t.Errorf("discord = %+v, want its ops, healthy, a source", d)
 	}
 	for _, name := range []string{"next", "whatsapp"} {
