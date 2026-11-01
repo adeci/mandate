@@ -357,7 +357,7 @@ func (h *harness) page(t *testing.T, path string) (int, string) {
 	return status, string(body)
 }
 
-func (h *harness) loginAssertion(t *testing.T, key *approvaltest.Authenticator) json.RawMessage {
+func (h *harness) loginChallenge(t *testing.T) []byte {
 	t.Helper()
 	status, body := h.call(t, http.MethodPost, "/login/options", "", nil)
 	if status != http.StatusOK {
@@ -371,12 +371,22 @@ func (h *harness) loginAssertion(t *testing.T, key *approvaltest.Authenticator) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	return key.Assert(c)
+	return c
+}
+
+func (h *harness) loginAssertion(t *testing.T, key *approvaltest.Authenticator) json.RawMessage {
+	t.Helper()
+	return key.Assert(h.loginChallenge(t))
 }
 
 func (h *harness) login(t *testing.T, key *approvaltest.Authenticator) string {
 	t.Helper()
-	resp := h.do(t, http.MethodPost, "/login", "", loginRequest{Assertion: h.loginAssertion(t, key)})
+	return h.signIn(t, loginRequest{Assertion: h.loginAssertion(t, key)})
+}
+
+func (h *harness) signIn(t *testing.T, req loginRequest) string {
+	t.Helper()
+	resp := h.do(t, http.MethodPost, "/login", "", req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)

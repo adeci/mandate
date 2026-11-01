@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS proposals (
     record     BLOB,
     nonce      BLOB,
     issued_at  INTEGER,           -- unix ns; the challenge hashes it at full precision
-    assertion  TEXT,
+    assertion  TEXT,              -- or, in an unlock window, {"delegation", "signature"}
     result     TEXT               -- JSON connector.Result
 ) STRICT;
 

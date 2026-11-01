@@ -43,6 +43,10 @@ function say(text, isError, el = $("#msg")) {
   el.dataset.kind = isError ? "error" : "";
 }
 
+// The server's clock minus this device's, from the Date header, so a window
+// ends at a time the server accepts even if this device's clock is off.
+let clockSkew = 0;
+
 async function call(method, url, body) {
   const init = { method, headers: {} };
   if (body !== undefined) {
@@ -50,6 +54,8 @@ async function call(method, url, body) {
     init.body = JSON.stringify(body);
   }
   const resp = await fetch(url, init);
+  const date = Date.parse(resp.headers.get("Date"));
+  if (date) clockSkew = date - Date.now();
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
     const err = new Error(data.error || resp.statusText);
@@ -84,6 +90,124 @@ async function getAssertion(o) {
   return assertion;
 }
 
+// An unlock window: a session key a passkey delegated to, so approving needs
+// no touch until it ends. The key lives only in this page's memory, so while
+// a window is open, links and forms load in place instead of navigating.
+const WINDOW_S = 600;
+let unlocked = null;
+
+const utf8 = (s) => new TextEncoder().encode(s);
+
+// Mirrors hashParts in the approval package.
+async function hashParts(...parts) {
+  const buf = new Uint8Array(parts.reduce((n, p) => n + 8 + p.length, 0));
+  const view = new DataView(buf.buffer);
+  let at = 0;
+  for (const p of parts) {
+    view.setBigUint64(at, BigInt(p.length));
+    buf.set(p, at + 8);
+    at += 8 + p.length;
+  }
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", buf));
+}
+
+// newWindow makes a session key and the challenge whose assertion delegates
+// to it and approves covers too.
+async function newWindow(covers) {
+  const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+  const pub = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+  const end = Math.floor((Date.now() + clockSkew) / 1000) + WINDOW_S;
+  const expires = new Date(end * 1000).toISOString().replace(".000Z", "Z");
+  return {
+    key: pair.privateKey,
+    until: end * 1000 - clockSkew,
+    delegation: { public_key: toB64(pub), expires_at: expires, covers: toB64(covers) },
+    challenge: await hashParts(utf8("mandate-unlock-v1"), pub, utf8(expires), covers),
+  };
+}
+
+async function sessionSign(win, challenge) {
+  return toB64(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, win.key, challenge));
+}
+
+function openWindow(win) {
+  unlocked = win;
+  showWindow();
+}
+
+function lock() {
+  unlocked = null;
+  showWindow();
+}
+
+const pad = (n) => String(n).padStart(2, "0");
+
+function showWindow() {
+  if (unlocked && Date.now() >= unlocked.until) unlocked = null;
+  const box = $("[data-window]");
+  if (box) {
+    box.hidden = !unlocked;
+    const s = unlocked ? Math.ceil((unlocked.until - Date.now()) / 1000) : 0;
+    $("[data-window-left]", box).textContent = `${Math.floor(s / 60)}:${pad(s % 60)}`;
+  }
+  const sign = $("[data-sign]");
+  if (sign) sign.textContent = unlocked ? "Approve →" : "Approve with passkey →";
+  const last = $("#steps li:last-child");
+  if (last) last.textContent = unlocked ? "approve" : "touch key";
+}
+
+// load shows url in this page, or navigates when there is no window to keep.
+async function load(url, init = {}, replace = false) {
+  if (!unlocked) {
+    if (replace) location.replace(url);
+    else location.assign(url);
+    return;
+  }
+  const resp = await fetch(url, init);
+  if (resp.status === 401 || new URL(resp.url).pathname === "/login") {
+    lock();
+    location.assign(resp.status === 401 ? "/login" : resp.url);
+    return;
+  }
+  if (!(resp.headers.get("Content-Type") || "").startsWith("text/html")) {
+    const data = await resp.json().catch(() => ({}));
+    throw new Error(data.error || resp.statusText);
+  }
+  const doc = new DOMParser().parseFromString(await resp.text(), "text/html");
+  document.title = doc.title;
+  document.body.replaceWith(doc.body);
+  if (replace) {
+    history.replaceState(null, "", resp.url);
+  } else {
+    history.pushState(null, "", resp.url);
+    scrollTo(0, 0);
+  }
+  bind();
+}
+
+const reload = () => (unlocked ? load(location.href, {}, true) : location.reload());
+
+function loadLink(ev) {
+  const a = ev.target.closest("a[href]");
+  if (!unlocked || !a || ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+  const url = new URL(a.href);
+  if (a.target || a.hasAttribute("download") || url.origin !== location.origin) return;
+  ev.preventDefault();
+  load(url.href).catch((e) => say(e.message, true));
+}
+
+function loadForm(ev) {
+  const form = ev.target;
+  if (!unlocked || ev.defaultPrevented) return;
+  const url = new URL(form.action);
+  if (url.pathname === "/logout") return lock();
+  ev.preventDefault();
+  const data = new URLSearchParams(new FormData(form));
+  if (form.method === "get") url.search = data;
+  const init = form.method === "get" ? {} : { method: "POST", body: data };
+  load(url.href, init).catch((e) => say(e.message, true));
+}
+
 // The session cookie is SameSite=Strict, so a link opened from a chat app
 // may arrive without it; a same-origin check finds an existing session.
 async function resumeSession(next) {
@@ -93,10 +217,13 @@ async function resumeSession(next) {
 
 async function login(button) {
   const o = await call("POST", "/login/options");
+  const win = await newWindow(fromB64(o.challenge));
   say("Waiting for your passkey…");
-  const assertion = await getAssertion(o);
-  const res = await call("POST", "/login", { assertion, next: button.dataset.login });
-  location.assign(res.next);
+  const assertion = await getAssertion({ ...o, challenge: toB64(win.challenge) });
+  const res = await call("POST", "/login", { assertion, unlock: win.delegation, next: button.dataset.login });
+  win.delegation.assertion = assertion;
+  openWindow(win);
+  await load(res.next, {}, true);
 }
 
 async function passwordLogin(form) {
@@ -145,12 +272,33 @@ async function review() {
 async function sign() {
   if (!pending) return;
   const { id, nonce, options } = pending;
-  say("Waiting for your passkey…");
-  const assertion = await getAssertion(options);
+  const challenge = fromB64(options.challenge);
+  let body;
+  let opening = null;
+  if (unlocked) {
+    body = { nonce, delegation: unlocked.delegation, signature: await sessionSign(unlocked, challenge) };
+  } else if ("passkey" in document.body.dataset) {
+    // One touch approves this request and opens a window.
+    opening = await newWindow(challenge);
+    say("Waiting for your passkey…");
+    opening.delegation.assertion = await getAssertion({ ...options, challenge: toB64(opening.challenge) });
+    body = { nonce, delegation: opening.delegation, signature: await sessionSign(opening, challenge) };
+  } else {
+    say("Waiting for your passkey…");
+    body = { nonce, assertion: await getAssertion(options) };
+  }
   say("Sending…");
   pending = null;
-  await call("POST", `/r/${id}/approve`, { nonce, assertion });
-  location.reload();
+  try {
+    await call("POST", `/r/${id}/approve`, body);
+  } catch (e) {
+    // The window closed or its key was removed; the passkey opens a new one.
+    if (e.status === 403) lock();
+    closeReview();
+    throw e;
+  }
+  if (opening) openWindow(opening);
+  await reload();
 }
 
 async function addKey(form) {
@@ -175,7 +323,7 @@ async function addKey(form) {
       transports: r.getTransports ? r.getTransports() : [],
     },
   });
-  location.reload();
+  await reload();
 }
 
 async function approveKey(panel) {
@@ -185,7 +333,7 @@ async function approveKey(panel) {
   say("Waiting for your passkey…", false, msg);
   const assertion = await getAssertion(res.options);
   await call("POST", `/keys/changes/${id}/approve`, { change: res.change, assertion });
-  location.reload();
+  await reload();
 }
 
 const POLL_MS = 2000;
@@ -201,10 +349,10 @@ function linkConnection(panel, args) {
 
   const finish = () => {
     stopped = true;
-    location.reload();
+    reload();
   };
   const step = async () => {
-    if (stopped) return;
+    if (stopped || !panel.isConnected) return;
     try {
       const s = await call("POST", `/connections/${name}/setup`, { args });
       if (s.done) return finish();
@@ -298,15 +446,16 @@ const engaged = () =>
 
 // Reloads after something changed elsewhere, e.g. a key approved on another
 // device, once the owner isn't in the middle of something here.
-function watch(version) {
-  let stale = false;
+function watch() {
+  let stale = null;
   const check = async () => {
-    if (document.hidden) return;
-    if (!stale) {
+    const version = document.body.dataset.version;
+    if (document.hidden || !version) return;
+    if (stale !== version) {
       const res = await call("GET", "/version").catch(() => null);
-      stale = res !== null && res.version !== version;
+      if (res !== null && res.version !== version) stale = version;
     }
-    if (stale && !engaged()) location.reload();
+    if (stale === version && !engaged()) reload();
   };
   setInterval(check, 3000);
   document.addEventListener("visibilitychange", check);
@@ -317,21 +466,34 @@ function countdown(el) {
   const until = Date.parse(el.dataset.until);
   // Only a countdown that ends while the page is open reloads it.
   const live = until > Date.now();
-  const pad = (n) => String(n).padStart(2, "0");
   const tick = () => {
+    if (!el.isConnected) return clearInterval(timer);
     const s = Math.max(0, Math.ceil((until - Date.now()) / 1000));
     const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, sec = s % 60;
     el.textContent = "in " + (h ? `${h}h ${pad(m)}m ${pad(sec)}s` : m ? `${m}m ${pad(sec)}s` : `${sec}s`);
-    if (s === 0 && live && !engaged()) location.reload();
+    if (s === 0 && live && !engaged()) reload();
   };
+  const timer = setInterval(tick, 1000);
   tick();
-  setInterval(tick, 1000);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  if (document.body.dataset.version) watch(document.body.dataset.version);
+  bind();
+  watch();
+  setInterval(showWindow, 1000);
+  document.addEventListener("click", loadLink);
+  document.addEventListener("submit", loadForm);
+  addEventListener("popstate", () => (unlocked ? load(location.href, {}, true).catch(() => location.reload()) : location.reload()));
+});
+
+// bind wires up the page's controls, on first load and after load swaps it in.
+function bind() {
+  pending = null;
+  showWindow();
   $("[data-theme-toggle]").addEventListener("click", toggleTheme);
   for (const el of $$("[data-until]")) countdown(el);
+  const lockButton = $("[data-lock]");
+  if (lockButton) lockButton.addEventListener("click", lock);
 
   const loginButton = $("[data-login]");
   if (loginButton) loginButton.addEventListener("click", busy(loginButton, () => login(loginButton)));
@@ -377,11 +539,11 @@ document.addEventListener("DOMContentLoaded", () => {
         "click",
         confirmFirst(unlink, "Confirm unlink", async () => {
           await unlinkConnection(panel);
-          location.reload();
+          await reload();
         }),
       );
       const again = $("[data-relink]", panel);
       again.addEventListener("click", confirmFirst(again, "Confirm relink", () => relink(panel)));
     }
   }
-});
+}

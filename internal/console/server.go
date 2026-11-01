@@ -357,9 +357,33 @@ func (s *Server) challenge(w http.ResponseWriter, r *http.Request, sess session)
 	})
 }
 
+// approveRequest carries a passkey assertion over the challenge, or, in an
+// unlock window, the delegation and the session key's signature over it.
 type approveRequest struct {
-	Nonce     string          `json:"nonce"`
-	Assertion json.RawMessage `json:"assertion"`
+	Nonce      string          `json:"nonce"`
+	Assertion  json.RawMessage `json:"assertion,omitempty"`
+	Delegation *delegation     `json:"delegation,omitempty"`
+	Signature  string          `json:"signature,omitempty"`
+}
+
+// delegation is an approval.Delegation as pages send it, in base64url.
+type delegation struct {
+	PublicKey string          `json:"public_key"`
+	ExpiresAt time.Time       `json:"expires_at"`
+	Covers    string          `json:"covers"`
+	Assertion json.RawMessage `json:"assertion,omitempty"`
+}
+
+func (d delegation) decode() (approval.Delegation, error) {
+	pub, err := base64.RawURLEncoding.DecodeString(d.PublicKey)
+	if err != nil {
+		return approval.Delegation{}, connector.Invalid("invalid unlock public key")
+	}
+	covers, err := base64.RawURLEncoding.DecodeString(d.Covers)
+	if err != nil {
+		return approval.Delegation{}, connector.Invalid("invalid unlock covers")
+	}
+	return approval.Delegation{PublicKey: pub, ExpiresAt: d.ExpiresAt, Covers: covers, Assertion: d.Assertion}, nil
 }
 
 func (s *Server) approve(w http.ResponseWriter, r *http.Request, sess session) {
@@ -371,6 +395,30 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request, sess session) {
 	if err != nil {
 		connector.WriteError(w, connector.Invalid("invalid nonce"))
 		return
+	}
+	a := approval.Approval{Assertion: req.Assertion}
+	// proof is what claim stores; signer is the passkey's assertion.
+	proof, signer := req.Assertion, req.Assertion
+	if req.Delegation != nil {
+		if sess.key.CredentialID == "" {
+			connector.WriteError(w, forbidden(errors.New("a password session can't unlock; sign in with a passkey")))
+			return
+		}
+		d, err := req.Delegation.decode()
+		if err != nil {
+			connector.WriteError(w, err)
+			return
+		}
+		if a.Signature, err = base64.RawURLEncoding.DecodeString(req.Signature); err != nil {
+			connector.WriteError(w, connector.Invalid("invalid signature"))
+			return
+		}
+		a.Delegation = &d
+		if proof, err = json.Marshal(windowProof{a.Delegation, a.Signature}); err != nil {
+			connector.WriteError(w, err)
+			return
+		}
+		signer = d.Assertion
 	}
 	id := r.PathValue("id")
 	ch, err := s.db.challenge(r.Context(), nonce)
@@ -397,7 +445,7 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request, sess session) {
 		connector.WriteError(w, &connector.Error{Status: http.StatusBadGateway, Message: fmt.Sprintf("connector %q is no longer configured", pr.Connector)})
 		return
 	}
-	a := approval.Approval{Record: ch.Record, Nonce: ch.Nonce, IssuedAt: ch.IssuedAt, Assertion: req.Assertion}
+	a.Record, a.Nonce, a.IssuedAt = ch.Record, ch.Nonce, ch.IssuedAt
 	// The connector verifies again; checking here refuses bad approvals
 	// before anything is marked executing.
 	rec, err := s.verifier.Verify(a)
@@ -410,11 +458,11 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request, sess session) {
 		connector.WriteError(w, &connector.Error{Status: http.StatusForbidden, Message: "approval is for a different request"})
 		return
 	}
-	approver, _ := s.keys.Find(b64(assertionRawID(req.Assertion)))
+	approver, _ := s.keys.Find(b64(assertionRawID(signer)))
 	// From here on the request runs to completion even if the page goes
 	// away: once claimed, the outcome must be recorded.
 	ctx := context.WithoutCancel(r.Context())
-	if err := s.db.claim(ctx, ch, rec, req.Assertion, approver.Name, s.now()); err != nil {
+	if err := s.db.claim(ctx, ch, rec, proof, approver.Name, s.now()); err != nil {
 		connector.WriteError(w, conflict(err))
 		return
 	}
@@ -432,6 +480,13 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request, sess session) {
 		return
 	}
 	connector.WriteJSON(w, http.StatusOK, out.Proposal)
+}
+
+// windowProof stands in for the assertion of an approval made in an unlock
+// window; it unmarshals into an approval.Approval.
+type windowProof struct {
+	Delegation *approval.Delegation `json:"delegation"`
+	Signature  []byte               `json:"signature"`
 }
 
 // execute hands the approval to the connector exactly once. Only failures

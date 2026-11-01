@@ -12,7 +12,7 @@
 <link rel="stylesheet" href="/static/app.css">
 <script src="/static/app.js"></script>
 </head>
-<body{{with .Version}} data-version="{{.}}"{{end}}>
+<body{{with .Version}} data-version="{{.}}"{{end}}{{if .Passkey}} data-passkey{{end}}>
 <header class="site">
   <div class="masthead"><a class="brand" href="/">mandate</a></div>
   {{- if .Who}}
@@ -25,6 +25,12 @@
   <button type="button" class="theme-toggle" data-theme-toggle aria-label="Switch between light and dark">
     <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><path d="M8 1.5a6.5 6.5 0 0 1 0 13z"/></svg>
   </button>
+  {{- if .Who}}
+  <div class="window" data-window hidden>
+    <span class="status" data-tone="ok">unlocked <span data-window-left></span></span>
+    <button type="button" class="compact" data-lock>Lock</button>
+  </div>
+  {{- end}}
 </header>
 <main>
 {{end}}

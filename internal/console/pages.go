@@ -104,6 +104,8 @@ type page struct {
 	Nav     string
 	Pending int
 	Who     string
+	// Passkey sessions may open an unlock window.
+	Passkey bool
 	Version string
 	Data    any
 }
@@ -131,7 +133,10 @@ func (s *Server) owner(w http.ResponseWriter, r *http.Request, sess session, nam
 	if err != nil {
 		s.cfg.Log.Error("count pending", "err", err)
 	}
-	s.render(w, http.StatusOK, name, page{Title: title, Nav: nav, Pending: n, Who: sess.who(), Version: sess.version, Data: data})
+	s.render(w, http.StatusOK, name, page{
+		Title: title, Nav: nav, Pending: n, Who: sess.who(), Passkey: sess.key.CredentialID != "",
+		Version: sess.version, Data: data,
+	})
 }
 
 // version changes whenever something a page shows may have, so open pages

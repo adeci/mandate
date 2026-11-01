@@ -169,8 +169,11 @@ func (s *Server) loginOptions(w http.ResponseWriter, _ *http.Request) {
 
 type loginRequest struct {
 	Assertion json.RawMessage `json:"assertion,omitempty"`
-	Password  string          `json:"password,omitempty"`
-	Next      string          `json:"next"`
+	// Unlock is the window the assertion also opens, covering the login
+	// challenge.
+	Unlock   *delegation `json:"unlock,omitempty"`
+	Password string      `json:"password,omitempty"`
+	Next     string      `json:"next"`
 }
 
 type loginResponse struct {
@@ -186,9 +189,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		k   approval.Key
 		err error
 	)
-	if req.Assertion != nil {
+	switch {
+	case req.Unlock != nil:
+		k, err = s.unlockLogin(req.Assertion, *req.Unlock)
+	case req.Assertion != nil:
 		k, err = s.verifyLogin(req.Assertion)
-	} else {
+	default:
 		err = s.checkPassword(req.Password)
 	}
 	if err != nil {
@@ -243,6 +249,26 @@ func (s *Server) verifyLogin(assertion json.RawMessage) (approval.Key, error) {
 		return approval.Key{}, forbidden(fmt.Errorf("%w (%s): %w", approval.ErrSignature, k.Name, webauthnErr(err)))
 	}
 	if err := s.logins.spend(c, now); err != nil {
+		return approval.Key{}, forbidden(err)
+	}
+	return k, nil
+}
+
+func (s *Server) unlockLogin(assertion json.RawMessage, unlock delegation) (approval.Key, error) {
+	d, err := unlock.decode()
+	if err != nil {
+		return approval.Key{}, err
+	}
+	d.Assertion = assertion
+	now := s.now()
+	if err := s.logins.check(d.Covers, now); err != nil {
+		return approval.Key{}, forbidden(err)
+	}
+	k, err := s.verifier.VerifyDelegation(d)
+	if err != nil {
+		return approval.Key{}, forbidden(webauthnErr(err))
+	}
+	if err := s.logins.spend(d.Covers, now); err != nil {
 		return approval.Key{}, forbidden(err)
 	}
 	return k, nil

@@ -279,7 +279,7 @@ func (d *db) challenge(ctx context.Context, nonce []byte) (challenge, error) {
 // claim spends challenge c and moves its proposal from pending to executing,
 // storing the proof. Exactly one caller wins; everyone else gets
 // errNotPending, which is what keeps a double tap from executing twice.
-func (d *db) claim(ctx context.Context, c challenge, rec approval.Record, assertion json.RawMessage, approver string, now time.Time) error {
+func (d *db) claim(ctx context.Context, c challenge, rec approval.Record, proof json.RawMessage, approver string, now time.Time) error {
 	args, err := json.Marshal(rec.Args)
 	if err != nil {
 		return err
@@ -301,7 +301,7 @@ func (d *db) claim(ctx context.Context, c challenge, rec approval.Record, assert
 			       record = ?, nonce = ?, issued_at = ?, assertion = ?
 			WHERE id = ? AND status = 'pending' AND expires_at > ?`,
 			string(args), string(display), ms(now), approver,
-			c.Record, c.Nonce, c.IssuedAt.UnixNano(), string(assertion), c.Proposal, ms(now))
+			c.Record, c.Nonce, c.IssuedAt.UnixNano(), string(proof), c.Proposal, ms(now))
 		if err != nil {
 			return err
 		}
