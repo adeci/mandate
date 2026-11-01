@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,6 +25,7 @@ import (
 var spec = connector.Spec{
 	Name: "matrix",
 	Doc: "Rooms and messages arrive by sync; fetch reads a room's older history from the homeserver.\n" +
+		"A message starting with [unverified] came with a key that does not trace back to a cross-signed device of its sender, so someone else may have written it.\n" +
 		"send proposes a message; it goes out from the owner's account once they approve it.",
 	Setup: setupParams,
 	Ops: []connector.Op{
@@ -79,22 +83,36 @@ func (c *mxConnector) Prepare(ctx context.Context, op string, args map[string]st
 	}, nil
 }
 
-// recipient checks that chat is a stored room and renders it for the owner.
+// recipient checks that chat is a stored room and renders it for the owner:
+// a DM by the other person's user ID, a room by its ID, each next to the name
+// they chose.
 func (c *mxConnector) recipient(ctx context.Context, chat string) (approval.Field, error) {
-	var kind, name string
-	err := c.st.DB().QueryRowContext(ctx, `SELECT kind, COALESCE(name, '') FROM containers WHERE id = ?1`, chat).Scan(&kind, &name)
+	var kind, name, participants string
+	err := c.st.DB().QueryRowContext(ctx, `SELECT kind, COALESCE(name, ''), participants_json FROM containers WHERE id = ?1`, chat).
+		Scan(&kind, &name, &participants)
 	if errors.Is(err, sql.ErrNoRows) {
 		return approval.Field{}, connector.Invalid("unknown chat %q: run mandate matrix chats", chat)
 	} else if err != nil {
 		return approval.Field{}, fmt.Errorf("look up chat: %w", err)
 	}
-	if name == "" {
-		name = chat
+	if kind != kindDM {
+		return approval.Field{Label: "Room", Value: named(name, chat)}, nil
 	}
-	if kind == kindDM {
-		return approval.Field{Label: "To", Value: name}, nil
+	var ps []store.Participant
+	if err := json.Unmarshal([]byte(participants), &ps); err != nil || len(ps) != 1 {
+		return approval.Field{}, fmt.Errorf("chat %s has no other participant", chat)
 	}
-	return approval.Field{Label: "Room", Value: name}, nil
+	return approval.Field{Label: "To", Value: named(ps[0].Name, ps[0].ID)}, nil
+}
+
+// named shows a name someone else chose, marked with "~", next to the ID it
+// stands for.
+func named(name, ident string) string {
+	name = strings.TrimPrefix(name, "~")
+	if name == "" || name == ident {
+		return ident
+	}
+	return "~" + name + " (" + ident + ")"
 }
 
 // Execute makes one PUT. Only a 4xx answer means the homeserver refused it;
@@ -144,18 +162,18 @@ func (c *mxConnector) Execute(ctx context.Context, rec approval.Record) connecto
 	return res
 }
 
-// encrypt shares a new group session with the room's members first if the
-// current one is missing or used up.
+// encrypt shares a new group session with the room's joined members first if
+// the current one is missing or used up. Invitees get it once they join.
 func (a *account) encrypt(ctx context.Context, room id.RoomID, t event.Type, content any) (*event.EncryptedEventContent, error) {
 	enc, err := a.mach.EncryptMegolmEvent(ctx, room, t, content)
 	if !errors.Is(err, crypto.ErrNoGroupSession) && !errors.Is(err, crypto.ErrSessionExpired) && !errors.Is(err, crypto.ErrSessionNotShared) {
 		return enc, err
 	}
-	users, err := a.state.GetRoomJoinedOrInvitedMembers(ctx, room)
+	members, err := a.state.GetRoomMembers(ctx, room, event.MembershipJoin)
 	if err != nil {
 		return nil, fmt.Errorf("room members: %w", err)
 	}
-	if err := a.mach.ShareGroupSession(ctx, room, users); err != nil {
+	if err := a.mach.ShareGroupSession(ctx, room, slices.Collect(maps.Keys(members))); err != nil {
 		return nil, fmt.Errorf("share room key: %w", err)
 	}
 	return a.mach.EncryptMegolmEvent(ctx, room, t, content)

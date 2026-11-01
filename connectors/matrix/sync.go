@@ -155,6 +155,13 @@ func (c *mxConnector) ingestRoom(ctx context.Context, a *account, room id.RoomID
 		switch evt.Type {
 		case event.StateMember:
 			a.mach.HandleMemberEvent(ctx, evt)
+			// HandleMemberEvent keeps the room key when an invitee joins,
+			// but encrypt shared it with joined members only.
+			if joinedFromInvite(evt) {
+				if err := a.crypto.RemoveOutboundGroupSession(ctx, room); err != nil {
+					c.log.Warn("drop room key", "room", room, "err", err)
+				}
+			}
 		case event.StateRoomName:
 			n := evt.Content.AsRoomName().Name
 			name = &n
@@ -189,6 +196,15 @@ func (c *mxConnector) ingestRoom(ctx context.Context, a *account, room id.RoomID
 		ct.LastMessageAt = time.UnixMilli(last)
 	}
 	return c.st.UpsertContainer(ctx, ct)
+}
+
+func joinedFromInvite(evt *event.Event) bool {
+	prev := evt.Unsigned.PrevContent
+	if prev == nil || evt.Content.AsMember().Membership != event.MembershipJoin {
+		return false
+	}
+	_ = prev.ParseRaw(evt.Type) // HandleMemberEvent may have parsed it
+	return prev.AsMember().Membership == event.MembershipInvite
 }
 
 // container describes room: a DM by the other person's name, a group by its

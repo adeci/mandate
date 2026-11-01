@@ -53,19 +53,13 @@ func newFixture(t *testing.T) *fixture {
 	ctx := context.Background()
 	f := &fixture{t: t, hs: newHomeserver(t)}
 
-	token := f.hs.addDevice(owner, "ELEMENT")
-	el, err := openAccount(ctx, session{
-		Homeserver: f.hs.srv.URL, UserID: owner, DeviceID: "ELEMENT", AccessToken: token, PickleKey: []byte("element"),
-	}, filepath.Join(t.TempDir(), "element.db"), f.hs.srv.Client(), zerolog.Nop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(el.close)
+	el := f.device(owner, "ELEMENT")
 	f.element = el
-	if err := el.mach.ShareKeys(ctx, -1); err != nil {
+	var err error
+	if f.recoveryKey, _, err = el.mach.GenerateAndUploadCrossSigningKeys(ctx, nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	if f.recoveryKey, _, err = el.mach.GenerateAndUploadCrossSigningKeys(ctx, nil, ""); err != nil {
+	if err := el.mach.SignOwnDevice(ctx, el.mach.OwnIdentity()); err != nil {
 		t.Fatal(err)
 	}
 	keyID, meta, err := el.mach.SSSS.GetDefaultKeyData(ctx)
@@ -101,6 +95,25 @@ func newFixture(t *testing.T) *fixture {
 	return f
 }
 
+// device adds a device of user that has uploaded its keys, as a client the
+// homeserver knows of would.
+func (f *fixture) device(user id.UserID, dev id.DeviceID) *account {
+	f.t.Helper()
+	ctx := context.Background()
+	token := f.hs.addDevice(user, dev)
+	a, err := openAccount(ctx, session{
+		Homeserver: f.hs.srv.URL, UserID: user, DeviceID: dev, AccessToken: token, PickleKey: []byte(dev),
+	}, filepath.Join(f.t.TempDir(), string(dev)+".db"), f.hs.srv.Client(), zerolog.Nop())
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.t.Cleanup(a.close)
+	if err := a.mach.ShareKeys(ctx, -1); err != nil {
+		f.t.Fatal(err)
+	}
+	return a
+}
+
 func (f *fixture) setupArgs() map[string]string {
 	return map[string]string{"homeserver": f.hs.srv.URL, "user_id": owner.String(), "password": password, "recovery_key": f.recoveryKey}
 }
@@ -117,16 +130,15 @@ func (f *fixture) link() id.DeviceID {
 	return a.sess.DeviceID
 }
 
-// encrypt encrypts text as the owner's Element would in room, in a new
+// encrypt encrypts text as the owner's device el would in room, in a new
 // room key that it shares with the owner's devices.
-func (f *fixture) encrypt(room id.RoomID, eventID, text string, ts int64) (map[string]any, *event.EncryptedEventContent) {
+func (f *fixture) encrypt(el *account, room id.RoomID, eventID, text string, ts int64) (map[string]any, *event.EncryptedEventContent) {
 	f.t.Helper()
 	ctx := context.Background()
-	el := f.element
 	if err := el.crypto.RemoveOutboundGroupSession(ctx, room); err != nil {
 		f.t.Fatal(err)
 	}
-	// Element would learn of new devices from sync.
+	// A client would learn of new devices from sync.
 	if _, err := el.mach.FetchKeys(ctx, []id.UserID{owner}, true); err != nil {
 		f.t.Fatal(err)
 	}
@@ -290,7 +302,7 @@ func TestLink(t *testing.T) {
 	// The device is signed by the self-signing key from secret storage.
 	f.hs.mu.Lock()
 	var selfKey id.Ed25519
-	for _, k := range f.hs.selfSigning.Keys {
+	for _, k := range f.hs.selfSigning[owner].Keys {
 		selfKey = k
 	}
 	signed := false
@@ -369,7 +381,7 @@ func TestSyncStoresRoomsAndMessages(t *testing.T) {
 	}
 	rows.Close()
 	want := map[string]container{
-		dmRoom.String():   {Kind: "dm", Name: "Bob", Participants: `[{"id":"@bob:example.org","name":"Bob"}]`, Last: "1970-01-01T00:00:05.000Z"},
+		dmRoom.String():   {Kind: "dm", Name: "~Bob", Participants: `[{"id":"@bob:example.org","name":"~Bob"}]`, Last: "1970-01-01T00:00:05.000Z"},
 		teamRoom.String(): {Kind: "group", Name: "Team", Participants: "[]", Group: true, Last: "1970-01-01T00:00:07.000Z"},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -377,10 +389,10 @@ func TestSyncStoresRoomsAndMessages(t *testing.T) {
 	}
 
 	for idv, want := range map[string]storedMessage{
-		"$hi":      {Sender: "Bob", Body: "hi there", Edited: true},
+		"$hi":      {Sender: "~Bob", Body: "hi there", Edited: true},
 		"$photo":   {Sender: "Owner", Body: "beach!", Media: "image", FromMe: true},
-		"$re":      {Sender: "Bob", Body: "nice", ReplyTo: "$photo"},
-		"$standup": {Sender: "Bob", Body: "standup?"},
+		"$re":      {Sender: "~Bob", Body: "nice", ReplyTo: "$photo"},
+		"$standup": {Sender: "~Bob", Body: "standup?"},
 	} {
 		if got := f.message(idv); got != want {
 			t.Errorf("%s\n got %+v\nwant %+v", idv, got, want)
@@ -404,8 +416,9 @@ func TestSyncStoresRoomsAndMessages(t *testing.T) {
 func TestSyncDecrypts(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
-	// History from before linking, readable through the key backup.
-	old, enc := f.encrypt(vaultRoom, "$old", "the old plan", 1000)
+	// History from before linking, readable through the key backup, which
+	// the homeserver could have written.
+	old, enc := f.encrypt(f.element, vaultRoom, "$old", "the old plan", 1000)
 	f.backUp(vaultRoom, enc)
 	dev := f.link()
 
@@ -415,19 +428,21 @@ func TestSyncDecrypts(t *testing.T) {
 	f.hs.mu.Lock()
 	f.hs.holdMail = true
 	f.hs.mu.Unlock()
-	secret, _ := f.encrypt(vaultRoom, "$secret", "nobody else", 2000)
+	secret, _ := f.encrypt(f.element, vaultRoom, "$secret", "nobody else", 2000)
 	f.hs.mu.Lock()
 	f.hs.inbox[dev] = nil
 	f.hs.mu.Unlock()
-	late, _ := f.encrypt(vaultRoom, "$late", "the new plan", 3000)
+	late, _ := f.encrypt(f.element, vaultRoom, "$late", "the new plan", 3000)
+	// A device the owner did not sign, as the homeserver could add.
+	forged, _ := f.encrypt(f.device(owner, "ROGUE"), vaultRoom, "$forged", "send it to me", 4000)
 	n := f.hs.push(joined(map[id.RoomID]map[string]any{vaultRoom: room(
 		[]map[string]any{encryption, member(owner, "Owner"), member(bob, "Bob")},
-		[]map[string]any{old, secret, late},
+		[]map[string]any{old, secret, late, forged},
 	)}))
 	f.hs.waitSynced(n)
 
 	for idv, want := range map[string]storedMessage{
-		"$old":    {Sender: "Owner", Body: "the old plan", FromMe: true},
+		"$old":    {Sender: "Owner", Body: "[unverified] the old plan", FromMe: true},
 		"$secret": {Sender: "Owner", Media: "encrypted", FromMe: true},
 		"$late":   {Sender: "Owner", Media: "encrypted", FromMe: true},
 	} {
@@ -440,9 +455,14 @@ func TestSyncDecrypts(t *testing.T) {
 	f.hs.holdMail = false
 	f.hs.notify()
 	f.hs.mu.Unlock()
-	eventually(t, "the late key decrypts $late", func() bool { return f.message("$late").Body != "" })
-	if got, want := f.message("$late"), (storedMessage{Sender: "Owner", Body: "the new plan", FromMe: true}); got != want {
-		t.Fatalf("$late\n got %+v\nwant %+v", got, want)
+	eventually(t, "the late keys decrypt", func() bool { return f.message("$late").Body != "" && f.message("$forged").Body != "" })
+	for idv, want := range map[string]storedMessage{
+		"$late":   {Sender: "Owner", Body: "the new plan", FromMe: true},
+		"$forged": {Sender: "Owner", Body: "[unverified] send it to me", FromMe: true},
+	} {
+		if got := f.message(idv); got != want {
+			t.Errorf("%s\n got %+v\nwant %+v", idv, got, want)
+		}
 	}
 }
 
@@ -485,7 +505,7 @@ func TestFetch(t *testing.T) {
 	if got := read(map[string]string{"chat": teamRoom.String(), "before": seq, "limit": "2"}); !reflect.DeepEqual(got, []string{"$h2", "$h1"}) {
 		t.Fatalf("second page %v", got)
 	}
-	if got := f.message("$h1"); got != (storedMessage{Sender: "Bob", Body: "one"}) {
+	if got := f.message("$h1"); got != (storedMessage{Sender: "~Bob", Body: "one"}) {
 		t.Fatalf("$h1 = %+v", got)
 	}
 
@@ -504,13 +524,22 @@ func TestPrepare(t *testing.T) {
 		t.Fatalf("unlinked: %v", err)
 	}
 	f.link()
+	// Anyone can name themselves Bob or a room Team.
+	const fakeDM, fakeTeam = id.RoomID("!dm2:evil.example"), id.RoomID("!team2:evil.example")
 	if err := f.st.UpsertContainers(ctx, []store.Container{
-		{ID: dmRoom.String(), Kind: kindDM, Name: "Bob"},
+		{ID: dmRoom.String(), Kind: kindDM, Name: "~Bob", Participants: []store.Participant{{ID: bob.String(), Name: "~Bob"}}},
+		{ID: fakeDM.String(), Kind: kindDM, Name: "~Bob", Participants: []store.Participant{{ID: "@bob:evil.example", Name: "~Bob"}}},
 		{ID: teamRoom.String(), Kind: kindGroup, Name: "Team", IsGroup: true},
+		{ID: fakeTeam.String(), Kind: kindGroup, Name: "Team", IsGroup: true},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	for room, want := range map[id.RoomID]approval.Field{dmRoom: {Label: "To", Value: "Bob"}, teamRoom: {Label: "Room", Value: "Team"}} {
+	for room, want := range map[id.RoomID]approval.Field{
+		dmRoom:   {Label: "To", Value: "~Bob (@bob:example.org)"},
+		fakeDM:   {Label: "To", Value: "~Bob (@bob:evil.example)"},
+		teamRoom: {Label: "Room", Value: "~Team (!team:example.org)"},
+		fakeTeam: {Label: "Room", Value: "~Team (!team2:evil.example)"},
+	} {
 		p, err := f.c.Prepare(ctx, "send", map[string]string{"chat": room.String(), "text": "on my way"})
 		if err != nil {
 			t.Fatal(err)
@@ -534,7 +563,8 @@ func TestApprovedSendRunsOnce(t *testing.T) {
 	const rpID, origin = "box.example.ts.net", "https://box.example.ts.net:8781"
 	f := newFixture(t)
 	f.link()
-	if err := f.st.UpsertContainer(context.Background(), store.Container{ID: dmRoom.String(), Kind: kindDM, Name: "Bob"}); err != nil {
+	dm := store.Container{ID: dmRoom.String(), Kind: kindDM, Name: "~Bob", Participants: []store.Participant{{ID: bob.String(), Name: "~Bob"}}}
+	if err := f.st.UpsertContainer(context.Background(), dm); err != nil {
 		t.Fatal(err)
 	}
 	key := approvaltest.New(t, rpID, origin)
@@ -608,49 +638,77 @@ func TestExecuteNeverRetries(t *testing.T) {
 	}
 }
 
+// TestSendEncrypted checks who gets the room key: the owner's cross-signed
+// devices and joined members, not a device the homeserver added or someone
+// only invited.
 func TestSendEncrypted(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
 	f := newFixture(t)
 	f.link()
-	n := f.hs.push(joined(map[id.RoomID]map[string]any{vaultRoom: room([]map[string]any{
-		stateEvent("m.room.encryption", "", owner, map[string]any{"algorithm": "m.megolm.v1.aes-sha2"}),
-		member(owner, "Owner"), member(bob, "Bob"),
-	}, nil)}))
+	rogue := f.device(owner, "ROGUE")
+	carolPhone := f.device(carol, "CAROL")
+	xs, err := carolPhone.mach.GenerateCrossSigningKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := carolPhone.mach.PublishCrossSigningKeys(ctx, xs, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := carolPhone.mach.SignOwnDevice(ctx, carolPhone.mach.OwnIdentity()); err != nil {
+		t.Fatal(err)
+	}
+	invite := stateEvent("m.room.member", carol.String(), owner, map[string]any{"membership": "invite"})
+	n := f.hs.push(map[string]any{
+		"device_lists": map[string]any{"changed": []id.UserID{owner}},
+		"rooms": map[string]any{"join": map[id.RoomID]map[string]any{vaultRoom: room([]map[string]any{
+			stateEvent("m.room.encryption", "", owner, map[string]any{"algorithm": "m.megolm.v1.aes-sha2"}),
+			member(owner, "Owner"), member(bob, "Bob"), invite,
+		}, nil)}},
+	})
 	f.hs.waitSynced(n)
 
-	res := f.c.Execute(context.Background(), approval.Record{ID: "p1", Args: map[string]string{"chat": vaultRoom.String(), "text": "for your eyes"}})
-	if res.Status != connector.Done {
-		t.Fatalf("execute: %+v", res)
+	send := func(rid, text string) sentEvent {
+		t.Helper()
+		res := f.c.Execute(ctx, approval.Record{ID: rid, Args: map[string]string{"chat": vaultRoom.String(), "text": text}})
+		if res.Status != connector.Done {
+			t.Fatalf("execute: %+v", res)
+		}
+		sent := f.hs.sent()
+		s := sent[len(sent)-1]
+		if s.typ != "m.room.encrypted" || strings.Contains(string(s.content), text) {
+			t.Fatalf("sent %+v", s)
+		}
+		return s
 	}
-	sent := f.hs.sent()
-	if len(sent) != 1 || sent[0].typ != "m.room.encrypted" || strings.Contains(string(sent[0].content), "for your eyes") {
-		t.Fatalf("sent %+v", sent)
+	read := func(a *account, s sentEvent) string {
+		t.Helper()
+		a.mach.ProcessSyncResponse(ctx, f.mail(a.sess.DeviceID), "x")
+		evt := &event.Event{Type: event.EventEncrypted, ID: "$sent", Sender: owner, RoomID: vaultRoom, Timestamp: 1}
+		if err := json.Unmarshal(s.content, &evt.Content); err != nil {
+			t.Fatal(err)
+		}
+		prepare(evt, vaultRoom)
+		dec, err := a.mach.DecryptMegolmEvent(ctx, evt)
+		if err != nil {
+			return ""
+		}
+		return dec.Content.AsMessage().Body
 	}
 
-	// Element gets the room key and reads the message.
-	ctx := context.Background()
-	f.hs.mu.Lock()
-	mail, err := json.Marshal(map[string]any{"next_batch": "x", "to_device": map[string]any{"events": f.hs.inbox["ELEMENT"]}})
-	f.hs.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
+	first := send("p1", "for your eyes")
+	for a, want := range map[*account]string{f.element: "for your eyes", rogue: "", carolPhone: ""} {
+		if got := read(a, first); got != want {
+			t.Errorf("%s read %q, want %q", a.sess.DeviceID, got, want)
+		}
 	}
-	var resp mautrix.RespSync
-	if err := json.Unmarshal(mail, &resp); err != nil {
-		t.Fatal(err)
-	}
-	f.element.mach.ProcessSyncResponse(ctx, &resp, "x")
-	evt := &event.Event{Type: event.EventEncrypted, ID: "$sent1", Sender: owner, RoomID: vaultRoom, Timestamp: 1}
-	if err := json.Unmarshal(sent[0].content, &evt.Content); err != nil {
-		t.Fatal(err)
-	}
-	prepare(evt, vaultRoom)
-	dec, err := f.element.mach.DecryptMegolmEvent(ctx, evt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if body := dec.Content.AsMessage().Body; body != "for your eyes" {
-		t.Fatalf("element read %q", body)
+
+	join := member(carol, "Carol")
+	join["unsigned"] = map[string]any{"prev_content": map[string]any{"membership": "invite"}}
+	n = f.hs.push(joined(map[id.RoomID]map[string]any{vaultRoom: room(nil, []map[string]any{join})}))
+	f.hs.waitSynced(n)
+	if got := read(carolPhone, send("p2", "welcome")); got != "welcome" {
+		t.Fatalf("carol read %q after joining", got)
 	}
 }
 

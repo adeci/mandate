@@ -71,7 +71,7 @@ func (c *mxConnector) apply(ctx context.Context, a *account, evt *event.Event, n
 			return false, nil
 		}
 		body, _ := messageBody(evt.Type, content.NewContent)
-		return false, c.edit(ctx, evt.RoomID, target, evt.Sender, body, time.UnixMilli(evt.Timestamp))
+		return false, c.edit(ctx, evt.RoomID, target, evt.Sender, unverified(evt, body), time.UnixMilli(evt.Timestamp))
 	}
 	msg := store.Message{
 		ID:          evt.ID.String(),
@@ -83,11 +83,13 @@ func (c *mxConnector) apply(ctx context.Context, a *account, evt *event.Event, n
 		ReplyToID:   content.RelatesTo.GetReplyTo().String(),
 	}
 	msg.Body, msg.MediaType = messageBody(evt.Type, content)
+	msg.Body = unverified(evt, msg.Body)
 	// The server bundles the latest edit with the original, which matters
 	// when history is read backwards and the edit comes first.
 	var editedAt time.Time
 	if e := a.bundledEdit(ctx, evt); e != nil {
-		msg.Body, _ = messageBody(e.Type, e.Content.AsMessage().NewContent)
+		body, _ := messageBody(e.Type, e.Content.AsMessage().NewContent)
+		msg.Body = unverified(e, body)
 		editedAt = time.UnixMilli(e.Timestamp)
 	}
 	if err := c.put(ctx, msg); err != nil {
@@ -145,14 +147,29 @@ func messageBody(t event.Type, content *event.MessageEventContent) (body, media 
 	return content.Body, ""
 }
 
+// unverified marks the body of a message whose room key does not trace back
+// to a cross-signed device of its sender: a device the homeserver may have
+// added, or a key from the backup, which the homeserver can write to.
+func unverified(evt *event.Event, body string) string {
+	if !evt.Mautrix.WasEncrypted || evt.Mautrix.TrustState >= id.TrustStateCrossSignedTOFU {
+		return body
+	}
+	return "[unverified] " + body
+}
+
+// name is user's display name in room, marked with "~" unless it is the
+// owner's, since anyone can pick one.
 func (a *account) name(ctx context.Context, room id.RoomID, user id.UserID, names map[id.UserID]string) string {
-	if n := names[user]; n != "" {
+	n := names[user]
+	if n == "" {
+		if m, _ := a.state.TryGetMember(ctx, room, user); m != nil {
+			n = m.Displayname
+		}
+	}
+	if n == "" || user == a.sess.UserID {
 		return n
 	}
-	if m, _ := a.state.TryGetMember(ctx, room, user); m != nil {
-		return m.Displayname
-	}
-	return ""
+	return "~" + n
 }
 
 // put stores m. A message stored before its key arrived is filled in without

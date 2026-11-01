@@ -22,6 +22,7 @@ import (
 const (
 	owner    = id.UserID("@owner:example.org")
 	bob      = id.UserID("@bob:example.org")
+	carol    = id.UserID("@carol:example.org")
 	password = "correct horse"
 )
 
@@ -53,11 +54,11 @@ type homeserver struct {
 	logins      []mautrix.ReqLogin
 	loggedOut   []id.DeviceID
 	accountData map[string]json.RawMessage
-	deviceKeys  map[id.DeviceID]mautrix.DeviceKeys
+	deviceKeys  map[id.UserID]map[id.DeviceID]mautrix.DeviceKeys
 	otks        map[id.DeviceID]map[id.KeyID]mautrix.OneTimeKey
-	master      mautrix.CrossSigningKeys
-	selfSigning mautrix.CrossSigningKeys
-	userSigning mautrix.CrossSigningKeys
+	master      map[id.UserID]mautrix.CrossSigningKeys
+	selfSigning map[id.UserID]mautrix.CrossSigningKeys
+	userSigning map[id.UserID]mautrix.CrossSigningKeys
 	signatures  []mautrix.ReqUploadSignatures
 
 	backupVersion *mautrix.RespRoomKeysVersion[backup.MegolmAuthData]
@@ -81,7 +82,10 @@ func newHomeserver(t *testing.T) *homeserver {
 		changed:     make(chan struct{}),
 		tokens:      map[string]device{},
 		accountData: map[string]json.RawMessage{},
-		deviceKeys:  map[id.DeviceID]mautrix.DeviceKeys{},
+		deviceKeys:  map[id.UserID]map[id.DeviceID]mautrix.DeviceKeys{},
+		master:      map[id.UserID]mautrix.CrossSigningKeys{},
+		selfSigning: map[id.UserID]mautrix.CrossSigningKeys{},
+		userSigning: map[id.UserID]mautrix.CrossSigningKeys{},
 		otks:        map[id.DeviceID]map[id.KeyID]mautrix.OneTimeKey{},
 		inbox:       map[id.DeviceID][]map[string]any{},
 		history:     map[id.RoomID][]map[string]any{},
@@ -188,7 +192,7 @@ func (h *homeserver) logout(w http.ResponseWriter, r *http.Request, dev device) 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.tokens, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
-	delete(h.deviceKeys, dev.id)
+	delete(h.deviceKeys[dev.user], dev.id)
 	h.loggedOut = append(h.loggedOut, dev.id)
 	writeJSON(w, http.StatusOK, struct{}{})
 }
@@ -219,7 +223,10 @@ func (h *homeserver) keysUpload(w http.ResponseWriter, r *http.Request, dev devi
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if req.DeviceKeys != nil {
-		h.deviceKeys[dev.id] = *req.DeviceKeys
+		if h.deviceKeys[dev.user] == nil {
+			h.deviceKeys[dev.user] = map[id.DeviceID]mautrix.DeviceKeys{}
+		}
+		h.deviceKeys[dev.user][dev.id] = *req.DeviceKeys
 	}
 	if h.otks[dev.id] == nil {
 		h.otks[dev.id] = map[id.KeyID]mautrix.OneTimeKey{}
@@ -241,14 +248,11 @@ func (h *homeserver) keysQuery(w http.ResponseWriter, r *http.Request, _ device)
 	}
 	for user := range req.DeviceKeys {
 		resp.DeviceKeys[user] = map[id.DeviceID]mautrix.DeviceKeys{}
-		if user != owner {
-			continue
-		}
-		maps.Copy(resp.DeviceKeys[user], h.deviceKeys)
-		if h.master.UserID != "" {
-			resp.MasterKeys[user] = h.master
-			resp.SelfSigningKeys[user] = h.selfSigning
-			resp.UserSigningKeys[user] = h.userSigning
+		maps.Copy(resp.DeviceKeys[user], h.deviceKeys[user])
+		if m, ok := h.master[user]; ok {
+			resp.MasterKeys[user] = m
+			resp.SelfSigningKeys[user] = h.selfSigning[user]
+			resp.UserSigningKeys[user] = h.userSigning[user]
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -273,21 +277,36 @@ func (h *homeserver) keysClaim(w http.ResponseWriter, r *http.Request, _ device)
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (h *homeserver) deviceSigningUpload(w http.ResponseWriter, r *http.Request, _ device) {
+func (h *homeserver) deviceSigningUpload(w http.ResponseWriter, r *http.Request, dev device) {
 	var req mautrix.UploadCrossSigningKeysReq[any]
 	decode(r, &req)
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.master, h.selfSigning, h.userSigning = req.Master, req.SelfSigning, req.UserSigning
+	h.master[dev.user], h.selfSigning[dev.user], h.userSigning[dev.user] = req.Master, req.SelfSigning, req.UserSigning
 	writeJSON(w, http.StatusOK, struct{}{})
 }
 
+// signaturesUpload adds signatures of devices to their keys.
 func (h *homeserver) signaturesUpload(w http.ResponseWriter, r *http.Request, _ device) {
 	var req mautrix.ReqUploadSignatures
 	decode(r, &req)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.signatures = append(h.signatures, req)
+	for user, keys := range req {
+		for keyID, s := range keys {
+			dk, ok := h.deviceKeys[user][id.DeviceID(keyID)]
+			if !ok {
+				continue
+			}
+			for signer, sigs := range s.Signatures {
+				if dk.Signatures[signer] == nil {
+					dk.Signatures[signer] = map[id.KeyID]string{}
+				}
+				maps.Copy(dk.Signatures[signer], sigs)
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, mautrix.RespUploadSignatures{})
 }
 
@@ -314,11 +333,11 @@ func (h *homeserver) sendToDevice(w http.ResponseWriter, r *http.Request, from d
 	decode(r, &req)
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for _, devices := range req.Messages {
+	for user, devices := range req.Messages {
 		for dev, content := range devices {
 			targets := []id.DeviceID{dev}
 			if dev == "*" {
-				targets = slices.Collect(maps.Keys(h.deviceKeys))
+				targets = slices.Collect(maps.Keys(h.deviceKeys[user]))
 			}
 			for _, t := range targets {
 				h.inbox[t] = append(h.inbox[t], map[string]any{

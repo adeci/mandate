@@ -106,7 +106,7 @@ func (f *fixture) verifier(ignore bool) *elementVerifier {
 	go func() {
 		defer close(done)
 		for ctx.Err() == nil {
-			if resp := f.elementMail(); len(resp.ToDevice.Events) > 0 {
+			if resp := f.mail("ELEMENT"); len(resp.ToDevice.Events) > 0 {
 				f.element.toDevice(ctx, resp, "")
 			}
 			time.Sleep(10 * time.Millisecond)
@@ -116,12 +116,12 @@ func (f *fixture) verifier(ignore bool) *elementVerifier {
 	return e
 }
 
-// elementMail takes Element's to-device inbox as a sync response.
-func (f *fixture) elementMail() *mautrix.RespSync {
+// mail takes the to-device inbox of dev as a sync response.
+func (f *fixture) mail(dev id.DeviceID) *mautrix.RespSync {
 	f.t.Helper()
 	f.hs.mu.Lock()
-	mail, err := json.Marshal(map[string]any{"next_batch": "x", "to_device": map[string]any{"events": f.hs.inbox["ELEMENT"]}})
-	f.hs.inbox["ELEMENT"] = nil
+	mail, err := json.Marshal(map[string]any{"next_batch": "x", "to_device": map[string]any{"events": f.hs.inbox[dev]}})
+	f.hs.inbox[dev] = nil
 	f.hs.mu.Unlock()
 	if err != nil {
 		f.t.Fatal(err)
@@ -192,7 +192,7 @@ func (f *fixture) compareAndLink(element *elementVerifier) {
 func TestVerifyLink(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
-	old, enc := f.encrypt(vaultRoom, "$old", "the old plan", 1000)
+	old, enc := f.encrypt(f.element, vaultRoom, "$old", "the old plan", 1000)
 	f.backUp(vaultRoom, enc)
 	f.shareBackupKey()
 	element := f.verifier(false)
@@ -221,7 +221,7 @@ func TestVerifyLink(t *testing.T) {
 	// Element signed the new device with its self-signing key.
 	f.hs.mu.Lock()
 	var selfKey id.Ed25519
-	for _, k := range f.hs.selfSigning.Keys {
+	for _, k := range f.hs.selfSigning[owner].Keys {
 		selfKey = k
 	}
 	signed := false
@@ -241,7 +241,7 @@ func TestVerifyLink(t *testing.T) {
 		[]map[string]any{old},
 	)}))
 	f.hs.waitSynced(n)
-	if got := f.message("$old"); got.Body != "the old plan" {
+	if got := f.message("$old"); got.Body != "[unverified] the old plan" {
 		t.Fatalf("$old = %+v", got)
 	}
 }

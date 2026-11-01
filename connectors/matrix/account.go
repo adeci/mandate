@@ -117,6 +117,10 @@ func (a *account) load(ctx context.Context, zl zerolog.Logger) error {
 	}
 	a.cli.StateStore = a.state
 	a.mach = crypto.NewOlmMachine(a.cli, &zl, a.crypto, a.state)
+	// mautrix sends room keys to any device by default, so one the
+	// homeserver adds to a member's account would read the room.
+	a.mach.SendKeysMinTrust = id.TrustStateCrossSignedTOFU
+	a.mach.ShareKeysMinTrust = id.TrustStateCrossSignedTOFU
 	a.cli.Crypto = olmCrypto{a}
 	a.mach.SessionReceived = func(_ context.Context, _ id.RoomID, sid id.SessionID, _ uint32) {
 		a.mu.Lock()
