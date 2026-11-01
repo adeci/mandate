@@ -164,7 +164,7 @@ let
           default =
             self.packages.${system}."mandate-${name}"
               or (throw "services.mandate.connectors.${name}.package must be set: ${name} isn't a built-in connector");
-          defaultText = lib.literalMD "the built-in connector of that name (`whatsapp`, `signal`, `matrix`, `discord`, `http`)";
+          defaultText = lib.literalMD "the built-in connector of that name (`whatsapp`, `signal`, `matrix`, `gmessages`, `discord`, `http`)";
           description = "The connector program.";
         };
         settings = lib.mkOption {

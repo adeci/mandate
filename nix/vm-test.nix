@@ -61,6 +61,7 @@ pkgs.testers.runNixOSTest {
         discord = { };
         signal = { };
         matrix = { };
+        gmessages = { };
         http = {
           settings.services.api = {
             base_url = "http://127.0.0.1:9000";
@@ -109,7 +110,7 @@ pkgs.testers.runNixOSTest {
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
     start_all()
-    for unit in ["recorder", "mandate-gateway", "mandate-whatsapp", "mandate-discord", "mandate-signal", "mandate-matrix", "mandate-console", "mandate-http"]:
+    for unit in ["recorder", "mandate-gateway", "mandate-whatsapp", "mandate-discord", "mandate-signal", "mandate-matrix", "mandate-gmessages", "mandate-console", "mandate-http"]:
         machine.wait_for_unit(f"{unit}.service")
     for port in [8780, 443, 9000]:
         machine.wait_for_open_port(port)
@@ -197,12 +198,12 @@ pkgs.testers.runNixOSTest {
         assert code != 200, code
         machine.succeed("printf '[whatsapp]\\nhide_containers = [\"hidden@s.whatsapp.net\"]\\n' > /var/lib/mandate-gateway/exposure.toml")
 
-    with subtest("unlinked WhatsApp, Discord, Signal and Matrix ask for the owner"):
+    with subtest("unlinked WhatsApp, Discord, Signal, Matrix and Google Messages ask for the owner"):
         code, out = gw("POST", "/v1/whatsapp/send", {"args": {"chat": "fam@g.us", "text": "hi"}})
         assert code == 503 and "https://${host}/connections" in out["error"], (code, out)
         health = json.loads(machine.succeed("curl -s --unix-socket /run/mandate-discord/connector.sock http://connector/health"))
         assert health == {"state": "setup", "detail": "needs a token"}, health
-        for name in ["signal", "matrix"]:
+        for name in ["signal", "matrix", "gmessages"]:
             health = json.loads(machine.succeed(f"curl -s --unix-socket /run/mandate-{name}/connector.sock http://connector/health"))
             assert health == {"state": "setup", "detail": "not linked"}, (name, health)
 
@@ -427,7 +428,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed("systemctl show -p Environment --value mandate-discord | grep -q TZ=Europe/Berlin")
 
     with subtest("hardened units"):
-        for unit in ["mandate-gateway", "mandate-whatsapp", "mandate-discord", "mandate-signal", "mandate-matrix", "mandate-console", "mandate-http"]:
+        for unit in ["mandate-gateway", "mandate-whatsapp", "mandate-discord", "mandate-signal", "mandate-matrix", "mandate-gmessages", "mandate-console", "mandate-http"]:
             machine.succeed(f"systemctl show -p MemoryDenyWriteExecute --value {unit} | grep -qx yes")
         machine.succeed("systemctl show -p CapabilityBoundingSet --value mandate-console | grep -qx cap_net_bind_service")
   '';
