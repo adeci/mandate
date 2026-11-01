@@ -202,14 +202,66 @@ func (a *Authenticator) Assert(challenge []byte) json.RawMessage {
 
 // Approve builds a complete approval for record bytes issued at issuedAt.
 func (a *Authenticator) Approve(record []byte, issuedAt time.Time) approval.Approval {
-	nonce := make([]byte, 16)
-	if _, err := rand.Read(nonce); err != nil {
-		panic(err)
-	}
+	nonce := newNonce()
 	return approval.Approval{
 		Record:    record,
 		Nonce:     nonce,
 		IssuedAt:  issuedAt,
 		Assertion: a.Assert(approval.Challenge(record, nonce, issuedAt)),
+	}
+}
+
+func newNonce() []byte {
+	nonce := make([]byte, 16)
+	rand.Read(nonce)
+	return nonce
+}
+
+// Session is a page's session key in a window a passkey opened.
+type Session struct {
+	Delegation approval.Delegation
+
+	key *ecdsa.PrivateKey
+}
+
+// Unlock opens a window until expiresAt with a new session key, the
+// assertion also approving covers, as signing in or approving does.
+func (a *Authenticator) Unlock(expiresAt time.Time, covers []byte) *Session {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	pub, err := key.PublicKey.Bytes()
+	if err != nil {
+		panic(err)
+	}
+	return &Session{key: key, Delegation: approval.Delegation{
+		PublicKey: pub,
+		ExpiresAt: expiresAt,
+		Covers:    covers,
+		Assertion: a.Assert(approval.UnlockChallenge(pub, expiresAt, covers)),
+	}}
+}
+
+// Sign signs challenge the way WebCrypto's ECDSA with SHA-256 does.
+func (s *Session) Sign(challenge []byte) []byte {
+	h := sha256.Sum256(challenge)
+	r, sig, err := ecdsa.Sign(rand.Reader, s.key, h[:])
+	if err != nil {
+		panic(err)
+	}
+	return append(r.FillBytes(make([]byte, 32)), sig.FillBytes(make([]byte, 32))...)
+}
+
+// Approve builds an approval for record bytes with the session key alone.
+func (s *Session) Approve(record []byte, issuedAt time.Time) approval.Approval {
+	nonce := newNonce()
+	d := s.Delegation
+	return approval.Approval{
+		Record:     record,
+		Nonce:      nonce,
+		IssuedAt:   issuedAt,
+		Delegation: &d,
+		Signature:  s.Sign(approval.Challenge(record, nonce, issuedAt)),
 	}
 }

@@ -151,6 +151,27 @@ func TestExecuteRunsApprovedWriteExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestExecuteRunsSessionKeyApprovalOnce(t *testing.T) {
+	t.Parallel()
+	h := start(t)
+	rec := h.approved(t, nil).Record
+	a := h.key.Unlock(time.Now().Add(approval.UnlockWindow), nil).Approve(rec, time.Now())
+	res, err := h.client.Execute(context.Background(), a)
+	if err != nil || res.Status != connector.Done {
+		t.Fatalf("execute: %+v %v", res, err)
+	}
+	if _, err := h.client.Execute(context.Background(), a); status(err) != http.StatusConflict {
+		t.Fatalf("replay: %v", err)
+	}
+	closed := h.key.Unlock(time.Now().Add(-time.Second), nil).Approve(rec, time.Now())
+	if _, err := h.client.Execute(context.Background(), closed); status(err) != http.StatusForbidden {
+		t.Fatalf("closed window: %v", err)
+	}
+	if n := h.fake.sent.Load(); n != 1 {
+		t.Fatalf("sent %d times", n)
+	}
+}
+
 func TestExecuteRefusesWithoutRunning(t *testing.T) {
 	t.Parallel()
 	h := start(t)

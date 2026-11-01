@@ -37,14 +37,17 @@ func hashParts(parts ...[]byte) []byte {
 	return h.Sum(nil)
 }
 
-// Approval is a stored record plus the owner's passkey assertion over its
-// challenge. Assertion is the PublicKeyCredential JSON that
-// navigator.credentials.get returns.
+// Approval is a stored record plus the owner's say-so over its challenge:
+// either a passkey Assertion, the PublicKeyCredential JSON that
+// navigator.credentials.get returns, or a Delegation and the session key's
+// Signature.
 type Approval struct {
-	Record    []byte          `json:"record"`
-	Nonce     []byte          `json:"nonce"`
-	IssuedAt  time.Time       `json:"issued_at"`
-	Assertion json.RawMessage `json:"assertion"`
+	Record     []byte          `json:"record"`
+	Nonce      []byte          `json:"nonce"`
+	IssuedAt   time.Time       `json:"issued_at"`
+	Assertion  json.RawMessage `json:"assertion,omitempty"`
+	Delegation *Delegation     `json:"delegation,omitempty"`
+	Signature  []byte          `json:"signature,omitempty"`
 }
 
 var (
@@ -61,16 +64,10 @@ type Verifier struct {
 	Now  func() time.Time
 }
 
-// Verify checks the assertion and returns the approved record. It does not
+// Verify checks the approval and returns the approved record. It does not
 // check nonce reuse; callers record nonces with Seen.
 func (v *Verifier) Verify(a Approval) (Record, error) {
-	if v.Keys == nil || v.Keys.empty() {
-		return Record{}, ErrNoKeys
-	}
-	now := time.Now()
-	if v.Now != nil {
-		now = v.Now()
-	}
+	now := v.now()
 	if a.IssuedAt.After(now.Add(skew)) || now.Sub(a.IssuedAt) > MaxAge {
 		return Record{}, ErrStale
 	}
@@ -78,16 +75,22 @@ func (v *Verifier) Verify(a Approval) (Record, error) {
 		return Record{}, errors.New("approval nonce is too short")
 	}
 
-	parsed, err := protocol.ParseCredentialRequestResponseBytes(a.Assertion)
-	if err != nil {
-		return Record{}, fmt.Errorf("parse assertion: %w", err)
-	}
-	key, ok := v.Keys.Find(base64.RawURLEncoding.EncodeToString(parsed.RawID))
-	if !ok {
-		return Record{}, ErrUnknown
-	}
-	if err := verifyAssertion(parsed, Challenge(a.Record, a.Nonce, a.IssuedAt), v.Keys.rpID, v.Keys.origin, key); err != nil {
-		return Record{}, err
+	challenge := Challenge(a.Record, a.Nonce, a.IssuedAt)
+	switch {
+	case a.Delegation == nil:
+		if _, err := v.passkey(a.Assertion, challenge); err != nil {
+			return Record{}, err
+		}
+	case len(a.Assertion) != 0:
+		return Record{}, errors.New("approval has both an assertion and a delegation")
+	default:
+		_, pub, err := v.delegation(*a.Delegation, now)
+		if err != nil {
+			return Record{}, err
+		}
+		if !sessionSigned(pub, challenge, a.Signature) {
+			return Record{}, fmt.Errorf("%w: session key", ErrSignature)
+		}
 	}
 
 	rec, err := Decode(a.Record)
@@ -98,4 +101,27 @@ func (v *Verifier) Verify(a Approval) (Record, error) {
 		return Record{}, ErrExpired
 	}
 	return rec, nil
+}
+
+func (v *Verifier) now() time.Time {
+	if v.Now != nil {
+		return v.Now()
+	}
+	return time.Now()
+}
+
+// passkey checks that a key trusted now signed challenge.
+func (v *Verifier) passkey(assertion json.RawMessage, challenge []byte) (Key, error) {
+	if v.Keys == nil || v.Keys.empty() {
+		return Key{}, ErrNoKeys
+	}
+	parsed, err := protocol.ParseCredentialRequestResponseBytes(assertion)
+	if err != nil {
+		return Key{}, fmt.Errorf("parse assertion: %w", err)
+	}
+	key, ok := v.Keys.Find(base64.RawURLEncoding.EncodeToString(parsed.RawID))
+	if !ok {
+		return Key{}, ErrUnknown
+	}
+	return key, verifyAssertion(parsed, challenge, v.Keys.rpID, v.Keys.origin, key)
 }
