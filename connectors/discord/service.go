@@ -50,8 +50,11 @@ type searchRequest struct {
 }
 
 type fetchRequest struct {
-	ChannelID, Before, After, Around string
-	Limit                            int
+	ChannelID string
+	// Anchor is before, after or around, naming the stored message Seq.
+	Anchor string
+	Seq    int64
+	Limit  int
 }
 
 // args consumes op arguments; anything left over is refused, so a typo never
@@ -117,14 +120,12 @@ func parseSearch(m map[string]string) (searchRequest, error) {
 
 func parseFetch(m map[string]string) (fetchRequest, error) {
 	a := newArgs(m)
-	r := fetchRequest{
-		ChannelID: a.str("channel_id"), Before: a.str("before"), After: a.str("after"),
-		Around: a.str("around"), Limit: a.int("limit"),
-	}
+	r := fetchRequest{ChannelID: a.str("channel_id"), Limit: a.int("limit")}
+	anchors := map[string]string{"before": a.str("before"), "after": a.str("after"), "around": a.str("around")}
 	if err := a.done(); err != nil {
 		return r, err
 	}
-	return r, validateFetch(&r)
+	return r, validateFetch(&r, anchors)
 }
 
 // Only Discord-ID-shaped strings are ever put into upstream URLs.
@@ -175,21 +176,23 @@ func validateSearch(r *searchRequest) error {
 	return nil
 }
 
-func validateFetch(r *fetchRequest) error {
+func validateFetch(r *fetchRequest, anchors map[string]string) error {
 	if err := checkID("channel_id", r.ChannelID, true); err != nil {
 		return err
 	}
-	anchors := 0
-	for _, a := range []struct{ field, v string }{{"before", r.Before}, {"after", r.After}, {"around", r.Around}} {
-		if err := checkID(a.field, a.v, false); err != nil {
-			return err
+	for _, field := range []string{"before", "after", "around"} {
+		v := anchors[field]
+		if v == "" {
+			continue
 		}
-		if a.v != "" {
-			anchors++
+		if r.Anchor != "" {
+			return badRequest("before, after, and around are mutually exclusive")
 		}
-	}
-	if anchors > 1 {
-		return badRequest("before, after, and around are mutually exclusive")
+		seq, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || seq < 1 {
+			return badRequest("%s must be a seq from mandate's output", field)
+		}
+		r.Anchor, r.Seq = field, seq
 	}
 	if r.Limit < 0 || r.Limit > maxLimit {
 		return badRequest("limit must be between 1 and %d", maxLimit)
@@ -565,6 +568,14 @@ func (s *service) fetch(ctx context.Context, dl time.Time, req fetchRequest) (co
 	if err := s.up.denied("channel:"+req.ChannelID, "channel "+req.ChannelID); err != nil {
 		return connector.ReadResult{}, err
 	}
+	q := url.Values{}
+	if req.Anchor != "" {
+		id, err := s.anchor(ctx, req.ChannelID, req.Seq)
+		if err != nil {
+			return connector.ReadResult{}, err
+		}
+		q.Set(req.Anchor, id)
+	}
 	c, upsert, err := s.resolveContainer(ctx, dl, req.ChannelID)
 	if err != nil {
 		return connector.ReadResult{}, err
@@ -576,15 +587,6 @@ func (s *service) fetch(ctx context.Context, dl time.Time, req fetchRequest) (co
 	limit := req.Limit
 	if limit == 0 {
 		limit = defaultLimit
-	}
-	q := url.Values{}
-	switch {
-	case req.Before != "":
-		q.Set("before", req.Before)
-	case req.After != "":
-		q.Set("after", req.After)
-	case req.Around != "":
-		q.Set("around", req.Around)
 	}
 	q.Set("limit", strconv.Itoa(limit))
 	guild := ""
@@ -629,4 +631,14 @@ func (s *service) fetch(ctx context.Context, dl time.Time, req fetchRequest) (co
 		ids = append(ids, msg.ID)
 	}
 	return connector.ReadResult{MessageIDs: ids}, nil
+}
+
+// anchor is the Discord ID of the stored message seq in the channel.
+func (s *service) anchor(ctx context.Context, channelID string, seq int64) (string, error) {
+	var id string
+	err := s.st.DB().QueryRowContext(ctx, `SELECT id FROM messages WHERE seq = ?1 AND container_id = ?2`, seq, channelID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && !isSnowflake(id) {
+		return "", badRequest("no message with seq %d in channel %s", seq, channelID)
+	}
+	return id, err
 }

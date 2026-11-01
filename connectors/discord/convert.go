@@ -154,6 +154,7 @@ func guildChannelContainers(guildID string, chans []apiChannel) []store.Containe
 }
 
 // Threads also get ParentID = guild ID, so hiding a guild hides everything in it.
+// Channels are named "#name" as in Discord; the gateway adds the guild's name.
 func channelContainer(c *apiChannel) (store.Container, bool) {
 	if c == nil || c.ID == "" {
 		return store.Container{}, false
@@ -184,7 +185,11 @@ func channelContainer(c *apiChannel) (store.Container, bool) {
 	case c.isThread():
 		return store.Container{ID: c.ID, Kind: kindThread, ParentID: c.GuildID, Name: c.Name}, true
 	default:
-		return store.Container{ID: c.ID, Kind: kindChannel, ParentID: c.GuildID, Name: c.Name}, true
+		name := c.Name
+		if name != "" {
+			name = "#" + name
+		}
+		return store.Container{ID: c.ID, Kind: kindChannel, ParentID: c.GuildID, Name: name}, true
 	}
 }
 

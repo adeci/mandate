@@ -198,7 +198,7 @@ func TestChannelContainer(t *testing.T) {
 		{
 			name: "text channel",
 			in:   &apiChannel{ID: "c", GuildID: "g", Name: "general", Type: 0},
-			want: store.Container{ID: "c", Kind: "channel", ParentID: "g", Name: "general"}, wantOK: true,
+			want: store.Container{ID: "c", Kind: "channel", ParentID: "g", Name: "#general"}, wantOK: true,
 		},
 		{
 			name: "public thread parents to guild, not channel",
@@ -263,7 +263,7 @@ func TestGuildContainers(t *testing.T) {
 		{ID: "t", Type: channelPublicThread, Name: "topic"},
 	}
 	want := []store.Container{
-		{ID: "c", Kind: "channel", ParentID: "g", Name: "general"},
+		{ID: "c", Kind: "channel", ParentID: "g", Name: "#general"},
 		{ID: "t", Kind: "thread", ParentID: "g", Name: "topic"},
 	}
 	if got := guildChannelContainers("g", chans); !reflect.DeepEqual(got, want) {

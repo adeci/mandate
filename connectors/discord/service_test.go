@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -413,7 +414,7 @@ func TestSearchUpsertsAndCaches(t *testing.T) {
 	if row := h.queryRow(`SELECT kind, name FROM containers WHERE id = ?`, guildID); row[0] != "guild" || row[1] != "Club" {
 		t.Errorf("guild row %v", row)
 	}
-	if row := h.queryRow(`SELECT kind, parent_id, name FROM containers WHERE id = ?`, chanGeneral); row[0] != "channel" || row[1] != guildID || row[2] != "general" {
+	if row := h.queryRow(`SELECT kind, parent_id, name FROM containers WHERE id = ?`, chanGeneral); row[0] != "channel" || row[1] != guildID || row[2] != "#general" {
 		t.Errorf("channel row %v", row)
 	}
 	if row := h.queryRow(`SELECT kind, parent_id, name FROM containers WHERE id = ?`, threadID); row[0] != "thread" || row[1] != guildID || row[2] != "rig thread" {
@@ -504,7 +505,8 @@ func TestFetchUpsertsMessages(t *testing.T) {
 	if row := h.queryRow(`SELECT container_id, is_from_me, body FROM messages WHERE id = ?`, msg4); row[0] != dmID || row[1] != int64(1) || row[2] != "see you" {
 		t.Errorf("message row %v", row)
 	}
-	h.callOK("fetch", map[string]string{"channel_id": dmID, "before": msg4, "limit": "10"}, &resp)
+	seq := h.queryRow(`SELECT seq FROM messages WHERE id = ?`, msg4)[0].(int64)
+	h.callOK("fetch", map[string]string{"channel_id": dmID, "before": strconv.FormatInt(seq, 10), "limit": "10"}, &resp)
 	hits := h.discord.all()
 	if len(hits) != 4 {
 		t.Fatalf("second fetch requests %v", h.discord.paths())
@@ -826,7 +828,7 @@ func TestDenialCached(t *testing.T) {
 	h.start()
 	h.callErr("fetch", map[string]string{"channel_id": otherChan}, http.StatusNotFound)
 	before := len(h.discord.all())
-	h.callErr("fetch", map[string]string{"channel_id": otherChan, "before": msg1}, http.StatusNotFound)
+	h.callErr("fetch", map[string]string{"channel_id": otherChan, "before": "1"}, http.StatusNotFound)
 	h.restart()
 	h.clock.Advance(23 * time.Hour)
 	h.callErr("fetch", map[string]string{"channel_id": otherChan}, http.StatusNotFound)
@@ -858,7 +860,8 @@ func TestValidation(t *testing.T) {
 		{"fetch encoded slash", "fetch", map[string]string{"channel_id": "110000000000000%2F"}},
 		{"fetch missing", "fetch", map[string]string{}},
 		{"fetch bad before", "fetch", map[string]string{"channel_id": dmID, "before": "x"}},
-		{"fetch two anchors", "fetch", map[string]string{"channel_id": dmID, "before": msg1, "after": msg2}},
+		{"fetch two anchors", "fetch", map[string]string{"channel_id": dmID, "before": "1", "after": "2"}},
+		{"fetch unstored anchor", "fetch", map[string]string{"channel_id": dmID, "before": "999"}},
 		{"fetch limit too big", "fetch", map[string]string{"channel_id": dmID, "limit": "101"}},
 		{"fetch unknown field", "fetch", map[string]string{"channel_id": dmID, "method": "DELETE"}},
 		{"search missing guild", "guild-search", map[string]string{"content": "x"}},

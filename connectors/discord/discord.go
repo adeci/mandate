@@ -297,41 +297,43 @@ func (w *worker) loop() {
 	}
 }
 
-var spec = connector.Spec{Name: "discord", Ops: []connector.Op{
-	{
-		Name: "sync", Kind: connector.Read,
-		Summary: "Refresh the list of Discord servers (guilds) and DMs; with guild_id, also that server's channels and threads. " +
-			"Run this first to learn IDs; lists are cached for a day, so repeats are free.",
-		Params: []connector.Param{
-			{Name: "guild_id", Doc: "Server ID whose channels and threads to list. Omit to list only servers and DMs.", Container: true},
+var spec = connector.Spec{
+	Name: "discord",
+	Doc: "sync, fetch and guild-search ask Discord and store what they get; chats, messages and search read only what is stored.\n" +
+		"Discord calls are paced like a person and may take a while. Start with sync, then sync guild_id=ID for a server's channels.",
+	Ops: []connector.Op{
+		{
+			Name: "sync", Kind: connector.Read,
+			Summary: "Store the server and DM lists; with guild_id, also that server's channels and threads. Cached for a day.",
+			Params: []connector.Param{
+				{Name: "guild_id", Doc: "server ID", Container: true},
+			},
+		},
+		{
+			Name: "guild-search", Kind: connector.Read,
+			Summary: "Search a server on Discord, newest first, 25 per page. Needs content, author_id, channel_id or has. Cached for an hour.",
+			Params: []connector.Param{
+				{Name: "guild_id", Doc: "server ID", Required: true, Container: true},
+				{Name: "content", Doc: "text to match, up to 512 characters"},
+				{Name: "author_id", Doc: "the author's sender_id"},
+				{Name: "channel_id", Doc: "channel or thread ID", Container: true},
+				{Name: "has", Doc: "link, embed, file, video, image or sound"},
+				{Name: "offset", Doc: "results to skip, a multiple of 25 up to 9975"},
+			},
+		},
+		{
+			Name: "fetch", Kind: connector.Read,
+			Summary: "Fetch messages of a channel, thread or DM from Discord, newest first. Page with one of before, after or around.",
+			Params: []connector.Param{
+				{Name: "channel_id", Doc: "channel, thread or DM ID", Required: true, Container: true},
+				{Name: "before", Doc: "seq; older messages"},
+				{Name: "after", Doc: "seq; newer messages"},
+				{Name: "around", Doc: "seq; messages around it"},
+				{Name: "limit", Doc: "1 to 100, default 50"},
+			},
 		},
 	},
-	{
-		Name: "guild-search", Kind: connector.Read,
-		Summary: "Search one server's message history the way Discord's search box does, 25 results per page, newest first. " +
-			"Needs at least one of content, author_id, channel_id, or has. Results are cached for an hour.",
-		Params: []connector.Param{
-			{Name: "guild_id", Doc: "Server ID to search (from sync).", Required: true, Container: true},
-			{Name: "content", Doc: "Words to match in message text, at most 512 characters."},
-			{Name: "author_id", Doc: "Only messages by this user ID."},
-			{Name: "channel_id", Doc: "Only messages in this channel or thread ID.", Container: true},
-			{Name: "has", Doc: "Only messages with this attachment kind: link, embed, file, video, image, or sound."},
-			{Name: "offset", Doc: "Skip this many results to page further, in steps of 25 (0 to 9975)."},
-		},
-	},
-	{
-		Name: "fetch", Kind: connector.Read,
-		Summary: "Read recent messages from one channel, thread, or DM, newest first. " +
-			"Anchor with at most one of before, after, or around to page through history.",
-		Params: []connector.Param{
-			{Name: "channel_id", Doc: "Channel, thread, or DM ID (from sync).", Required: true, Container: true},
-			{Name: "before", Doc: "Only messages older than this message ID."},
-			{Name: "after", Doc: "Only messages newer than this message ID."},
-			{Name: "around", Doc: "Messages surrounding this message ID."},
-			{Name: "limit", Doc: "How many messages, 1 to 100 (default 50)."},
-		},
-	},
-}}
+}
 
 func (w *worker) Spec() connector.Spec { return spec }
 
