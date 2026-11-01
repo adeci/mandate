@@ -16,7 +16,7 @@ func TestReceive(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	f := newFixture(t)
-	in := newIngester(f.cli(), f.c.dev, f.st, f.sess.timers, discard)
+	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, discard)
 	const t1, t2, t3, t4, t5, t6 = 1798000000000, 1798000001000, 1798000002000, 1798000003000, 1798000004000, 1798000005000
 	dm, group := farid.String(), string(climbing)
 	for _, e := range []*events.ChatEvent{
@@ -37,6 +37,14 @@ func TestReceive(t *testing.T) {
 		{Info: events.MessageInfo{Sender: mallory, ChatID: group, GroupRevision: 3}, Event: &signalpb.DataMessage{
 			Delete: &signalpb.DataMessage_Delete{TargetSentTimestamp: new(uint64(t2))}, Timestamp: new(uint64(t5)),
 		}},
+		// Neither someone else's delete nor an admin delete applies.
+		{Info: events.MessageInfo{Sender: farid, ChatID: stranger.String()}, Event: &signalpb.DataMessage{
+			Delete: &signalpb.DataMessage_Delete{TargetSentTimestamp: new(uint64(t3))}, Timestamp: new(uint64(t5)),
+		}},
+		{Info: events.MessageInfo{Sender: stranger, ChatID: stranger.String()}, Event: &signalpb.DataMessage{
+			AdminDelete: &signalpb.DataMessage_AdminDelete{TargetAuthorAciBinary: owner[:], TargetSentTimestamp: new(uint64(t3))},
+			Timestamp:   new(uint64(t5)),
+		}},
 		{Info: events.MessageInfo{Sender: farid, ChatID: dm}, Event: &signalpb.DataMessage{
 			Reaction: &signalpb.DataMessage_Reaction{Emoji: new("👍"), TargetSentTimestamp: new(uint64(t3))}, Timestamp: new(uint64(t6)),
 		}},
@@ -51,7 +59,7 @@ func TestReceive(t *testing.T) {
 		{ID: messageID(dm, farid, t1), ContainerID: dm, SenderID: farid.String(), SenderName: "Farid Haddad", Body: "running very late"},
 		{
 			ID: messageID(group, mallory, t2), ContainerID: group, SenderID: mallory.String(), SenderName: "~Mom",
-			Body: "look @Farid Haddad 🧗", MediaType: "image", ReplyToID: messageID(group, farid, t1),
+			MediaType: "image", ReplyToID: messageID(group, farid, t1),
 		},
 		{ID: messageID(stranger.String(), owner, t3), ContainerID: stranger.String(), SenderID: owner.String(), IsFromMe: true, Body: "who is this?"},
 	}
@@ -89,7 +97,7 @@ func TestContactListNamesDMs(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	f := newFixture(t)
-	in := newIngester(f.cli(), f.c.dev, f.st, f.sess.timers, discard)
+	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, discard)
 	in.handle(ctx, &events.ContactList{Contacts: []*types.Recipient{
 		{ACI: farid, ContactName: "Farid Haddad", Profile: types.Profile{Name: "Bank Support"}},
 		{ACI: mallory, Profile: types.Profile{Name: "Mom"}},

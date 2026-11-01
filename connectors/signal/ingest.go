@@ -30,18 +30,22 @@ type lookup interface {
 }
 
 type ingester struct {
-	cli    lookup
-	dev    *sgstore.Device
-	st     *store.Store
-	timers *timers
-	log    *slog.Logger
+	cli        lookup
+	dev        *sgstore.Device
+	st         *store.Store
+	timers     *timers
+	identities *identities
+	log        *slog.Logger
 
 	mu   sync.Mutex
 	seen map[string]uint32 // chats upserted by this process, with the group revision
 }
 
-func newIngester(cli lookup, dev *sgstore.Device, st *store.Store, t *timers, log *slog.Logger) *ingester {
-	return &ingester{cli: cli, dev: dev, st: st, timers: t, log: log, seen: make(map[string]uint32)}
+func newIngester(cli lookup, dev *sgstore.Device, st *store.Store, sess *session, log *slog.Logger) *ingester {
+	return &ingester{
+		cli: cli, dev: dev, st: st, timers: sess.timers, identities: sess.identities, log: log,
+		seen: make(map[string]uint32),
+	}
 }
 
 // Returning false for a message leaves it unacknowledged, so the server
@@ -52,6 +56,12 @@ func (in *ingester) handle(ctx context.Context, evt events.SignalEvent) bool {
 		return in.chatEvent(ctx, e)
 	case *events.ContactList:
 		in.renameDMs(ctx, e.Contacts)
+	case *events.IdentityChange:
+		if err := in.identities.changed(ctx, e.ServiceID.String(), time.Now()); err != nil {
+			in.log.Error("store identity change", "service_id", e.ServiceID.String(), "err", err)
+		} else {
+			in.log.Warn("safety number changed", "service_id", e.ServiceID.String())
+		}
 	}
 	return true
 }

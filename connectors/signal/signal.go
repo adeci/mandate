@@ -67,7 +67,7 @@ func start(ctx context.Context, env *connector.Env, _ struct{}) (connector.Conne
 			onEvent(evt)
 			return in.handle(ctx, evt)
 		})
-		in = newIngester(cli, dev, st, sess.timers, env.Log)
+		in = newIngester(cli, dev, st, sess, env.Log)
 		return cli
 	}
 	c := newConnector(ctx, st, env.Log, sess, dev, provision, newClient)
@@ -96,9 +96,10 @@ func (p *program) Close() error {
 }
 
 type session struct {
-	db      *sql.DB
-	devices *sgstore.Container
-	timers  *timers
+	db         *sql.DB
+	devices    *sgstore.Container
+	timers     *timers
+	identities *identities
 }
 
 func (s *session) Close() error { return s.db.Close() }
@@ -130,9 +131,11 @@ func openSession(ctx context.Context, path string, log dbutil.DatabaseLogger) (*
 		db.Close()
 		return nil, fmt.Errorf("upgrade session: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, timersSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("upgrade session: %w", err)
+	for _, schema := range []string{timersSchema, identitiesSchema} {
+		if _, err := db.ExecContext(ctx, schema); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("upgrade session: %w", err)
+		}
 	}
-	return &session{db: db, devices: devices, timers: &timers{db: db}}, nil
+	return &session{db: db, devices: devices, timers: &timers{db: db}, identities: &identities{db: db}}, nil
 }

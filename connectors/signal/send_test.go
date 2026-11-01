@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -37,6 +38,7 @@ var (
 	stranger    = uuid.MustParse("00000000-0000-4000-8000-000000000005")
 	strangerPNI = uuid.MustParse("00000000-0000-4000-8000-000000000105")
 	climbing    = types.GroupIdentifier(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	bouldering  = types.GroupIdentifier(base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)))
 )
 
 var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -265,7 +267,11 @@ func newFixture(t *testing.T) *fixture {
 		{ACI: owner}, {ACI: farid}, {ACI: mallory},
 	}}
 	for _, c := range []store.Container{
-		{ID: string(climbing), Kind: "group", IsGroup: true, Name: "Climbing crew"},
+		{
+			ID: string(climbing), Kind: "group", IsGroup: true, Name: "Climbing crew",
+			Participants: []store.Participant{{ID: owner.String()}, {ID: farid.String()}, {ID: mallory.String()}},
+		},
+		{ID: string(bouldering), Kind: "group", IsGroup: true, Name: "Climbing crew"},
 		{ID: farid.String(), Kind: "dm", Name: "Bank Support"},
 		{ID: mallory.String(), Kind: "dm"},
 		{ID: stranger.String(), Kind: "dm"},
@@ -295,10 +301,11 @@ func TestPrepareKnownChat(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	for chat, want := range map[string]approval.Field{
-		farid.String():    {Label: "To", Value: "Farid Haddad (+15551234567)"},
-		mallory.String():  {Label: "To", Value: "~Mom"},
-		stranger.String(): {Label: "To", Value: "+15557654321 (not in your contacts)"},
-		string(climbing):  {Label: "Group", Value: "Climbing crew"},
+		farid.String():     {Label: "To", Value: "Farid Haddad (+15551234567)"},
+		mallory.String():   {Label: "To", Value: "~Mom (" + mallory.String() + ")"},
+		stranger.String():  {Label: "To", Value: "+15557654321 (not in your contacts)"},
+		string(climbing):   {Label: "Group", Value: "~Climbing crew (" + string(climbing) + ")"},
+		string(bouldering): {Label: "Group", Value: "~Climbing crew (" + string(bouldering) + ")"},
 	} {
 		ctx := context.Background()
 		p, err := f.c.Prepare(ctx, "send", map[string]string{"chat": chat, "text": "on my way"})
@@ -316,6 +323,50 @@ func TestPrepareKnownChat(t *testing.T) {
 		if again, err := f.c.Prepare(ctx, "send", p.Args); err != nil || !reflect.DeepEqual(again, p) {
 			t.Errorf("%s: not idempotent: %+v %v", chat, again, err)
 		}
+	}
+}
+
+// Prepare warns of safety numbers that changed in the last week.
+func TestPrepareShowsIdentityChange(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t)
+	security := func(chat string) string {
+		t.Helper()
+		p, err := f.c.Prepare(ctx, "send", map[string]string{"chat": chat, "text": "hi"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range p.Display {
+			if d.Label == "Security" {
+				return d.Value
+			}
+		}
+		return ""
+	}
+
+	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, discard)
+	in.handle(ctx, &events.IdentityChange{ServiceID: libsignalgo.NewPNIServiceID(strangerPNI)})
+	if got := security(stranger.String()); !strings.HasPrefix(got, "! safety number changed 20") {
+		t.Fatalf("stranger: %q", got)
+	}
+
+	at := time.Now().UTC().Add(-6 * 24 * time.Hour)
+	for id, when := range map[string]time.Time{farid.String(): at, mallory.String(): at.Add(-2 * 24 * time.Hour)} {
+		if err := f.sess.identities.changed(ctx, id, when); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := "! safety number changed " + at.Format("2006-01-02 15:04 UTC")
+	if got := security(farid.String()); got != want {
+		t.Fatalf("farid: %q, want %q", got, want)
+	}
+	if got := security(mallory.String()); got != "" {
+		t.Fatalf("change from 8 days ago shown: %q", got)
+	}
+	want = "! safety number changed for +15551234567 " + at.Format("2006-01-02 15:04 UTC")
+	if got := security(string(climbing)); got != want {
+		t.Fatalf("group: %q, want %q", got, want)
 	}
 }
 
@@ -426,7 +477,7 @@ func TestExecuteKeepsTimer(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
 	f.groups[climbing].DisappearingMessagesDuration = 86400
-	in := newIngester(f.cli(), f.c.dev, f.st, f.sess.timers, discard)
+	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, discard)
 	for _, m := range []*signalpb.DataMessage{
 		{Body: new("hi"), Timestamp: new(uint64(1)), ExpireTimer: new(uint32(3600)), ExpireTimerVersion: new(uint32(2))},
 		// A message from a client that has not seen the latest change.

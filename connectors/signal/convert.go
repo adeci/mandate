@@ -52,20 +52,19 @@ func kindFor(chat string) string {
 }
 
 // Reactions, receipts, typing, calls, and group changes are not stored.
-// name renders a mentioned user.
+// Admin deletes are ignored: they name another member's message, and group
+// roles are not tracked here. name renders a mentioned user.
 func convert(e *events.ChatEvent, chat string, own uuid.UUID, name func(uuid.UUID) string) (op, bool) {
 	sender := e.Info.Sender
 	switch m := e.Event.(type) {
 	case *signalpb.DataMessage:
 		switch {
 		case m.Delete != nil:
+			// The target ID includes its author, so only the author's own
+			// delete finds it; edits work the same way.
 			return op{kind: opDelete, target: messageID(chat, sender, m.Delete.GetTargetSentTimestamp())}, true
 		case m.AdminDelete != nil:
-			author, err := uuid.FromBytes(m.AdminDelete.GetTargetAuthorAciBinary())
-			if err != nil {
-				return op{}, false
-			}
-			return op{kind: opDelete, target: messageID(chat, author, m.AdminDelete.GetTargetSentTimestamp())}, true
+			return op{}, false
 		}
 		body, media, ok := content(m, name)
 		ts := m.GetTimestamp()
