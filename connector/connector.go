@@ -253,7 +253,8 @@ type SetupStep struct {
 const SetupConfirm = "confirm"
 
 // Setupper is implemented by connectors the owner links from the console.
-// Setup starts or continues linking; it must refuse while already linked.
+// Setup starts or continues linking; the console sends the owner's inputs
+// once and polls without args. It must refuse while already linked.
 type Setupper interface {
 	Setup(ctx context.Context, args map[string]string) (SetupStep, error)
 }

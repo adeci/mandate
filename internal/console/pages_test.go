@@ -212,7 +212,10 @@ func TestSetupConfirm(t *testing.T) {
 
 func TestSetupFlow(t *testing.T) {
 	h := start(t)
-	if _, body := h.page(t, "/connections"); !strings.Contains(body, `name="account"`) || !strings.Contains(body, `name="token" type="password"`) {
+	// Password managers offer to save type=password fields, so secrets are
+	// textareas they skip.
+	if _, body := h.page(t, "/connections"); !strings.Contains(body, `name="account"`) ||
+		!strings.Contains(body, `<textarea id="setup-fake-token" name="token" class="secret"`) || strings.Contains(body, `type="password"`) {
 		t.Fatalf("connections page lacks the setup inputs:\n%s", body)
 	}
 

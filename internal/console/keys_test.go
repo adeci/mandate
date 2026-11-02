@@ -173,6 +173,10 @@ func TestPasswordOffOncePasskeyTrusted(t *testing.T) {
 	if _, body := h.call(t, http.MethodGet, "/login", "", nil); strings.Contains(string(body), `type="password"`) {
 		t.Fatal("login page offers the password")
 	}
+	phone := h.login(t, h.key)
+	if h.addKey(t, phone, approvaltest.New(t, rpID, origin), "laptop") {
+		t.Fatal("second key trusted without approval")
+	}
 
 	// mandate-reset-keys deletes the key log while the console is stopped.
 	h.srv.Close()
@@ -184,12 +188,21 @@ func TestPasswordOffOncePasskeyTrusted(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { srv.Close() })
+	h.srv = srv
 	h.pages = httptest.NewServer(srv.Handler())
 	t.Cleanup(h.pages.Close)
 	if status, _ := h.call(t, http.MethodGet, "/session", pw, nil); status != http.StatusUnauthorized {
 		t.Fatalf("password session from before the first key after a reset = %d", status)
 	}
-	h.passwordLogin(t)
+	if cs, err := srv.db.keyChanges(context.Background(), srv.now()); err != nil || len(cs) != 0 {
+		t.Fatalf("key requests after a reset = %v, %v", cs, err)
+	}
+	if !h.addKey(t, h.passwordLogin(t), h.key, "phone") {
+		t.Fatal("first key after a reset is not trusted")
+	}
+	if status, _ := h.call(t, http.MethodGet, "/session", phone, nil); status != http.StatusUnauthorized {
+		t.Fatalf("passkey session from before the reset = %d", status)
+	}
 }
 
 func TestKeyChanges(t *testing.T) {

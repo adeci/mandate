@@ -100,6 +100,12 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	for name, sock := range cfg.Connectors {
 		s.conns[name] = &conn{name: name, client: connector.Dial(sock, executeTimeout)}
 	}
+	if len(keys.Trusted()) == 0 {
+		if err := d.forgetKeys(ctx); err != nil {
+			d.Close()
+			return nil, fmt.Errorf("forget reset keys: %w", err)
+		}
+	}
 	ids, err := d.recoverInterrupted(ctx)
 	if err != nil {
 		d.Close()
