@@ -63,6 +63,12 @@ func TestMediaFollowsHideRules(t *testing.T) {
 		m.SentAt = at
 		mustDo(t, st.UpsertMessage(context.Background(), m))
 	}
+	// A code in a file name withholds the message and its file; stored
+	// earlier so it stays off the first page below.
+	mustDo(t, st.UpsertMessage(context.Background(), store.Message{
+		ID: "p12", ContainerID: "conv-family", SenderID: "+15550001", SentAt: at.Add(-time.Hour),
+		Media: []store.Media{{Type: "application/pdf", Name: "code-482910.pdf"}},
+	}))
 	mustDo(t, st.Close())
 
 	f := &fakeMedia{files: map[string][]byte{"p7": []byte("jpeg!"), "p11": bytes.Repeat([]byte("x"), 2000)}}
@@ -86,6 +92,7 @@ func TestMediaFollowsHideRules(t *testing.T) {
 	}
 	for query, want := range map[string]int{
 		"chat=conv-family&seq=5":          http.StatusForbidden,             // login code
+		"chat=conv-family&seq=12":         http.StatusForbidden,             // login code in the file name
 		"chat=conv-family&seq=8":          http.StatusNotFound,              // hidden sender
 		"chat=conv-private&seq=9":         http.StatusNotFound,              // hidden chat
 		"chat=conv-family&seq=9":          http.StatusNotFound,              // not in that chat

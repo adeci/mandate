@@ -14,10 +14,10 @@ import (
 )
 
 // filter prefixes every query: chats leaves out hidden containers, DMs with
-// hidden senders and everything under either, and gives each chat its
-// ancestors' names as a prefix; msgs leaves out hidden senders and blanks
-// login-code bodies. ?1 and ?2 are the hidden container and sender IDs as
-// JSON arrays.
+// hidden senders and everything under either, gives each chat its
+// ancestors' names as a prefix and hides a name that reads like a login
+// code; msgs leaves out hidden senders and blanks login-code and deleted
+// bodies. ?1 and ?2 are the hidden container and sender IDs as JSON arrays.
 //
 // A DM's ID is not its other participant's ID everywhere (Discord channels,
 // Matrix rooms), so a DM is also matched by its stored participants and by
@@ -33,6 +33,9 @@ import (
 // media marked in brackets. Search matches body, not the markers. A message's
 // files are marked by type and name, and numbered for media --index when
 // there are several; a message without stored files keeps its media_type.
+// The login-code check reads the file names too, as senders name a file
+// after the code it holds. A deleted message keeps only its marker:
+// connectors keep deleted bodies (Fastmail's trash) for restore.
 const filter = `WITH
 hidden_sender(id) AS (SELECT value FROM json_each(?2)),
 hidden(id) AS (
@@ -43,7 +46,7 @@ hidden(id) AS (
   UNION SELECT container_id FROM messages
     WHERE sender_id IN (SELECT id FROM hidden_sender) AND NOT is_from_me
       AND +container_id IN (SELECT id FROM containers WHERE kind = 'dm')),
-chats AS (
+named AS (
   SELECT c.id, c.kind, c.last_message_at,
          CASE WHEN COALESCE(p1.name, p2.name, p3.name) IS NULL THEN c.name
               ELSE concat_ws(' / ', p3.name, p2.name, p1.name, COALESCE(c.name, c.id)) END AS name
@@ -56,21 +59,27 @@ chats AS (
     AND COALESCE(c.parent_id, '') NOT IN (SELECT id FROM hidden)
     AND COALESCE(p1.parent_id, '') NOT IN (SELECT id FROM hidden)
     AND COALESCE(p2.parent_id, '') NOT IN (SELECT id FROM hidden)),
-visible AS (
-  SELECT m.*, is_auth(m.sender_id, m.body) AS auth
+chats AS (
+  SELECT id, kind, last_message_at, iif(name_auth, '[login code hidden]', name) AS name, name_auth
+  FROM (SELECT *, name IS NOT NULL AND is_auth('', name) AS name_auth FROM named)),
+stored AS (
+  SELECT m.*, COALESCE(
+    (SELECT iif(count(*) = 1, '[' || type || COALESCE(' ' || name, '') || ']',
+                group_concat('[#' || idx || ' ' || type || COALESCE(' ' || name, '') || ']', ' ' ORDER BY idx))
+     FROM media WHERE message_id = m.id),
+    '[' || m.media_type || ']') AS files
   FROM messages AS m JOIN chats AS c ON c.id = m.container_id
   WHERE COALESCE(m.sender_id, '') NOT IN (SELECT id FROM hidden_sender)),
+visible AS (
+  SELECT *, is_auth(sender_id, concat_ws(' ', files, body)) AS auth FROM stored),
 msgs AS (
   SELECT seq, id, container_id, sent_at, strftime('%Y-%m-%d %H:%M', sent_at) AS at, reply_to_id,
          sender_id, CASE WHEN is_from_me THEN 'me' ELSE sender_name END AS sender,
-         CASE WHEN auth THEN NULL ELSE body END AS body,
+         auth, deleted,
+         CASE WHEN auth OR deleted THEN NULL ELSE body END AS body,
          CASE WHEN auth THEN '[login code hidden]'
-              ELSE rtrim(iif(deleted, '[deleted] ', '') || COALESCE(
-                (SELECT iif(count(*) = 1, '[' || type || COALESCE(' ' || name, '') || '] ',
-                            group_concat('[#' || idx || ' ' || type || COALESCE(' ' || name, '') || ']', ' ' ORDER BY idx) || ' ')
-                 FROM media WHERE message_id = visible.id),
-                '[' || media_type || '] ', '') || COALESCE(body, ''), ' ')
-         END AS text
+              WHEN deleted THEN '[deleted]'
+              ELSE concat_ws(' ', files, NULLIF(body, '')) END AS text
   FROM visible)
 `
 
@@ -218,6 +227,13 @@ func (s *source) visible(id string) (bool, error) {
 	return len(rows) == 1, err
 }
 
+// messageVisible says whether agents see message id's body, as messages
+// shows it.
+func (s *source) messageVisible(id string) (bool, error) {
+	rows, err := s.query(`SELECT 1 FROM msgs WHERE id = ?3 AND NOT auth AND NOT deleted`, id)
+	return len(rows) == 1, err
+}
+
 // visibleCount counts the visible chats among ids.
 func (s *source) visibleCount(ids []string) (int, error) {
 	if len(ids) == 0 {
@@ -258,14 +274,18 @@ var (
 const replyTo = `(SELECT r.seq FROM msgs AS r WHERE r.id = m.reply_to_id)`
 
 // last_message is the later of the newest visible message and the activity
-// the connector reported for the chat.
+// the connector reported for the chat. A chat whose stored messages are all
+// hidden, login codes or deleted is left out: connectors name some chats
+// after a message (Fastmail threads, Discord threads).
 func (s *source) chats(search string, limit int64) (*table, error) {
 	rows, err := s.query(`SELECT id, kind, name, strftime('%Y-%m-%d %H:%M', at) FROM (
   SELECT c.id, c.kind, c.name, NULLIF(max(
     COALESCE((SELECT max(sent_at) FROM msgs WHERE container_id = c.id), ''),
     COALESCE(c.last_message_at, '')), '') AS at
   FROM chats AS c
-  WHERE ?3 = '' OR instr(lower(COALESCE(c.name, '')), lower(?3)) OR instr(lower(c.id), lower(?3)))
+  WHERE (EXISTS (SELECT 1 FROM msgs WHERE container_id = c.id AND NOT auth AND NOT deleted)
+         OR NOT EXISTS (SELECT 1 FROM messages WHERE container_id = c.id))
+    AND (?3 = '' OR instr(lower(iif(c.name_auth, '', COALESCE(c.name, ''))), lower(?3)) OR instr(lower(c.id), lower(?3))))
 ORDER BY at DESC NULLS LAST, id LIMIT ?4`, search, limit+1)
 	if err != nil {
 		return nil, err

@@ -423,7 +423,7 @@ func (h *handler) op(w http.ResponseWriter, r *http.Request) {
 		h.read(w, r, name, opName, req.Args)
 		return
 	}
-	h.propose(w, r, name, opName, req)
+	h.propose(w, r, name, op, req)
 }
 
 func (h *handler) read(w http.ResponseWriter, r *http.Request, name, op string, args map[string]string) {
@@ -464,10 +464,10 @@ func (h *handler) read(w http.ResponseWriter, r *http.Request, name, op string, 
 	connector.WriteJSON(w, http.StatusOK, t)
 }
 
-func (h *handler) propose(w http.ResponseWriter, r *http.Request, name, op string, req opRequest) {
+func (h *handler) propose(w http.ResponseWriter, r *http.Request, name string, op connector.Op, req opRequest) {
 	start := time.Now()
-	attrs := []any{"remote", r.RemoteAddr, "connector", name, "op", op}
-	prepared, err := h.connectors.calls[name].Prepare(r.Context(), op, req.Args)
+	attrs := []any{"remote", r.RemoteAddr, "connector", name, "op", op.Name}
+	prepared, err := h.connectors.calls[name].Prepare(r.Context(), op.Name, req.Args)
 	if err != nil {
 		slog.Info("propose", append(attrs, "err", err.Error())...)
 		relay(w, "connector "+name, err)
@@ -477,8 +477,12 @@ func (h *handler) propose(w http.ResponseWriter, r *http.Request, name, op strin
 		slog.Info("propose", append(attrs, "refused", "prepared container")...)
 		return
 	}
+	if prepared.Message != "" && !h.messageVisible(w, r, name, op, req.Args, prepared.Message) {
+		slog.Info("propose", append(attrs, "refused", "prepared message")...)
+		return
+	}
 	p, err := h.console.Submit(r.Context(), proposal.Request{
-		Connector: name, Op: op, Args: prepared.Args, Note: req.Note,
+		Connector: name, Op: op.Name, Args: prepared.Args, Note: req.Note,
 	})
 	if err != nil {
 		slog.Info("propose", append(attrs, "err", err.Error())...)
@@ -487,6 +491,38 @@ func (h *handler) propose(w http.ResponseWriter, r *http.Request, name, op strin
 	}
 	slog.Info("propose", append(attrs, "id", p.ID, "duration_ms", time.Since(start).Milliseconds())...)
 	connector.WriteJSON(w, http.StatusAccepted, p)
+}
+
+// messageVisible refuses unless agents see message id. The refusal names
+// only what the agent passed, so it reveals nothing of the stored message.
+func (h *handler) messageVisible(w http.ResponseWriter, r *http.Request, name string, op connector.Op, args map[string]string, id string) bool {
+	if _, ok := h.cfg.Sources[name]; !ok {
+		writeError(w, http.StatusForbidden, fmt.Sprintf("connector %s has no data source on this gateway, so it cannot answer messages", name))
+		return false
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), h.cfg.Timeout)
+	defer cancel()
+	s, ok := h.source(ctx, w, name)
+	if !ok {
+		return false
+	}
+	defer s.close()
+	ok, err := s.messageVisible(id)
+	if err != nil {
+		slog.Error("message lookup", "source", name, "err", err)
+		writeError(w, http.StatusServiceUnavailable, "gateway unavailable; tell the owner")
+		return false
+	}
+	if !ok {
+		var passed []string
+		for _, p := range op.Params {
+			if v := args[p.Name]; v != "" && (p.Container || p.Name == "seq") {
+				passed = append(passed, p.Name+"="+v)
+			}
+		}
+		writeError(w, http.StatusNotFound, fmt.Sprintf("no message to answer at %s; see mandate %s messages", strings.Join(passed, " "), name))
+	}
+	return ok
 }
 
 var proposalID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)

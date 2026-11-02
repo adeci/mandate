@@ -179,10 +179,15 @@ func main() {
 - **Reading** is optional. Implement `connector.Reader` for read ops. Write
   messages to `env.DataPath()` with the `store` package and agents get
   `chats`, `messages` and `search` over them, with the owner's hide rules and
-  login-code redaction applied.
+  login-code redaction applied. The login-code check also reads chat names
+  and file names. Deleted messages show as `[deleted]`, and a chat whose
+  stored messages agents may not see is not listed.
 - **Media** is optional; see below.
 - **Chats**: mark a param `Container` and the gateway refuses the op unless
   it names a stored, visible chat.
+- **Answering a message**: set `Prepared.Message` to the stored message ID a
+  write answers, and the gateway refuses the proposal unless agents can see
+  that message.
 - **Health and linking** are optional: `connector.Checker`,
   `connector.Setupper` with its inputs declared in `Spec.Setup`, and
   `connector.Unlinker`, which lets the owner unlink and relink. The console
@@ -292,6 +297,9 @@ services.mandate.connectors.matrix.serviceConfig.IPAddressAllow = [ "192.168.1.2
 
 Without systemd-resolved, allow the DNS servers in `/etc/resolv.conf` the
 same way.
+
+Each connector has `MemoryMax = "1G"`; raise it in the same
+`serviceConfig` if an account needs more.
 
 ## The http connector
 
