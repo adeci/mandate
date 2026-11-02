@@ -3,16 +3,20 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"go.mau.fi/mautrix-signal/pkg/signalmeow"
 	"go.mau.fi/mautrix-signal/pkg/signalmeow/events"
 	"go.mau.fi/mautrix-signal/pkg/signalmeow/protobuf/signalpb"
+	"go.mau.fi/mautrix-signal/pkg/signalmeow/web"
 
 	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/store"
@@ -24,14 +28,15 @@ func TestMediaFetchesWhatIngestRecorded(t *testing.T) {
 	f := newFixture(t)
 	plain := []byte("\xff\xd8\xff a photo of the crag")
 	key := bytes.Repeat([]byte("k"), 64)
-	f.c.download = func(_ context.Context, p *signalpb.AttachmentPointer) ([]byte, error) {
+	f.c.download = func(_ context.Context, p *signalpb.AttachmentPointer, into *os.File) error {
 		if p.GetCdnKey() == "gone" {
-			return nil, signalmeow.ErrAttachmentNotFound
+			return signalmeow.ErrAttachmentNotFound
 		}
 		if p.GetCdnNumber() != 3 || p.GetCdnKey() != "topo" || !bytes.Equal(p.GetKey(), key) || string(p.GetDigest()) != "digest" {
-			return nil, errors.New("unexpected pointer " + p.String())
+			return errors.New("unexpected pointer " + p.String())
 		}
-		return plain, nil
+		_, err := into.Write(plain)
+		return err
 	}
 
 	const ts = 1798000000000
@@ -74,3 +79,85 @@ func TestMediaFetchesWhatIngestRecorded(t *testing.T) {
 		}
 	}
 }
+
+// signalmeow indexes its CDN host list with the pointer's CDN number.
+func TestUnknownCDN(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t)
+	f.c.download = func(context.Context, *signalpb.AttachmentPointer, *os.File) error {
+		t.Error("downloaded from an unknown CDN")
+		return nil
+	}
+	p := &signalpb.AttachmentPointer{
+		AttachmentIdentifier: &signalpb.AttachmentPointer_CdnKey{CdnKey: "x"}, CdnNumber: new(uint32(len(web.CDNHosts))),
+		Key: bytes.Repeat([]byte("k"), 64), Digest: []byte("digest"),
+	}
+	if _, ok := attachment(p); ok {
+		t.Error("recorded an attachment on an unknown CDN")
+	}
+	dm := farid.String()
+	m := store.Message{ID: messageID(dm, farid, 1), ContainerID: dm, SentAt: time.UnixMilli(1798000000000).UTC(), Media: []store.Media{{
+		Type: "image/jpeg", Ref: []byte(`{"cdn_number":4,"cdn_key":"x"}`),
+	}}}
+	if err := f.st.UpsertMessage(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var cerr *connector.Error
+	if _, err := f.c.Media(ctx, m.ID, 0); !errors.As(err, &cerr) || cerr.Status != http.StatusBadGateway {
+		t.Errorf("Media = %v, want 502", err)
+	}
+}
+
+// Signal's CDN states a length, and signalmeow allocates it and reads the
+// body whole; both stop at the limit. Not parallel: it replaces
+// signalmeow's HTTP transport.
+func TestMediaStopsAtLimit(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	f.c.download = download
+	var served atomic.Int64
+	chunked := false
+	orig := web.SignalHTTPClient.Transport
+	t.Cleanup(func() { web.SignalHTTPClient.Transport = orig })
+	web.SignalHTTPClient.Transport = capMedia{roundTrip(func(req *http.Request) (*http.Response, error) {
+		const size = 4 << 20
+		body := io.NopCloser(io.TeeReader(io.LimitReader(zeros{}, size), writerFunc(func(p []byte) { served.Add(int64(len(p))) })))
+		resp := &http.Response{StatusCode: http.StatusOK, Body: body, Header: http.Header{}, Request: req, ContentLength: size}
+		if chunked {
+			resp.ContentLength = -1
+		}
+		return resp, nil
+	})}
+	dm := farid.String()
+	m := store.Message{ID: messageID(dm, farid, 1), ContainerID: dm, SentAt: time.UnixMilli(1798000000000).UTC(), Media: []store.Media{{
+		Type: "application/pdf", Size: 1, Ref: []byte(`{"cdn_number":2,"cdn_key":"big","key":"` +
+			base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("k"), 64)) + `","digest":"ZGlnZXN0","size":1}`),
+	}}}
+	if err := f.st.UpsertMessage(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	const limit = 64 << 10
+	for _, chunked = range []bool{false, true} {
+		served.Store(0)
+		var cerr *connector.Error
+		if _, err := f.c.Media(connector.WithMediaLimit(ctx, limit), m.ID, 0); !errors.As(err, &cerr) || cerr.Status != http.StatusRequestEntityTooLarge {
+			t.Errorf("chunked %v: Media = %v, want 413", chunked, err)
+		}
+		if n := served.Load(); n > 2*limit {
+			t.Errorf("chunked %v: read %d bytes with a %d byte limit", chunked, n, limit)
+		}
+	}
+}
+
+type roundTrip func(*http.Request) (*http.Response, error)
+
+func (f roundTrip) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+type writerFunc func([]byte)
+
+func (f writerFunc) Write(p []byte) (int, error) { f(p); return len(p), nil }
+
+type zeros struct{}
+
+func (zeros) Read(p []byte) (int, error) { clear(p); return len(p), nil }

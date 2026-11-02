@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -56,8 +57,8 @@ type sgConnector struct {
 	provision func(ctx context.Context) <-chan signalmeow.ProvisioningResponse
 	// newClient wires onEvent, then ingest, into a client for dev.
 	newClient func(dev *sgstore.Device, onEvent func(events.SignalEvent)) sgClient
-	// download fetches and decrypts an attachment from Signal's CDN.
-	download func(ctx context.Context, p *signalpb.AttachmentPointer) ([]byte, error)
+	// download fetches an attachment from Signal's CDN and decrypts it into a file.
+	download func(ctx context.Context, p *signalpb.AttachmentPointer, into *os.File) error
 
 	mu sync.Mutex
 	// cli and dev are nil until linked.
