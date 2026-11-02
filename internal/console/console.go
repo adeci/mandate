@@ -98,6 +98,7 @@ func Command(ctx context.Context, args []string) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go srv.Sweep(ctx, 30*time.Second)
+	go srv.Watch(ctx, 15*time.Second)
 
 	errc := make(chan error, 2)
 	go func() { errc <- wrap("proposal socket", connector.ServeUnix(ctx, *socket, srv.ProposalHandler())) }()

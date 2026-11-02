@@ -68,6 +68,12 @@ type conn struct {
 	// keysProblem is why the connector's key log differs from ours, if it
 	// does.
 	keysProblem string
+
+	// hmu guards the last health seen and when it turned down; mu is held
+	// while fetching the spec.
+	hmu       sync.Mutex
+	health    connector.Health
+	downSince time.Time
 }
 
 // New opens the database and key log in cfg.StateDir and settles proposals

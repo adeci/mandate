@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
@@ -19,11 +20,19 @@ import (
 const (
 	healthTimeout = 5 * time.Second
 	setupTimeout  = 30 * time.Second
+	// downGrace is how long a connector may be down before the console
+	// shows it as failed: services have short outages and phones sleep,
+	// and connectors retry by themselves.
+	downGrace = 3 * time.Minute
 )
 
 type connView struct {
 	Name   string
 	Health connector.Health
+	// Tone is how the state shows; Retrying marks a connector down for less
+	// than downGrace.
+	Tone     string
+	Retrying bool
 	// Setup are the inputs the connector takes when linking. With Required
 	// set it links only with them, all given at once.
 	Setup    []connector.Param
@@ -33,24 +42,100 @@ type connView struct {
 	Keys string
 }
 
-// view asks for the spec first: a connector speaking another protocol is
-// down whatever its health says.
 func (s *Server) view(ctx context.Context, c *conn) connView {
 	ctx, cancel := context.WithTimeout(ctx, healthTimeout)
 	defer cancel()
 	v := connView{Name: c.name}
-	spec, err := c.getSpec(ctx, s.now())
+	spec, err := s.check(ctx, c)
+	v.Health, v.Tone = c.shown(s.now())
+	v.Retrying = v.Health.State == connector.Broken && v.Tone != "alert"
 	if err != nil {
-		v.Health = connector.Health{State: connector.Broken, Detail: problem(err)}
 		return v
 	}
 	v.Setup, v.Unlink = spec.Setup, spec.Unlink
 	v.Required = slices.ContainsFunc(spec.Setup, func(p connector.Param) bool { return p.Required })
-	if v.Health, err = c.client.Health(ctx); err != nil {
-		v.Health = connector.Health{State: connector.Broken, Detail: problem(err)}
-	}
 	v.Keys = s.syncConn(ctx, c)
 	return v
+}
+
+// check asks c for its health and records it, and returns the spec or why
+// there is none. A connector speaking another protocol is down whatever its
+// health says.
+func (s *Server) check(ctx context.Context, c *conn) (connector.Spec, error) {
+	spec, specErr := c.getSpec(ctx, s.now())
+	h, err := connector.Health{}, specErr
+	if err == nil {
+		h, err = c.client.Health(ctx)
+	}
+	if err != nil {
+		h = connector.Health{State: connector.Broken, Detail: problem(err)}
+	}
+	now := s.now()
+	c.hmu.Lock()
+	defer c.hmu.Unlock()
+	if h.State != connector.Broken {
+		c.downSince = time.Time{}
+	} else if c.downSince.IsZero() {
+		c.downSince = now
+	}
+	c.health = h
+	return spec, specErr
+}
+
+// shown is c's last health and its tone; down is a wait until downGrace has
+// passed.
+func (c *conn) shown(now time.Time) (connector.Health, string) {
+	c.hmu.Lock()
+	defer c.hmu.Unlock()
+	t := tone(c.health.State)
+	if c.health.State == connector.Broken && now.Sub(c.downSince) < downGrace {
+		t = "wait"
+	}
+	return c.health, t
+}
+
+// Watch checks every connector's health now and every interval, so the nav
+// and open pages follow it.
+func (s *Server) Watch(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		var wg sync.WaitGroup
+		for _, c := range s.conns {
+			wg.Go(func() {
+				ctx, cancel := context.WithTimeout(ctx, healthTimeout)
+				defer cancel()
+				_, _ = s.check(ctx, c)
+			})
+		}
+		wg.Wait()
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// health sums up the connectors as last seen: each one's state and tone in
+// name order, how many need attention, and the worst tone among those.
+func (s *Server) health() (states string, n int, worst string) {
+	names := slices.Sorted(maps.Keys(s.conns))
+	now := s.now()
+	for _, name := range names {
+		h, t := s.conns[name].shown(now)
+		states += "." + string(h.State) + "/" + t
+		switch t {
+		case "alert":
+			n, worst = n+1, t
+		case "wait":
+			n++
+			if worst == "" {
+				worst = t
+			}
+		}
+	}
+	return states, n, worst
 }
 
 // unreachable means nothing serves the connector's socket.

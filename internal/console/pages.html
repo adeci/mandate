@@ -18,7 +18,7 @@
   {{- if .Who}}
   <nav>
     <a href="/"{{if eq .Nav "inbox"}} aria-current="page"{{end}}>Inbox{{if .Pending}} <span class="count">{{.Pending}}</span>{{end}}</a>
-    <a href="/connections"{{if eq .Nav "connections"}} aria-current="page"{{end}}>Connections</a>
+    <a href="/connections"{{if eq .Nav "connections"}} aria-current="page"{{end}}>Connections{{if .Attention}} <span class="count" data-tone="{{.AttentionTone}}">{{.Attention}}</span>{{end}}</a>
     <a href="/keys"{{if eq .Nav "keys"}} aria-current="page"{{end}}>Keys</a>
   </nav>
   {{- end}}
@@ -220,13 +220,14 @@
 <div class="cols">
 {{range .Data}}
 <section class="panel{{if eq .Health.State "setup"}} danger{{end}}" data-connection="{{.Name}}" data-state="{{.Health.State}}">
-  <header><h3>{{.Name}}</h3>{{template "status" .Health.State}}</header>
+  <header><h3>{{.Name}}</h3><span class="status" data-tone="{{.Tone}}">{{.Health.State}}</span></header>
   {{if or .Health.Detail (not .Health.Until.IsZero)}}
   <dl class="kv">
     {{with .Health.Detail}}<div><dt>detail</dt><dd class="message">{{.}}</dd></div>{{end}}
     {{if not .Health.Until.IsZero}}<div><dt>until</dt><dd>{{when .Health.Until}} <span class="muted" data-until="{{.Health.Until.UTC.Format "2006-01-02T15:04:05Z07:00"}}"></span></dd></div>{{end}}
   </dl>
   {{end}}
+  {{if .Retrying}}<p class="hint">retrying; it shows as failed after 3 minutes down</p>{{end}}
   {{with .Keys}}<p class="flash" data-kind="error">Keys out of sync: {{.}}</p>{{end}}
   {{$setup := eq .Health.State "setup"}}
   {{if or $setup .Unlink}}

@@ -106,7 +106,10 @@ type page struct {
 	Title   string
 	Nav     string
 	Pending int
-	Who     string
+	// Attention counts connectors that need a look, in the worst one's tone.
+	Attention     int
+	AttentionTone string
+	Who           string
 	// Passkey sessions may open an unlock window.
 	Passkey bool
 	Version string
@@ -136,21 +139,24 @@ func (s *Server) owner(w http.ResponseWriter, r *http.Request, sess session, nam
 	if err != nil {
 		s.cfg.Log.Error("count pending", "err", err)
 	}
+	_, attention, worst := s.health()
 	s.render(w, http.StatusOK, name, page{
-		Title: title, Nav: nav, Pending: n, Who: sess.who(), Passkey: sess.key.CredentialID != "",
-		Version: sess.version, Data: data,
+		Title: title, Nav: nav, Pending: n, Attention: attention, AttentionTone: worst,
+		Who: sess.who(), Passkey: sess.key.CredentialID != "", Version: sess.version, Data: data,
 	})
 }
 
 // version changes whenever something a page shows may have, so open pages
-// can reload after a decision made on another device.
+// can reload after a decision made on another device or a connector's
+// health changes.
 func (s *Server) version(ctx context.Context) string {
 	v, err := s.db.version(ctx, s.now())
 	if err != nil {
 		s.cfg.Log.Error("console version", "err", err)
 	}
 	n, head := s.keys.Head()
-	return v + "." + strconv.Itoa(n) + "." + head
+	states, _, _ := s.health()
+	return v + "." + strconv.Itoa(n) + "." + head + states
 }
 
 func (s *Server) errorPage(w http.ResponseWriter, status int, msg string) {
@@ -370,7 +376,10 @@ func (s *Server) requestPage(w http.ResponseWriter, r *http.Request, sess sessio
 }
 
 func (s *Server) connectionsPage(w http.ResponseWriter, r *http.Request, sess session) {
-	s.owner(w, r, sess, "connections", "Connections", "connections", s.connections(r.Context()))
+	conns := s.connections(r.Context())
+	// Checking them may have changed what the page began with.
+	sess.version = s.version(r.Context())
+	s.owner(w, r, sess, "connections", "Connections", "connections", conns)
 }
 
 // maxMarks is how many combining marks in a row pass unmarked: enough for

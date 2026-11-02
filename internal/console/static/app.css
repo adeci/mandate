@@ -69,6 +69,8 @@ section { margin-bottom: calc(var(--lh) * 2); }
 .site nav a:hover { background: var(--bg-hover); color: var(--fg-strong); }
 .site nav a[aria-current="page"] { background: var(--accent-bg); color: var(--accent); font-weight: var(--w-medium); }
 .count { font-weight: var(--w-bold); }
+.count[data-tone="wait"] { color: var(--notice); }
+.count[data-tone="alert"] { color: var(--error); }
 .theme-toggle { position: absolute; top: 0; right: 0; height: calc(var(--lh) * 2);
   padding: 0 1ch; border: 0; background: none; color: var(--fg); }
 .theme-toggle svg { width: var(--lh); height: var(--lh); fill: none; stroke: currentColor; stroke-width: 2px; }

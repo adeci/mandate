@@ -323,3 +323,52 @@ func TestOtherProtocolIsDown(t *testing.T) {
 		t.Fatalf("connector speaking another protocol was called %d times", n)
 	}
 }
+
+func TestConnectorHealthInNav(t *testing.T) {
+	h := start(t)
+	ctx := context.Background()
+	refresh := func() {
+		for _, c := range h.srv.conns {
+			h.srv.check(ctx, c)
+		}
+	}
+	nav := func(want string) {
+		t.Helper()
+		if _, body := h.page(t, "/"); !strings.Contains(body, ">Connections"+want+"</a>") {
+			t.Fatalf("nav lacks Connections%s:\n%s", want, body)
+		}
+	}
+	card := func(tone string, retrying bool) {
+		t.Helper()
+		_, body := h.page(t, "/connections")
+		if !strings.Contains(body, `data-tone="`+tone+`">down</span>`) || !strings.Contains(body, "not running") ||
+			strings.Contains(body, "retrying") != retrying {
+			t.Fatalf("card isn't %s down, retrying %v:\n%s", tone, retrying, body)
+		}
+	}
+
+	refresh()
+	nav(` <span class="count" data-tone="wait">1</span>`)
+	if status, body := h.post(t, "/connections/fake/setup", setupRequest{Args: map[string]string{"token": "t"}}); status != http.StatusOK {
+		t.Fatalf("link = %d %s", status, body)
+	}
+	refresh()
+	nav("")
+
+	linked := h.srv.version(ctx)
+	h.stopConnector()
+	refresh()
+	down := h.srv.version(ctx)
+	if down == linked {
+		t.Fatal("version kept when the connector went down")
+	}
+	nav(` <span class="count" data-tone="wait">1</span>`)
+	card("wait", true)
+
+	h.clock.advance(downGrace)
+	if h.srv.version(ctx) == down {
+		t.Fatal("version kept when the grace ended")
+	}
+	nav(` <span class="count" data-tone="alert">1</span>`)
+	card("alert", false)
+}
