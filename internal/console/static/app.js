@@ -498,6 +498,18 @@ function countdown(el) {
   tick();
 }
 
+// Watches a connector that is connecting, e.g. just after linking, and
+// reloads once it settles.
+function settle(panel) {
+  const poll = async () => {
+    if (!panel.isConnected) return;
+    const h = await call("GET", `/connections/${panel.dataset.connection}/health`).catch(() => null);
+    if (h && h.state !== "connecting" && !engaged()) return reload();
+    setTimeout(poll, POLL_MS);
+  };
+  setTimeout(poll, POLL_MS);
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   bind();
   watch();
@@ -550,6 +562,7 @@ function bind() {
   }
 
   for (const panel of $$("[data-connection]")) {
+    if (panel.dataset.state === "connecting") settle(panel);
     const link = $("[data-link]", panel);
     if (link) link.addEventListener("click", busy(link, () => linkConnection(panel, {})));
     for (const form of $$("[data-setup]", panel)) {

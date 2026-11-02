@@ -219,7 +219,7 @@
 <h1>Connections</h1>
 <div class="cols">
 {{range .Data}}
-<section class="panel{{if eq .Health.State "setup"}} danger{{end}}" data-connection="{{.Name}}">
+<section class="panel{{if eq .Health.State "setup"}} danger{{end}}" data-connection="{{.Name}}" data-state="{{.Health.State}}">
   <header><h3>{{.Name}}</h3>{{template "status" .Health.State}}</header>
   {{if or .Health.Detail (not .Health.Until.IsZero)}}
   <dl class="kv">

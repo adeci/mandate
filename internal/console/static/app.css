@@ -262,8 +262,13 @@ summary:hover { color: var(--fg-strong); }
 .qr-box { border: var(--bw) solid var(--line); background: #fff; width: min(100%, 264px);
   margin: 0 0 var(--lh); line-height: 0; }
 .qr-box svg { width: 100%; height: auto; display: block; }
-.code { font-size: 2rem; line-height: calc(var(--lh) * 2); font-weight: var(--w-bold);
-  background: var(--accent-bg); color: var(--accent); padding: 0 1ch; display: inline-block; user-select: all; }
+/* Emoji are taller than a line of text: the box grows around the glyph and
+   centres it. */
+.code { font-size: 2rem; line-height: 1.25; font-weight: var(--w-bold);
+  background: var(--accent-bg); color: var(--accent); padding: 0 1ch;
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: calc(var(--lh) * 3); min-width: calc(var(--lh) * 3); max-width: 100%;
+  overflow-wrap: anywhere; user-select: all; }
 .setup { margin-bottom: var(--lh); }
 .setup label { font-weight: var(--w-normal); color: var(--fg-alt); }
 @media (min-width: 800px) {
