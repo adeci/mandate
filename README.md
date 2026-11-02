@@ -17,6 +17,7 @@ services.mandate = {
   hostname = "mandate.example.com";
   useACMEHost = "mandate.example.com"; # or tlsCertFile and tlsKeyFile
   connectors.whatsapp = { };
+  gatewayUrl = "http://box.example.ts.net:8780"; # optional, for agent setup
   notify.ntfy.url = "http://ntfy.example.ts.net/mandate"; # optional
 };
 ```
@@ -26,8 +27,10 @@ After deploying:
 1. Sign in to the console with `sudo cat /var/lib/mandate/admin-password`
    and add a passkey under Keys.
 2. Link your accounts under Connections.
-3. Create an agent under Access and give it the token your browser shows,
-   which is shown only once.
+3. Create an agent under Agents. The setup sheet lists what it needs, each
+   value with a copy button: the gateway URL (from `gatewayUrl`), its token,
+   which is shown only once, the CLI download and the skill. The sheet
+   shows when the agent first connects.
 
 The gateway (port 8780) and the console (443) listen on all addresses, and
 the firewall opens them on `tailscale0` only (`openFirewallOn`).
@@ -40,6 +43,8 @@ export MANDATE_URL=http://box:8780 MANDATE_TOKEN_FILE=~/.config/mandate/token
 mandate --help
 mandate access                                     # what this agent may read now
 mandate request whatsapp --chat Family --for 30m --since 7d --reason "find the dinner plan"
+mandate request signal --chat Family --every weekdays --at 07:00 --for 20m --reason "morning summary"
+mandate request whatsapp --extend --for 30m --reason "still reading"
 mandate whatsapp send 15551234567@s.whatsapp.net "running 10 late" --wait 10m
 mandate whatsapp media 15551234567@s.whatsapp.net 812   # save that message's photo
 ```
@@ -54,34 +59,50 @@ instructions.
 ## Access
 
 Each agent has its own token, and reads or writes nothing until you grant it.
-The Access page lists agents, grants, pending requests and recent reads. A
-grant, signed with your passkey, covers one agent and one connector, every
+A grant, signed with your passkey, covers one agent and one connector, every
 chat or the ones you check, during a window:
 
 - **once**, from now for a duration, or
-- **on a schedule**, such as weekdays at 08:00 for 30 minutes, in your
+- **a routine**, such as weekdays at 07:00 for 20 minutes, in your
   browser's time zone,
 
 and a horizon: messages older than 24 hours, 7 days or 30 days stay hidden,
 or none with all history. Checked chats are exact: a thread or channel
 created later is not included. A grant also lets the agent propose writes
-to the chats it covers. Grants on `http` cover every allowlisted read, with
-no chats or horizon. Revoking a grant or deleting an agent needs no passkey
-and takes effect within 15 seconds.
+to the chats it covers, while it is open and for 24 hours after it ends
+unless you closed it. Grants on `http` cover every allowlisted read, with no
+chats or horizon.
+
+The console's home, Now, shows:
+
+- **Waiting for you**: agents' requests to read, to run a routine or to
+  extend an open grant, and their proposed writes, each naming the agent,
+  the chats, the time and the agent's reason. Adjust a request's chats,
+  time or horizon before you approve it with your passkey, or deny it.
+  Chats start unticked unless the request matched a single contact.
+- **Open now**: grants that are open, with the time left, `+30m`
+  (passkey) and `Close`.
+- **Routines**, with `Pause`; `Resume` signs the same routine again.
+- **Today**: who read what and when, and what was proposed, approved or
+  closed.
+
+Closing, pausing, denying and `Stop all`, which closes every grant and
+denies every waiting request, need no passkey and take effect within 15
+seconds. Agents lists each agent with when it was last seen and its grants;
+grants you make yourself start there.
 
 An agent without a grant gets a 403 that tells it to run `mandate request`.
-The request shows in the inbox and on the Access page, with the terms that
-matched no chat. Check the chats to allow, shorten the time or horizon, then
-approve it with your passkey, or deny it. Undecided requests expire after an
-hour, and an agent may have 3 waiting at a time. With `notify.ntfy.url` (and
-`notify.ntfy.tokenFile` for a protected topic) set, the console posts to
-that ntfy topic whenever a write or a request waits for you.
+Undecided requests expire after an hour, and an agent may have 3 waiting at
+a time. With `notify.ntfy.url` (and `notify.ntfy.tokenFile` for a protected
+topic) set, the console posts to that ntfy topic whenever a write or a
+request waits for you, titled with the agent's name; requests to read come
+with high priority.
 
 ## Approving
 
-Writes wait in the console's inbox. Approving with a passkey unlocks the tab
-for 10 minutes, so further approvals need no touch; lock or close the tab to
-end it sooner. Agents and grants always take a touch. To add a passkey,
+Writes wait on Now; `Review` opens one. Approving with a passkey unlocks the
+tab for 10 minutes, so further approvals need no touch; lock or close the
+tab to end it sooner. Agents and grants always take a touch. To add a passkey,
 register it under Keys and approve the addition with a trusted one; removing
 one needs a trusted one too. Once a passkey is trusted, the admin password no
 longer signs in. Lost them all? `sudo mandate-reset-keys` lets the admin

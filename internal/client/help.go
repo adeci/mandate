@@ -30,7 +30,7 @@ anything that writes is a proposal the owner approves first.
 usage:
   mandate <connector> <command> [args]
   mandate access
-  `+requestUsage+`
+  `+requestUsages+`
   mandate status ID [--wait DUR]
 
 `)
@@ -60,11 +60,13 @@ After proposing, tell the owner it is waiting, then run mandate status ID --wait
 Reading a connector needs an open grant: mandate access lists yours. So does
 proposing a write, which may only target or answer chats and messages the
 grant lets you read. Without one, commands answer "no read access" (or
-"unknown chat" for a chat outside it). If the task needs it, ask once with
-mandate request: the fewest chats (--chat matches chat names), the shortest
---for, a --since that covers only what the task needs, and a --reason the
-owner can judge. Recurring work runs in windows the owner schedules; don't
-request in a loop.
+"unknown chat" for a chat outside it); writes still work for a day after a
+window closes. If the task needs it, ask once with mandate request: every
+chat the task needs in that one request and no more (--chat matches chat
+names), the shortest --for, a --since that covers only what the task needs,
+and a --reason the owner can judge. Tell the owner to approve on their phone.
+Extend a window with --extend rather than asking again; for recurring work,
+request a routine with --every and --at. Don't request in a loop.
 
 exit codes:
   0   done, or access granted

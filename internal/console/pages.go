@@ -10,7 +10,6 @@ import (
 	"html/template"
 	"io/fs"
 	"iter"
-	"maps"
 	"net/http"
 	"strconv"
 	"strings"
@@ -31,6 +30,9 @@ var staticFS embed.FS
 
 var templates = template.Must(template.New("").Funcs(template.FuncMap{
 	"when":    func(t time.Time) string { return t.Local().Format(stamp) },
+	"clock":   func(t time.Time) string { return t.Local().Format("15:04") },
+	"iso":     func(t time.Time) string { return t.UTC().Format(time.RFC3339) },
+	"shortID": shortID,
 	"visible": visible,
 	"tone":    tone,
 }).Parse(pagesHTML))
@@ -55,7 +57,10 @@ func (s *Server) Handler() http.Handler {
 		files.ServeHTTP(w, r)
 	}))
 
-	mux.HandleFunc("GET /{$}", s.page(s.inboxPage))
+	mux.HandleFunc("GET /{$}", s.page(s.nowPage))
+	mux.HandleFunc("GET /now.json", s.api(s.nowJSON))
+	mux.HandleFunc("GET /agents", s.page(s.agentsPage))
+	mux.HandleFunc("GET /agents.json", s.api(s.agentsJSON))
 	mux.HandleFunc("GET /r/{id}", s.page(s.requestPage))
 	mux.HandleFunc("POST /r/{id}/challenge", s.api(s.challenge))
 	mux.HandleFunc("POST /r/{id}/approve", s.api(s.approve))
@@ -66,14 +71,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /connections/{name}/setup", s.api(s.setup))
 	mux.HandleFunc("POST /connections/{name}/unlink", s.api(s.unlink))
 	mux.HandleFunc("GET /keys", s.page(s.keysPage))
-	mux.HandleFunc("GET /access", s.page(s.accessPage))
+	mux.HandleFunc("GET /access", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	})
 	mux.HandleFunc("GET /access/chats", s.api(s.searchChats))
 	mux.HandleFunc("GET /access/chats/tree", s.api(s.chatTreeHandler))
 	mux.HandleFunc("POST /access/challenge", s.api(s.accessChallenge))
 	mux.HandleFunc("POST /access/approve", s.api(s.accessApprove))
 	mux.HandleFunc("POST /access/agents/{id}/delete", s.api(s.deleteAgent))
-	mux.HandleFunc("POST /access/grants/{id}/revoke", s.api(s.revokeGrant))
+	mux.HandleFunc("POST /access/grants/{id}/close", s.api(s.closeGrant))
 	mux.HandleFunc("POST /access/requests/{id}/deny", s.api(s.denyAccess))
+	mux.HandleFunc("POST /access/stop-all", s.api(s.stopAll))
 	mux.HandleFunc("POST /keys/options", s.api(s.registerOptions))
 	mux.HandleFunc("POST /keys", s.api(s.addKey))
 	mux.HandleFunc("POST /keys/remove", s.api(s.removeKey))
@@ -111,11 +119,13 @@ func securityHeaders(h http.Handler) http.Handler {
 
 // page is what the layout needs besides the page's own data.
 type page struct {
-	Title   string
-	Nav     string
-	Pending int
-	// Requests counts access requests waiting.
-	Requests int
+	Title string
+	Nav   string
+	// Waiting counts what waits for the owner, Agents the agents and
+	// KeyChanges the key changes waiting for a trusted key.
+	Waiting    int
+	Agents     int
+	KeyChanges int
 	// Attention counts connectors that need a look, in the worst one's tone.
 	Attention     int
 	AttentionTone string
@@ -146,19 +156,29 @@ func (s *Server) renderString(name string, data any) (string, error) {
 
 func (s *Server) owner(w http.ResponseWriter, r *http.Request, sess session, name, title, nav string, data any) {
 	ctx := r.Context()
-	n, err := s.db.pendingCount(ctx)
+	now := s.now()
+	p := page{Title: title, Nav: nav, Who: sess.who(), Passkey: sess.key.CredentialID != "", Version: sess.version, Data: data}
+	proposals, err := s.db.pendingCount(ctx)
 	if err != nil {
 		s.cfg.Log.Error("count pending", "err", err)
 	}
-	requests, err := s.db.pendingAccessCount(ctx, s.now())
+	requests, err := s.db.pendingAccessCount(ctx, now)
 	if err != nil {
 		s.cfg.Log.Error("count access requests", "err", err)
 	}
-	_, attention, worst := s.health()
-	s.render(w, http.StatusOK, name, page{
-		Title: title, Nav: nav, Pending: n + requests, Requests: requests, Attention: attention, AttentionTone: worst,
-		Who: sess.who(), Passkey: sess.key.CredentialID != "", Version: sess.version, Data: data,
-	})
+	p.Waiting = proposals + requests
+	if agents, err := s.db.agents(ctx); err == nil {
+		p.Agents = len(agents)
+	} else {
+		s.cfg.Log.Error("count agents", "err", err)
+	}
+	if changes, err := s.db.keyChanges(ctx, now); err == nil {
+		p.KeyChanges = len(changes)
+	} else {
+		s.cfg.Log.Error("count key changes", "err", err)
+	}
+	_, p.Attention, p.AttentionTone = s.health()
+	s.render(w, http.StatusOK, name, p)
 }
 
 // version changes whenever something a page shows may have, so open pages
@@ -192,143 +212,7 @@ func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
 	s.render(w, http.StatusOK, "login", page{Title: "Sign in", Data: loginView{Passkeys: len(s.keys.Trusted()) > 0, Next: next}})
 }
 
-type listItem struct {
-	Href, Action string
-	Who, What    template.HTML
-	Status       proposal.Status
-	When         string
-}
-
-// item is a request as one row: the first field not tied to a param (e.g.
-// the recipient) and the first that is (e.g. the start of the message).
-func (s *Server) item(pr row) listItem {
-	var who, what string
-	for _, f := range pr.Display {
-		switch {
-		case f.Param == "" && who == "":
-			who = f.Value
-		case f.Param != "" && what == "":
-			what = f.Value
-		}
-	}
-	it := listItem{
-		Href: "/r/" + pr.ID, Action: pr.Connector + " " + pr.Op, Status: pr.Status,
-		Who: visible(oneLine(who, 40)), What: visible(oneLine(what, 80)),
-	}
-	if pr.Status == proposal.Pending {
-		it.When = left(pr.ExpiresAt.Sub(s.now()))
-	} else {
-		it.When = pr.DecidedAt.Local().Format(stamp)
-	}
-	return it
-}
-
-func oneLine(s string, n int) string {
-	s = strings.Join(strings.Fields(s), " ")
-	if utf8.RuneCountInString(s) > n {
-		s = string([]rune(s)[:n]) + "…"
-	}
-	return s
-}
-
-const (
-	stamp    = "2006-01-02 15:04"
-	pageSize = 25
-)
-
-type inboxView struct {
-	Waiting, Done []listItem
-	// The search form as submitted.
-	Q, Connector, Status, From, To string
-	Connectors                     []string
-	Statuses                       []proposal.Status
-	First, Last, Total             int
-	Newer, Older                   string
-}
-
-var decidedStatuses = []proposal.Status{proposal.Done, proposal.Rejected, proposal.Expired, proposal.Failed, proposal.Unknown}
-
-// inboxPage lists every waiting request, then one page of decided ones
-// matching the search form.
-func (s *Server) inboxPage(w http.ResponseWriter, r *http.Request, sess session) {
-	ctx := r.Context()
-	fail := func(err error) {
-		s.cfg.Log.Error("load inbox", "err", err)
-		s.errorPage(w, http.StatusInternalServerError, "Couldn't load the inbox.")
-	}
-	if err := s.db.expireDue(ctx, s.now()); err != nil {
-		s.cfg.Log.Error("expire proposals", "err", err)
-	}
-	form := r.URL.Query()
-	v := inboxView{
-		Q: form.Get("q"), Connector: form.Get("connector"), Status: form.Get("status"),
-		From: form.Get("from"), To: form.Get("to"), Statuses: decidedStatuses,
-	}
-	q := search{Text: strings.TrimSpace(v.Q), Connector: v.Connector, Status: v.Status}
-	if t, err := time.ParseInLocation(time.DateOnly, v.From, time.Local); err == nil {
-		q.From = t
-	}
-	if t, err := time.ParseInLocation(time.DateOnly, v.To, time.Local); err == nil {
-		q.To = t.AddDate(0, 0, 1)
-	}
-	n, _ := strconv.Atoi(form.Get("page"))
-	n = max(n, 1)
-
-	waiting, err := s.db.pending(ctx)
-	if err != nil {
-		fail(err)
-		return
-	}
-	done, total, err := s.db.decided(ctx, q, pageSize, (n-1)*pageSize)
-	if err != nil {
-		fail(err)
-		return
-	}
-	if v.Connectors, err = s.db.decidedConnectors(ctx); err != nil {
-		fail(err)
-		return
-	}
-	requests, err := s.db.pendingAccessRequests(ctx, s.now())
-	if err != nil {
-		fail(err)
-		return
-	}
-	for _, ar := range requests {
-		v.Waiting = append(v.Waiting, listItem{
-			Href: "/access#request-" + ar.ID, Action: oneLine(ar.AgentName, 40) + " asks to read " + ar.Connector,
-			Status: proposal.Pending, What: visible(oneLine(ar.Reason, 80)), When: left(ar.ExpiresAt.Sub(s.now())),
-		})
-	}
-	for _, pr := range waiting {
-		v.Waiting = append(v.Waiting, s.item(pr))
-	}
-	for _, pr := range done {
-		v.Done = append(v.Done, s.item(pr))
-	}
-	v.Total = total
-	if len(done) > 0 {
-		v.First = (n-1)*pageSize + 1
-		v.Last = v.First + len(done) - 1
-	}
-	link := func(p int) string {
-		u := maps.Clone(form)
-		u.Set("page", strconv.Itoa(p))
-		if p == 1 {
-			u.Del("page")
-		}
-		if len(u) == 0 {
-			return "/"
-		}
-		return "/?" + u.Encode()
-	}
-	if n > 1 {
-		v.Newer = link(n - 1)
-	}
-	if v.Last > 0 && v.Last < total {
-		v.Older = link(n + 1)
-	}
-	s.owner(w, r, sess, "inbox", "Inbox", "inbox", v)
-}
+const stamp = "2006-01-02 15:04"
 
 type fieldView struct {
 	Label, Param string

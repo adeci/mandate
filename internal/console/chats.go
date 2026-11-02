@@ -6,6 +6,7 @@ import (
 	"html/template"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/adeci/mandate/connector"
 )
@@ -22,30 +23,30 @@ const (
 	treeNodes = 50
 )
 
-// chatNode is a chat as the owner picks it: labelled with its stored name
-// and ID, and with its current descendants, each picked on its own.
+// chatNode is a chat as the owner picks it, with its stored name ("~"
+// included) and its current descendants, each picked on its own.
 type chatNode struct {
-	ID string `json:"id"`
-	// Label is the stored name, "~" included, and the ID, escaped with
-	// hidden characters marked.
-	Label    template.HTML `json:"label"`
-	Kind     string        `json:"kind,omitempty"`
-	Active   string        `json:"active,omitempty"`
-	Children []chatNode    `json:"children,omitempty"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Label is Name escaped with hidden characters marked, for pages.
+	Label        template.HTML `json:"label"`
+	Kind         string        `json:"kind,omitempty"`
+	LastActivity time.Time     `json:"last_activity,omitzero"`
+	Children     []chatNode    `json:"children,omitempty"`
 	// More counts the chats under it left out, past treeNodes.
 	More int `json:"more,omitempty"`
+	// Ticked starts ticked on an approval card.
+	Ticked bool `json:"ticked,omitempty"`
 }
 
+// chatLabel is a chat's name and ID for the passkey summary, escaped with
+// hidden characters marked.
 func chatLabel(name, id string) template.HTML {
 	return visible(cmpOr(name, id)) + " (" + visible(id) + ")"
 }
 
 func chatNodeOf(c connector.Container) chatNode {
-	n := chatNode{ID: c.ID, Label: chatLabel(c.Name, c.ID), Kind: c.Kind}
-	if !c.LastActivity.IsZero() {
-		n.Active = c.LastActivity.Local().Format(stamp)
-	}
-	return n
+	return chatNode{ID: c.ID, Name: c.Name, Label: visible(cmpOr(c.Name, c.ID)), Kind: c.Kind, LastActivity: c.LastActivity}
 }
 
 func (s *Server) conn(name string) (*conn, error) {
@@ -125,7 +126,7 @@ func (s *Server) children(ctx context.Context, name, parent string, depth int, b
 // chatTree is chat id with the chats under it, at most budget of them;
 // known is its name if the connector no longer has it.
 func (s *Server) chatTree(ctx context.Context, name, id, known string, budget *int) (chatNode, error) {
-	n := chatNode{ID: id, Label: chatLabel(known, id)}
+	n := chatNode{ID: id, Name: known, Label: visible(cmpOr(known, id))}
 	if c, ok := s.chat(ctx, name, id); ok {
 		n = chatNodeOf(c)
 	}
@@ -146,21 +147,6 @@ func (s *Server) requestTree(ctx context.Context, ar accessRequest) ([]chatNode,
 		}
 	}
 	return out, nil
-}
-
-// chatLabels labels ids, preferring known names and asking the connector
-// for the rest.
-func (s *Server) chatLabels(ctx context.Context, name string, ids []string, known map[string]string) template.HTML {
-	labels := make([]string, len(ids))
-	for i, id := range ids {
-		n, ok := known[id]
-		if !ok {
-			c, _ := s.chat(ctx, name, id)
-			n = c.Name
-		}
-		labels[i] = string(chatLabel(n, id))
-	}
-	return template.HTML(strings.Join(labels, ", "))
 }
 
 type chatsResponse struct {

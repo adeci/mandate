@@ -26,7 +26,7 @@ import (
 
 const usage = "usage: mandate console --hostname HOST --tls-cert FILE --tls-key FILE --state DIR " +
 	"--socket PATH --admin-password-hash-file FILE [--listen ADDR] [--connector NAME=SOCKET ...] " +
-	"[--ntfy-url URL [--ntfy-token-file FILE]]"
+	"[--ntfy-url URL [--ntfy-token-file FILE]] [--gateway-url URL]"
 
 type connectorFlags map[string]string
 
@@ -57,6 +57,7 @@ func Command(ctx context.Context, args []string) error {
 	flags.Var(conns, "connector", "NAME=SOCKET of a connector; repeatable")
 	ntfyURL := flags.String("ntfy-url", "", "ntfy topic URL to notify when something waits for the owner")
 	ntfyTokenFile := flags.String("ntfy-token-file", "", "file holding the ntfy access token")
+	gatewayURL := flags.String("gateway-url", "", "where agents reach the gateway, shown when setting one up")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -101,6 +102,7 @@ func Command(ctx context.Context, args []string) error {
 		Connectors:   conns,
 		NtfyURL:      *ntfyURL,
 		NtfyToken:    ntfyToken,
+		GatewayURL:   *gatewayURL,
 		StateDir:     *stateDir,
 		Log:          log,
 	})

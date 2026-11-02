@@ -86,6 +86,6 @@ func (h *handler) forward(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 	w.Write(data)
 	if resp.StatusCode < 400 {
-		h.report(r.Context(), name, "get", "", sc.grants, 1)
+		h.report(r.Context(), name, "get", "", "", sc.grants, 1)
 	}
 }

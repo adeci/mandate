@@ -48,6 +48,7 @@ func (h *handler) media(w http.ResponseWriter, r *http.Request, name string, sc 
 		return
 	}
 	m, err := s.mediaMessage(chat, seq, index)
+	chatName := s.chatName(chat)
 	s.close()
 	if err != nil {
 		logFor(r.Context()).Error("media lookup", "source", name, "err", err)
@@ -108,7 +109,7 @@ func (h *handler) media(w http.ResponseWriter, r *http.Request, name string, sc 
 		return
 	}
 	log.Info("media", attrs...)
-	h.report(r.Context(), name, "media", chat, sc.grants, 1)
+	h.report(r.Context(), name, "media", chat, chatName, sc.grants, 1)
 }
 
 func tooLarge(size, limit int64) string {

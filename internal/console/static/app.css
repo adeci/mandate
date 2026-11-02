@@ -320,3 +320,27 @@ legend { padding: 0; font-weight: var(--w-medium); color: var(--fg-strong); }
   table.stack td { border: 0; padding-block: 0; }
   table.stack td.width-min { width: auto; }
 }
+
+/* Names, messages and reasons are other people's words: a proportional
+   face in their own case. Meta (kinds, IDs, times) stays mono. */
+:root { --content: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif; }
+.content { font-family: var(--content); text-transform: none; }
+.meta { font-size: .875em; color: var(--fg-alt); overflow-wrap: anywhere; }
+button, .button, .compact, select { min-height: 44px; }
+input[type=checkbox], input[type=radio] { min-width: 22px; min-height: 22px; }
+.tree label, .checks label { min-height: 44px; }
+button, .button { white-space: normal; text-align: center; }
+
+.card .who { margin-bottom: calc(var(--lh) / 2); }
+.card .target { margin-bottom: 0; font-weight: var(--w-medium); }
+.card .chats { list-style: none; padding: 0; }
+.card .chats li { margin-bottom: calc(var(--lh) / 2); }
+.card .chat-name { display: block; font-size: 1.375em; line-height: 1.3; color: var(--fg-strong); }
+.card .window { color: var(--fg-strong); }
+.reason em { font-style: italic; }
+.adjust { border-top: var(--bw) dashed var(--line); padding-top: var(--lh); margin-bottom: var(--lh); }
+.page-heading form { margin: 0; }
+.timeline { list-style: none; padding: 0; }
+.timeline li { padding: calc(var(--lh) / 4) 0; border-bottom: var(--bw) solid var(--line); overflow-wrap: anywhere; }
+.grantline summary { min-height: 44px; display: flex; align-items: center; flex-wrap: wrap; gap: 0 1ch; }
+input.copy { flex: 1; min-width: 0; }

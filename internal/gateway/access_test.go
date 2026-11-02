@@ -59,9 +59,10 @@ func testHandler(cfg Config) *handler {
 func TestNoGrantRefusesReadsAndWrites(t *testing.T) {
 	t.Parallel()
 	r, f := forwardRig(t, func(http.ResponseWriter) {})
-	// An open grant elsewhere and one that ended open nothing here.
+	// An open grant elsewhere and one that ended over a day ago open nothing
+	// here, not even writes.
 	ended := oneOff("g-ended", "discord", 0)
-	ended.From, ended.Until = ended.From.Add(-2*time.Hour), ended.From.Add(-time.Hour)
+	ended.From, ended.Until = ended.From.Add(-50*time.Hour), ended.From.Add(-49*time.Hour)
 	r.h.access = testAccess(oneOff("g-wa", "whatsapp", 0), ended)
 	for _, tc := range []struct{ method, path, body string }{
 		{http.MethodGet, "/v1/discord/chats", ""},
@@ -169,7 +170,8 @@ func TestGrantScopeHorizonAndUnion(t *testing.T) {
 	for len(h.reads) > 0 {
 		ev = <-h.reads
 	}
-	if ev.AgentID != "a1" || ev.Verb != "media" || ev.Chat != "c-recent" || !slices.Equal(ev.Grants, []string{"g-week"}) || ev.Count != 1 {
+	if ev.AgentID != "a1" || ev.Verb != "media" || ev.Chat != "c-recent" || ev.ChatName != "Recent" ||
+		!slices.Equal(ev.Grants, []string{"g-week"}) || ev.Count != 1 {
 		t.Errorf("last read event = %+v", ev)
 	}
 
@@ -520,10 +522,10 @@ func TestDroppedReadsRideOnTheNextEvent(t *testing.T) {
 	h := newRig(t, nil).h
 	ctx := withAgent(t.Context(), h.access.agents()[0])
 	for range readQueue + 2 {
-		h.report(ctx, "discord", "chats", "", nil, 1)
+		h.report(ctx, "discord", "chats", "", "", nil, 1)
 	}
 	<-h.reads
-	h.report(ctx, "discord", "chats", "", nil, 1)
+	h.report(ctx, "discord", "chats", "", "", nil, 1)
 	var last proposal.ReadEvent
 	for len(h.reads) > 0 {
 		last = <-h.reads
@@ -531,7 +533,7 @@ func TestDroppedReadsRideOnTheNextEvent(t *testing.T) {
 	if last.Dropped != 2 {
 		t.Errorf("last event dropped = %d, want the 2 reads before it", last.Dropped)
 	}
-	h.report(ctx, "discord", "chats", "", nil, 1)
+	h.report(ctx, "discord", "chats", "", "", nil, 1)
 	if ev := <-h.reads; ev.Dropped != 0 {
 		t.Errorf("dropped counted twice: %d", ev.Dropped)
 	}
@@ -662,7 +664,7 @@ func TestFailedReadEventsCountAsDropped(t *testing.T) {
 	h.dropMu.Lock()
 	h.dropped["a1"] = 2
 	h.dropMu.Unlock()
-	h.report(withAgent(t.Context(), h.access.agents()[0]), "discord", "chats", "", nil, 1)
+	h.report(withAgent(t.Context(), h.access.agents()[0]), "discord", "chats", "", "", nil, 1)
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
 		h.dropMu.Lock()
 		n := h.dropped["a1"]
@@ -672,4 +674,106 @@ func TestFailedReadEventsCountAsDropped(t *testing.T) {
 		}
 	}
 	t.Error("a read event the console refused was not counted as dropped with what it carried")
+}
+
+// Writes may answer what the agent read for a day after its window closed,
+// as it was then; a grant ended longer ago, or revoked, no longer counts.
+func TestWritesAfterTheWindow(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, nil)
+	ended := func(id string, ago time.Duration, chats ...string) approval.Grant {
+		g := oneOff(id, "discord", 0, chats...)
+		g.From, g.Until = time.Now().Add(-ago-time.Hour), time.Now().Add(-ago)
+		return g
+	}
+	send := func(chat string) int {
+		return call(r.h, http.MethodPost, "/v1/discord/send", `{"args":{"chat":"`+chat+`","text":"hi"}}`).Code
+	}
+	r.h.access = testAccess(ended("g-memes", 2*time.Hour, "c-memes"), ended("g-cats", 25*time.Hour, "t-cats"))
+	if code := send("c-memes"); code != http.StatusAccepted {
+		t.Errorf("send to a chat whose grant ended 2h ago: %d, want 202", code)
+	}
+	if code := send("t-cats"); code != http.StatusNotFound {
+		t.Errorf("send to a chat whose grant ended 25h ago: %d, want 404", code)
+	}
+	if code, _, _ := getTable(t, r.h, "/v1/discord/messages?chat=c-memes"); code != http.StatusForbidden {
+		t.Errorf("read after the window: %d, want 403", code)
+	}
+	// Revoking drops the grant from the snapshot.
+	r.h.access = testAccess(ended("g-cats", 25*time.Hour, "t-cats"), oneOff("g-other", "discord", 0, "t-cats"))
+	if code := send("c-memes"); code != http.StatusNotFound {
+		t.Errorf("send after the grant was revoked: %d, want 404", code)
+	}
+}
+
+func TestLastEnd(t *testing.T) {
+	t.Parallel()
+	now := time.Now().UTC().Truncate(time.Minute)
+	daily := approval.Grant{ID: "g", Agent: "a1", Connector: "c", Schedule: &approval.Schedule{
+		Start: now.Add(-3 * time.Hour).Format("15:04"), Length: time.Hour, Zone: "UTC",
+	}}
+	if end, ok := lastEnd(daily, now); !ok || !end.Equal(now.Add(-2*time.Hour)) {
+		t.Errorf("daily routine that ran until 2h ago: %v %v", end, ok)
+	}
+	open := oneOff("g", "c", 0)
+	if end, ok := lastEnd(open, now); !ok || !end.Equal(open.Until) {
+		t.Errorf("open grant: %v %v, want its end", end, ok)
+	}
+	future := open
+	future.From, future.Until = now.Add(time.Hour), now.Add(2*time.Hour)
+	if _, ok := lastEnd(future, now); ok {
+		t.Error("a grant not yet open counts for writes")
+	}
+}
+
+func TestSeenReportedOncePerMinute(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, nil)
+	for range 3 {
+		call(r.h, http.MethodGet, "/v1/access", "")
+	}
+	for deadline := time.Now().Add(5 * time.Second); r.console.seen.Load() == 0 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := r.console.seen.Load(); n != 1 {
+		t.Errorf("console told %d times the agent was seen, want once", n)
+	}
+}
+
+func TestRoutineAndExtendRequests(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, nil)
+	r.h.access = testAccess()
+	ns := func(d time.Duration) string { return strconv.FormatInt(int64(d), 10) }
+	for _, body := range []string{
+		`{"connector":"discord","chats":["mem"],"schedule":{"days":[5,1,1],"start":"07:00","length":` + ns(20*time.Minute) + `},"reason":"standup notes"}`,
+		`{"connector":"discord","extend":true,"reason":"still summarizing"}`,
+	} {
+		if rec := call(r.h, http.MethodPost, "/v1/access/requests", body); rec.Code != http.StatusAccepted {
+			t.Fatalf("%s: %d %s", body, rec.Code, rec.Body)
+		}
+	}
+	r.console.mu.Lock()
+	got := slices.Clone(r.console.requests)
+	r.console.mu.Unlock()
+	if s := got[0].Schedule; s == nil || !slices.Equal(s.Days, []time.Weekday{time.Monday, time.Friday}) ||
+		s.Start != "07:00" || s.Length != 20*time.Minute || got[0].For != 0 || len(got[0].Chats) == 0 {
+		t.Errorf("routine forwarded as %+v (schedule %+v)", got[0], got[0].Schedule)
+	}
+	if e := got[1]; !e.Extend || e.For != defaultFor || e.Horizon != 0 || e.Schedule != nil || len(e.Terms) != 0 {
+		t.Errorf("extend forwarded as %+v", e)
+	}
+
+	for _, body := range []string{
+		`{"connector":"discord","schedule":{"start":"7am","length":` + ns(time.Hour) + `},"reason":"x"}`,
+		`{"connector":"discord","schedule":{"start":"07:00","length":` + ns(25*time.Hour) + `},"reason":"x"}`,
+		`{"connector":"discord","schedule":{"days":[7],"start":"07:00","length":` + ns(time.Hour) + `},"reason":"x"}`,
+		`{"connector":"discord","schedule":{"start":"07:00","length":` + ns(time.Hour) + `},"for":` + ns(time.Hour) + `,"reason":"x"}`,
+		`{"connector":"discord","extend":true,"chats":["mem"],"reason":"x"}`,
+	} {
+		if rec := call(r.h, http.MethodPost, "/v1/access/requests", body); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: %d %s, want 400", body, rec.Code, rec.Body)
+		}
+	}
 }

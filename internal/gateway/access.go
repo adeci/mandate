@@ -322,17 +322,6 @@ func (a *access) save() error {
 	return approval.WriteAtomic(a.path, b)
 }
 
-// open lists the agent's grants on connector that are open at now.
-func (ag *agent) open(connector string, now time.Time) []approval.Grant {
-	var out []approval.Grant
-	for _, g := range ag.grants {
-		if open, _ := g.Open(now); open && g.Connector == connector {
-			out = append(out, g)
-		}
-	}
-	return out
-}
-
 // window is an agent's access to a connector now: whether it is open and
 // until when, or else when it next opens.
 type window struct {
@@ -377,11 +366,11 @@ type rule struct {
 // everything is the scope of writes, which grants do not limit.
 const everything = `[{"cutoff":""}]`
 
-func scope(grants []approval.Grant, now time.Time) (string, error) {
+func scope(grants []approval.Grant, at []time.Time) (string, error) {
 	rules := make([]rule, len(grants))
 	for i, g := range grants {
 		rules[i].Chats = g.Chats
-		if c := g.Cutoff(now); !c.IsZero() {
+		if c := g.Cutoff(at[i]); !c.IsZero() {
 			rules[i].Cutoff = c.UTC().Format(sentAtFormat)
 		}
 	}
@@ -431,13 +420,15 @@ func (h *handler) reportReads(ctx context.Context) {
 	}
 }
 
-func (h *handler) report(ctx context.Context, name, verb, chat string, grants []approval.Grant, count int) {
+func (h *handler) report(ctx context.Context, name, verb, chat, chatName string, grants []approval.Grant, count int) {
 	ag := agentOf(ctx)
 	ids := make([]string, len(grants))
 	for i, g := range grants {
 		ids[i] = g.ID
 	}
-	ev := proposal.ReadEvent{AgentID: ag.ID, Connector: name, Verb: verb, Chat: chat, Grants: ids, Count: count, At: time.Now()}
+	ev := proposal.ReadEvent{
+		AgentID: ag.ID, Connector: name, Verb: verb, Chat: chat, ChatName: chatName, Grants: ids, Count: count, At: time.Now(),
+	}
 	// What was dropped rides on the agent's next event, so a flood of cheap
 	// reads cannot hide the others without a trace.
 	h.dropMu.Lock()
@@ -450,4 +441,28 @@ func (h *handler) report(ctx context.Context, name, verb, chat string, grants []
 		h.dropped[ag.ID]++
 		logFor(ctx).Warn("read log full; dropped", "connector", name, "verb", verb)
 	}
+}
+
+const seenEvery = time.Minute
+
+// markSeen tells the console the agent is using the gateway, at most once
+// per seenEvery, without holding up the request.
+func (h *handler) markSeen(id string) {
+	now := time.Now()
+	h.seenMu.Lock()
+	due := now.Sub(h.seen[id]) >= seenEvery
+	if due {
+		h.seen[id] = now
+	}
+	h.seenMu.Unlock()
+	if !due {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+		defer cancel()
+		if err := h.console.Seen(ctx, proposal.Seen{AgentID: id, At: now}); err != nil {
+			slog.Warn("report seen", "agent_id", id, "err", err)
+		}
+	}()
 }

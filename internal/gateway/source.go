@@ -296,6 +296,19 @@ func (s *source) names(ids []string) (map[string]string, error) {
 	return out, nil
 }
 
+// chatName is chat's name as the agent sees it, "" when hidden, unnamed or
+// unknown. It only labels the read log, so a failed lookup is no error.
+func (s *source) chatName(chat string) string {
+	if chat == "" {
+		return ""
+	}
+	names, err := s.names([]string{chat})
+	if err != nil {
+		s.log.Warn("chat name", "err", err)
+	}
+	return names[chat]
+}
+
 // page trims the extra row queried past limit; seqCol is the seq column or -1.
 func page(t *table, rows [][]any, limit int64, seqCol int) *table {
 	if int64(len(rows)) > limit {

@@ -324,7 +324,7 @@ func (h *handler) verb(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Info("verb", append(attrs, "rows", len(t.Rows))...)
 	connector.WriteJSON(w, http.StatusOK, t)
-	h.report(r.Context(), name, verb, chat, sc.grants, len(t.Rows))
+	h.report(r.Context(), name, verb, chat, s.chatName(chat), sc.grants, len(t.Rows))
 }
 
 func (h *handler) source(ctx context.Context, w http.ResponseWriter, name, scope string) (*source, bool) {
@@ -415,8 +415,12 @@ func (h *handler) op(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Writes need a grant too: what a write may target or answer is what the
-	// agent may read.
-	sc, ok := h.readable(w, r, name)
+	// agent may read, or could while its window was open.
+	scoped := h.readable
+	if op.Kind == connector.Write {
+		scoped = h.writable
+	}
+	sc, ok := scoped(w, r, name)
 	if !ok {
 		return
 	}
@@ -487,7 +491,7 @@ func (h *handler) read(w http.ResponseWriter, r *http.Request, name string, op c
 	if len(ids) > 0 {
 		chat = ids[0]
 	}
-	h.report(r.Context(), name, op.Name, chat, sc.grants, len(t.Rows))
+	h.report(r.Context(), name, op.Name, chat, s.chatName(chat), sc.grants, len(t.Rows))
 }
 
 // agentProposal is what agents see of a proposal. The display and note

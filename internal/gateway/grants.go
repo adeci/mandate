@@ -3,6 +3,7 @@ package gateway
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -40,22 +41,76 @@ type noAccess struct {
 // readable answers the agent's open grants on name in the current snapshot,
 // or refuses with how to ask for one.
 func (h *handler) readable(w http.ResponseWriter, r *http.Request, name string) (readScope, bool) {
-	return h.scoped(w, r, name, func(approval.Grant) bool { return true }, "")
+	return h.scoped(w, r, name, openAt, "")
 }
 
 // forwardable is readable for raw reads, which neither chats nor a horizon
 // can limit, so only a grant on every chat with whole history opens them.
 func (h *handler) forwardable(w http.ResponseWriter, r *http.Request, name string) (readScope, bool) {
-	return h.scoped(w, r, name, func(g approval.Grant) bool { return len(g.Chats) == 0 && g.Horizon == 0 },
-		"; raw reads need a grant on every chat with whole history")
+	return h.scoped(w, r, name, func(g approval.Grant, now time.Time) (time.Time, bool) {
+		at, ok := openAt(g, now)
+		return at, ok && len(g.Chats) == 0 && g.Horizon == 0
+	}, "; raw reads need a grant on every chat with whole history")
 }
 
-func (h *handler) scoped(w http.ResponseWriter, r *http.Request, name string, usable func(approval.Grant) bool, why string) (readScope, bool) {
+// writable is the scope writes go by: grants open now, or whose last window
+// closed within writeGrace, so an agent can answer what it read once its
+// window is over. Each grant shows what it showed when it closed.
+func (h *handler) writable(w http.ResponseWriter, r *http.Request, name string) (readScope, bool) {
+	return h.scoped(w, r, name, func(g approval.Grant, now time.Time) (time.Time, bool) {
+		end, ok := lastEnd(g, now)
+		if end.After(now) {
+			end = now
+		}
+		return end, ok
+	}, "")
+}
+
+// writeGrace is how long after a grant's window closes the agent may still
+// propose writes within it.
+const writeGrace = 24 * time.Hour
+
+// openAt applies g when it is open now, with its cutoff taken now.
+func openAt(g approval.Grant, now time.Time) (time.Time, bool) {
+	open, _ := g.Open(now)
+	return now, open
+}
+
+// lastEnd is when the latest window of g that was open within writeGrace
+// before now closes, which is after now while it is still open.
+func lastEnd(g approval.Grant, now time.Time) (time.Time, bool) {
+	var end time.Time
+	// A grant has at most one window a day, so a few steps cover the span.
+	for t, i := now.Add(-writeGrace), 0; i < 8; i++ {
+		open, at := g.Open(t)
+		switch {
+		case open:
+			end, t = at, at
+			if !at.Before(now) {
+				return end, true
+			}
+		case at.IsZero() || at.After(now):
+			return end, !end.IsZero()
+		default:
+			t = at
+		}
+	}
+	return end, !end.IsZero()
+}
+
+// scoped answers the agent's grants on name that pick applies, each with
+// the time its cutoff is taken at, or refuses with how to ask for one.
+func (h *handler) scoped(w http.ResponseWriter, r *http.Request, name string, pick func(approval.Grant, time.Time) (time.Time, bool), why string) (readScope, bool) {
 	now := time.Now()
 	ag := h.access.byID(agentOf(r.Context()).ID)
 	var grants []approval.Grant
+	var at []time.Time
 	if ag != nil {
-		grants = slices.DeleteFunc(ag.open(name, now), func(g approval.Grant) bool { return !usable(g) })
+		for _, g := range ag.grants {
+			if t, ok := pick(g, now); ok && g.Connector == name {
+				grants, at = append(grants, g), append(at, t)
+			}
+		}
 	}
 	if len(grants) == 0 {
 		cmd := fmt.Sprintf("mandate request %s --reason WHY", name)
@@ -70,7 +125,7 @@ func (h *handler) scoped(w http.ResponseWriter, r *http.Request, name string, us
 		connector.WriteJSON(w, http.StatusForbidden, noAccess{Error: msg, Request: cmd})
 		return readScope{}, false
 	}
-	sql, err := scope(grants, now)
+	sql, err := scope(grants, at)
 	if err != nil {
 		logFor(r.Context()).Error("scope", "connector", name, "err", err)
 		writeError(w, http.StatusServiceUnavailable, "gateway unavailable; tell the owner")
@@ -165,7 +220,11 @@ type accessRequest struct {
 	Chats     []string       `json:"chats,omitempty"`
 	For       time.Duration  `json:"for,omitempty"`
 	Horizon   *time.Duration `json:"horizon,omitempty"`
-	Reason    string         `json:"reason"`
+	// Schedule asks for a routine, whose windows last Schedule.Length.
+	Schedule *proposal.RequestSchedule `json:"schedule,omitempty"`
+	// Extend asks to lengthen the agent's current window by For.
+	Extend bool   `json:"extend,omitempty"`
+	Reason string `json:"reason"`
 }
 
 // requestAccess resolves the request's chat terms and passes it to the
@@ -201,6 +260,18 @@ func (h *handler) requestAccess(w http.ResponseWriter, r *http.Request) {
 	case horizon < 0:
 		writeError(w, http.StatusBadRequest, "--since must not be negative")
 		return
+	case req.Extend && (len(req.Chats) > 0 || req.Horizon != nil || req.Schedule != nil):
+		writeError(w, http.StatusBadRequest, "--extend keeps the chats and horizon of the window it extends; leave out --chat, --since and --every")
+		return
+	case req.Schedule != nil && req.For != 0:
+		writeError(w, http.StatusBadRequest, "a routine's windows last its schedule's length; leave out for")
+		return
+	}
+	if req.Schedule != nil {
+		if err := checkSchedule(req.Schedule); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	terms, err := cleanTerms(req.Chats)
 	if err != nil {
@@ -225,8 +296,13 @@ func (h *handler) requestAccess(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("%s keeps no chats; ask without --chat", name))
 		return
 	}
-	if forward || !source {
+	if forward || !source || req.Extend {
 		horizon = 0
+	}
+	// A routine's length is in its schedule.
+	period := cmp.Or(req.For, defaultFor)
+	if req.Schedule != nil {
+		period = 0
 	}
 	// Resolving costs time that depends on what matches, so it runs only for
 	// a request the console will take.
@@ -241,7 +317,7 @@ func (h *handler) requestAccess(w http.ResponseWriter, r *http.Request) {
 	}
 	ref, err := h.console.RequestAccess(r.Context(), proposal.AccessRequest{
 		AgentID: ag.ID, AgentName: ag.Name, Connector: name, Terms: terms, Chats: chats, Unmatched: unmatched,
-		For: cmp.Or(req.For, defaultFor), Horizon: horizon, Reason: req.Reason,
+		For: period, Horizon: horizon, Schedule: req.Schedule, Extend: req.Extend, Reason: req.Reason,
 	})
 	if err != nil {
 		relay(w, r, "console", err)
@@ -249,6 +325,25 @@ func (h *handler) requestAccess(w http.ResponseWriter, r *http.Request) {
 	}
 	logFor(r.Context()).Info("access requested", "connector", name, "id", ref.ID, "chats", len(chats), "unmatched", len(unmatched))
 	connector.WriteJSON(w, http.StatusAccepted, ref)
+}
+
+// checkSchedule refuses a routine the console could not sign, with the
+// flags that set it.
+func checkSchedule(s *proposal.RequestSchedule) error {
+	if _, err := time.Parse("15:04", s.Start); err != nil {
+		return errors.New("--at must be HH:MM, e.g. 07:00")
+	}
+	if s.Length <= 0 || s.Length > 24*time.Hour {
+		return errors.New("--for of a routine must be positive and at most 24h")
+	}
+	for _, d := range s.Days {
+		if d < time.Sunday || d > time.Saturday {
+			return fmt.Errorf("--every has an unknown day %d", d)
+		}
+	}
+	slices.Sort(s.Days)
+	s.Days = slices.Compact(s.Days)
+	return nil
 }
 
 // cleanTerms trims and deduplicates chat terms, ignoring case as matching

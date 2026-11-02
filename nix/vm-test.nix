@@ -40,6 +40,15 @@ let
       ('inv/b', 'inv', 'billing@example.com', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'new invoice', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
   '';
 
+  signalFixture = pkgs.writeText "signal.sql" ''
+    INSERT INTO containers (id, kind, name, updated_at) VALUES
+      ('sfam', 'dm', 'Mum', '2026-10-01T00:00:00.000Z'),
+      ('swork', 'group', 'Work', '2026-10-01T00:00:00.000Z');
+    INSERT INTO messages (id, container_id, sender_id, sent_at, body, ingested_at) VALUES
+      ('sfam/a', 'sfam', '+15550001', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'call me', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      ('swork/a', 'swork', '+15550002', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'standup moved', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+  '';
+
   # Logs every request to a stand-in service as a JSON line.
   recorder = pkgs.writeText "recorder.py" ''
     import http.server, json, sys
@@ -109,6 +118,7 @@ pkgs.testers.runNixOSTest {
         url = "http://127.0.0.1:9001/mandate";
         tokenFile = "/etc/mandate-ntfy-token";
       };
+      gatewayUrl = "http://machine:8780";
     };
     environment.etc."mandate-ntfy-token".text = "tk_ntfytest";
     # No ACME server answers, so the console keeps the self-signed placeholder.
@@ -276,8 +286,17 @@ pkgs.testers.runNixOSTest {
         gw_until("/v1/connectors", lambda code, _: code == 200)
         code, _ = gw("GET", "/v1/connectors", tok="f" * 64)
         assert code == 401, code
-        code, page = console("GET", "/access")
+        code, page = console("GET", "/agents")
         assert code == 200 and "Grok Bot" in page and token not in page, code
+        code, _ = console("GET", "/access")
+        assert code == 303, code
+        # The setup sheet's URL, and the gateway reporting that the agent connected.
+        code, out = console("GET", "/agents.json")
+        assert code == 200 and out["gateway_url"] == "http://machine:8780", (code, out)
+        machine.wait_until_succeeds(
+            "curl -s -b /tmp/jar --cacert /var/lib/acme/${host}/chain.pem --resolve ${host}:443:127.0.0.1 "
+            "https://${host}/agents.json | grep -q first_seen"
+        )
         machine.fail(f"grep -rq {token} /var/lib/mandate-console")
         machine.fail("curl -sf http://127.0.0.1:8780/v1/whatsapp/chats")
 
@@ -328,7 +347,7 @@ pkgs.testers.runNixOSTest {
             "cd /var/lib/mandate-fastmail && sudo -u mandate-fastmail sh -c "
             "'umask 0027 && sqlite3 data.db < ${../store/schema.sql} && sqlite3 data.db < ${fastmailFixture}'"
         )
-        grant({"connector": "fastmail", "chats": ["inv"], "for": "30m", "horizon": "24h"})
+        mail = grant({"connector": "fastmail", "chats": ["inv"], "for": "30m", "horizon": "24h"})
         gw_until("/v1/fastmail/chats", lambda code, _: code == 200)
         # The old email and one that doesn't exist get the same 404 before the
         # connector is asked; the new one reaches it.
@@ -347,7 +366,7 @@ pkgs.testers.runNixOSTest {
         signed = machine.succeed(
             f"sudo -u mandate-console sqlite3 /var/lib/mandate-console/console.db \"SELECT hex(signed) FROM grants WHERE id = '{scoped}'\""
         ).strip()
-        code, _ = console("POST", f"/access/grants/{scoped}/revoke")
+        code, _ = console("POST", f"/access/grants/{scoped}/close")
         assert code == 303, code
         gw_until("/v1/whatsapp/chats", lambda code, _: code == 403)
         gone = machine.succeed(
@@ -373,15 +392,14 @@ pkgs.testers.runNixOSTest {
         rid = ref["id"]
         code, st = gw("GET", f"/v1/access/requests/{rid}?wait=1")
         assert code == 200 and st["status"] == "pending", (code, st)
-        code, page = console("GET", "/access")
-        assert "plan dinner" in page and "Book club" in page and "fam@g.us" in page, code
-        assert "no visible chat matched" in page and "Nobody" in page and "hidden@s.whatsapp.net" not in page, code
         code, page = console("GET", "/")
-        assert "Grok Bot" in page, code
+        assert "Grok Bot" in page and "plan dinner" in page and "Book club" in page and "fam@g.us" in page, code
+        assert "no visible chat matched" in page and "Nobody" in page and "hidden@s.whatsapp.net" not in page, code
         machine.wait_until_succeeds("grep -q 'Grok Bot' /var/lib/ntfy/log.jsonl")
         [note] = recorded("ntfy")
         assert note["method"] == "POST" and note["path"] == "/mandate", note
-        assert note["headers"]["Title"] == "mandate" and note["headers"]["Click"].startswith("https://${host}/"), note
+        assert note["headers"]["Title"] == "Grok Bot" and note["headers"]["Priority"] == "high", note
+        assert note["headers"]["Click"].startswith("https://${host}/"), note
         assert note["headers"]["Authorization"] == "Bearer tk_ntfytest", note
         assert "Family" not in note["body"] and "Book" not in note["body"] and "plan dinner" not in note["body"], note
 
@@ -413,6 +431,55 @@ pkgs.testers.runNixOSTest {
             assert code == 303, code
             code, st = gw("GET", f"/v1/access/requests/{rid}?wait=5")
             assert st["status"] == "denied", (code, st)
+
+    with subtest("an agent asks for a routine; it opens on schedule, pauses and resumes"):
+        machine.succeed(
+            "cd /var/lib/mandate-signal && sudo -u mandate-signal sh -c "
+            "'umask 0027 && sqlite3 data.db < ${../store/schema.sql} && sqlite3 data.db < ${signalFixture}'"
+        )
+        # Every day from this minute, so the first window is open now.
+        start = machine.succeed("TZ=Europe/Berlin date +%H:%M").strip()
+        code, ref = gw("POST", "/v1/access/requests", {"connector": "signal", "chats": ["Mum"], "reason": "morning summary",
+                                                         "schedule": {"start": start, "length": 30 * 60 * 10**9}})
+        assert code == 202, (code, ref)
+        code, page = console("GET", "/")
+        assert "morning summary" in page, code
+        code, out = sign({"kind": "grant", "request": ref["id"], "zone": "Europe/Berlin", "chats": ["sfam"]})
+        assert code == 200 and out["kind"] == "grant", (code, out)
+        routine = out["id"]
+        code, st = gw("GET", f"/v1/access/requests/{ref['id']}?wait=5")
+        assert st["status"] == "granted" and st["grant_id"] == routine, (code, st)
+        _, out = gw_until("/v1/signal/chats", lambda code, _: code == 200)
+        assert rows(out) == ["sfam"], out
+        code, now = console("GET", "/now.json")
+        assert {"waiting", "open", "routines", "stopped", "today"} <= set(now) and routine in json.dumps(now["routines"]), now
+
+        code, _ = console("POST", f"/access/grants/{routine}/close")
+        assert code == 303, code
+        gw_until("/v1/signal/chats", lambda code, _: code == 403)
+        code, out = sign({"kind": "resume", "grant": routine})
+        assert code == 200 and out["id"] != routine, (code, out)
+        routine = out["id"]
+        gw_until("/v1/signal/chats", lambda code, _: code == 200)
+
+    with subtest("an agent asks to extend an open grant; the owner adds more with one touch"):
+        code, ref = gw("POST", "/v1/access/requests", {"connector": "fastmail", "extend": True, "for": 30 * 60 * 10**9,
+                                                         "reason": "still reading"})
+        assert code == 202, (code, ref)
+        code, out = sign({"kind": "grant", "request": ref["id"]})
+        assert code == 200 and out["kind"] == "grant" and out["id"] != mail, (code, out)
+        code, st = gw("GET", f"/v1/access/requests/{ref['id']}?wait=5")
+        assert st["status"] == "granted" and st["grant_id"] == out["id"], (code, st)
+        extended = out["id"]
+        code, out = sign({"kind": "extend", "grant": extended, "for": "30m"})
+        assert code == 200 and out["id"] != extended, (code, out)
+        mail = out["id"]
+        _, out = gw_until("/v1/access", lambda code, out: code == 200 and mail in json.dumps(out))
+        assert extended not in json.dumps(out), out
+        code, now = console("GET", "/now.json")
+        assert mail in json.dumps(now["open"]), now
+        code, out = gw("POST", "/v1/fastmail/fetch", {"args": {"chat": "inv", "seq": "2"}})
+        assert code == 503, (code, out)
 
     with subtest("a grant on every chat reads them all, through the hide rules"):
         grant({"connector": "whatsapp", "for": "30m", "horizon": "0"})
@@ -492,6 +559,7 @@ pkgs.testers.runNixOSTest {
         assert code == 200 and "filing it" in page and "Grok Bot" in page, code
         machine.wait_until_succeeds(f"grep -q '/r/{pid}' /var/lib/ntfy/log.jsonl")
         note = recorded("ntfy")[-1]
+        assert note["headers"]["Title"] == "Grok Bot" and "Priority" not in note["headers"], note
         assert "original" not in note["body"] and "filing it" not in note["body"], note
 
     with subtest("the gateway can reach a connector but cannot make it act or change its keys"):
@@ -700,6 +768,35 @@ pkgs.testers.runNixOSTest {
         code, options = console("POST", "/login/options", {}, jar="/tmp/laptopjar")
         code, out = console("POST", "/login", {"assertion": assertion(options, key=laptop, cred=laptop_cred)}, jar="/tmp/laptopjar")
         assert code == 200, (code, out)
+
+    with subtest("Stop all closes every grant and denies every request, and leaves writes alone"):
+        code, ref = gw("POST", "/v1/access/requests", {"connector": "discord", "reason": "look around"})
+        assert code == 202, (code, ref)
+        code, _ = console("POST", "/access/stop-all")
+        assert code == 303, code
+        for path in ["/v1/whatsapp/chats", "/v1/signal/chats", "/v1/fastmail/chats", "/v1/forward/http/api/items"]:
+            gw_until(path, lambda code, _: code == 403)
+        code, st = gw("GET", f"/v1/access/requests/{ref['id']}?wait=5")
+        assert st["status"] == "denied", (code, st)
+        code, p = gw("GET", f"/v1/proposals/{third}")
+        assert p["status"] == "pending", p
+        code, now = console("GET", "/now.json")
+        waiting = json.dumps(now["waiting"])
+        assert not now["open"] and ref["id"] not in waiting and third in waiting, now
+        assert routine in json.dumps(now["stopped"]), now
+
+    with subtest("writes may follow a grant for a day after it ends, unless it was closed"):
+        grant({"connector": "signal", "chats": ["sfam"], "for": "10m", "horizon": "0"})
+        closed = grant({"connector": "signal", "chats": ["swork"], "for": "10m", "horizon": "0"})
+        code, _ = console("POST", f"/access/grants/{closed}/close")
+        assert code == 303, code
+        gw_until("/v1/signal/chats", lambda code, out: code == 200 and rows(out) == ["sfam"])
+        machine.succeed("date -s @$(( $(date +%s) + 7200 ))")
+        gw_until("/v1/signal/chats", lambda code, _: code == 403)
+        code, out = gw("POST", "/v1/signal/send", {"args": {"chat": "sfam", "text": "on my way"}})
+        assert code == 503 and "needs the owner" in out["error"], (code, out)
+        code, out = gw("POST", "/v1/signal/send", {"args": {"chat": "swork", "text": "on my way"}})
+        assert code == 404 and "unknown chat" in out["error"], (code, out)
 
     with subtest("mandate-reset-keys clears every key list and the agents they signed; the password is back"):
         machine.succeed("mandate-reset-keys")

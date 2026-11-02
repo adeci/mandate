@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -65,8 +66,59 @@ func TestAccessPrintsGrants(t *testing.T) {
 	}
 	want := "connector\tnow\tchats\twhen\tsince\tid\tnote\n" +
 		"signal\topen until 2026-11-02 15:00\tFamily (c1)\t2026-11-02 14:00 to 2026-11-02 15:00\tlast 7d\tg1\t\n" +
-		"mail\tclosed, opens 2026-11-06 06:00\tall\tMon,Fri 07:00 for 1h30m (Europe/Berlin)\tall history\tg2\t\n"
+		"mail\tclosed, opens 2026-11-06 06:00\tall\tevery Mon,Fri at 07:00 for 1h30m (Europe/Berlin)\tall history\tg2\t\n"
 	if out.String() != want {
 		t.Errorf("access:\n%q\nwant\n%q", out, want)
+	}
+}
+
+func TestRequestRoutineAndExtend(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		args []string
+		want func(accessRequest) bool
+	}{
+		"routine": {[]string{"signal", "--chat", "Family", "--every", "weekdays", "--at", "07:00", "--for", "20m"}, func(r accessRequest) bool {
+			s := r.Schedule
+			return s != nil && len(s.Days) == 5 && s.Days[0] == time.Monday && s.Start == "07:00" && s.Length == 20*time.Minute && r.For == 0
+		}},
+		"routine on chosen days": {[]string{"signal", "--every", "wed,mon", "--at", "18:30"}, func(r accessRequest) bool {
+			s := r.Schedule
+			return s != nil && slices.Equal(s.Days, []time.Weekday{time.Monday, time.Wednesday}) && s.Length == 30*time.Minute
+		}},
+		"extend": {[]string{"signal", "--extend", "--for", "1h"}, func(r accessRequest) bool {
+			return r.Extend && r.For == time.Hour && r.Schedule == nil && len(r.Chats) == 0
+		}},
+	} {
+		var got accessRequest
+		mux := http.NewServeMux()
+		mux.HandleFunc("POST /v1/access/requests", func(w http.ResponseWriter, r *http.Request) {
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Error(err)
+			}
+			w.Write([]byte(`{"id":"r1","url":"https://console.example/#r1"}`))
+		})
+		mux.HandleFunc("GET /v1/access/requests/r1", func(w http.ResponseWriter, _ *http.Request) {
+			w.Write([]byte(`{"status":"granted","agent_id":"a1"}`))
+		})
+		srv := httptest.NewServer(mux)
+		c, _, _ := testClient(t, srv.URL, false)
+		err := c.request(t.Context(), append(tc.args, "--reason", "daily summary"))
+		srv.Close()
+		if err != nil || !tc.want(got) {
+			t.Errorf("%s: %v, sent %+v (schedule %+v)", name, err, got, got.Schedule)
+		}
+	}
+
+	c, _, _ := testClient(t, "http://127.0.0.1:1", false)
+	for _, args := range [][]string{
+		{"signal", "--every", "daily", "--reason", "x"},
+		{"signal", "--at", "07:00", "--reason", "x"},
+		{"signal", "--every", "someday", "--at", "07:00", "--reason", "x"},
+		{"signal", "--extend", "--chat", "Family", "--reason", "x"},
+	} {
+		if err := c.request(t.Context(), args); exitcode.For(err) != exitcode.Usage {
+			t.Errorf("%q: %v, want usage", args, err)
+		}
 	}
 }

@@ -249,6 +249,7 @@ var fakeChats = append([]store.Container{
 	{ID: "t1", Kind: "thread", ParentID: "c1", Name: "cats"},
 	{ID: "c2", Kind: "group", Name: "Work"},
 	{ID: "d1", Kind: "dm", Name: "~Mom"},
+	{ID: "d2", Kind: "dm", Name: "Dad"},
 }, workThreads...)
 
 var workThreads = func() []store.Container {

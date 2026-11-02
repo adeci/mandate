@@ -21,16 +21,19 @@ var (
 	errNoChallenge = errors.New("this approval was already used or has expired; start again")
 )
 
-// accessRequest is a stored access request.
+// accessRequest is a stored access request. Extends is the grant an extend
+// request would lengthen.
 type accessRequest struct {
 	proposal.AccessRequest
 	ID, Status, GrantID  string
+	Extends              string
 	CreatedAt, ExpiresAt time.Time
 	DecidedAt            time.Time
 }
 
 // accessChallenge is an access record waiting for the passkey: the exact
-// bytes it signs, and the access request a grant answers.
+// bytes it signs, the access request a grant answers, the grant it
+// replaces, and the names of its chats as the owner saw them.
 type accessChallenge struct {
 	Nonce    []byte
 	Kind     string
@@ -38,32 +41,53 @@ type accessChallenge struct {
 	IssuedAt time.Time
 	Session  []byte
 	Request  string
+	Replaces string
+	Names    map[string]string
 }
 
 type agentRow struct {
 	approval.Agent
-	LastRead time.Time
+	FirstSeen, LastSeen time.Time
+}
+
+// grantRow is a stored grant: its record, kept after the signature is
+// dropped, and the chat names the owner saw when signing it.
+type grantRow struct {
+	approval.Grant
+	Names      map[string]string
+	RevokedAt  time.Time
+	ReplacedBy string
 }
 
 func (d *db) addAccessChallenge(ctx context.Context, c accessChallenge) error {
-	_, err := d.sql.ExecContext(ctx, `
-		INSERT INTO access_challenges (nonce, kind, record, issued_at, session, request)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		c.Nonce, c.Kind, c.Record, c.IssuedAt.UnixNano(), c.Session, c.Request)
+	names, err := json.Marshal(c.Names)
+	if err != nil {
+		return err
+	}
+	_, err = d.sql.ExecContext(ctx, `
+		INSERT INTO access_challenges (nonce, kind, record, issued_at, session, request, replaces, names)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.Nonce, c.Kind, c.Record, c.IssuedAt.UnixNano(), c.Session, c.Request, c.Replaces, string(names))
 	return err
 }
 
 func (d *db) accessChallenge(ctx context.Context, nonce []byte) (accessChallenge, error) {
 	c := accessChallenge{Nonce: nonce}
-	var issued int64
+	var (
+		issued int64
+		names  string
+	)
 	err := d.sql.QueryRowContext(ctx,
-		`SELECT kind, record, issued_at, session, request FROM access_challenges WHERE nonce = ?`, nonce).
-		Scan(&c.Kind, &c.Record, &issued, &c.Session, &c.Request)
+		`SELECT kind, record, issued_at, session, request, replaces, names FROM access_challenges WHERE nonce = ?`, nonce).
+		Scan(&c.Kind, &c.Record, &issued, &c.Session, &c.Request, &c.Replaces, &names)
 	if errors.Is(err, sql.ErrNoRows) {
 		return accessChallenge{}, errNoChallenge
 	}
+	if err != nil {
+		return accessChallenge{}, err
+	}
 	c.IssuedAt = time.Unix(0, issued).UTC()
-	return c, err
+	return c, json.Unmarshal([]byte(names), &c.Names)
 }
 
 // spend deletes challenge c and runs store in the same transaction, so a
@@ -90,9 +114,14 @@ func (d *db) addAgent(ctx context.Context, c accessChallenge, a approval.Agent, 
 	})
 }
 
-// addGrant stores g for a live agent and, when c answers an access request,
-// marks it granted while it is still pending.
+// addGrant stores g for a live agent. When c answers an access request it
+// marks it granted while it is still pending; when c replaces a grant, the
+// old one is revoked and replaced, once.
 func (d *db) addGrant(ctx context.Context, c accessChallenge, g approval.Grant, signed []byte, now time.Time) error {
+	names, err := json.Marshal(c.Names)
+	if err != nil {
+		return err
+	}
 	return d.spend(ctx, c, func(tx *sql.Tx) error {
 		if c.Request != "" {
 			res, err := tx.ExecContext(ctx, `
@@ -105,16 +134,29 @@ func (d *db) addGrant(ctx context.Context, c accessChallenge, g approval.Grant, 
 				return err
 			}
 		}
+		if c.Replaces != "" {
+			res, err := tx.ExecContext(ctx, `
+				UPDATE grants SET revoked_at = coalesce(revoked_at, ?), signed = NULL, replaced_by = ?
+				WHERE id = ? AND replaced_by = ''`, ms(now), g.ID, c.Replaces)
+			if err != nil {
+				return err
+			}
+			if err := oneRow(res, errReplaced); err != nil {
+				return err
+			}
+		}
 		res, err := tx.ExecContext(ctx, `
-			INSERT INTO grants (id, agent, connector, signed, created_at)
-			SELECT ?, id, ?, ?, ? FROM agents WHERE id = ? AND deleted_at IS NULL`,
-			g.ID, g.Connector, string(signed), ms(g.CreatedAt), g.Agent)
+			INSERT INTO grants (id, agent, connector, signed, record, names, created_at)
+			SELECT ?, id, ?, ?, ?, ?, ? FROM agents WHERE id = ? AND deleted_at IS NULL`,
+			g.ID, g.Connector, string(signed), c.Record, string(names), ms(g.CreatedAt), g.Agent)
 		if err != nil {
 			return err
 		}
 		return oneRow(res, errNoAgent)
 	})
 }
+
+var errReplaced = errors.New("that grant was already extended or resumed")
 
 // deleteAgent ends the agent and its grants, dropping their signatures, and
 // refuses its waiting access requests and proposals.
@@ -158,6 +200,27 @@ func (d *db) revokeGrant(ctx context.Context, id string, now time.Time) error {
 	return oneRow(res, errNoGrant)
 }
 
+// stopAll revokes every live grant and denies every waiting access request.
+func (d *db) stopAll(ctx context.Context, now time.Time) (grants, requests int64, err error) {
+	err = d.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE grants SET revoked_at = ?, signed = NULL WHERE revoked_at IS NULL`, ms(now))
+		if err != nil {
+			return err
+		}
+		if grants, err = res.RowsAffected(); err != nil {
+			return err
+		}
+		res, err = tx.ExecContext(ctx, `
+			UPDATE access_requests SET status = 'denied', decided_at = ? WHERE status = 'pending'`, ms(now))
+		if err != nil {
+			return err
+		}
+		requests, err = res.RowsAffected()
+		return err
+	})
+	return grants, requests, err
+}
+
 // liveRecords returns the signed agents and grants not deleted or revoked,
 // as stored.
 func (d *db) liveRecords(ctx context.Context) ([]json.RawMessage, error) {
@@ -180,10 +243,10 @@ func (d *db) liveRecords(ctx context.Context) ([]json.RawMessage, error) {
 	return out, rs.Err()
 }
 
-// agents returns the live agents, oldest first, with their last read.
+// agents returns the live agents, oldest first.
 func (d *db) agents(ctx context.Context) ([]agentRow, error) {
 	rs, err := d.sql.QueryContext(ctx, `
-		SELECT id, name, token_sha256, created_at, (SELECT max(at) FROM reads WHERE agent_id = agents.id)
+		SELECT id, name, token_sha256, created_at, first_seen, last_seen
 		FROM agents WHERE deleted_at IS NULL ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
@@ -192,20 +255,28 @@ func (d *db) agents(ctx context.Context) ([]agentRow, error) {
 	var out []agentRow
 	for rs.Next() {
 		var (
-			a       agentRow
-			created int64
-			last    sql.NullInt64
+			a           agentRow
+			created     int64
+			first, last sql.NullInt64
 		)
-		if err := rs.Scan(&a.ID, &a.Name, &a.TokenSHA256, &created, &last); err != nil {
+		if err := rs.Scan(&a.ID, &a.Name, &a.TokenSHA256, &created, &first, &last); err != nil {
 			return nil, err
 		}
 		a.CreatedAt = fromMS(created)
-		if last.Valid {
-			a.LastRead = fromMS(last.Int64)
+		if first.Valid {
+			a.FirstSeen, a.LastSeen = fromMS(first.Int64), fromMS(last.Int64)
 		}
 		out = append(out, a)
 	}
 	return out, rs.Err()
+}
+
+// seen records that agent used the gateway at at.
+func (d *db) seen(ctx context.Context, agent string, at time.Time) error {
+	_, err := d.sql.ExecContext(ctx, `
+		UPDATE agents SET first_seen = coalesce(first_seen, ?1), last_seen = max(coalesce(last_seen, 0), ?1)
+		WHERE id = ?2 AND deleted_at IS NULL`, ms(at), agent)
+	return err
 }
 
 func (d *db) agent(ctx context.Context, id string) (approval.Agent, error) {
@@ -224,44 +295,67 @@ func (d *db) agent(ctx context.Context, id string) (approval.Agent, error) {
 }
 
 // grant returns a live grant by ID.
-func (d *db) grant(ctx context.Context, id string) (approval.Grant, error) {
-	gs, err := d.queryGrants(ctx, `WHERE id = ? AND revoked_at IS NULL`, id)
+func (d *db) grant(ctx context.Context, id string) (grantRow, error) {
+	return d.oneGrant(ctx, `id = ? AND revoked_at IS NULL`, id)
+}
+
+// endedGrant returns a revoked grant that nothing replaced yet.
+func (d *db) endedGrant(ctx context.Context, id string) (grantRow, error) {
+	return d.oneGrant(ctx, `id = ? AND revoked_at IS NOT NULL AND replaced_by = ''`, id)
+}
+
+func (d *db) oneGrant(ctx context.Context, cond string, args ...any) (grantRow, error) {
+	gs, err := d.queryGrants(ctx, cond, args...)
 	if err != nil {
-		return approval.Grant{}, err
+		return grantRow{}, err
 	}
 	if len(gs) == 0 {
-		return approval.Grant{}, errNoGrant
+		return grantRow{}, errNoGrant
 	}
 	return gs[0], nil
 }
 
 // grants returns the live grants, oldest first.
-func (d *db) grants(ctx context.Context) ([]approval.Grant, error) {
-	return d.queryGrants(ctx, `WHERE revoked_at IS NULL ORDER BY created_at, id`)
+func (d *db) grants(ctx context.Context) ([]grantRow, error) {
+	return d.queryGrants(ctx, `revoked_at IS NULL`)
 }
 
-// queryGrants decodes grants from their signed records.
-func (d *db) queryGrants(ctx context.Context, where string, args ...any) ([]approval.Grant, error) {
-	rs, err := d.sql.QueryContext(ctx, `SELECT id, signed FROM grants `+where, args...)
+// grantsSince returns the grants live now or revoked since since, oldest
+// first.
+func (d *db) grantsSince(ctx context.Context, since time.Time) ([]grantRow, error) {
+	return d.queryGrants(ctx, `revoked_at IS NULL OR revoked_at >= ?`, ms(since))
+}
+
+// queryGrants decodes the grants matching cond from their records, oldest
+// first; grants revoked before records were kept apart from signatures are
+// left out.
+func (d *db) queryGrants(ctx context.Context, cond string, args ...any) ([]grantRow, error) {
+	rs, err := d.sql.QueryContext(ctx, `
+		SELECT id, record, names, revoked_at, replaced_by FROM grants
+		WHERE record IS NOT NULL AND (`+cond+`) ORDER BY created_at, id`, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rs.Close()
-	var out []approval.Grant
+	var out []grantRow
 	for rs.Next() {
 		var (
-			id, signed string
-			s          approval.Signed
+			id, names string
+			record    []byte
+			revoked   sql.NullInt64
+			g         grantRow
 		)
-		if err := rs.Scan(&id, &signed); err != nil {
+		if err := rs.Scan(&id, &record, &names, &revoked, &g.ReplacedBy); err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal([]byte(signed), &s); err != nil {
+		if g.Grant, err = approval.DecodeGrant(record); err != nil {
 			return nil, fmt.Errorf("grant %s: %w", id, err)
 		}
-		g, err := approval.DecodeGrant(s.Record)
-		if err != nil {
-			return nil, fmt.Errorf("grant %s: %w", id, err)
+		if err := json.Unmarshal([]byte(names), &g.Names); err != nil {
+			return nil, fmt.Errorf("grant %s names: %w", id, err)
+		}
+		if revoked.Valid {
+			g.RevokedAt = fromMS(revoked.Int64)
 		}
 		out = append(out, g)
 	}
@@ -303,16 +397,24 @@ func (d *db) addAccessRequest(ctx context.Context, r accessRequest, waiting, per
 	if err != nil {
 		return err
 	}
+	var schedule any
+	if r.Schedule != nil {
+		b, err := json.Marshal(r.Schedule)
+		if err != nil {
+			return err
+		}
+		schedule = string(b)
+	}
 	return d.tx(ctx, func(tx *sql.Tx) error {
 		if err := accessQuota(ctx, tx, r.AgentID, r.CreatedAt, waiting, perHour); err != nil {
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO access_requests (id, agent_id, agent_name, connector, chats, unmatched, for_ns, horizon_ns, reason,
-			                             status, created_at, expires_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+			                             schedule, extends, status, created_at, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
 			r.ID, r.AgentID, r.AgentName, r.Connector, string(chats), string(unmatched), int64(r.For), int64(r.Horizon), r.Reason,
-			ms(r.CreatedAt), ms(r.ExpiresAt))
+			schedule, r.Extends, ms(r.CreatedAt), ms(r.ExpiresAt))
 		return err
 	})
 }
@@ -332,6 +434,11 @@ func (d *db) pendingAccessRequests(ctx context.Context, now time.Time) ([]access
 	return d.queryAccessRequests(ctx, now, `WHERE status = 'pending' ORDER BY created_at DESC`)
 }
 
+// accessRequestsBetween returns the requests made in [from, to).
+func (d *db) accessRequestsBetween(ctx context.Context, from, to, now time.Time) ([]accessRequest, error) {
+	return d.queryAccessRequests(ctx, now, `WHERE created_at >= ? AND created_at < ?`, ms(from), ms(to))
+}
+
 func (d *db) pendingAccessCount(ctx context.Context, now time.Time) (int, error) {
 	var n int
 	err := d.sql.QueryRowContext(ctx,
@@ -346,8 +453,8 @@ func (d *db) queryAccessRequests(ctx context.Context, now time.Time, where strin
 		return nil, err
 	}
 	rs, err := d.sql.QueryContext(ctx, `
-		SELECT id, agent_id, agent_name, connector, chats, unmatched, for_ns, horizon_ns, reason, status, grant_id,
-		       created_at, expires_at, decided_at
+		SELECT id, agent_id, agent_name, connector, chats, unmatched, for_ns, horizon_ns, reason, schedule, extends,
+		       status, grant_id, created_at, expires_at, decided_at
 		FROM access_requests `+where, args...)
 	if err != nil {
 		return nil, err
@@ -358,12 +465,13 @@ func (d *db) queryAccessRequests(ctx context.Context, now time.Time, where strin
 		var (
 			r                accessRequest
 			chats, unmatched string
+			schedule         sql.NullString
 			forNS, horizonNS int64
 			created, expires int64
 			decided          sql.NullInt64
 		)
 		if err := rs.Scan(&r.ID, &r.AgentID, &r.AgentName, &r.Connector, &chats, &unmatched, &forNS, &horizonNS, &r.Reason,
-			&r.Status, &r.GrantID, &created, &expires, &decided); err != nil {
+			&schedule, &r.Extends, &r.Status, &r.GrantID, &created, &expires, &decided); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(chats), &r.Chats); err != nil {
@@ -372,6 +480,12 @@ func (d *db) queryAccessRequests(ctx context.Context, now time.Time, where strin
 		if err := json.Unmarshal([]byte(unmatched), &r.Unmatched); err != nil {
 			return nil, fmt.Errorf("access request %s: decode unmatched: %w", r.ID, err)
 		}
+		if schedule.Valid {
+			if err := json.Unmarshal([]byte(schedule.String), &r.Schedule); err != nil {
+				return nil, fmt.Errorf("access request %s: decode schedule: %w", r.ID, err)
+			}
+		}
+		r.Extend = r.Extends != ""
 		r.For, r.Horizon = time.Duration(forNS), time.Duration(horizonNS)
 		r.CreatedAt, r.ExpiresAt = fromMS(created), fromMS(expires)
 		if decided.Valid {
@@ -405,15 +519,20 @@ func (d *db) addRead(ctx context.Context, e proposal.ReadEvent) error {
 		return err
 	}
 	_, err = d.sql.ExecContext(ctx, `
-		INSERT INTO reads (at, agent_id, connector, verb, chat, grants, count, dropped) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		ms(e.At), e.AgentID, e.Connector, e.Verb, e.Chat, string(grants), e.Count, e.Dropped)
+		INSERT INTO reads (at, agent_id, connector, verb, chat, chat_name, grants, count, dropped)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ms(e.At), e.AgentID, e.Connector, e.Verb, e.Chat, e.ChatName, string(grants), e.Count, e.Dropped)
 	return err
 }
 
-// reads returns the newest limit reads.
-func (d *db) reads(ctx context.Context, limit int) ([]proposal.ReadEvent, error) {
+// maxReads bounds the reads one Today page groups.
+const maxReads = 20000
+
+// reads returns the reads in [from, to), oldest first.
+func (d *db) reads(ctx context.Context, from, to time.Time) ([]proposal.ReadEvent, error) {
 	rs, err := d.sql.QueryContext(ctx, `
-		SELECT at, agent_id, connector, verb, chat, grants, count, dropped FROM reads ORDER BY at DESC LIMIT ?`, limit)
+		SELECT at, agent_id, connector, verb, chat, chat_name, grants, count, dropped FROM reads
+		WHERE at >= ? AND at < ? ORDER BY at LIMIT ?`, ms(from), ms(to), maxReads)
 	if err != nil {
 		return nil, err
 	}
@@ -425,7 +544,7 @@ func (d *db) reads(ctx context.Context, limit int) ([]proposal.ReadEvent, error)
 			at     int64
 			grants string
 		)
-		if err := rs.Scan(&at, &e.AgentID, &e.Connector, &e.Verb, &e.Chat, &grants, &e.Count, &e.Dropped); err != nil {
+		if err := rs.Scan(&at, &e.AgentID, &e.Connector, &e.Verb, &e.Chat, &e.ChatName, &grants, &e.Count, &e.Dropped); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(grants), &e.Grants); err != nil {
@@ -454,4 +573,9 @@ func (d *db) sweepAccess(ctx context.Context, now time.Time) error {
 	}
 	_, err = d.sql.ExecContext(ctx, `DELETE FROM reads WHERE at < ?`, old)
 	return err
+}
+
+// decidedBetween returns the proposals decided in [from, to).
+func (d *db) decidedBetween(ctx context.Context, from, to time.Time) ([]row, error) {
+	return d.query(ctx, `WHERE decided_at >= ? AND decided_at < ? ORDER BY decided_at`, ms(from), ms(to))
 }

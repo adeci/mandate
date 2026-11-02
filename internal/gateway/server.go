@@ -173,6 +173,9 @@ type handler struct {
 
 	dropMu  sync.Mutex
 	dropped map[string]int // read events dropped per agent ID
+
+	seenMu sync.Mutex
+	seen   map[string]time.Time // when each agent ID was last reported seen
 }
 
 func newHandler(cfg Config, acc *access) *handler {
@@ -185,6 +188,7 @@ func newHandler(cfg Config, acc *access) *handler {
 		console:    proposal.Dial(cfg.ConsoleSocket),
 		reads:      make(chan proposal.ReadEvent, readQueue),
 		dropped:    map[string]int{},
+		seen:       map[string]time.Time{},
 	}
 	h.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
 	h.mux.HandleFunc("GET /v1/connectors", h.authed(h.list))
@@ -212,6 +216,7 @@ func (h *handler) authed(next http.HandlerFunc) http.HandlerFunc {
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
+		h.markSeen(ag.ID)
 		next(w, r.WithContext(withAgent(r.Context(), ag)))
 	}
 }

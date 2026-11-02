@@ -86,23 +86,70 @@ func openDB(ctx context.Context, path string) (*db, error) {
 	return &db{sql: s}, nil
 }
 
-// migrate adds the columns that CREATE TABLE IF NOT EXISTS doesn't give a
-// table created by an older version, and the index on them.
+// columns are those added since their table was first released, which
+// CREATE TABLE IF NOT EXISTS doesn't give a table created before.
+var columns = []struct{ table, name, decl string }{
+	{"proposals", "agent_id", "TEXT NOT NULL DEFAULT ''"},
+	{"proposals", "agent_name", "TEXT NOT NULL DEFAULT ''"},
+	{"agents", "first_seen", "INTEGER"},
+	{"agents", "last_seen", "INTEGER"},
+	{"grants", "record", "BLOB"},
+	{"grants", "names", "TEXT NOT NULL DEFAULT '{}'"},
+	{"grants", "replaced_by", "TEXT NOT NULL DEFAULT ''"},
+	{"access_requests", "schedule", "TEXT"},
+	{"access_requests", "extends", "TEXT NOT NULL DEFAULT ''"},
+	{"access_challenges", "names", "TEXT NOT NULL DEFAULT '{}'"},
+	{"access_challenges", "replaces", "TEXT NOT NULL DEFAULT ''"},
+	{"reads", "chat_name", "TEXT NOT NULL DEFAULT ''"},
+}
+
+// migrate adds columns, the indexes on them, and the grant records that
+// older versions kept only inside the signature.
 func migrate(ctx context.Context, s *sql.DB) error {
-	for _, col := range []string{"agent_id", "agent_name"} {
+	for _, c := range columns {
 		var n int
-		err := s.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('proposals') WHERE name = ?`, col).Scan(&n)
+		err := s.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, c.table, c.name).Scan(&n)
 		if err != nil {
 			return err
 		}
 		if n == 0 {
-			if _, err := s.ExecContext(ctx, `ALTER TABLE proposals ADD COLUMN `+col+` TEXT NOT NULL DEFAULT ''`); err != nil {
+			if _, err := s.ExecContext(ctx, `ALTER TABLE `+c.table+` ADD COLUMN `+c.name+` `+c.decl); err != nil {
 				return err
 			}
 		}
 	}
-	_, err := s.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS proposals_by_agent ON proposals (agent_id, status)`)
-	return err
+	if _, err := s.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS proposals_by_agent ON proposals (agent_id, status)`); err != nil {
+		return err
+	}
+	rs, err := s.QueryContext(ctx, `SELECT id, signed FROM grants WHERE record IS NULL AND signed IS NOT NULL`)
+	if err != nil {
+		return err
+	}
+	records := map[string][]byte{}
+	for rs.Next() {
+		var (
+			id, signed string
+			sg         approval.Signed
+		)
+		if err := rs.Scan(&id, &signed); err != nil {
+			rs.Close()
+			return err
+		}
+		if err := json.Unmarshal([]byte(signed), &sg); err != nil {
+			rs.Close()
+			return fmt.Errorf("grant %s: %w", id, err)
+		}
+		records[id] = sg.Record
+	}
+	if err := errors.Join(rs.Err(), rs.Close()); err != nil {
+		return err
+	}
+	for id, rec := range records {
+		if _, err := s.ExecContext(ctx, `UPDATE grants SET record = ? WHERE id = ?`, rec, id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (d *db) Close() error { return d.sql.Close() }
@@ -166,54 +213,6 @@ func (d *db) get(ctx context.Context, id string) (row, error) {
 
 func (d *db) pending(ctx context.Context) ([]row, error) {
 	return d.query(ctx, `WHERE status = 'pending' ORDER BY created_at DESC`)
-}
-
-// search narrows decided proposals; To is exclusive and zero times are open.
-type search struct {
-	Text, Connector, Status string
-	From, To                time.Time
-}
-
-// decided returns a page of decided proposals matching q, newest first, and
-// how many match in all.
-func (d *db) decided(ctx context.Context, q search, limit, offset int) ([]row, int, error) {
-	bound := func(t time.Time) int64 {
-		if t.IsZero() {
-			return 0
-		}
-		return ms(t)
-	}
-	where := `WHERE status != 'pending'
-		AND (?1 = '' OR instr(lower(note), lower(?1)) OR instr(lower(connector || ' ' || op), lower(?1))
-		     OR EXISTS (SELECT 1 FROM json_each(display) WHERE instr(lower(json_extract(value, '$.value')), lower(?1))))
-		AND (?2 = '' OR connector = ?2)
-		AND (?3 = '' OR status = ?3)
-		AND (?4 = 0 OR decided_at >= ?4)
-		AND (?5 = 0 OR decided_at < ?5)`
-	args := []any{q.Text, q.Connector, q.Status, bound(q.From), bound(q.To)}
-	var total int
-	if err := d.sql.QueryRowContext(ctx, `SELECT count(*) FROM proposals `+where, args...).Scan(&total); err != nil {
-		return nil, 0, err
-	}
-	rows, err := d.query(ctx, where+` ORDER BY decided_at DESC, id DESC LIMIT ?6 OFFSET ?7`, append(args, limit, offset)...)
-	return rows, total, err
-}
-
-func (d *db) decidedConnectors(ctx context.Context) ([]string, error) {
-	rs, err := d.sql.QueryContext(ctx, `SELECT DISTINCT connector FROM proposals WHERE status != 'pending' ORDER BY 1`)
-	if err != nil {
-		return nil, err
-	}
-	defer rs.Close()
-	var out []string
-	for rs.Next() {
-		var c string
-		if err := rs.Scan(&c); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rs.Err()
 }
 
 func (d *db) pendingCount(ctx context.Context) (int, error) {

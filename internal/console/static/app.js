@@ -352,18 +352,54 @@ async function signAccess(body, msg) {
 
 const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 
-// The token is made and shown here; the console only signs its hash.
+// The token is made and shown here; the console only signs its hash. The
+// setup sheet then waits for the agent's first call through the gateway.
 async function newAgent(form) {
   const name = form.elements.name.value;
   const token = hex(crypto.getRandomValues(new Uint8Array(32)));
   const tokenSHA256 = hex(await crypto.subtle.digest("SHA-256", utf8(token)));
-  await signAccess({ kind: "agent", name, token_sha256: tokenSHA256 }, $(".msg", form));
-  const panel = $("#agent-token");
+  const res = await signAccess({ kind: "agent", name, token_sha256: tokenSHA256 }, $(".msg", form));
+  const sheet = $("#agent-setup");
+  const d = sheet.dataset;
+  const values = [];
+  if (d.gatewayUrl) values.push(`MANDATE_URL=${d.gatewayUrl}`);
+  values.push(`MANDATE_TOKEN=${token}`);
+  values.push(
+    `curl -LO ${d.releaseUrl}/mandate-linux-amd64 && curl -LO ${d.releaseUrl}/SHA256SUMS && sha256sum --ignore-missing -c SHA256SUMS`,
+  );
+  values.push(d.skillUrl);
+  $("[data-setup-values]", sheet).replaceChildren(
+    ...values.map((v) => {
+      const row = document.createElement("div");
+      row.className = "row";
+      const input = document.createElement("input");
+      input.readOnly = true;
+      input.className = "copy";
+      // A changed input also keeps watch() from reloading the token away.
+      input.value = v;
+      const copy = document.createElement("button");
+      copy.type = "button";
+      copy.textContent = "Copy";
+      copy.addEventListener("click", () => navigator.clipboard.writeText(v));
+      row.append(input, copy);
+      return row;
+    }),
+  );
+  for (const el of $$("[data-setup-name]", sheet)) el.textContent = name;
   form.hidden = true;
-  $("[data-token-name]", panel).textContent = name;
-  // A changed input also keeps watch() from reloading the token away.
-  $("[data-token]", panel).value = token;
-  panel.hidden = false;
+  sheet.hidden = false;
+  const state = $("[data-setup-state]", sheet);
+  const poll = async () => {
+    if (!sheet.isConnected) return;
+    const data = await call("GET", "/agents.json").catch(() => null);
+    const agent = data && data.agents.find((a) => a.id === res.id);
+    if (agent && agent.first_seen) {
+      state.textContent = `${name} connected.`;
+      return;
+    }
+    setTimeout(poll, POLL_MS);
+  };
+  poll();
 }
 
 // tree builds nested checkboxes for a chat and the chats under it, with
@@ -377,16 +413,15 @@ function tree(nodes, checkFirst) {
     const box = document.createElement("input");
     box.type = "checkbox";
     box.value = n.id;
-    box.checked = checkFirst && i === 0;
+    box.checked = (checkFirst && i === 0) || n.ticked;
     const text = document.createElement("span");
+    text.className = "content";
     text.innerHTML = n.label;
-    label.append(box, " ", text);
-    if (n.kind || n.active) {
-      const meta = document.createElement("span");
-      meta.className = "muted";
-      meta.textContent = ` ${[n.kind, n.active].filter(Boolean).join(" · ")}`;
-      label.append(meta);
-    }
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    const when = n.last_activity ? new Date(n.last_activity).toLocaleString() : "";
+    meta.textContent = [n.kind, when, n.id].filter(Boolean).join(" · ");
+    label.append(box, " ", text, " ", meta);
     li.append(label);
     if (n.children && n.children.length) li.append(tree(n.children, false));
     if (n.more) {
@@ -450,29 +485,94 @@ function picker(root, connector, msg) {
   };
 }
 
-async function approveAccess(panel) {
-  const body = { kind: "grant", request: panel.dataset.accessRequest, for: $("select[name=for]", panel).value };
-  const horizon = $("select[name=horizon]", panel);
+// cardChats is what approving a card signs for chats: undefined keeps the
+// request's choice, a list narrows it.
+function cardChats(card) {
+  if (card.dataset.chats === "named") return checked($("[data-tree]", card));
+  if (card.picker && $("input[value=pick]", card).checked) return card.picker.chats();
+  return undefined;
+}
+
+async function approveAccess(card) {
+  const body = { kind: "grant", request: card.dataset.id };
+  const forSel = $("select[name=for]", card);
+  if (forSel) body.for = forSel.value;
+  const horizon = $("select[name=horizon]", card);
   if (horizon) body.horizon = horizon.value;
-  if (panel.dataset.chats === "named") {
-    body.chats = checked($("[data-tree]", panel));
-    if (!body.chats.length) throw new Error("tick the chats to grant");
-  } else if (panel.picker && $("input[value=pick]", panel).checked) {
-    body.chats = panel.picker.chats();
-    if (!body.chats.length) throw new Error("pick at least one chat");
+  if (card.dataset.card === "routine") body.zone = timeZone();
+  const chats = cardChats(card);
+  if (chats !== undefined) {
+    if (!chats.length) throw new Error("tick the chats to grant under Adjust");
+    body.chats = chats;
   }
-  await signAccess(body, $(".msg", panel));
+  await signAccess(body, $(".msg", card));
   await reload();
 }
 
-// requestPanel lets a request for every chat be narrowed with the picker.
-function requestPanel(panel) {
-  if (panel.dataset.chats !== "every") return;
-  const p = picker($("[data-chat-picker]", panel), () => panel.dataset.connector, $(".msg", panel));
-  panel.picker = p;
-  for (const radio of $$("input[type=radio]", panel)) {
-    radio.addEventListener("change", () => p.show($("input[value=pick]", panel).checked));
+// goShort turns a Go duration such as 168h0m0s into the server's short
+// form, 7d; zero is all history.
+function goShort(v) {
+  const h = Number((v.match(/(\d+)h/) || [0, 0])[1]);
+  const m = Number((v.match(/(\d+)m/) || [0, 0])[1]);
+  if (!h && !m) return "all";
+  if (!m && h % 24 === 0) return `${h / 24}d`;
+  return m ? `${h * 60 + m}m` : `${h}h`;
+}
+
+// requestCard wires Adjust, the picker for a request for every chat, and
+// keeps the Approve button naming what it signs.
+function requestCard(card) {
+  const approve = $("[data-approve-access]", card);
+  const adjust = $("[data-adjust]", card);
+  const panel = $("[data-adjust-panel]", card);
+  if (adjust && panel) adjust.addEventListener("click", () => (panel.hidden = !panel.hidden));
+  if (card.dataset.chats === "every") {
+    card.picker = picker($("[data-chat-picker]", card), () => card.dataset.connector, $(".msg", card));
+    for (const radio of $$("input[type=radio]", card)) {
+      radio.addEventListener("change", () => card.picker.show($("input[value=pick]", card).checked));
+    }
   }
+  if (!approve || card.dataset.card === "extend") return;
+  const label = () => {
+    const forSel = $("select[name=for]", card);
+    const parts = ["Approve", forSel ? goShort(forSel.value) : approve.dataset.window];
+    const chats = cardChats(card);
+    if (card.dataset.chats === "none") parts.push("allowlisted reads");
+    else if (chats === undefined) parts.push("every chat");
+    else if (chats.length === 1) parts.push($(`input[value="${CSS.escape(chats[0])}"]`, card).closest("label").querySelector(".content").textContent);
+    else parts.push(chats.length ? `${chats.length} chats` : "no chats yet");
+    const horizon = $("select[name=horizon]", card);
+    if (horizon) parts.push(goShort(horizon.value));
+    approve.textContent = parts.join(" · ");
+  };
+  card.addEventListener("change", label);
+  card.addEventListener("click", (ev) => ev.target.closest("[data-picked]") && label());
+}
+
+// countdowns shows time left on open windows and how long ago agents were
+// seen, without a reload.
+function countdowns() {
+  for (const el of $$("[data-left]")) {
+    const s = Math.max(0, Math.round((Date.parse(el.dataset.left) - Date.now()) / 1000));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor(s / 60) % 60;
+    el.textContent = s ? `${h ? `${h}h ` : ""}${m}m left` : "closed";
+  }
+  for (const el of $$("[data-ago]")) {
+    const m = Math.floor((Date.now() - Date.parse(el.dataset.ago)) / 60000);
+    el.textContent = m < 1 ? "just now" : m < 60 ? `${m}m ago` : m < 1440 ? `${Math.floor(m / 60)}h ago` : `${Math.floor(m / 1440)}d ago`;
+  }
+}
+
+// seenLive refreshes the agents' last-seen times from /agents.json.
+async function seenLive() {
+  if (!$("[data-agent] [data-ago]") || document.hidden) return;
+  const data = await call("GET", "/agents.json").catch(() => null);
+  for (const a of (data && data.agents) || []) {
+    const el = $(`[data-agent="${CSS.escape(a.id)}"] [data-ago]`);
+    if (el && a.last_seen) el.dataset.ago = a.last_seen;
+  }
+  countdowns();
 }
 
 const timeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -704,6 +804,8 @@ document.addEventListener("DOMContentLoaded", () => {
   bind();
   watch();
   setInterval(showWindow, 1000);
+  setInterval(countdowns, 15000);
+  setInterval(seenLive, 30000);
   document.addEventListener("click", loadLink);
   document.addEventListener("submit", loadForm);
   addEventListener("popstate", () => (unlocked ? load(location.href, {}, true).catch(() => location.reload()) : location.reload()));
@@ -715,6 +817,7 @@ function bind() {
   showWindow();
   $("[data-theme-toggle]").addEventListener("click", toggleTheme);
   for (const el of $$("[data-until]")) countdown(el);
+  countdowns();
   const lockButton = $("[data-lock]");
   if (lockButton) lockButton.addEventListener("click", lock);
 
@@ -782,14 +885,27 @@ function bind() {
 
   const agentForm = $("#new-agent");
   if (agentForm) agentForm.addEventListener("submit", busy(agentForm, () => newAgent(agentForm)));
-  const copy = $("[data-copy-token]");
-  if (copy) copy.addEventListener("click", () => navigator.clipboard.writeText($("[data-token]").value));
-  const done = $("[data-token-done]");
+  const done = $("[data-setup-done]");
   if (done) done.addEventListener("click", () => location.reload());
-  for (const panel of $$("[data-access-request]")) {
-    requestPanel(panel);
-    const button = $("[data-approve-access]", panel);
-    if (button) button.addEventListener("click", busy(button, () => approveAccess(panel)));
+  for (const card of $$("[data-card]")) {
+    if (card.dataset.card === "send") continue;
+    requestCard(card);
+    const button = $("[data-approve-access]", card);
+    if (button) button.addEventListener("click", busy(button, () => approveAccess(card)));
+  }
+  for (const button of $$("[data-extend]")) {
+    const body = { kind: "extend", grant: button.dataset.extend, for: "30m" };
+    button.addEventListener("click", busy(button, async () => {
+      await signAccess(body, $(".msg", button.closest("[data-access]")));
+      await reload();
+    }));
+  }
+  for (const button of $$("[data-resume]")) {
+    const body = { kind: "resume", grant: button.dataset.resume };
+    button.addEventListener("click", busy(button, async () => {
+      await signAccess(body, $(".msg", button.closest("[data-access]")));
+      await reload();
+    }));
   }
   const grant = $("#new-grant");
   if (grant) {

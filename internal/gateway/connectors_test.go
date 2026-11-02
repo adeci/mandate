@@ -92,6 +92,7 @@ type fakeConsole struct {
 	statuses  map[string]proposal.AccessStatus
 	overQuota atomic.Bool
 	quotas    atomic.Int32
+	seen      atomic.Int32
 }
 
 func (a *fakeConsole) set(p proposal.Proposal) {
@@ -120,6 +121,13 @@ func (a *fakeConsole) handler() http.Handler {
 		p := proposal.Proposal{ID: "p1", Connector: req.Connector, Op: req.Op, Note: req.Note, Status: proposal.Pending}
 		a.proposals[p.ID] = p
 		connector.WriteJSON(w, http.StatusOK, p)
+	})
+	mux.HandleFunc("POST /access/seen", func(w http.ResponseWriter, r *http.Request) {
+		var s proposal.Seen
+		if connector.DecodeJSON(w, r, &s, maxRequestBytes) && s.AgentID == "a1" {
+			a.seen.Add(1)
+		}
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("GET /access/quota", func(w http.ResponseWriter, r *http.Request) {
 		a.quotas.Add(1)

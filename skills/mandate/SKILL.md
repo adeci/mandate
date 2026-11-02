@@ -37,17 +37,35 @@ mandate request signal --chat alice --for 30m --since 2d \
   --reason "the owner asked for Alice's address from last week" --wait 15m
 ```
 
+- Batch: put every chat the task needs into one request (repeat `--chat`),
+  rather than asking again for each.
 - Ask narrowly: the fewest chats (`--chat` matches chat names), the shortest
   `--for` (default 30m, at most 12h), and a `--since` that covers only what
   the task needs (default 7d, `all` for whole history).
 - Say in `--reason` what the task is and why it needs this; the owner reads
   it before approving.
-- It prints a request ID and an approve link; send the owner the link. Exit 0
-  means granted, 75 still waiting, 1 denied or expired.
+- It prints a request ID and an approve link. Tell the owner "approve on your
+  phone": they get a notification. Exit 0 means granted, 75 still waiting,
+  1 denied or expired.
+- Running out of time mid-task? Extend instead of asking again; the window
+  keeps its chats and horizon:
+
+  ```sh
+  mandate request signal --extend --for 30m --reason "summary not done yet"
+  ```
+
+- Recurring work (a daily summary) needs a routine: propose one once, and
+  then run the task when `mandate access` shows it open.
+
+  ```sh
+  mandate request signal --chat Family --every weekdays --at 07:00 --for 20m \
+    --since 1d --reason "weekday morning summary of the family chat"
+  ```
+
+  `--every` takes daily, weekdays, weekends or days like `mon,wed`; `--at`
+  is the owner's local time; `--for` is each window's length (at most 24h).
 - Never retry a request in a loop, and don't ask again after a denial unless
   the owner says so.
-- Recurring work (a daily summary) runs in windows the owner schedules. Run
-  it when `mandate access` shows the grant open; don't request access for it.
 
 ## Reading
 
@@ -65,8 +83,9 @@ print its path; files marked `[#0 …] [#1 …]` are picked with `--index`.
 
 ## Writing
 
-Writing needs an open grant too: a proposal may only go to a chat, or answer
-a message, that your grants let you read. Anything else answers
+Writing needs a grant too: a proposal may only go to a chat, or answer a
+message, that a grant open now, or one that closed within the last day, let
+you read. Anything else answers
 `unknown chat`. The proposal answer and `mandate status` show its state and
 result, not the message text.
 

@@ -179,23 +179,24 @@ func TestAccessRequestLifecycle(t *testing.T) {
 	ref := h.requestAccess(t, named(agent))
 	note := <-notes
 	text, _ := io.ReadAll(note.Body)
-	if string(text) != "Grok Bot asks to read fake" || note.Header.Get("Title") != "mandate" ||
+	if string(text) != "Grok Bot asks to read fake" || note.Header.Get("Title") != "Grok Bot" || note.Header.Get("Priority") != "high" ||
 		note.Header.Get("Click") != ref.URL || note.Header.Get("Authorization") != "Bearer tk" {
 		t.Fatalf("notification %q %v", text, note.Header)
 	}
 	if st := h.accessStatus(t, ref.ID); st.Status != proposal.AccessPending || st.AgentID != agent {
 		t.Fatalf("status = %+v", st)
 	}
-	if _, page := h.page(t, "/"); !strings.Contains(page, "Grok Bot asks to read fake") {
-		t.Fatal("inbox doesn't list the request")
-	}
-	_, page := h.page(t, "/access")
-	for _, want := range []string{`id="request-` + ref.ID + `"`, `<input type="checkbox" value="t1"> <span>cats (t1)</span>`, `~Mom (d1)`, `no visible chat matched "lawyer"`} {
+	_, page := h.page(t, "/")
+	for _, want := range []string{
+		`id="request-` + ref.ID + `"`, `<strong class="content">Grok Bot</strong> wants to read`,
+		`<input type="checkbox" value="t1"> <span class="content">cats</span>`, `~Mom`, `no visible chat matched "lawyer"`,
+		"summarise the week", "Approve · 2h · no chats yet · 7d",
+	} {
 		if !strings.Contains(page, want) {
-			t.Errorf("access page lacks %s", want)
+			t.Errorf("Now lacks %s", want)
 		}
 	}
-	if strings.Contains(page, "checked> <span>") {
+	if strings.Contains(page, `checked> <span class="content">`) {
 		t.Error("a requested chat starts ticked")
 	}
 
@@ -234,7 +235,8 @@ func TestAccessRequestLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	note = <-notes
-	if text, _ := io.ReadAll(note.Body); string(text) != "Grok Bot proposes a fake send" || note.Header.Get("Click") != p.URL {
+	if text, _ := io.ReadAll(note.Body); string(text) != "Grok Bot proposes a fake send" || note.Header.Get("Click") != p.URL ||
+		note.Header.Get("Priority") != "" {
 		t.Fatalf("proposal notification %q %v", text, note.Header)
 	}
 	if _, page := h.page(t, "/r/"+p.ID); !strings.Contains(page, "from Grok Bot") {
@@ -376,7 +378,7 @@ func TestRequestShowsBoundedTree(t *testing.T) {
 		AgentID: agent, Connector: "fake", Terms: []string{"Work"}, Chats: []proposal.Chat{{ID: "c2", Name: "Work"}},
 		For: time.Hour, Reason: "r",
 	})
-	_, page := h.page(t, "/access")
+	_, page := h.page(t, "/")
 	if more := len(workThreads) - (treeNodes - 1); !strings.Contains(page, fmt.Sprintf("and %d more under it", more)) {
 		t.Fatal("the request doesn't say how many chats it leaves out")
 	}
@@ -481,8 +483,8 @@ func TestAccessRecordsLeaveWhenEnded(t *testing.T) {
 		t.Fatalf("schedule without a zone: %d", status)
 	}
 
-	if status, _ := h.post(t, "/access/grants/"+revoked.ID+"/revoke", nil); status != http.StatusSeeOther {
-		t.Fatalf("revoke: %d", status)
+	if status, _ := h.post(t, "/access/grants/"+revoked.ID+"/close", nil); status != http.StatusSeeOther {
+		t.Fatalf("close: %d", status)
 	}
 	if status, _ := h.post(t, "/access/agents/"+gone+"/delete", nil); status != http.StatusSeeOther {
 		t.Fatalf("delete: %d", status)
@@ -496,8 +498,11 @@ func TestAccessRecordsLeaveWhenEnded(t *testing.T) {
 	if err != nil || signed != 2 {
 		t.Fatalf("signatures kept: %d %v", signed, err)
 	}
-	if _, page := h.page(t, "/access"); !strings.Contains(page, "Mon at 07:00 for 1 hour (Europe/Berlin)") {
-		t.Fatal("access page doesn't describe the schedule")
+	if _, page := h.page(t, "/"); !strings.Contains(page, "Mon at 07:00 for 1 hour (Europe/Berlin)") {
+		t.Fatal("Now doesn't describe the routine")
+	}
+	if _, page := h.page(t, "/agents"); !strings.Contains(page, "1 ended") || !strings.Contains(page, ">Pause</button>") || strings.Contains(page, ">gone<") {
+		t.Fatal("Agents doesn't list the routine and the ended window, or lists the deleted agent")
 	}
 }
 
@@ -506,7 +511,7 @@ func TestReadsAndChatPicker(t *testing.T) {
 	status, body := h.call(t, http.MethodGet, "/access/chats?connector=fake&q=FAM", h.session, nil)
 	var chats chatsResponse
 	if err := json.Unmarshal(body, &chats); status != http.StatusOK || err != nil ||
-		len(chats.Chats) != 1 || chats.Chats[0].ID != "c1" || chats.Chats[0].Label != "family (c1)" {
+		len(chats.Chats) != 1 || chats.Chats[0].ID != "c1" || chats.Chats[0].Name != "family" || chats.Chats[0].Label != "family" {
 		t.Fatalf("chats: %d %s", status, body)
 	}
 	status, body = h.call(t, http.MethodGet, "/access/chats/tree?connector=fake&id=g", h.session, nil)
@@ -515,16 +520,19 @@ func TestReadsAndChatPicker(t *testing.T) {
 		tree.Children[0].ID != "c1" || len(tree.Children[0].Children) != 1 || tree.Children[0].Children[0].ID != "t1" {
 		t.Fatalf("tree: %d %s", status, body)
 	}
-
 	agent := h.agent(t, "bot")
-	err := h.api.Read(context.Background(), proposal.ReadEvent{
-		AgentID: agent, Connector: "fake", Verb: "messages", Chat: "c1", Grants: []string{"g1"}, Count: 3, Dropped: 4, At: h.clock.now(),
-	})
-	if err != nil {
-		t.Fatal(err)
+	for i, at := range []time.Duration{0, 5 * time.Minute, 30 * time.Minute} {
+		err := h.api.Read(context.Background(), proposal.ReadEvent{
+			AgentID: agent, Connector: "fake", Verb: "messages", Chat: "c1", ChatName: "family", Grants: []string{"g1"},
+			Count: 3, Dropped: i, At: h.clock.now().Add(-time.Hour + at),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
-	if _, page := h.page(t, "/access"); !strings.Contains(page, "fake messages <code>c1</code>") || !strings.Contains(page, "4 reads not logged") {
-		t.Fatal("access page doesn't show the read")
+	_, page := h.page(t, "/")
+	if strings.Count(page, "bot read family on fake") != 2 || !strings.Contains(page, "· 6 messages ·") || !strings.Contains(page, "1 read not logged") {
+		t.Fatal("Today doesn't group the reads into sessions")
 	}
 	ref := h.requestAccess(t, named(agent))
 	h.post(t, "/access/requests/"+ref.ID+"/deny", nil)
@@ -532,10 +540,179 @@ func TestReadsAndChatPicker(t *testing.T) {
 	if err := h.srv.db.sweep(ctx, h.clock.now().Add(accessKept+time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if reads, err := h.srv.db.reads(ctx, 10); err != nil || len(reads) != 0 {
+	if reads, err := h.srv.db.reads(ctx, time.Time{}, h.clock.now().Add(accessKept+time.Minute)); err != nil || len(reads) != 0 {
 		t.Fatalf("reads after 30 days: %v %v", reads, err)
 	}
 	if _, err := h.srv.db.accessRequest(ctx, ref.ID, h.clock.now()); !errors.Is(err, errNotFound) {
 		t.Fatalf("decided request after 30 days: %v", err)
+	}
+}
+
+func (h *harness) nowJSON(t *testing.T) nowData {
+	t.Helper()
+	status, body := h.call(t, http.MethodGet, "/now.json", h.session, nil)
+	var d nowData
+	if status != http.StatusOK || json.Unmarshal(body, &d) != nil {
+		t.Fatalf("now.json: %d %s", status, body)
+	}
+	return d
+}
+
+func ids(gs []grantView) []string {
+	out := []string{}
+	for _, g := range gs {
+		out = append(out, g.ID)
+	}
+	return out
+}
+
+func TestPreTicking(t *testing.T) {
+	h := start(t)
+	agent := h.agent(t, "bot")
+	for term, chat := range map[string]proposal.Chat{
+		"Dad":  {ID: "d2", Name: "Dad"},
+		"Mom":  {ID: "d1", Name: "~Mom"},
+		"Work": {ID: "c2", Name: "Work"},
+	} {
+		h.requestAccess(t, proposal.AccessRequest{
+			AgentID: agent, Connector: "fake", Terms: []string{term}, Chats: []proposal.Chat{chat}, For: time.Hour, Reason: "r",
+		})
+	}
+	ticked := map[string]string{}
+	for _, c := range h.nowJSON(t).Waiting {
+		for _, n := range c.Chats {
+			if n.Ticked {
+				ticked[n.ID] = c.Approve
+			}
+		}
+	}
+	// Only the DM under a name the owner gave it, the one chat that matched.
+	if len(ticked) != 1 || ticked["d2"] != "Approve · 1h · Dad · all" {
+		t.Fatalf("ticked = %v", ticked)
+	}
+}
+
+func TestExtendRequest(t *testing.T) {
+	h := start(t)
+	ctx := context.Background()
+	agent := h.agent(t, "bot")
+	extend := proposal.AccessRequest{AgentID: agent, Connector: "fake", Extend: true, For: 30 * time.Minute, Reason: "still reading"}
+	var e *connector.Error
+	if _, err := h.api.RequestAccess(ctx, extend); !errors.As(err, &e) || e.Status != http.StatusConflict {
+		t.Fatalf("extend with nothing open: %v", err)
+	}
+	first, _ := h.sign(t, accessChallengeRequest{Kind: approval.KindGrant, Agent: agent, Connector: "fake", Chats: []string{"c2"}, For: "1h", Horizon: "24h"})
+	_, grants := h.records(t)
+	until := grants[0].Until
+
+	ref := h.requestAccess(t, extend)
+	if w := h.nowJSON(t).Waiting; len(w) != 1 || w[0].Kind != "extend" || w[0].Extends == nil || w[0].Extends.ID != first.ID {
+		t.Fatalf("waiting = %+v", w)
+	}
+	got, _ := h.sign(t, accessChallengeRequest{Kind: approval.KindGrant, Request: ref.ID})
+	_, grants = h.records(t)
+	if len(grants) != 1 || grants[0].ID != got.ID || !slices.Equal(grants[0].Chats, []string{"c2"}) ||
+		grants[0].Horizon != 24*time.Hour || !grants[0].Until.Equal(until.Add(30*time.Minute)) {
+		t.Fatalf("after extending: %+v", grants)
+	}
+
+	// The owner's +30m does the same from Now.
+	more, _ := h.sign(t, accessChallengeRequest{Kind: kindExtend, Grant: got.ID, For: "30m"})
+	_, grants = h.records(t)
+	if len(grants) != 1 || grants[0].ID != more.ID || !grants[0].Until.Equal(until.Add(time.Hour)) {
+		t.Fatalf("after +30m: %+v", grants)
+	}
+}
+
+func TestRoutinePauseResume(t *testing.T) {
+	h := start(t)
+	agent := h.agent(t, "bot")
+	ref := h.requestAccess(t, proposal.AccessRequest{
+		AgentID: agent, Connector: "fake", Terms: []string{"Work"}, Chats: []proposal.Chat{{ID: "c2", Name: "Work"}},
+		Horizon:  24 * time.Hour,
+		Schedule: &proposal.RequestSchedule{Days: []time.Weekday{1, 2, 3, 4, 5}, Start: "07:00", Length: 20 * time.Minute},
+		Reason:   "morning summary",
+	})
+	if w := h.nowJSON(t).Waiting; len(w) != 1 || w[0].Kind != "routine" || w[0].When != "weekdays at 07:00 for 20 minutes (your time zone)" {
+		t.Fatalf("waiting = %+v", w)
+	}
+	if status, _, _ := h.accessChallenge(t, accessChallengeRequest{Kind: approval.KindGrant, Request: ref.ID, Chats: []string{"c2"}}); status != http.StatusBadRequest {
+		t.Fatalf("a routine without the owner's zone: %d", status)
+	}
+	routine, _ := h.sign(t, accessChallengeRequest{Kind: approval.KindGrant, Request: ref.ID, Chats: []string{"c2"}, Zone: "America/New_York"})
+	_, grants := h.records(t)
+	if sc := grants[0].Schedule; len(grants) != 1 || sc == nil || sc.Zone != "America/New_York" || sc.Start != "07:00" || sc.Length != 20*time.Minute {
+		t.Fatalf("routine = %+v", grants)
+	}
+
+	if status, _ := h.post(t, "/access/grants/"+routine.ID+"/close", nil); status != http.StatusSeeOther {
+		t.Fatalf("pause: %d", status)
+	}
+	if d := h.nowJSON(t); len(d.Routines) != 0 || !slices.Equal(ids(d.Stopped), []string{routine.ID}) {
+		t.Fatalf("paused: routines %v, stopped %v", ids(d.Routines), ids(d.Stopped))
+	}
+	resumed, _ := h.sign(t, accessChallengeRequest{Kind: kindResume, Grant: routine.ID})
+	_, grants = h.records(t)
+	if resumed.ID == routine.ID || len(grants) != 1 || grants[0].ID != resumed.ID || grants[0].Schedule.Zone != "America/New_York" {
+		t.Fatalf("resumed %s: %+v", resumed.ID, grants)
+	}
+	if d := h.nowJSON(t); !slices.Equal(ids(d.Routines), []string{resumed.ID}) || len(d.Stopped) != 0 {
+		t.Fatalf("resumed: routines %v, stopped %v", ids(d.Routines), ids(d.Stopped))
+	}
+	if status, _, _ := h.accessChallenge(t, accessChallengeRequest{Kind: kindResume, Grant: routine.ID}); status != http.StatusNotFound {
+		t.Fatalf("resuming twice: %d", status)
+	}
+}
+
+func TestStopAll(t *testing.T) {
+	h := start(t)
+	ctx := context.Background()
+	agent := h.agent(t, "bot")
+	h.sign(t, accessChallengeRequest{Kind: approval.KindGrant, Agent: agent, Connector: "fake", For: "1h"})
+	routine, _ := h.sign(t, accessChallengeRequest{
+		Kind: approval.KindGrant, Agent: agent, Connector: "fake",
+		Schedule: &scheduleRequest{Start: "07:00", Length: "1h", Zone: "UTC"},
+	})
+	ref := h.requestAccess(t, named(agent))
+	p, err := h.api.Submit(ctx, proposal.Request{
+		Connector: "fake", Op: "send", Args: map[string]string{"to": "Farid", "text": "hi"}, AgentID: agent, AgentName: "bot",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if status, _ := h.post(t, "/access/stop-all", nil); status != http.StatusSeeOther {
+		t.Fatalf("stop all: %d", status)
+	}
+	if _, grants := h.records(t); len(grants) != 0 {
+		t.Fatalf("grants after stop all: %+v", grants)
+	}
+	if st := h.accessStatus(t, ref.ID); st.Status != proposal.AccessDenied {
+		t.Fatalf("request after stop all: %+v", st)
+	}
+	if got, err := h.api.Get(ctx, p.ID, agent); err != nil || got.Status != proposal.Pending {
+		t.Fatalf("proposal after stop all: %+v %v", got, err)
+	}
+	d := h.nowJSON(t)
+	if len(d.Waiting) != 1 || d.Waiting[0].Kind != "send" || len(d.Open) != 0 || !slices.Equal(ids(d.Stopped), []string{routine.ID}) {
+		t.Fatalf("now after stop all: %+v", d)
+	}
+}
+
+func TestSeen(t *testing.T) {
+	h := start(t)
+	ctx := context.Background()
+	agent := h.agent(t, "bot")
+	first := h.clock.now().UTC().Truncate(time.Millisecond)
+	for _, at := range []time.Time{first, first.Add(time.Minute)} {
+		if err := h.api.Seen(ctx, proposal.Seen{AgentID: agent, At: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	status, body := h.call(t, http.MethodGet, "/agents.json", h.session, nil)
+	var d agentsData
+	if status != http.StatusOK || json.Unmarshal(body, &d) != nil || len(d.Agents) != 1 ||
+		!d.Agents[0].FirstSeen.Equal(first) || !d.Agents[0].LastSeen.Equal(first.Add(time.Minute)) {
+		t.Fatalf("agents.json: %d %s", status, body)
 	}
 }

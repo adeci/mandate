@@ -3,13 +3,11 @@ package console
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/internal/proposal"
@@ -88,55 +86,6 @@ func TestRequestPage(t *testing.T) {
 	}
 }
 
-func TestInbox(t *testing.T) {
-	h := startWith(t, func(cfg *Config, dir string) {
-		sock := filepath.Join(dir, "other.sock")
-		serveFake(t, sock, "other", emptyKeys(t))
-		cfg.Connectors["other"] = sock
-	})
-	deny := func(p proposal.Proposal) {
-		t.Helper()
-		if status, _ := h.post(t, "/r/"+p.ID+"/deny", nil); status != http.StatusSeeOther {
-			t.Fatalf("deny = %d", status)
-		}
-	}
-	for i := range pageSize + 5 {
-		deny(h.submit(t, fmt.Sprintf("routine %d", i)))
-	}
-	deny(h.submitTo(t, "other", "dinner on Sunday?"))
-	older, newer := h.submit(t, "waiting a"), h.submit(t, "waiting b")
-
-	_, body := h.page(t, "/")
-	if i, j := strings.Index(body, newer.ID), strings.Index(body, older.ID); i < 0 || j < 0 || i > j {
-		t.Fatal("waiting isn't newest first")
-	}
-	if !strings.Contains(body, `<span class="count">2</span>`) || !strings.Contains(body, "1–25 of 31") ||
-		!strings.Contains(body, `href="/?page=2"`) || strings.Contains(body, "← newer") {
-		t.Fatalf("first page:\n%s", body)
-	}
-	if _, body = h.page(t, "/?page=2"); !strings.Contains(body, "26–31 of 31") ||
-		!strings.Contains(body, "← newer") || strings.Contains(body, "older →") {
-		t.Fatalf("last page:\n%s", body)
-	}
-
-	today := time.Now().Format(time.DateOnly)
-	tomorrow := time.Now().AddDate(0, 0, 1).Format(time.DateOnly)
-	for query, want := range map[string]string{
-		"q=SUNDAY":         "1–1 of 1",
-		"connector=other":  "1–1 of 1",
-		"status=rejected":  "1–25 of 31",
-		"status=done":      "No matches.",
-		"to=" + today:      "1–25 of 31",
-		"from=" + tomorrow: "No matches.",
-		// Labels like "Text" aren't searched, only what they label.
-		"q=text": "No matches.",
-	} {
-		if _, body := h.page(t, "/?"+query); !strings.Contains(body, want) {
-			t.Errorf("%s: want %q", query, want)
-		}
-	}
-}
-
 func TestSecurityHeaders(t *testing.T) {
 	h := start(t)
 	p := h.submit(t, "hi")
@@ -157,7 +106,7 @@ func TestSecurityHeaders(t *testing.T) {
 			t.Errorf("%s: headers = %v", path, resp.Header)
 		}
 	}
-	for _, path := range []string{"/", "/?q=x&page=2", "/r/" + p.ID, "/login", "/connections", "/keys"} {
+	for _, path := range []string{"/", "/agents", "/r/" + p.ID, "/login", "/connections", "/keys"} {
 		_, body := h.page(t, path)
 		if strings.Count(body, "<script") != strings.Count(body, `<script src="/static/app.js"`) ||
 			strings.Contains(body, "style=") || strings.Contains(body, "<style") {

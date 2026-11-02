@@ -11,6 +11,7 @@
 //	POST /access/requests        AccessRequest -> RequestRef
 //	GET  /access/requests/{id}   ?wait=SECONDS -> AccessStatus
 //	POST /access/reads           ReadEvent -> 204
+//	POST /access/seen            Seen -> 204
 package proposal
 
 import (
@@ -81,8 +82,21 @@ type AccessRequest struct {
 	Unmatched []string      `json:"unmatched,omitempty"`
 	For       time.Duration `json:"for"`
 	Horizon   time.Duration `json:"horizon"`
+	// Schedule asks for a routine instead of a window of For; the owner's
+	// browser supplies the zone when approving.
+	Schedule *RequestSchedule `json:"schedule,omitempty"`
+	// Extend asks to lengthen the agent's current window on Connector by
+	// For, with its chats and horizon.
+	Extend bool `json:"extend,omitempty"`
 	// Reason is the agent's, shown to the owner as untrusted text.
 	Reason string `json:"reason"`
+}
+
+// RequestSchedule is an approval.Schedule without its zone.
+type RequestSchedule struct {
+	Days   []time.Weekday `json:"days,omitempty"`
+	Start  string         `json:"start"` // "HH:MM"
+	Length time.Duration  `json:"length"`
 }
 
 type RequestRef struct {
@@ -108,15 +122,23 @@ type AccessStatus struct {
 
 // ReadEvent is one read the gateway served.
 type ReadEvent struct {
-	AgentID   string    `json:"agent_id"`
-	Connector string    `json:"connector"`
-	Verb      string    `json:"verb"`
-	Chat      string    `json:"chat,omitempty"`
-	Grants    []string  `json:"grants"`
-	Count     int       `json:"count"`
-	At        time.Time `json:"at"`
+	AgentID   string `json:"agent_id"`
+	Connector string `json:"connector"`
+	Verb      string `json:"verb"`
+	Chat      string `json:"chat,omitempty"`
+	// ChatName is the chat's name as the agent sees it, empty when hidden.
+	ChatName string    `json:"chat_name,omitempty"`
+	Grants   []string  `json:"grants"`
+	Count    int       `json:"count"`
+	At       time.Time `json:"at"`
 	// Dropped counts this agent's earlier events the gateway couldn't queue.
 	Dropped int `json:"dropped,omitempty"`
+}
+
+// Seen says an agent used the gateway at At.
+type Seen struct {
+	AgentID string    `json:"agent_id"`
+	At      time.Time `json:"at"`
 }
 
 type accessRecords struct {
@@ -180,6 +202,11 @@ func (c *Client) RequestAccess(ctx context.Context, r AccessRequest) (RequestRef
 // a 429 *connector.Error when it is over its limits.
 func (c *Client) AccessQuota(ctx context.Context, agent string) error {
 	return c.do(ctx, callTimeout, http.MethodGet, "/access/quota?agent="+url.QueryEscape(agent), nil, nil)
+}
+
+// Seen records that an agent used the gateway; the caller throttles it.
+func (c *Client) Seen(ctx context.Context, s Seen) error {
+	return c.do(ctx, callTimeout, http.MethodPost, "/access/seen", s, nil)
 }
 
 // AccessStatus answers once the request is decided or wait is over.

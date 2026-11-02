@@ -17,8 +17,9 @@ type notifier struct {
 	log        *slog.Logger
 }
 
-// notify sends in the background; a lost notification is only logged.
-func (n *notifier) notify(text, click string) {
+// notify sends in the background under title; high marks what is waited on
+// now, such as an agent asking to read. A lost notification is only logged.
+func (n *notifier) notify(title, text, click string, high bool) {
 	if n == nil {
 		return
 	}
@@ -30,8 +31,11 @@ func (n *notifier) notify(text, click string) {
 			n.log.Error("notify", "err", err)
 			return
 		}
-		req.Header.Set("Title", "mandate")
+		req.Header.Set("Title", title)
 		req.Header.Set("Click", click)
+		if high {
+			req.Header.Set("Priority", "high")
+		}
 		if n.token != "" {
 			req.Header.Set("Authorization", "Bearer "+n.token)
 		}

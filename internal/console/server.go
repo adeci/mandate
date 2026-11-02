@@ -43,9 +43,11 @@ type Config struct {
 	// NtfyURL is the ntfy topic notified when something waits for the
 	// owner, NtfyToken its access token; none when empty.
 	NtfyURL, NtfyToken string
-	StateDir           string
-	Log                *slog.Logger
-	Now                func() time.Time
+	// GatewayURL is where agents reach the gateway, for their setup sheet.
+	GatewayURL string
+	StateDir   string
+	Log        *slog.Logger
+	Now        func() time.Time
 }
 
 type Server struct {
@@ -201,6 +203,7 @@ func (s *Server) ProposalHandler() http.Handler {
 	mux.HandleFunc("POST /access/requests", s.requestAccess)
 	mux.HandleFunc("GET /access/requests/{id}", s.accessStatus)
 	mux.HandleFunc("POST /access/reads", s.recordRead)
+	mux.HandleFunc("POST /access/seen", s.recordSeen)
 	return mux
 }
 
@@ -249,7 +252,8 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	}
 	s.cfg.Log.Info("proposed", "id", pr.ID, "connector", req.Connector, "op", req.Op, "agent", req.AgentName)
 	pr.URL = s.url(pr.ID)
-	s.notify.notify(fmt.Sprintf("%s proposes a %s %s", agentName(req.AgentName), req.Connector, req.Op), pr.URL)
+	who := agentName(req.AgentName)
+	s.notify.notify(who, fmt.Sprintf("%s proposes a %s %s", who, req.Connector, req.Op), pr.URL, false)
 	connector.WriteJSON(w, http.StatusCreated, pr.Proposal)
 }
 
