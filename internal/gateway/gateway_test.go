@@ -133,8 +133,8 @@ func TestVerbsNeverShowHiddenChatsOrLoginCodes(t *testing.T) {
 	h, _ := sourceHandler(t)
 
 	_, res, _ := getTable(t, h, "/v1/whatsapp/chats")
-	if got := column(t, res, "id"); !slices.Equal(got, []any{"conv-bank", "conv-family"}) && !slices.Equal(got, []any{"conv-family", "conv-bank"}) {
-		t.Errorf("whatsapp chats = %v, want family and bank (hidden chat and hidden sender's DM dropped)", got)
+	if got := column(t, res, "id"); !slices.Equal(got, []any{"conv-family"}) {
+		t.Errorf("whatsapp chats = %v, want family (hidden chat, hidden sender's DM and the bank's login-code-only DM dropped)", got)
 	}
 	_, res, _ = getTable(t, h, "/v1/discord/chats")
 	got := column(t, res, "name")
@@ -183,6 +183,52 @@ func TestVerbsNeverShowHiddenChatsOrLoginCodes(t *testing.T) {
 	}
 }
 
+// Chats named after a message, and deleted bodies a connector keeps for
+// restore, show agents nothing the messages themselves would not.
+func TestChatsAndDeletionsShowOnlyVisibleContent(t *testing.T) {
+	t.Parallel()
+	h, _ := sourceHandler(t)
+	ctx := context.Background()
+	dc, err := store.Open(ctx, h.cfg.Sources["discord"])
+	mustDo(t, err)
+	for _, c := range []store.Container{
+		{ID: "t-gossip", Kind: "thread", ParentID: "c-memes", Name: "gossip about Bob"},
+		{ID: "t-otp", Kind: "thread", ParentID: "c-memes", Name: "Your login code is 482913"},
+	} {
+		mustDo(t, dc.UpsertContainer(ctx, c))
+	}
+	for _, m := range []store.Message{
+		{ID: "d11", ContainerID: "t-gossip", SenderID: "u-hidden", Body: "gossip about Bob"},
+		{ID: "d12", ContainerID: "t-otp", SenderID: "u2", Body: "ok"},
+		{ID: "d13", ContainerID: "c-memes", SenderID: "u2", Body: "trashed but restorable"},
+	} {
+		m.SentAt = time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC)
+		mustDo(t, dc.UpsertMessage(ctx, m))
+	}
+	_, err = dc.DB().ExecContext(ctx, `UPDATE messages SET deleted = 1 WHERE id = 'd13'`)
+	mustDo(t, err)
+	mustDo(t, dc.Close())
+
+	_, res, _ := getTable(t, h, "/v1/discord/chats")
+	got := column(t, res, "name")
+	slices.SortFunc(got, func(a, b any) int { return strings.Compare(a.(string), b.(string)) })
+	if want := []any{"Fun", "Fun / memes", "Fun / memes / cats", "[login code hidden]"}; !slices.Equal(got, want) {
+		t.Errorf("chats = %v, want %v: the hidden sender's thread dropped, the login-code name redacted", got, want)
+	}
+	for _, q := range []string{"482913", "login", "gossip"} {
+		if _, res, _ := getTable(t, h, "/v1/discord/chats?search="+q); len(res.Rows) != 0 {
+			t.Errorf("chats --search %s found %v", q, res.Rows)
+		}
+	}
+	_, res, _ = getTable(t, h, "/v1/discord/messages?chat=c-memes&limit=1")
+	if got := column(t, res, "body"); !slices.Equal(got, []any{"[deleted]"}) {
+		t.Errorf("deleted message = %v, want only the marker", got)
+	}
+	if _, res, _ := getTable(t, h, "/v1/discord/search?text=restorable"); len(res.Rows) != 0 {
+		t.Errorf("search found the deleted body: %v", res.Rows)
+	}
+}
+
 func TestVerbsPaginate(t *testing.T) {
 	t.Parallel()
 	h, _ := sourceHandler(t)
@@ -194,7 +240,7 @@ func TestVerbsPaginate(t *testing.T) {
 	if res.More || len(res.Rows) != 1 || res.Rows[0][0] != float64(1) {
 		t.Errorf("second page: %+v, want seq 1 and no more", res)
 	}
-	_, res, _ = getTable(t, h, "/v1/whatsapp/chats?limit=1")
+	_, res, _ = getTable(t, h, "/v1/discord/chats?limit=1")
 	if !res.More || res.NextBefore != 0 || len(res.Rows) != 1 {
 		t.Errorf("chats page: %+v", res)
 	}
