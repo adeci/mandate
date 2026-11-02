@@ -460,6 +460,19 @@ func (d *db) deletePasswordSessions(ctx context.Context) error {
 	return err
 }
 
+// forgetKeys drops the key requests and passkey sessions left behind when
+// mandate-reset-keys deleted the key log, so a key added again doesn't
+// revive them.
+func (d *db) forgetKeys(ctx context.Context) error {
+	return d.tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM key_requests`); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE credential_id != ''`)
+		return err
+	})
+}
+
 // addKeyChange stores c unless limit changes are waiting, one already names
 // its key, or c adds a key under the name of one waiting to be added.
 func (d *db) addKeyChange(ctx context.Context, c keyChange, limit int) error {

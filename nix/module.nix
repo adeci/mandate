@@ -50,7 +50,8 @@ let
   credential = flag: name: " ${flag} %d/${name}";
 
   # Deletes every key so the admin password can sign in and add a first one
-  # again.
+  # again. The console, finding no keys on start, drops pending key requests
+  # and passkey sessions.
   resetKeys = pkgs.writeShellApplication {
     name = "mandate-reset-keys";
     text = ''
