@@ -130,6 +130,8 @@ input, textarea, select, button, .button {
 }
 input:not([type=checkbox]):not([type=radio]), textarea, select { width: 100%; }
 textarea { height: auto; min-height: calc(var(--lh) * 6); line-height: var(--lh); resize: vertical; }
+/* A textarea, which password managers leave alone, masked like a password field. */
+textarea.secret { height: calc(var(--lh) * 2); min-height: 0; resize: none; overflow: hidden; white-space: pre; -webkit-text-security: disc; }
 @media (max-width: 480px) { input, textarea, select { font-size: 16px; } }
 ::placeholder { color: var(--fg-alt); opacity: 1; }
 label { display: block; font-weight: var(--w-medium); color: var(--fg-strong); }

@@ -244,7 +244,8 @@
     <div class="setup">
       <label for="setup-{{$conn}}-{{.Name}}">{{.Name}}{{if not .Required}} <span class="muted">optional</span>{{end}}</label>
       <div class="row">
-        <input id="setup-{{$conn}}-{{.Name}}" name="{{.Name}}"{{if .Secret}} type="password"{{end}}{{if .Required}} required{{end}} autocomplete="off">
+        {{if .Secret}}<textarea id="setup-{{$conn}}-{{.Name}}" name="{{.Name}}" class="secret" rows="1" wrap="off" spellcheck="false" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore{{if .Required}} required{{end}}></textarea>
+        {{else}}<input id="setup-{{$conn}}-{{.Name}}" name="{{.Name}}"{{if .Required}} required{{end}} autocomplete="off">{{end}}
       </div>
       {{with .Doc}}<p class="hint">{{.}}</p>{{end}}
     </div>
@@ -259,7 +260,8 @@
   <form class="setup" data-setup>
     <label for="setup-{{$conn}}-{{.Name}}">or link with {{.Name}}</label>
     <div class="row">
-      <input id="setup-{{$conn}}-{{.Name}}" name="{{.Name}}"{{if .Secret}} type="password"{{end}} required autocomplete="off">
+      {{if .Secret}}<textarea id="setup-{{$conn}}-{{.Name}}" name="{{.Name}}" class="secret" rows="1" wrap="off" spellcheck="false" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore required></textarea>
+      {{else}}<input id="setup-{{$conn}}-{{.Name}}" name="{{.Name}}" required autocomplete="off">{{end}}
       <button type="submit">Link</button>
     </div>
     {{with .Doc}}<p class="hint">{{.}}</p>{{end}}
