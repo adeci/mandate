@@ -52,7 +52,7 @@ func (h *harness) serveFile(path, signature, body string) {
 
 func (h *harness) media(message string, index int) (string, http.Header, error) {
 	h.t.Helper()
-	resp, err := h.client.Media(context.Background(), message, index)
+	resp, err := h.client.Media(context.Background(), message, index, 0)
 	if err != nil {
 		return "", nil, err
 	}
@@ -179,5 +179,44 @@ func TestMediaOfOldMessagesIsLookedUpAgain(t *testing.T) {
 	h.mediaErr(msg4, 0, http.StatusNotFound)
 	if n := len(h.discord.all()); n != 3 {
 		t.Errorf("%d requests, want 3: a sticker has no file to look up", n)
+	}
+}
+
+func TestMediaOverTheLimitIsRefused(t *testing.T) {
+	h := newHarness(t, nil)
+	ctx := context.Background()
+	if err := h.st.UpsertContainer(ctx, store.Container{ID: dmID, Kind: kindDM}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.st.UpsertMessage(ctx, store.Message{ID: msgFile, ContainerID: dmID, SentAt: time.Date(2026, 10, 28, 12, 30, 0, 0, time.UTC), MediaType: "application/pdf"}); err != nil {
+		t.Fatal(err)
+	}
+	photoPath := "/attachments/" + dmID + "/" + attPhoto + "/rig.png"
+	h.discord.reply(api("/channels/"+dmID+"/messages"), 200, []map[string]any{fileMessage(
+		attachment(attPlan, "plan.pdf", "application/pdf", 10, "?ex=1&is=2&hm=a&"),
+		attachment(attPhoto, "rig.png", "image/png", 0, "?ex=1&is=2&hm=b&"),
+	)})
+	big := strings.Repeat("x", 2048)
+	h.discord.handle(planPath, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		io.WriteString(w, big)
+	})
+	// Without a Content-Length and with no size from Discord; the body ends
+	// only once the connector stops reading.
+	h.discord.handle(photoPath, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.(http.Flusher).Flush()
+		io.WriteString(w, big)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+	h.start()
+	for i := range 2 {
+		resp, err := h.client.Media(ctx, msgFile, i, 1024)
+		if err == nil {
+			resp.Body.Close()
+		}
+		var e *connector.Error
+		if !errors.As(err, &e) || e.Status != http.StatusRequestEntityTooLarge {
+			t.Fatalf("file %d: got %v, want 413", i, err)
+		}
 	}
 }

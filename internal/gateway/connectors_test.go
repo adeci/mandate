@@ -62,6 +62,7 @@ func (f *fakeDiscord) Spec() connector.Spec {
 		{Name: "send", Kind: connector.Write, Params: []connector.Param{
 			{Name: "chat", Required: true, Container: true},
 			{Name: "text", Required: true, Editable: true},
+			{Name: "seq"},
 		}},
 	}}
 }
@@ -350,6 +351,33 @@ func TestWriteOpProposesPreparedArgs(t *testing.T) {
 	}
 	if n := r.console.calls.Load(); n != 1 {
 		t.Errorf("console calls = %d, want 1", n)
+	}
+}
+
+// A write answering a message agents may not see is refused, and the refusal
+// shows nothing the connector rendered from it.
+func TestWriteOpRefusesAnsweringHiddenMessage(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, nil)
+	r.discord.prepare = func(args map[string]string) (connector.Prepared, error) {
+		// d2 is visible; d9 is from a hidden sender.
+		id := map[string]string{"2": "d2", "6": "d9"}[args["seq"]]
+		return connector.Prepared{
+			Args:      args,
+			Display:   []approval.Field{{Label: "In reply to", Value: "quoted " + id}},
+			Container: args["chat"],
+			Message:   id,
+		}, nil
+	}
+	rec := call(r.h, http.MethodPost, "/v1/discord/send", `{"args":{"chat":"c-memes","seq":"6","text":"hi"}}`)
+	if rec.Code != http.StatusNotFound || strings.Contains(rec.Body.String(), "quoted") || !strings.Contains(rec.Body.String(), "chat=c-memes seq=6") {
+		t.Errorf("answering a hidden sender: %d %s, want 404 naming only chat and seq", rec.Code, rec.Body)
+	}
+	if n := r.console.calls.Load(); n != 0 {
+		t.Fatalf("a refused write reached the console %d times", n)
+	}
+	if rec := call(r.h, http.MethodPost, "/v1/discord/send", `{"args":{"chat":"c-memes","seq":"2","text":"hi"}}`); rec.Code != http.StatusAccepted {
+		t.Errorf("answering a visible message: %d %s", rec.Code, rec.Body)
 	}
 }
 

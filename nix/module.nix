@@ -169,6 +169,9 @@ let
           "mandate-gateway"
         ];
         RestartSec = "30s";
+        # A connector buffers whole media files; a cap keeps a runaway one
+        # from taking the host's memory with it.
+        MemoryMax = "1G";
         IPAddressDeny = privateNets;
       }
       // c.serviceConfig
@@ -210,7 +213,8 @@ let
             systemd service settings merged over the defaults. Connectors
             may not reach localhost, the LAN or the tailnet; list a host in
             `IPAddressAllow` to let this one reach it, e.g. a self-hosted
-            homeserver or a LAN API.
+            homeserver or a LAN API. Each connector is capped at
+            `MemoryMax = "1G"`; raise it here for a large account.
           '';
         };
       };

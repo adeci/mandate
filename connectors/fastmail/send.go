@@ -10,6 +10,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"golang.org/x/net/idna"
 
 	"github.com/adeci/mandate/approval"
 	"github.com/adeci/mandate/connector"
@@ -20,7 +24,7 @@ var fromParam = connector.Param{Name: "from", Doc: "one of the owner's sending a
 var spec = connector.Spec{
 	Name: "fastmail",
 	Doc: "Chats are email threads. The last 90 days of mail arrive by the first sync, new mail within a minute; " +
-		"Trash, Spam and Drafts are left out. A body cut at 16 KiB ends in " + truncatedMarker + ".\n" +
+		"Trash, Spam and Drafts are left out, and mail moved there can't be fetched or replied to. A body cut at 16 KiB ends in " + truncatedMarker + ".\n" +
 		"send and reply propose an email; it goes out from the owner's account once they approve it.",
 	Setup: setupParams,
 	Ops: []connector.Op{
@@ -61,6 +65,7 @@ func (c *fmConnector) Spec() connector.Spec { return spec }
 var (
 	errNotLinked  = &connector.Error{Status: http.StatusServiceUnavailable, Message: "fastmail is not linked"}
 	errConnecting = &connector.Error{Status: http.StatusServiceUnavailable, Message: "fastmail is connecting to Fastmail; try again in a minute"}
+	errDeleted    = &connector.Error{Status: http.StatusGone, Message: "the email is in Trash or Spam, or was deleted"}
 )
 
 // linked returns the account's settings once its session is known.
@@ -118,14 +123,14 @@ func prepareSend(cn *conn, args map[string]string) (connector.Prepared, error) {
 	if err != nil {
 		return connector.Prepared{}, err
 	}
-	to, err := recipients("to", args["to"])
+	to, toShown, err := recipients("to", args["to"])
 	if err != nil {
 		return connector.Prepared{}, err
 	}
 	if to == "" {
 		return connector.Prepared{}, connector.Invalid("to is required")
 	}
-	cc, err := recipients("cc", args["cc"])
+	cc, ccShown, err := recipients("cc", args["cc"])
 	if err != nil {
 		return connector.Prepared{}, err
 	}
@@ -137,10 +142,10 @@ func prepareSend(cn *conn, args map[string]string) (connector.Prepared, error) {
 		return connector.Prepared{}, connector.Invalid("subject must be one line")
 	}
 	out := map[string]string{"from": from, "to": to, "subject": subject, "body": args["body"]}
-	display := []approval.Field{{Label: "From", Value: from}, {Label: "To", Value: to}}
+	display := []approval.Field{{Label: "From", Value: from}, {Label: "To", Value: toShown}}
 	if cc != "" {
 		out["cc"] = cc
-		display = append(display, approval.Field{Label: "Cc", Value: cc})
+		display = append(display, approval.Field{Label: "Cc", Value: ccShown})
 	}
 	display = append(display,
 		approval.Field{Label: "Subject", Value: subject, Param: "subject"},
@@ -153,39 +158,48 @@ func (c *fmConnector) prepareReply(ctx context.Context, cn *conn, args map[strin
 	if chat == "" {
 		return connector.Prepared{}, connector.Invalid("chat is required")
 	}
-	var seq int64
-	var replyTo, subject, rcpts string
-	q := `SELECT m.seq, e.reply_to, e.subject, e.recipients FROM messages AS m JOIN fastmail_emails AS e ON e.id = m.id
-WHERE m.container_id = ?1 ORDER BY m.deleted, m.is_from_me, m.sent_at DESC, m.seq DESC LIMIT 1`
+	var (
+		seq                                      int64
+		id, replyTo, subject, rcpts, msgID, refs string
+		deleted                                  bool
+	)
+	const cols = `SELECT m.seq, m.id, m.deleted, e.reply_to, e.subject, e.recipients, e.message_id, e.refs
+FROM messages AS m JOIN fastmail_emails AS e ON e.id = m.id `
+	q := cols + `WHERE m.container_id = ?1 AND NOT m.deleted ORDER BY m.is_from_me, m.sent_at DESC, m.seq DESC LIMIT 1`
 	qargs := []any{chat}
 	if s := args["seq"]; s != "" {
 		n, err := strconv.ParseInt(s, 10, 64)
 		if err != nil || n < 1 {
 			return connector.Prepared{}, connector.Invalid("seq must be a seq from mandate's output")
 		}
-		q = `SELECT m.seq, e.reply_to, e.subject, e.recipients FROM messages AS m JOIN fastmail_emails AS e ON e.id = m.id
-WHERE m.container_id = ?1 AND m.seq = ?2`
+		q = cols + `WHERE m.container_id = ?1 AND m.seq = ?2`
 		qargs = append(qargs, n)
 	}
-	err := c.st.DB().QueryRowContext(ctx, q, qargs...).Scan(&seq, &replyTo, &subject, &rcpts)
+	err := c.st.DB().QueryRowContext(ctx, q, qargs...).Scan(&seq, &id, &deleted, &replyTo, &subject, &rcpts, &msgID, &refs)
 	switch {
 	case errors.Is(err, sql.ErrNoRows) && len(qargs) > 1:
 		return connector.Prepared{}, connector.Invalid("no email with seq %s in chat %s", args["seq"], chat)
 	case errors.Is(err, sql.ErrNoRows):
-		return connector.Prepared{}, connector.Invalid("unknown chat %q: run mandate fastmail chats", chat)
+		return connector.Prepared{}, connector.Invalid("unknown chat %q, or it has only deleted mail: run mandate fastmail chats", chat)
 	case err != nil:
 		return connector.Prepared{}, fmt.Errorf("look up the email: %w", err)
+	case deleted:
+		return connector.Prepared{}, errDeleted
+	case !headerSafe(msgID) || !headerSafe(refs):
+		return connector.Prepared{}, connector.Invalid("the email's Message-ID or References header is malformed")
 	}
-	to, err := recipients("to", replyTo)
+	// Errors from here on leave out the stored addresses and subject: the
+	// gateway relays them to agents, who may not see this email.
+	to, toShown, err := recipients("to", replyTo)
 	if err != nil || to == "" {
 		return connector.Prepared{}, connector.Invalid("the email has no address to reply to")
 	}
 	subject = reSubject(subject)
 	if v, ok := args["to"]; ok && v != to {
-		return connector.Prepared{}, connector.Invalid("a reply goes to %s; use send to write to others", to)
+		return connector.Prepared{}, connector.Invalid("a reply's recipients are fixed; use send to write to others")
 	}
 	if v, ok := args["subject"]; ok && v != subject {
-		return connector.Prepared{}, connector.Invalid("a reply's subject is %q; use send for another", subject)
+		return connector.Prepared{}, connector.Invalid("a reply's subject is fixed; use send for another")
 	}
 	from := args["from"]
 	if from == "" {
@@ -201,11 +215,12 @@ WHERE m.container_id = ?1 AND m.seq = ?2`
 		},
 		Display: []approval.Field{
 			{Label: "From", Value: from},
-			{Label: "To", Value: to},
+			{Label: "To", Value: toShown},
 			{Label: "Subject", Value: subject},
 			{Label: "Text", Value: args["body"], Param: "body"},
 		},
 		Container: chat,
+		Message:   id,
 	}, nil
 }
 
@@ -221,6 +236,9 @@ func sender(cn *conn, s string) (string, error) {
 	}
 	a, err := mail.ParseAddress(s)
 	if err != nil {
+		return "", connector.Invalid("from: %v", err)
+	}
+	if _, err := shown(a.Address); err != nil {
 		return "", connector.Invalid("from: %v", err)
 	}
 	if _, ok := cn.identity(a.Address); !ok {
@@ -242,24 +260,57 @@ func replyFrom(cn *conn, rcpts string) string {
 	return ""
 }
 
-// recipients normalizes a comma-separated address list to bare addresses.
-func recipients(param, s string) (string, error) {
+// recipients normalizes a comma-separated address list to bare addresses,
+// and returns it as the owner is shown it too.
+func recipients(param, s string) (addrs, display string, err error) {
 	if strings.TrimSpace(s) == "" {
-		return "", nil
+		return "", "", nil
 	}
 	list, err := mail.ParseAddressList(s)
 	if err != nil {
-		return "", connector.Invalid("%s: %v", param, err)
+		return "", "", connector.Invalid("%s: %v", param, err)
 	}
-	addrs := make([]string, len(list))
+	bare := make([]string, len(list))
+	show := make([]string, len(list))
 	for i, a := range list {
 		domain := a.Address[strings.LastIndexByte(a.Address, '@')+1:]
 		if !strings.Contains(domain, ".") {
-			return "", connector.Invalid("%s: %s has no domain like example.com", param, a.Address)
+			return "", "", connector.Invalid("%s: %s has no domain like example.com", param, a.Address)
 		}
-		addrs[i] = a.Address
+		if show[i], err = shown(a.Address); err != nil {
+			return "", "", connector.Invalid("%s: %v", param, err)
+		}
+		bare[i] = a.Address
 	}
-	return strings.Join(addrs, ", "), nil
+	return strings.Join(bare, ", "), strings.Join(show, ", "), nil
+}
+
+// shown is addr as the owner sees it on approval: an internationalized
+// domain gets its ASCII form alongside, so a look-alike such as Cyrillic
+// "о" in place of "o" shows as xn--. Local parts can't be told apart that
+// way, so only ASCII ones are accepted.
+func shown(addr string) (string, error) {
+	at := strings.LastIndexByte(addr, '@')
+	local, domain := addr[:at], addr[at+1:]
+	for _, r := range local {
+		if r >= utf8.RuneSelf {
+			return "", fmt.Errorf("%s: only ASCII is accepted before the @", addr)
+		}
+	}
+	ascii, err := idna.Lookup.ToASCII(domain)
+	if err != nil {
+		return "", fmt.Errorf("%s: invalid domain: %w", addr, err)
+	}
+	if !strings.EqualFold(ascii, domain) {
+		return addr + " (" + local + "@" + ascii + ")", nil
+	}
+	return addr, nil
+}
+
+// headerSafe reports whether a stored Message-ID or References value has no
+// control characters that could end the header it goes into.
+func headerSafe(s string) bool {
+	return !strings.ContainsFunc(s, unicode.IsControl)
 }
 
 func reSubject(s string) string {
@@ -319,6 +370,9 @@ func (c *fmConnector) Execute(ctx context.Context, rec approval.Record) connecto
 WHERE m.seq = ?1 AND m.container_id = ?2`, rec.Args["seq"], rec.Args["chat"]).Scan(&messageID, &refs)
 		if err != nil {
 			return failed("look up the email: %v", err)
+		}
+		if !headerSafe(messageID) || !headerSafe(refs) {
+			return failed("the email's Message-ID or References header is malformed")
 		}
 		if messageID != "" {
 			draft["inReplyTo"] = []string{messageID}

@@ -276,16 +276,25 @@ func (u *upstream) download(ctx, bodyCtx context.Context, dl time.Time, link str
 		cancel()
 		return nil, 0, &upstreamError{status: resp.StatusCode, msg: " for the file"}
 	}
+	limit := connector.MediaLimit(ctx)
+	if resp.ContentLength > limit {
+		resp.Body.Close()
+		cancel()
+		return nil, 0, connector.TooLarge(limit)
+	}
 	// A body fhttp decompressed has no length; Discord's size is the file's.
 	size := resp.ContentLength
 	if size < 0 {
 		size = known
 	}
 	if size <= 0 {
-		b, err := io.ReadAll(resp.Body)
+		b, err := connector.ReadMedia(ctx, resp.Body)
 		resp.Body.Close()
 		cancel()
-		if err != nil {
+		var ce *connector.Error
+		if errors.As(err, &ce) {
+			return nil, 0, err
+		} else if err != nil {
 			return nil, 0, &upstreamError{msg: cdnTemplate + ": " + err.Error()}
 		}
 		return io.NopCloser(bytes.NewReader(b)), int64(len(b)), nil

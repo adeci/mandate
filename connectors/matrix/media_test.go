@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -51,7 +52,7 @@ func TestMedia(t *testing.T) {
 	f.hs.mu.Lock()
 	f.hs.history[vaultRoom] = []map[string]any{old}
 	f.hs.mu.Unlock()
-	if err := f.st.UpsertMessage(ctx, store.Message{ID: "$old", ContainerID: vaultRoom.String(), SentAt: time.UnixMilli(1000), MediaType: "image"}); err != nil {
+	if err := f.st.UpsertMessage(ctx, store.Message{ID: "$old", ContainerID: vaultRoom.String(), SenderID: owner.String(), SentAt: time.UnixMilli(1000), MediaType: "image"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -108,5 +109,70 @@ func TestMedia(t *testing.T) {
 	}
 	if _, err := f.c.Media(ctx, "$beach", 1); !errors.As(err, &ce) || ce.Status != http.StatusNotFound {
 		t.Fatalf("second file: %v", err)
+	}
+
+	// The homeserver answers a refetch: only the stored message, carried as
+	// ingest would trust it, is used.
+	forged := encryptedImage("$forged", "mxc://example.org/forged", []byte("forged"), 4000)
+	plain := msgEvent("$plain", owner, 5000, map[string]any{"msgtype": "m.image", "body": "x.png", "url": "mxc://example.org/beach"})
+	f.hs.mu.Lock()
+	f.hs.history[vaultRoom] = append(f.hs.history[vaultRoom], forged, plain)
+	f.hs.events = map[string]map[string]any{"$swapped": old}
+	f.hs.mu.Unlock()
+	for _, m := range []store.Message{
+		{ID: "$forged", SenderID: bob.String()},
+		{ID: "$plain", SenderID: owner.String()},
+		{ID: "$swapped", SenderID: owner.String()},
+	} {
+		m.ContainerID, m.SentAt, m.MediaType = vaultRoom.String(), time.UnixMilli(4000), "image"
+		if err := f.st.UpsertMessage(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.c.Media(ctx, m.ID, 0); !errors.As(err, &ce) || ce.Status != http.StatusBadGateway {
+			t.Errorf("refetched %s: %v", m.ID, err)
+		}
+	}
+}
+
+func TestMediaOverTheLimitIsRefused(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t)
+	f.link()
+	// The event claims a small file; the homeserver serves more than the
+	// limit, without a Content-Length.
+	ef := attachment.NewEncryptedFile()
+	small := []byte("small")
+	ef.EncryptInPlace(small)
+	huge, _ := f.encryptContent(f.element, vaultRoom, "$huge", &event.MessageEventContent{
+		MsgType: event.MsgFile, Body: "huge.bin", Info: &event.FileInfo{Size: len(small)},
+		File: &event.EncryptedFileInfo{EncryptedFile: *ef, URL: "mxc://example.org/huge"},
+	}, 1000)
+	f.hs.mu.Lock()
+	f.hs.media["mxc://example.org/huge"] = make([]byte, 64<<10)
+	f.hs.history[vaultRoom] = []map[string]any{huge}
+	f.hs.mu.Unlock()
+	n := f.hs.push(joined(map[id.RoomID]map[string]any{vaultRoom: room([]map[string]any{
+		stateEvent("m.room.encryption", "", owner, map[string]any{"algorithm": "m.megolm.v1.aes-sha2"}),
+		member(owner, "Owner"),
+	}, []map[string]any{huge})}))
+	f.hs.waitSynced(n)
+
+	srv := &connector.Server{Connector: f.c, Log: f.env.Log}
+	sock := filepath.Join(t.TempDir(), "c.sock")
+	sctx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(sctx, sock) }()
+	t.Cleanup(func() { cancel(); <-done })
+	client := connector.Dial(sock, 5*time.Second)
+	eventually(t, "the socket serves", func() bool { _, err := client.Spec(ctx); return err == nil })
+
+	resp, err := client.Media(ctx, "$huge", 0, 1<<10)
+	if err == nil {
+		resp.Body.Close()
+	}
+	var ce *connector.Error
+	if !errors.As(err, &ce) || ce.Status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("got %v, want 413", err)
 	}
 }
