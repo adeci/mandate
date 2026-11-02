@@ -157,6 +157,7 @@ func writeConnectorHelp(w io.Writer, ci connectorInfo) {
 			fmt.Fprintln(w, "A message with several files marks them [#0 image/png] [#1 ...]; pass that --index.")
 		}
 		fmt.Fprintln(w, "When more rows exist, stderr gives the --before value for the next page.")
+		fmt.Fprintf(w, "Bodies over %d characters are cut; --full prints them whole, --seq SEQ one message whole.\n", bodyPreview)
 		if reads {
 			fmt.Fprintln(w, "Read ops print messages in search's columns.")
 		}

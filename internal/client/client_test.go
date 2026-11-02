@@ -77,6 +77,40 @@ func TestOutputModes(t *testing.T) {
 	}
 }
 
+func TestLongBodies(t *testing.T) {
+	t.Parallel()
+	long := strings.Repeat("é", bodyPreview+5)
+	reply := `{"columns":["seq","body"],"rows":[[7,"` + long + `"]]}`
+	srv, rec := gateway(t, http.StatusOK, reply)
+	for name, tc := range map[string]struct {
+		args       []string
+		body, want string
+	}{
+		"cut":   {[]string{"messages", "c"}, "", strings.Repeat("é", bodyPreview) + "…[+5 chars; messages CHAT_ID --seq SEQ prints it whole]"},
+		"full":  {[]string{"messages", "c", "--full"}, "", long},
+		"one":   {[]string{"messages", "c", "--seq", "7"}, "before=8&chat=c&limit=1", long},
+		"other": {[]string{"messages", "c", "--seq", "6"}, "", ""},
+	} {
+		c, out, _ := testClient(t, srv.URL, false)
+		err := c.connector(t.Context(), "fastmail", tc.args)
+		if name == "other" {
+			if err == nil || !strings.Contains(err.Error(), "no message 6") {
+				t.Errorf("other: %v %q", err, out)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if tc.body != "" && rec.query != tc.body {
+			t.Errorf("%s: query %q", name, rec.query)
+		}
+		if want := "seq\tbody\n7\t" + tc.want + "\n"; out.String() != want {
+			t.Errorf("%s:\n%q\nwant\n%q", name, out, want)
+		}
+	}
+}
+
 func TestRequests(t *testing.T) {
 	t.Parallel()
 	for name, tc := range map[string]struct {

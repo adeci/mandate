@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -30,14 +31,18 @@ const (
 
 const (
 	chatsUsage    = "mandate %s chats [--search TEXT] [--limit 20]"
-	messagesUsage = "mandate %s messages CHAT_ID [--limit 20] [--before SEQ]"
-	searchUsage   = "mandate %s search TEXT [--chat CHAT_ID] [--since YYYY-MM-DD] [--limit 50] [--before SEQ]"
+	messagesUsage = "mandate %s messages CHAT_ID [--limit 20] [--before SEQ] [--seq SEQ] [--full]"
+	searchUsage   = "mandate %s search TEXT [--chat CHAT_ID] [--since YYYY-MM-DD] [--limit 50] [--before SEQ] [--full]"
 	sendUsage     = "mandate %s send CHAT_ID TEXT [--note WHY] [--wait DUR]"
 	opUsage       = "mandate %s %s [KEY=VALUE...] [--note WHY] [--wait DUR]"
 	getUsage      = "mandate %s get PATH [--head]"
 	mediaUsage    = "mandate %s media CHAT_ID SEQ [--index N] [-o PATH]"
 	statusUsage   = "mandate status ID [--wait DUR]"
 )
+
+// bodyPreview is where listings cut a body, so an email thread doesn't fill
+// an agent's context; --full and --seq print bodies whole.
+const bodyPreview = 600
 
 type client struct {
 	url    string
@@ -48,6 +53,8 @@ type client struct {
 	tty    bool
 	json   bool
 	name   string
+	full   bool  // print bodies whole
+	seq    int64 // the one message asked for, if any
 }
 
 func fromEnv(getenv func(string) string, out, errOut io.Writer, tty bool) (*client, error) {
@@ -131,9 +138,15 @@ func (c *client) connector(ctx context.Context, name string, args []string) erro
 		help := fmt.Sprintf(messagesUsage, name)
 		limit := fs.Int("limit", 0, "")
 		before := fs.Int("before", 0, "")
+		seq := fs.Int("seq", 0, "")
+		fs.BoolVar(&c.full, "full", false, "")
 		pos, err := c.parse(fs, help, args, 1, 1)
 		if err != nil {
 			return err
+		}
+		if *seq > 0 {
+			c.seq, c.full = int64(*seq), true
+			*before, *limit = *seq+1, 1
 		}
 		return c.rows(ctx, base+"messages", query("chat", pos[0], "limit", *limit, "before", *before))
 	case "search":
@@ -142,6 +155,7 @@ func (c *client) connector(ctx context.Context, name string, args []string) erro
 		since := fs.String("since", "", "")
 		limit := fs.Int("limit", 0, "")
 		before := fs.Int("before", 0, "")
+		fs.BoolVar(&c.full, "full", false, "")
 		pos, err := c.parse(fs, help, args, 1, -1)
 		if err != nil {
 			return err
@@ -321,12 +335,16 @@ func (c *client) rows(ctx context.Context, path, query string) error {
 // table prints rows as TSV, or aligned on a terminal; the footer goes to
 // stderr so stdout stays parseable.
 func (c *client) table(raw []byte) error {
-	if c.json {
-		_, err := c.out.Write(append(bytes.TrimRight(raw, "\n"), '\n'))
-		return err
-	}
 	var t table
 	if err := json.Unmarshal(raw, &t); err != nil {
+		return err
+	}
+	seqCol, body := slices.Index(t.Columns, "seq"), slices.Index(t.Columns, "body")
+	if c.seq > 0 && (len(t.Rows) == 0 || seqCol < 0 || cell(t.Rows[0][seqCol]) != strconv.FormatInt(c.seq, 10)) {
+		return fmt.Errorf("no message %d in that chat", c.seq)
+	}
+	if c.json {
+		_, err := c.out.Write(append(bytes.TrimRight(raw, "\n"), '\n'))
 		return err
 	}
 	w := c.out
@@ -342,6 +360,9 @@ func (c *client) table(raw []byte) error {
 	for _, row := range t.Rows {
 		cells := make([]string, len(row))
 		for i, v := range row {
+			if s, ok := v.(string); ok && i == body && !c.full {
+				v = preview(s)
+			}
 			cells[i] = cell(v)
 		}
 		fmt.Fprintln(w, strings.Join(cells, "\t"))
@@ -352,6 +373,7 @@ func (c *client) table(raw []byte) error {
 		}
 	}
 	switch {
+	case c.seq > 0:
 	case t.NextBefore > 0:
 		fmt.Fprintf(c.errOut, "next: --before %d\n", t.NextBefore)
 	case t.More:
@@ -361,6 +383,15 @@ func (c *client) table(raw []byte) error {
 		fmt.Fprintf(c.errOut, "%d chats updated; list them with mandate %s chats\n", t.Containers, c.name)
 	}
 	return nil
+}
+
+// preview cuts a long body and says how to read the rest.
+func preview(s string) string {
+	r := []rune(s)
+	if len(r) <= bodyPreview {
+		return s
+	}
+	return fmt.Sprintf("%s…[+%d chars; messages CHAT_ID --seq SEQ prints it whole]", string(r[:bodyPreview]), len(r)-bodyPreview)
 }
 
 // escapeTSV keeps a value on one line and in one cell; help documents it.

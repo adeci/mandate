@@ -19,12 +19,14 @@ are missing, or the gateway refuses the token, tell the owner.
 ```sh
 mandate signal chats --search alice          # find the chat id
 mandate signal messages CHAT_ID --limit 50
+mandate fastmail messages CHAT_ID --seq 12     # one message, body whole
 mandate signal search "dinner friday" --since 2026-01-01
 mandate signal media CHAT_ID SEQ             # save a message's [image/jpeg] or other file
 ```
 
-Connectors that list `media` save a message's file here and print its path;
-files marked `[#0 …] [#1 …]` are picked with `--index`.
+Long bodies are cut at 600 characters in listings; `--seq SEQ` prints one
+message whole. Connectors that list `media` save a message's file here and
+print its path; files marked `[#0 …] [#1 …]` are picked with `--index`.
 
 ## Writing
 
