@@ -79,7 +79,7 @@ func (h *handler) media(w http.ResponseWriter, r *http.Request, name string) {
 		return
 	}
 
-	resp, err := h.connectors.media[name].Media(r.Context(), m.id, int(index))
+	resp, err := h.connectors.media[name].Media(r.Context(), m.id, int(index), h.cfg.MaxMedia)
 	attrs := []any{"remote", r.RemoteAddr, "connector", name, "seq", seq, "index", index}
 	if err != nil {
 		slog.Info("media", append(attrs, "err", err.Error())...)

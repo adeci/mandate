@@ -169,6 +169,39 @@ type MediaFile struct {
 	Body io.ReadCloser
 }
 
+// DefaultMediaLimit caps a file when the caller names no limit.
+const DefaultMediaLimit = 100 << 20
+
+type mediaLimitKey struct{}
+
+// MediaLimit is the largest file the caller of Media accepts. A sender can
+// understate a file's size, so connectors stop downloading past it rather
+// than trust the stored size.
+func MediaLimit(ctx context.Context) int64 {
+	if n, ok := ctx.Value(mediaLimitKey{}).(int64); ok && n > 0 {
+		return n
+	}
+	return DefaultMediaLimit
+}
+
+// ReadMedia reads all of r, refusing it once it passes MediaLimit(ctx).
+func ReadMedia(ctx context.Context, r io.Reader) ([]byte, error) {
+	limit := MediaLimit(ctx)
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, TooLarge(limit)
+	}
+	return b, nil
+}
+
+// TooLarge refuses a file over limit bytes.
+func TooLarge(limit int64) *Error {
+	return &Error{Status: http.StatusRequestEntityTooLarge, Message: fmt.Sprintf("the file is larger than the %d MiB limit", limit>>20)}
+}
+
 type HealthState string
 
 const (

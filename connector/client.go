@@ -115,10 +115,10 @@ func (c *Client) PutKeys(ctx context.Context, log []approval.SignedChange) (Keys
 	return h, err
 }
 
-// Media streams a stored message's file; the caller closes the body.
-// Refusals come back as *Error.
-func (c *Client) Media(ctx context.Context, message string, index int) (*http.Response, error) {
-	b, err := json.Marshal(mediaRequest{Message: message, Index: index})
+// Media streams a stored message's file of at most limit bytes; the caller
+// closes the body. Refusals come back as *Error.
+func (c *Client) Media(ctx context.Context, message string, index int, limit int64) (*http.Response, error) {
+	b, err := json.Marshal(mediaRequest{Message: message, Index: index, Limit: limit})
 	if err != nil {
 		return nil, err
 	}

@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -34,6 +35,8 @@ type Server struct {
 	// call every route.
 	Peers *Peers
 	Log   *slog.Logger
+
+	mediaFetches atomic.Int32
 }
 
 // Peers names the uids that may call a Server over its socket. The console
@@ -261,7 +264,13 @@ func (s *Server) read(w http.ResponseWriter, r *http.Request) {
 type mediaRequest struct {
 	Message string `json:"message"`
 	Index   int    `json:"index"`
+	// Limit is the largest file the caller accepts; 0 means DefaultMediaLimit.
+	Limit int64 `json:"limit,omitempty"`
 }
+
+// maxMediaFetches bounds the files a connector downloads at once, since
+// some services only hand them over whole.
+const maxMediaFetches = 2
 
 func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 	var req mediaRequest
@@ -273,16 +282,30 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, &Error{Status: http.StatusNotFound, Message: "this connector serves no media"})
 		return
 	}
-	if req.Message == "" || req.Index < 0 {
+	if req.Message == "" || req.Index < 0 || req.Limit < 0 {
 		WriteError(w, Invalid("a message and an index from 0 are required"))
 		return
 	}
-	f, err := m.Media(r.Context(), req.Message, req.Index)
+	if s.mediaFetches.Add(1) > maxMediaFetches {
+		s.mediaFetches.Add(-1)
+		WriteError(w, &Error{Status: http.StatusTooManyRequests, Message: "other files are downloading; try again shortly"})
+		return
+	}
+	defer s.mediaFetches.Add(-1)
+	ctx := r.Context()
+	if req.Limit > 0 {
+		ctx = context.WithValue(ctx, mediaLimitKey{}, req.Limit)
+	}
+	f, err := m.Media(ctx, req.Message, req.Index)
 	if err != nil {
 		WriteError(w, err)
 		return
 	}
 	defer f.Body.Close()
+	if limit := MediaLimit(ctx); f.Size > limit {
+		WriteError(w, TooLarge(limit))
+		return
+	}
 	h := w.Header()
 	h.Set("Content-Type", cmp.Or(f.Type, "application/octet-stream"))
 	h.Set("Content-Length", strconv.FormatInt(f.Size, 10))

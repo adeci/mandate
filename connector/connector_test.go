@@ -1,6 +1,7 @@
 package connector_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -69,8 +70,16 @@ func (f *fake) Read(context.Context, string, map[string]string) (json.RawMessage
 	return json.RawMessage(`{"ids":["a"]}`), nil
 }
 
-func (f *fake) Media(_ context.Context, message string, index int) (connector.MediaFile, error) {
-	if message != "m1" || index != 0 {
+func (f *fake) Media(ctx context.Context, message string, index int) (connector.MediaFile, error) {
+	switch {
+	case message == "big" && index == 0:
+		// A file whose stored size understates it.
+		b, err := connector.ReadMedia(ctx, strings.NewReader("0123456789"))
+		if err != nil {
+			return connector.MediaFile{}, err
+		}
+		return connector.MediaFile{Type: "text/plain", Size: int64(len(b)), Body: io.NopCloser(bytes.NewReader(b))}, nil
+	case message != "m1" || index != 0:
 		return connector.MediaFile{}, &connector.Error{Status: http.StatusNotFound, Message: "no such file"}
 	}
 	return connector.MediaFile{Type: "image/png", Name: "dot.png", Size: 3, Body: io.NopCloser(strings.NewReader("png"))}, nil
@@ -179,7 +188,7 @@ func TestControlRoutesOnlyFromConsole(t *testing.T) {
 	if _, err := h.client.Keys(ctx); err != nil {
 		t.Fatalf("gateway keys: %v", err)
 	}
-	resp, err := h.client.Media(ctx, "m1", 0)
+	resp, err := h.client.Media(ctx, "m1", 0, 0)
 	if err != nil {
 		t.Fatalf("gateway media: %v", err)
 	}
@@ -225,11 +234,37 @@ func TestControlRoutesOnlyFromConsole(t *testing.T) {
 
 // mediaStatus asks for a message's first file and answers the refusal's status.
 func mediaStatus(h *harness, message string) int {
-	resp, err := h.client.Media(context.Background(), message, 0)
+	resp, err := h.client.Media(context.Background(), message, 0, 0)
 	if err == nil {
 		resp.Body.Close()
 	}
 	return status(err)
+}
+
+func TestMediaLimit(t *testing.T) {
+	t.Parallel()
+	h := start(t, nil)
+	ctx := context.Background()
+	for _, c := range []struct {
+		message string
+		limit   int64
+		want    int
+	}{
+		{"big", 4, http.StatusRequestEntityTooLarge},
+		{"m1", 2, http.StatusRequestEntityTooLarge},
+		{"big", 10, http.StatusOK},
+	} {
+		resp, err := h.client.Media(ctx, c.message, 0, c.limit)
+		got := http.StatusOK
+		if err != nil {
+			got = status(err)
+		} else {
+			resp.Body.Close()
+		}
+		if got != c.want {
+			t.Errorf("%s with limit %d: %d, want %d (%v)", c.message, c.limit, got, c.want, err)
+		}
+	}
 }
 
 func TestExecuteRunsSessionKeyApprovalOnce(t *testing.T) {
