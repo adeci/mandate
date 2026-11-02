@@ -64,6 +64,23 @@ What each part is trusted with:
 - **Unofficial clients**: the WhatsApp, Signal, Discord and Google Messages
   connectors can get an account limited or banned.
 
+## If the server is compromised
+
+Unlinking in the console deletes mandate's copy of a login; it doesn't end
+the session at the service. To end each one there:
+
+| What | Where to end it |
+|---|---|
+| Agent token | regenerate it (`tokenFile`, or `/var/lib/mandate/token`) and redeploy |
+| Passkeys | remove them under Keys, or `sudo mandate-reset-keys` |
+| WhatsApp | phone: Settings → Linked devices → mandate → Log out |
+| Signal | phone: Settings → Linked devices → mandate → Unlink |
+| Matrix | Element: Settings → Sessions → mandate → Sign out |
+| Discord | change the account password, which ends every token |
+| Google Messages | phone: Messages → Device pairing → Unpair; and the pairing Google account: Security → Your devices → sign out the browser session the cookies came from |
+| Fastmail | Settings → Privacy & Security → Connected apps & API tokens → revoke |
+| `http` services | revoke the token at each service |
+
 ## Reporting
 
 Report vulnerabilities privately through GitHub's
