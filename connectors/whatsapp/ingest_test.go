@@ -109,3 +109,50 @@ func TestEditsAndDeletesFromAuthor(t *testing.T) {
 		}
 	}
 }
+
+// Stanza IDs are chosen by the sending device, so a new message may reuse
+// a stored ID; only its author's redelivery replaces the stored message.
+func TestReusedIDFromOtherAuthor(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t)
+	dev, err := f.container.GetFirstDevice(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sent := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	for id, from := range map[string]types.JID{"O1": me, "F1": farid, "S1": samPark} {
+		if err := f.st.UpsertMessage(ctx, store.Message{
+			ID: messageID(climbing, id), ContainerID: climbing.String(), SenderID: from.String(),
+			IsFromMe: from == me, SentAt: sent, Body: "original",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	send := func(from types.JID, id, body string) {
+		if !in.handle(ctx, &events.Message{
+			Info: types.MessageInfo{
+				MessageSource: types.MessageSource{Chat: climbing, Sender: from, IsGroup: true},
+				ID:            id, Timestamp: sent.Add(time.Minute),
+			},
+			Message: &waE2E.Message{Conversation: proto.String(body)},
+		}) {
+			t.Fatalf("%s from %s not acked", id, from)
+		}
+	}
+	send(farid, "O1", "farid over the owner")
+	send(samParkL, "F1", "sam over farid")
+	send(samParkL, "S1", "sam again")
+
+	for id, want := range map[string]string{"O1": "original", "F1": "original", "S1": "sam again"} {
+		var body string
+		if err := f.st.DB().QueryRowContext(ctx, `SELECT body FROM messages WHERE id = ?`, messageID(climbing, id)).
+			Scan(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body != want {
+			t.Errorf("%s: body %q, want %q", id, body, want)
+		}
+	}
+}

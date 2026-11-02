@@ -106,17 +106,21 @@ func (c *gmConnector) Media(ctx context.Context, message string, index int) (con
 	var data []byte
 	switch {
 	case ref.ID != "":
-		data, err = download(cli, ref.ID, ref.Key)
+		data, err = download(ctx, cli, ref.ID, ref.Key)
 	case ref.whole(item.Size):
 		data = ref.Data
 	default:
-		data, err = download(cli, ref.ThumbID, ref.ThumbKey)
+		data, err = download(ctx, cli, ref.ThumbID, ref.ThumbKey)
 		// A video's preview is an image, so its type is the preview's own,
 		// and the name leaves the extension to it.
 		file.Type, _, _ = mime.ParseMediaType(http.DetectContentType(data))
 		file.Name = "preview"
 	}
-	if err != nil {
+	var refused *connector.Error
+	switch {
+	case errors.As(err, &refused):
+		return connector.MediaFile{}, err
+	case err != nil:
 		return connector.MediaFile{}, &connector.Error{Status: http.StatusBadGateway, Message: "download from Google Messages: " + err.Error()}
 	}
 	file.Size, file.Body = int64(len(data)), io.NopCloser(bytes.NewReader(data))
@@ -124,14 +128,20 @@ func (c *gmConnector) Media(ctx context.Context, message string, index int) (con
 }
 
 // libgm reports the size the sender gave, which the decrypted stream need
-// not match, so the file is read whole.
-func download(cli gmClient, id string, key []byte) ([]byte, error) {
+// not match, so the stream is read up to the media limit. DownloadMedia
+// takes no context; closing the body ends the transfer once ctx is done.
+func download(ctx context.Context, cli gmClient, id string, key []byte) ([]byte, error) {
 	body, err := cli.DownloadMedia(id, key)
 	if err != nil {
 		return nil, err
 	}
 	defer body.Close()
-	return io.ReadAll(body)
+	defer context.AfterFunc(ctx, func() { body.Close() })()
+	data, err := connector.ReadMedia(ctx, body)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return data, err
 }
 
 // refetch asks the phone for the messages up to message, stores what it

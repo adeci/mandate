@@ -28,7 +28,7 @@ type op struct {
 	kind   opKind
 	chat   types.JID     // container JID (non-AD, phone number preferred)
 	sender types.JID     // author, editor or deleter (non-AD, phone number preferred)
-	fromMe bool          // opEdit, opDelete: sent by the owner
+	fromMe bool          // sent by the owner
 	msg    store.Message // opUpsert
 	target string        // opEdit, opDelete: store message ID
 	body   string        // opEdit
@@ -201,7 +201,7 @@ func convert(evt *events.Message, pn pnResolver) (op, bool) {
 	if reply := contextInfo(m).GetStanzaID(); reply != "" {
 		msg.ReplyToID = messageID(chat, reply)
 	}
-	return op{kind: opUpsert, chat: chat, sender: sender, msg: msg}, true
+	return op{kind: opUpsert, chat: chat, sender: sender, fromMe: evt.Info.IsFromMe, msg: msg}, true
 }
 
 func content(m *waE2E.Message) (body, media string, ok bool) {

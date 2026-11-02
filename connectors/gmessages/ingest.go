@@ -37,6 +37,8 @@ type ingester struct {
 	syncing, again bool
 	// phoneSyncing is set while the phone rebuilds its message database.
 	phoneSyncing bool
+	// dmsFilled is set once fillDMs has run.
+	dmsFilled bool
 }
 
 func newIngester(st *store.Store, log *slog.Logger) *ingester {
@@ -255,6 +257,51 @@ func (in *ingester) syncOnce(ctx context.Context, cli gmClient) error {
 		msgs += n
 	}
 	in.log.Info("synced", "conversations", len(resp.GetConversations()), "fetched", fetched, "messages", msgs)
+	in.mu.Lock()
+	filled := in.dmsFilled
+	in.mu.Unlock()
+	if !filled {
+		return in.fillDMs(ctx, cli)
+	}
+	return nil
+}
+
+// fillDMs asks the phone for the DMs stored without their participant, as
+// they were before DMs recorded it, so a hidden number hides them.
+func (in *ingester) fillDMs(ctx context.Context, cli gmClient) error {
+	rows, err := in.st.DB().QueryContext(ctx, `SELECT id FROM containers WHERE kind = 'dm' AND participants_json = '[]'`)
+	if err != nil {
+		return fmt.Errorf("read stored conversations: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		conv, err := in.lookup(ctx, cli, id)
+		if errors.Is(err, libgm.ErrPhoneNotResponding) || errors.Is(err, libgm.ErrConnectionClosed) || ctx.Err() != nil {
+			return err
+		}
+		if err != nil {
+			in.log.Warn("look up conversation", "conversation", id, "err", err)
+			continue
+		}
+		if err := in.st.UpsertContainer(ctx, container(conv)); err != nil {
+			return err
+		}
+	}
+	in.mu.Lock()
+	in.dmsFilled = true
+	in.mu.Unlock()
 	return nil
 }
 

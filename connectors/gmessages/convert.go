@@ -79,22 +79,21 @@ func container(conv *gmproto.Conversation) store.Container {
 		c.LastMessageAt = time.UnixMicro(ts).UTC()
 	}
 	ps := others(conv)
-	if !c.IsGroup {
-		if len(ps) == 1 {
-			if n := participantName(ps[0]); n != "" {
-				c.Name = n
-			}
-		}
-		return c
-	}
-	c.Participants = make([]store.Participant, 0, len(ps))
 	names := make([]string, 0, len(ps))
+	if c.IsGroup || len(ps) > 0 {
+		// A DM lists its participant too, so a hidden number hides it
+		// even when it holds only the owner's messages.
+		c.Participants = make([]store.Participant, 0, len(ps))
+	}
 	for _, p := range ps {
 		part := store.Participant{ID: participantID(p), Name: participantName(p)}
 		c.Participants = append(c.Participants, part)
 		names = append(names, part.Name)
 	}
-	if c.Name == "" {
+	switch {
+	case !c.IsGroup && len(ps) == 1 && names[0] != "":
+		c.Name = names[0]
+	case c.IsGroup && c.Name == "":
 		c.Name = strings.Join(names, ", ")
 	}
 	return c

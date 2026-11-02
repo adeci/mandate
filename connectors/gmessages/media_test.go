@@ -1,16 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/crypto"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+	"go.mau.fi/util/exhttp"
 
 	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/store"
@@ -178,3 +183,40 @@ func TestMediaWithoutFileID(t *testing.T) {
 		t.Fatalf("preview: %+v %q, %v", file, body, err)
 	}
 }
+
+// The size Google Messages reports is the sender's; libgm's download is
+// read only up to the limit.
+func TestDownloadStopsAtLimit(t *testing.T) {
+	t.Parallel()
+	key := bytes.Repeat([]byte("k"), 32)
+	gcm, err := crypto.NewAESGCMHelper(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := gcm.EncryptData(make([]byte, 4<<20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var served atomic.Int64
+	s := exhttp.SensibleClientSettings
+	s.TransportOverride = func(exhttp.ClientSettings) http.RoundTripper {
+		return roundTrip(func(req *http.Request) (*http.Response, error) {
+			body := io.NopCloser(io.TeeReader(bytes.NewReader(enc), writerFunc(func(p []byte) { served.Add(int64(len(p))) })))
+			return &http.Response{StatusCode: http.StatusOK, Body: body, Header: http.Header{}, Request: req}, nil
+		})
+	}
+	cli := libgmClient{libgm.NewClient(libgm.NewAuthData(), nil, zerolog.Nop(), s)}
+	const limit = 64 << 10
+	_, err = download(connector.WithMediaLimit(context.Background(), limit), cli, "md1", key)
+	var e *connector.Error
+	if !errors.As(err, &e) || e.Status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("download = %v, want 413", err)
+	}
+	if n := served.Load(); n > 4*limit {
+		t.Errorf("read %d bytes of %d with a %d byte limit", n, len(enc), limit)
+	}
+}
+
+type writerFunc func([]byte)
+
+func (f writerFunc) Write(p []byte) (int, error) { f(p); return len(p), nil }

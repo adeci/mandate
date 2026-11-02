@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/util"
@@ -131,7 +132,28 @@ func (c *gmConnector) Execute(ctx context.Context, rec approval.Record) connecto
 		return connector.Result{Status: connector.Failed, Detail: "look up the chat on the phone: " + err.Error()}
 	}
 	req := sendRequest(conv, c.in.sim(conv), text, util.GenerateTmpID())
-	return sendResult(cli.SendMessage(ctx, req))
+	return sendResult(cli.SendMessage(singleAttempt(ctx), req))
+}
+
+type singleAttemptKey struct{}
+
+// singleAttempt lets the first HTTP request under ctx through and refuses
+// any after it. libgm resends a request answered with a server error, which
+// the relay may already have passed to the phone.
+func singleAttempt(ctx context.Context) context.Context {
+	return context.WithValue(ctx, singleAttemptKey{}, new(atomic.Bool))
+}
+
+var errNotResent = errors.New("google answered with a server error and the message was not resent; it may or may not have gone out")
+
+// onceTransport enforces singleAttempt for libgm's HTTP clients.
+type onceTransport struct{ http.RoundTripper }
+
+func (t onceTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if sent, ok := req.Context().Value(singleAttemptKey{}).(*atomic.Bool); ok && sent.Swap(true) {
+		return nil, errNotResent
+	}
+	return t.RoundTripper.RoundTrip(req)
 }
 
 func sendRequest(conv *gmproto.Conversation, sim *gmproto.SIMPayload, text, tmpID string) *gmproto.SendMessageRequest {

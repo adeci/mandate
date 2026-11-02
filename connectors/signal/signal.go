@@ -19,6 +19,7 @@ import (
 	"go.mau.fi/mautrix-signal/pkg/signalmeow"
 	"go.mau.fi/mautrix-signal/pkg/signalmeow/events"
 	sgstore "go.mau.fi/mautrix-signal/pkg/signalmeow/store"
+	"go.mau.fi/mautrix-signal/pkg/signalmeow/web"
 	"go.mau.fi/util/dbutil"
 
 	"github.com/adeci/mandate/connector"
@@ -37,6 +38,7 @@ func start(ctx context.Context, env *connector.Env, _ struct{}) (connector.Conne
 		Timestamp().Str("module", "signalmeow").Logger()
 	ctx = zl.WithContext(ctx)
 	signalmeow.SetLogger(zl)
+	web.SignalHTTPClient.Transport = capMedia{web.SignalHTTPClient.Transport}
 
 	st, err := store.Open(ctx, env.DataPath())
 	if err != nil {

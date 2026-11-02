@@ -61,6 +61,7 @@ type fakeClient struct {
 	logouts     int
 	logoutErr   error
 	blobs       map[string][]byte // direct path -> encrypted file
+	served      int64             // bytes DownloadToFile streamed
 }
 
 func (f *fakeClient) IsConnected() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.connected }
@@ -76,16 +77,25 @@ func (f *fakeClient) SendMessage(_ context.Context, to types.JID, msg *waE2E.Mes
 	return whatsmeow.SendResponse{ID: "3EB0AA", Timestamp: time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC)}, nil
 }
 
-// Download decrypts the file at msg's direct path as whatsmeow does.
-func (f *fakeClient) Download(_ context.Context, msg whatsmeow.DownloadableMessage) ([]byte, error) {
+// DownloadToFile streams the file at msg's direct path into file and
+// decrypts it as whatsmeow does.
+func (f *fakeClient) DownloadToFile(_ context.Context, msg whatsmeow.DownloadableMessage, file whatsmeow.File) error {
 	f.mu.Lock()
 	blob, ok := f.blobs[msg.GetDirectPath()]
 	f.mu.Unlock()
 	if !ok {
-		return nil, whatsmeow.ErrMediaDownloadFailedWith404
+		return whatsmeow.ErrMediaDownloadFailedWith404
+	}
+	body := &countingReader{r: bytes.NewReader(blob)}
+	_, err := io.Copy(file, body)
+	f.mu.Lock()
+	f.served += body.n
+	f.mu.Unlock()
+	if err != nil {
+		return err
 	}
 	if sum := sha256.Sum256(blob); !bytes.Equal(sum[:], msg.GetFileEncSHA256()) {
-		return nil, whatsmeow.ErrInvalidMediaEncSHA256
+		return whatsmeow.ErrInvalidMediaEncSHA256
 	}
 	keys := hkdfutil.SHA256(msg.GetMediaKey(), nil, []byte(whatsmeow.GetMediaType(msg)), 112)
 	iv, cipherKey, macKey := keys[:16], keys[16:48], keys[48:80]
@@ -94,16 +104,31 @@ func (f *fakeClient) Download(_ context.Context, msg whatsmeow.DownloadableMessa
 	h.Write(iv)
 	h.Write(ciphertext)
 	if !hmac.Equal(h.Sum(nil)[:10], mac) {
-		return nil, whatsmeow.ErrInvalidMediaHMAC
+		return whatsmeow.ErrInvalidMediaHMAC
 	}
 	plain, err := cbcutil.Decrypt(cipherKey, iv, ciphertext)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if sum := sha256.Sum256(plain); !bytes.Equal(sum[:], msg.GetFileSHA256()) {
-		return nil, whatsmeow.ErrInvalidMediaSHA256
+		return whatsmeow.ErrInvalidMediaSHA256
 	}
-	return plain, nil
+	if _, err := file.WriteAt(plain, 0); err != nil {
+		return err
+	}
+	return file.Truncate(int64(len(plain)))
+}
+
+// countingReader is a response body: no WriteTo, so io.Copy reads it in chunks.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // GetQRChannel opens a QR session whose first code is "qr-<session>-1".

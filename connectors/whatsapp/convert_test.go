@@ -103,7 +103,7 @@ func TestConvert(t *testing.T) {
 				},
 				Message: &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{FileName: proto.String("x.pdf")}},
 			},
-			want: op{kind: opUpsert, chat: alice, sender: me, msg: store.Message{
+			want: op{kind: opUpsert, chat: alice, sender: me, fromMe: true, msg: store.Message{
 				ID: "15550001111@s.whatsapp.net/A4", ContainerID: "15550001111@s.whatsapp.net",
 				SenderID: "15559990000@s.whatsapp.net", SentAt: ts, IsFromMe: true, MediaType: "document",
 			}},
@@ -271,7 +271,7 @@ func TestConvertHistorySync(t *testing.T) {
 				MessageTimestamp: &sec,
 				Message:          &waE2E.Message{VideoMessage: &waE2E.VideoMessage{Caption: proto.String("clip")}},
 			},
-			want: op{kind: opUpsert, chat: group, sender: me, msg: store.Message{
+			want: op{kind: opUpsert, chat: group, sender: me, fromMe: true, msg: store.Message{
 				ID: "120363000000000001@g.us/H2", ContainerID: "120363000000000001@g.us",
 				SenderID: "15559990000@s.whatsapp.net", SentAt: ts, IsFromMe: true, Body: "clip", MediaType: "video",
 			}},
