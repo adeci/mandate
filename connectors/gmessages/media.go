@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"path/filepath"
 	"time"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
@@ -29,35 +31,54 @@ const (
 )
 
 // mediaRef is what libgm needs to download and decrypt a file from Google's
-// servers. ID is empty while the phone has not downloaded an MMS; Data
-// holds a file sent inline.
+// servers. ID is empty until the phone has uploaded the whole file, which
+// for an MMS waits for the phone to download it; a preview may be there
+// before. Data holds a file sent whole within the message.
 type mediaRef struct {
-	ID   string `json:"id,omitempty"`
-	Key  []byte `json:"key,omitempty"`
-	Data []byte `json:"data,omitempty"`
+	ID       string `json:"id,omitempty"`
+	Key      []byte `json:"key,omitempty"`
+	ThumbID  string `json:"thumb_id,omitempty"`
+	ThumbKey []byte `json:"thumb_key,omitempty"`
+	Data     []byte `json:"data,omitempty"`
+}
+
+// whole reports whether r serves the file of the given size itself. The
+// data within a message is often only a small preview.
+func (r mediaRef) whole(size int64) bool {
+	return r.ID != "" || r.Data != nil && (size == 0 || int64(len(r.Data)) == size)
 }
 
 func attachment(mc *gmproto.MediaContent) store.Media {
-	ref := mediaRef{ID: mc.GetMediaID(), Key: mc.GetDecryptionKey()}
-	if ref.ID == "" {
-		ref.Data = mc.GetMediaData()
+	ref := mediaRef{
+		ID: mc.GetMediaID(), Key: mc.GetDecryptionKey(),
+		ThumbID: mc.GetThumbnailMediaID(), ThumbKey: mc.GetThumbnailDecryptionKey(),
 	}
-	data, _ := json.Marshal(ref) // a struct of strings and bytes
 	size := mc.GetSize()
-	if size == 0 {
+	if inline := (mediaRef{Data: mc.GetMediaData()}); ref.ID == "" && inline.whole(size) {
+		ref.Data = inline.Data
 		size = int64(len(ref.Data))
 	}
+	data, _ := json.Marshal(ref) // a struct of strings and bytes
 	return store.Media{
 		Type: cmp.Or(libgm.FormatToMediaType[mc.GetFormat()].Format, mc.GetMimeType(), "application/octet-stream"),
-		Name: mc.GetMediaName(),
+		Name: fileName(mc.GetMediaName()),
 		Size: size,
 		Ref:  data,
 	}
 }
 
+// fileName drops what Google gives in place of a file name, such as a part
+// number, so a name without an extension counts as none.
+func fileName(name string) string {
+	if filepath.Ext(name) == "" {
+		return ""
+	}
+	return name
+}
+
 // Media downloads a stored message's file and decrypts it. A message stored
-// without the file's reference, or before the phone had the file, is looked
-// up on the phone again.
+// without the whole file's reference is looked up on the phone again; if the
+// phone has only a preview so far, the preview is served, named as one.
 func (c *gmConnector) Media(ctx context.Context, message string, index int) (connector.MediaFile, error) {
 	cli, h := c.state()
 	if cli == nil {
@@ -73,7 +94,7 @@ func (c *gmConnector) Media(ctx context.Context, message string, index int) (con
 			return connector.MediaFile{}, fmt.Errorf("media reference of %s: %w", message, err)
 		}
 	}
-	if ref.ID == "" && ref.Data == nil {
+	if !ref.whole(item.Size) {
 		if h.State != connector.Healthy {
 			return connector.MediaFile{}, &connector.Error{Status: http.StatusServiceUnavailable, Message: "google messages is not connected: " + h.Detail}
 		}
@@ -81,20 +102,31 @@ func (c *gmConnector) Media(ctx context.Context, message string, index int) (con
 			return connector.MediaFile{}, err
 		}
 	}
-	data := ref.Data
-	if ref.ID != "" {
-		data, err = download(cli, ref)
-		if err != nil {
-			return connector.MediaFile{}, &connector.Error{Status: http.StatusBadGateway, Message: "download from Google Messages: " + err.Error()}
-		}
+	file := connector.MediaFile{Type: item.Type, Name: fileName(item.Name)}
+	var data []byte
+	switch {
+	case ref.ID != "":
+		data, err = download(cli, ref.ID, ref.Key)
+	case ref.whole(item.Size):
+		data = ref.Data
+	default:
+		data, err = download(cli, ref.ThumbID, ref.ThumbKey)
+		// A video's preview is an image, so its type is the preview's own,
+		// and the name leaves the extension to it.
+		file.Type, _, _ = mime.ParseMediaType(http.DetectContentType(data))
+		file.Name = "preview"
 	}
-	return connector.MediaFile{Type: item.Type, Name: item.Name, Size: int64(len(data)), Body: io.NopCloser(bytes.NewReader(data))}, nil
+	if err != nil {
+		return connector.MediaFile{}, &connector.Error{Status: http.StatusBadGateway, Message: "download from Google Messages: " + err.Error()}
+	}
+	file.Size, file.Body = int64(len(data)), io.NopCloser(bytes.NewReader(data))
+	return file, nil
 }
 
 // libgm reports the size the sender gave, which the decrypted stream need
 // not match, so the file is read whole.
-func download(cli gmClient, ref mediaRef) ([]byte, error) {
-	body, err := cli.DownloadMedia(ref.ID, ref.Key)
+func download(cli gmClient, id string, key []byte) ([]byte, error) {
+	body, err := cli.DownloadMedia(id, key)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +135,8 @@ func download(cli gmClient, ref mediaRef) ([]byte, error) {
 }
 
 // refetch asks the phone for the messages up to message, stores what it
-// says about it, and returns its file at index.
+// says about it, and returns its file at index: the whole file, or else a
+// preview.
 func (c *gmConnector) refetch(ctx context.Context, cli gmClient, message string, index int) (store.Media, mediaRef, error) {
 	var chat, sent string
 	err := c.st.DB().QueryRowContext(ctx, `SELECT container_id, sent_at FROM messages WHERE id = ?1`, message).Scan(&chat, &sent)
@@ -143,7 +176,7 @@ func (c *gmConnector) refetch(ctx context.Context, cli gmClient, message string,
 			if err := json.Unmarshal(files[index].Ref, &ref); err != nil {
 				return store.Media{}, mediaRef{}, err
 			}
-			if ref.ID != "" || ref.Data != nil {
+			if ref.whole(files[index].Size) || ref.ThumbID != "" {
 				return files[index], ref, nil
 			}
 		}
