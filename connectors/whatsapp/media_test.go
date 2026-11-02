@@ -84,3 +84,38 @@ func TestMediaFetchesWhatIngestRecorded(t *testing.T) {
 		}
 	}
 }
+
+// The sender states the file's length; the download stops at the limit
+// whatever it says.
+func TestMediaStopsAtLimit(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	mediaKey := []byte(strings.Repeat("k", 32))
+	plain := make([]byte, 4<<20)
+	blob := encryptMedia(t, plain, mediaKey, whatsmeow.MediaDocument)
+	encSum, sum := sha256.Sum256(blob), sha256.Sum256(plain)
+	f.cli.blobs = map[string][]byte{"/v/big": blob}
+	info := dmInfo("BIG")
+	info.Chat, info.Sender = farid, farid
+	o, ok := convert(&events.Message{Info: info, Message: &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
+		Mimetype: proto.String("application/pdf"), FileName: proto.String("small.pdf"),
+		DirectPath: proto.String("/v/big"), MediaKey: mediaKey,
+		FileSHA256: sum[:], FileEncSHA256: encSum[:], FileLength: proto.Uint64(1),
+	}}}, func(j types.JID) types.JID { return j })
+	if !ok {
+		t.Fatal("document not converted")
+	}
+	ctx := context.Background()
+	if err := f.st.UpsertMessage(ctx, o.msg); err != nil {
+		t.Fatal(err)
+	}
+	const limit = 64 << 10
+	_, err := f.c.Media(connector.WithMediaLimit(ctx, limit), o.msg.ID, 0)
+	var e *connector.Error
+	if !errors.As(err, &e) || e.Status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("Media = %v, want 413", err)
+	}
+	if served := f.cli.served; served > 2*limit {
+		t.Errorf("read %d bytes of a %d byte file with a %d byte limit", served, len(blob), limit)
+	}
+}

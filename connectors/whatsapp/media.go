@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -9,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -97,13 +97,105 @@ func (c *waConnector) Media(ctx context.Context, message string, index int) (con
 	if !cli.IsConnected() || !cli.IsLoggedIn() {
 		return connector.MediaFile{}, &connector.Error{Status: http.StatusServiceUnavailable, Message: "whatsapp is not connected"}
 	}
-	data, err := cli.Download(ctx, &ref)
+	file, size, err := download(ctx, cli, &ref)
+	var tooLarge *connector.Error
 	switch {
+	case errors.As(err, &tooLarge):
+		return connector.MediaFile{}, err
 	case errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403), errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404),
 		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410):
 		return connector.MediaFile{}, &connector.Error{Status: http.StatusNotFound, Message: "WhatsApp's servers no longer have this file; they keep media only for a while"}
 	case err != nil:
 		return connector.MediaFile{}, &connector.Error{Status: http.StatusBadGateway, Message: "download from WhatsApp: " + err.Error()}
 	}
-	return connector.MediaFile{Type: item.Type, Name: item.Name, Size: int64(len(data)), Body: io.NopCloser(bytes.NewReader(data))}, nil
+	return connector.MediaFile{Type: item.Type, Name: item.Name, Size: size, Body: file}, nil
+}
+
+// AES-CBC padding and the MAC that whatsmeow strips after downloading.
+const encryptionOverhead = 16 + 10
+
+var errOverLimit = errors.New("file over the media limit")
+
+// download has whatsmeow fetch ref into an unlinked temporary file and
+// decrypt it there, so the file is held on disk, and only up to the media
+// limit: writes past it fail and cancel the download.
+func download(ctx context.Context, cli waClient, ref *mediaRef) (*os.File, int64, error) {
+	limit := connector.MediaLimit(ctx)
+	f, err := os.CreateTemp("", "media-")
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := os.Remove(f.Name()); err != nil {
+		f.Close()
+		return nil, 0, err
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	capped := &cappedFile{f: f, max: limit + encryptionOverhead, cancel: cancel}
+	err = cli.DownloadToFile(ctx, ref, capped)
+	var size int64
+	if err == nil {
+		var fi os.FileInfo
+		if fi, err = f.Stat(); err == nil {
+			size = fi.Size()
+			_, err = f.Seek(0, io.SeekStart)
+		}
+	}
+	switch {
+	case capped.over || err == nil && size > limit:
+		err = connector.TooLarge(limit)
+	case err == nil:
+		return f, size, nil
+	}
+	f.Close()
+	return nil, 0, err
+}
+
+// cappedFile is the whatsmeow.File it downloads into. It does not embed
+// *os.File: io.Copy would use its ReadFrom past Write, and whatsmeow would
+// preallocate the server's Content-Length.
+type cappedFile struct {
+	f      *os.File
+	max    int64
+	over   bool
+	cancel context.CancelFunc
+}
+
+func (c *cappedFile) Read(p []byte) (int, error)                { return c.f.Read(p) }
+func (c *cappedFile) ReadAt(p []byte, off int64) (int, error)   { return c.f.ReadAt(p, off) }
+func (c *cappedFile) Seek(off int64, whence int) (int64, error) { return c.f.Seek(off, whence) }
+func (c *cappedFile) Stat() (os.FileInfo, error)                { return c.f.Stat() }
+
+func (c *cappedFile) Write(p []byte) (int, error) {
+	off, err := c.f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, err
+	}
+	if err := c.check(off + int64(len(p))); err != nil {
+		return 0, err
+	}
+	return c.f.Write(p)
+}
+
+func (c *cappedFile) WriteAt(p []byte, off int64) (int, error) {
+	if err := c.check(off + int64(len(p))); err != nil {
+		return 0, err
+	}
+	return c.f.WriteAt(p, off)
+}
+
+func (c *cappedFile) Truncate(size int64) error {
+	if err := c.check(size); err != nil {
+		return err
+	}
+	return c.f.Truncate(size)
+}
+
+func (c *cappedFile) check(end int64) error {
+	if end > c.max {
+		c.over = true
+		c.cancel()
+		return errOverLimit
+	}
+	return nil
 }
