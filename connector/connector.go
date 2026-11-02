@@ -90,11 +90,13 @@ func (s Spec) Op(name string) (Op, bool) {
 }
 
 // Prepared is a write after normalization: the args to execute, the fields the
-// owner must see, and the container it writes to (for exposure checks).
+// owner must see, the container it writes to and the stored message it answers,
+// if any (both for exposure checks).
 type Prepared struct {
 	Args      map[string]string `json:"args"`
 	Display   []approval.Field  `json:"display"`
 	Container string            `json:"container,omitempty"`
+	Message   string            `json:"message,omitempty"`
 }
 
 type Status string
