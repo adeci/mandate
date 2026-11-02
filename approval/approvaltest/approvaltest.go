@@ -211,6 +211,18 @@ func (a *Authenticator) Approve(record []byte, issuedAt time.Time) approval.Appr
 	}
 }
 
+// SignAccess signs access record bytes of kind issued at issuedAt.
+func (a *Authenticator) SignAccess(kind string, record []byte, issuedAt time.Time) approval.Signed {
+	nonce := newNonce()
+	return approval.Signed{
+		Kind:      kind,
+		Record:    record,
+		Nonce:     nonce,
+		IssuedAt:  issuedAt,
+		Assertion: a.Assert(approval.AccessChallenge(kind, record, nonce, issuedAt)),
+	}
+}
+
 func newNonce() []byte {
 	nonce := make([]byte, 16)
 	rand.Read(nonce)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"time"
 
@@ -18,6 +19,15 @@ import (
 // ancestors' names as a prefix and hides a name that reads like a login
 // code; msgs leaves out hidden senders and blanks login-code and deleted
 // bodies. ?1 and ?2 are the hidden container and sender IDs as JSON arrays.
+//
+// ?3 is the agent's scope, a JSON array of rules (see rule). A chat is
+// covered by a rule that names its ID, or that names no chats; a grant on a
+// guild or channel covers nothing under it, as the owner signs exactly the
+// chats they checked. A chat's cutoff is the earliest of its covering
+// rules', and chats leaves out a chat no rule covers. msgs leaves out
+// messages sent before their chat's cutoff, which makes the grants a union.
+// An ancestor's name prefixes a chat's only when the scope covers the
+// ancestor too, so a grant on a thread does not name its channel.
 //
 // A DM's ID is not its other participant's ID everywhere (Discord channels,
 // Matrix rooms), so a DM is also matched by its stored participants and by
@@ -46,10 +56,14 @@ hidden(id) AS (
   UNION SELECT container_id FROM messages
     WHERE sender_id IN (SELECT id FROM hidden_sender) AND NOT is_from_me
       AND +container_id IN (SELECT id FROM containers WHERE kind = 'dm')),
+rule(cutoff, chats) AS (SELECT value ->> 'cutoff', value ->> 'chats' FROM json_each(?3)),
+granted(id) AS (SELECT k.value FROM rule AS g CROSS JOIN json_each(g.chats) AS k WHERE g.chats IS NOT NULL),
 named AS (
-  SELECT c.id, c.kind, c.last_message_at,
-         CASE WHEN COALESCE(p1.name, p2.name, p3.name) IS NULL THEN c.name
-              ELSE concat_ws(' / ', p3.name, p2.name, p1.name, COALESCE(c.name, c.id)) END AS name
+  SELECT c.id, c.kind, c.last_message_at, c.name AS own,
+         concat_ws(' / ',
+           iif(p3.id IN (SELECT id FROM granted) OR EXISTS (SELECT 1 FROM rule WHERE chats IS NULL), p3.name, NULL),
+           iif(p2.id IN (SELECT id FROM granted) OR EXISTS (SELECT 1 FROM rule WHERE chats IS NULL), p2.name, NULL),
+           iif(p1.id IN (SELECT id FROM granted) OR EXISTS (SELECT 1 FROM rule WHERE chats IS NULL), p1.name, NULL)) AS prefix
   FROM containers AS c
   LEFT JOIN containers AS p1 ON p1.id = c.parent_id
   LEFT JOIN containers AS p2 ON p2.id = p1.parent_id
@@ -59,9 +73,15 @@ named AS (
     AND COALESCE(c.parent_id, '') NOT IN (SELECT id FROM hidden)
     AND COALESCE(p1.parent_id, '') NOT IN (SELECT id FROM hidden)
     AND COALESCE(p2.parent_id, '') NOT IN (SELECT id FROM hidden)),
+covered AS (
+  SELECT n.id, n.kind, n.last_message_at,
+         iif(n.prefix = '', n.own, n.prefix || ' / ' || COALESCE(n.own, n.id)) AS name,
+         (SELECT min(g.cutoff) FROM rule AS g
+          WHERE g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value = n.id)) AS cutoff
+  FROM named AS n),
 chats AS (
-  SELECT id, kind, last_message_at, iif(name_auth, '[login code hidden]', name) AS name, name_auth
-  FROM (SELECT *, name IS NOT NULL AND is_auth('', name) AS name_auth FROM named)),
+  SELECT id, kind, last_message_at, cutoff, iif(name_auth, '[login code hidden]', name) AS name, name_auth
+  FROM (SELECT *, name IS NOT NULL AND is_auth('', name) AS name_auth FROM covered WHERE cutoff IS NOT NULL)),
 stored AS (
   SELECT m.*, COALESCE(
     (SELECT iif(count(*) = 1, '[' || type || COALESCE(' ' || name, '') || ']',
@@ -69,7 +89,7 @@ stored AS (
      FROM media WHERE message_id = m.id),
     '[' || m.media_type || ']') AS files
   FROM messages AS m JOIN chats AS c ON c.id = m.container_id
-  WHERE COALESCE(m.sender_id, '') NOT IN (SELECT id FROM hidden_sender)),
+  WHERE COALESCE(m.sender_id, '') NOT IN (SELECT id FROM hidden_sender) AND m.sent_at >= c.cutoff),
 visible AS (
   SELECT *, is_auth(sender_id, concat_ws(' ', files, body)) AS auth FROM stored),
 msgs AS (
@@ -94,20 +114,21 @@ type table struct {
 	Containers int `json:"containers,omitempty"`
 }
 
-// source is a source database opened for one request. db is nil until the
-// connector has stored something.
+// source is a source database opened for one request, limited to scope.
+// db is nil until the connector has stored something.
 type source struct {
-	db                  *sqlite3.Conn
-	hideChats, hideFrom string
+	db                         *sqlite3.Conn
+	hideChats, hideFrom, scope string
+	log                        *slog.Logger
 }
 
-func (h *handler) openSource(ctx context.Context, name string) (_ *source, err error) {
+func (h *handler) openSource(ctx context.Context, name, scope string) (_ *source, err error) {
 	pol, err := h.policy.get()
 	if err != nil {
 		return nil, err
 	}
 	exp := pol.sources[name]
-	s := &source{}
+	s := &source{scope: scope, log: logFor(ctx)}
 	if s.hideChats, err = jsonList(exp.HideContainers); err != nil {
 		return nil, err
 	}
@@ -178,7 +199,7 @@ func (s *source) close() {
 	}
 }
 
-// query runs filter plus sql, which reads chats and msgs; args bind from ?3.
+// query runs filter plus sql, which reads chats and msgs; args bind from ?4.
 func (s *source) query(sql string, args ...any) ([][]any, error) {
 	rows := [][]any{}
 	if s.db == nil {
@@ -189,7 +210,7 @@ func (s *source) query(sql string, args ...any) ([][]any, error) {
 		return nil, err
 	}
 	defer stmt.Close()
-	for i, a := range append([]any{s.hideChats, s.hideFrom}, args...) {
+	for i, a := range append([]any{s.hideChats, s.hideFrom, s.scope}, args...) {
 		switch a := a.(type) {
 		case string:
 			err = stmt.BindText(i+1, a)
@@ -223,14 +244,20 @@ func (s *source) query(sql string, args ...any) ([][]any, error) {
 }
 
 func (s *source) visible(id string) (bool, error) {
-	rows, err := s.query(`SELECT 1 FROM chats WHERE id = ?3`, id)
+	rows, err := s.query(`SELECT 1 FROM chats WHERE id = ?4`, id)
 	return len(rows) == 1, err
 }
 
 // messageVisible says whether agents see message id's body, as messages
 // shows it.
 func (s *source) messageVisible(id string) (bool, error) {
-	rows, err := s.query(`SELECT 1 FROM msgs WHERE id = ?3 AND NOT auth AND NOT deleted`, id)
+	rows, err := s.query(`SELECT 1 FROM msgs WHERE id = ?4 AND NOT auth AND NOT deleted`, id)
+	return len(rows) == 1, err
+}
+
+// seqVisible says whether message seq in chat is one agents see the body of.
+func (s *source) seqVisible(chat string, seq int64) (bool, error) {
+	rows, err := s.query(`SELECT 1 FROM msgs WHERE container_id = ?4 AND seq = ?5 AND NOT auth AND NOT deleted`, chat, seq)
 	return len(rows) == 1, err
 }
 
@@ -243,12 +270,30 @@ func (s *source) visibleCount(ids []string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	rows, err := s.query(`SELECT count(*) FROM chats WHERE id IN (SELECT value FROM json_each(?3))`, string(b))
+	rows, err := s.query(`SELECT count(*) FROM chats WHERE id IN (SELECT value FROM json_each(?4))`, string(b))
 	if err != nil || len(rows) == 0 {
 		return 0, err
 	}
 	n, _ := rows[0][0].(int64)
 	return int(n), nil
+}
+
+// names maps the visible chats among ids to their names.
+func (s *source) names(ids []string) (map[string]string, error) {
+	b, err := json.Marshal(ids)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.query(`SELECT id, COALESCE(name, '') FROM chats WHERE id IN (SELECT value FROM json_each(?4))`, string(b))
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(rows))
+	for _, r := range rows {
+		id, _ := r[0].(string)
+		out[id], _ = r[1].(string)
+	}
+	return out, nil
 }
 
 // page trims the extra row queried past limit; seqCol is the seq column or -1.
@@ -276,29 +321,57 @@ const replyTo = `(SELECT r.seq FROM msgs AS r WHERE r.id = m.reply_to_id)`
 // last_message is the later of the newest visible message and the activity
 // the connector reported for the chat. A chat whose stored messages are all
 // hidden, login codes or deleted is left out: connectors name some chats
-// after a message (Fastmail threads, Discord threads).
+// after a message (Fastmail threads, Discord threads). So is a chat last
+// active before its cutoff.
 func (s *source) chats(search string, limit int64) (*table, error) {
 	rows, err := s.query(`SELECT id, kind, name, strftime('%Y-%m-%d %H:%M', at) FROM (
-  SELECT c.id, c.kind, c.name, NULLIF(max(
+  SELECT c.id, c.kind, c.name, c.cutoff, NULLIF(max(
     COALESCE((SELECT max(sent_at) FROM msgs WHERE container_id = c.id), ''),
     COALESCE(c.last_message_at, '')), '') AS at
   FROM chats AS c
   WHERE (EXISTS (SELECT 1 FROM msgs WHERE container_id = c.id AND NOT auth AND NOT deleted)
          OR NOT EXISTS (SELECT 1 FROM messages WHERE container_id = c.id))
-    AND (?3 = '' OR instr(lower(iif(c.name_auth, '', COALESCE(c.name, ''))), lower(?3)) OR instr(lower(c.id), lower(?3))))
-ORDER BY at DESC NULLS LAST, id LIMIT ?4`, search, limit+1)
+    AND (?4 = '' OR instr(lower(iif(c.name_auth, '', COALESCE(c.name, ''))), lower(?4)) OR instr(lower(c.id), lower(?4))))
+WHERE cutoff = '' OR at >= cutoff
+ORDER BY at DESC NULLS LAST, id LIMIT ?5`, search, limit+1)
 	if err != nil {
 		return nil, err
 	}
 	return page(&table{Columns: chatColumns}, rows, limit, -1), nil
 }
 
+// matches finds the chats each term names, as chats(term, per) would list
+// them, in one query: rows of term index, id and name. Resolving every term
+// at once keeps a request's cost from growing with what each term matches.
+func (s *source) matches(terms []string, per int64) ([][]any, error) {
+	b, err := json.Marshal(terms)
+	if err != nil {
+		return nil, err
+	}
+	return s.query(`, cand AS MATERIALIZED (
+  SELECT * FROM (
+    SELECT c.id, c.name, c.name_auth, c.cutoff, NULLIF(max(
+      COALESCE((SELECT max(sent_at) FROM msgs WHERE container_id = c.id), ''),
+      COALESCE(c.last_message_at, '')), '') AS at
+    FROM chats AS c
+    WHERE (EXISTS (SELECT 1 FROM msgs WHERE container_id = c.id AND NOT auth AND NOT deleted)
+           OR NOT EXISTS (SELECT 1 FROM messages WHERE container_id = c.id))
+      AND EXISTS (SELECT 1 FROM json_each(?4) AS t
+        WHERE instr(lower(iif(c.name_auth, '', COALESCE(c.name, ''))), lower(t.value)) OR instr(lower(c.id), lower(t.value))))
+  WHERE cutoff = '' OR at >= cutoff)
+SELECT k, id, name FROM (
+  SELECT t.key AS k, l.id, l.name, row_number() OVER (PARTITION BY t.key ORDER BY l.at DESC NULLS LAST, l.id) AS n
+  FROM json_each(?4) AS t JOIN cand AS l
+    ON instr(lower(iif(l.name_auth, '', COALESCE(l.name, ''))), lower(t.value)) OR instr(lower(l.id), lower(t.value)))
+WHERE n <= ?5 ORDER BY k, n`, string(b), per)
+}
+
 // before is the seq of the last message seen; the page continues after it in
 // (sent_at, seq) order, since seq follows ingestion, not sending.
 func (s *source) messages(chat string, before, limit int64) (*table, error) {
 	rows, err := s.query(`SELECT m.seq, m.at, m.sender_id, m.sender, `+replyTo+`, m.text FROM msgs AS m
-WHERE m.container_id = ?3 AND (?4 = 0 OR (m.sent_at, m.seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?4))
-ORDER BY m.sent_at DESC, m.seq DESC LIMIT ?5`, chat, before, limit+1)
+WHERE m.container_id = ?4 AND (?5 = 0 OR (m.sent_at, m.seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?5))
+ORDER BY m.sent_at DESC, m.seq DESC LIMIT ?6`, chat, before, limit+1)
 	if err != nil {
 		return nil, err
 	}
@@ -310,9 +383,9 @@ const searchSelect = `SELECT m.seq, m.at, m.container_id, c.name, m.sender_id, m
 // Matches the filtered body, where login codes are blank. before as in messages.
 func (s *source) search(text, chat, since string, before, limit int64) (*table, error) {
 	rows, err := s.query(searchSelect+` FROM msgs AS m JOIN chats AS c ON c.id = m.container_id
-WHERE instr(lower(m.body), lower(?3)) AND (?4 = '' OR m.container_id = ?4) AND m.sent_at >= ?5
-  AND (?6 = 0 OR (m.sent_at, m.seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?6))
-ORDER BY m.sent_at DESC, m.seq DESC LIMIT ?7`, text, chat, since, before, limit+1)
+WHERE instr(lower(m.body), lower(?4)) AND (?5 = '' OR m.container_id = ?5) AND m.sent_at >= ?6
+  AND (?7 = 0 OR (m.sent_at, m.seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?7))
+ORDER BY m.sent_at DESC, m.seq DESC LIMIT ?8`, text, chat, since, before, limit+1)
 	if err != nil {
 		return nil, err
 	}
@@ -325,7 +398,7 @@ func (s *source) byID(ids []string) (*table, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.query(searchSelect+` FROM json_each(?3) AS j JOIN msgs AS m ON m.id = j.value
+	rows, err := s.query(searchSelect+` FROM json_each(?4) AS j JOIN msgs AS m ON m.id = j.value
 JOIN chats AS c ON c.id = m.container_id ORDER BY j.key`, string(b))
 	if err != nil {
 		return nil, err
@@ -348,8 +421,8 @@ type mediaMessage struct {
 func (s *source) mediaMessage(chat string, seq, index int64) (*mediaMessage, error) {
 	rows, err := s.query(`SELECT id, auth, deleted, media_type IS NOT NULL,
   (SELECT count(*) FROM media WHERE message_id = m.id),
-  (SELECT size FROM media WHERE message_id = m.id AND idx = ?5)
-FROM visible AS m WHERE container_id = ?3 AND seq = ?4`, chat, seq, index)
+  (SELECT size FROM media WHERE message_id = m.id AND idx = ?6)
+FROM visible AS m WHERE container_id = ?4 AND seq = ?5`, chat, seq, index)
 	if err != nil || len(rows) == 0 {
 		return nil, err
 	}

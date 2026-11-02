@@ -1,9 +1,9 @@
 # Boots every unit under its real sandbox. WhatsApp and Discord stay unlinked,
 # so both are checked for wiring only. A recorder stands in for an HTTP API,
-# whose token the owner sets in the console, and the test driver plays the
-# owner's passkey. The console serves the ACME module's self-signed
-# placeholder certificate, and the token and admin password are generated on
-# first start.
+# whose token the owner sets in the console, and another for ntfy. The test
+# driver plays the owner's passkey, creating the agent and its grants through
+# the console. The console serves the ACME module's self-signed placeholder
+# certificate, and the admin password is generated on first start.
 { pkgs, self }:
 let
   apiToken = "api-token-0123456789abcdef";
@@ -11,27 +11,45 @@ let
   host = "mandate.example.com";
 
   fixture = pkgs.writeText "fixture.sql" ''
-    INSERT INTO containers (id, kind, name, is_group, updated_at) VALUES
-      ('fam@g.us', 'group', 'Family', 1, '2026-10-01T00:00:00.000Z'),
-      ('hidden@s.whatsapp.net', 'dm', 'Hidden', 0, '2026-10-01T00:00:00.000Z');
+    INSERT INTO containers (id, kind, parent_id, name, is_group, updated_at) VALUES
+      ('fam@g.us', 'group', NULL, 'Family', 1, '2026-10-01T00:00:00.000Z'),
+      ('sub@g.us', 'thread', 'fam@g.us', 'Dinner thread', 1, '2026-10-01T00:00:00.000Z'),
+      ('club@g.us', 'group', NULL, 'Book club', 1, '2026-10-01T00:00:00.000Z'),
+      ('hidden@s.whatsapp.net', 'dm', NULL, 'Hidden', 0, '2026-10-01T00:00:00.000Z'),
+      ('long@g.us', 'group', NULL, 'Long ' || replace(hex(zeroblob(120)), '0', 'w'), 1, '2026-10-01T00:00:00.000Z');
     INSERT INTO messages (id, container_id, sender_id, sent_at, body, ingested_at) VALUES
       ('fam@g.us/1', 'fam@g.us', '1555@s.whatsapp.net', '2026-10-01T12:00:00.000Z', 'dinner at 7?', '2026-10-01T12:00:00.000Z'),
       ('fam@g.us/2', 'fam@g.us', '1555@s.whatsapp.net', '2026-10-01T12:01:00.000Z', 'Your WhatsApp code: 482-913', '2026-10-01T12:01:00.000Z'),
       ('hidden@s.whatsapp.net/3', 'hidden@s.whatsapp.net', '1666@s.whatsapp.net', '2026-10-01T12:02:00.000Z', 'private', '2026-10-01T12:02:00.000Z'),
-      ('fam@g.us/4', 'fam@g.us', '1555@s.whatsapp.net', '2026-10-01T12:03:00.000Z', 'look', '2026-10-01T12:03:00.000Z');
+      ('fam@g.us/4', 'fam@g.us', '1555@s.whatsapp.net', '2026-10-01T12:03:00.000Z', 'look', '2026-10-01T12:03:00.000Z'),
+      ('fam@g.us/5', 'fam@g.us', '1555@s.whatsapp.net', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'fresh family', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      ('club@g.us/6', 'club@g.us', '1777@s.whatsapp.net', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'fresh club', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      ('sub@g.us/7', 'sub@g.us', '1555@s.whatsapp.net', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'fresh thread', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      ('long@g.us/8', 'long@g.us', '1555@s.whatsapp.net', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'fresh long', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
     INSERT INTO media (message_id, idx, type, size) VALUES
       ('hidden@s.whatsapp.net/3', 0, 'image/jpeg', 5),
       ('fam@g.us/4', 0, 'image/jpeg', 5);
   '';
 
-  # Logs every request to the stand-in API as a JSON line.
+  # One email thread with an old email (seq 1) and a new one (seq 2).
+  fastmailFixture = pkgs.writeText "fastmail.sql" ''
+    INSERT INTO containers (id, kind, name, updated_at) VALUES
+      ('inv', 'thread', 'Invoice', '2026-10-01T00:00:00.000Z');
+    INSERT INTO messages (id, container_id, sender_id, sent_at, body, ingested_at) VALUES
+      ('inv/a', 'inv', 'billing@example.com', '2026-10-01T12:00:00.000Z', 'old invoice', '2026-10-01T12:00:00.000Z'),
+      ('inv/b', 'inv', 'billing@example.com', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'new invoice', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+  '';
+
+  # Logs every request to a stand-in service as a JSON line.
   recorder = pkgs.writeText "recorder.py" ''
-    import http.server, json
+    import http.server, json, sys
+
+    port, log = int(sys.argv[1]), sys.argv[2]
 
     class H(http.server.BaseHTTPRequestHandler):
         def handle_one(self):
             body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
-            with open("/var/lib/recorder/log.jsonl", "a") as f:
+            with open(log, "a") as f:
                 f.write(json.dumps({"method": self.command, "path": self.path,
                                     "headers": dict(self.headers), "body": body}) + "\n")
             self.send_response(201 if self.command == "POST" else 200)
@@ -42,8 +60,19 @@ let
         def log_message(self, *args):
             pass
 
-    http.server.ThreadingHTTPServer(("127.0.0.1", 9000), H).serve_forever()
+    http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
   '';
+  recorderService = port: name: {
+    wantedBy = [ "multi-user.target" ];
+    before = [
+      "mandate-http.service"
+      "mandate-console.service"
+    ];
+    serviceConfig = {
+      ExecStart = "${pkgs.python3}/bin/python3 ${recorder} ${toString port} /var/lib/${name}/log.jsonl";
+      StateDirectory = name;
+    };
+  };
 in
 pkgs.testers.runNixOSTest {
   name = "mandate";
@@ -76,7 +105,12 @@ pkgs.testers.runNixOSTest {
           serviceConfig.IPAddressAllow = [ "127.0.0.1" ];
         };
       };
+      notify.ntfy = {
+        url = "http://127.0.0.1:9001/mandate";
+        tokenFile = "/etc/mandate-ntfy-token";
+      };
     };
+    environment.etc."mandate-ntfy-token".text = "tk_ntfytest";
     # No ACME server answers, so the console keeps the self-signed placeholder.
     security.acme = {
       acceptTerms = true;
@@ -84,14 +118,8 @@ pkgs.testers.runNixOSTest {
       certs.${host}.webroot = "/var/lib/acme/acme-challenge";
     };
     time.timeZone = "Europe/Berlin";
-    systemd.services.recorder = {
-      wantedBy = [ "multi-user.target" ];
-      before = [ "mandate-http.service" ];
-      serviceConfig = {
-        ExecStart = "${pkgs.python3}/bin/python3 ${recorder}";
-        StateDirectory = "recorder";
-      };
-    };
+    systemd.services.recorder = recorderService 9000 "recorder";
+    systemd.services.ntfy = recorderService 9001 "ntfy";
     environment.systemPackages = [
       pkgs.sqlite
       pkgs.curl
@@ -108,6 +136,7 @@ pkgs.testers.runNixOSTest {
     import hashlib
     import json
     import re
+    import secrets
     import time
 
     import cbor2
@@ -117,13 +146,13 @@ pkgs.testers.runNixOSTest {
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
     start_all()
-    for unit in ["recorder", "mandate-gateway", "mandate-whatsapp", "mandate-discord", "mandate-signal", "mandate-matrix", "mandate-fastmail", "mandate-gmessages", "mandate-console", "mandate-http"]:
+    for unit in ["recorder", "ntfy", "mandate-gateway", "mandate-whatsapp", "mandate-discord", "mandate-signal", "mandate-matrix", "mandate-fastmail", "mandate-gmessages", "mandate-console", "mandate-http"]:
         machine.wait_for_unit(f"{unit}.service")
-    for port in [8780, 443, 9000]:
+    for port in [8780, 443, 9000, 9001]:
         machine.wait_for_open_port(port)
 
-    token = machine.succeed("cat /var/lib/mandate/token").strip()
     admin_password = machine.succeed("cat /var/lib/mandate/admin-password").strip()
+    token = "0" * 64
 
     def curl(args, body=None):
         cmd = "curl -s -o /tmp/resp -w '%{http_code}' " + args
@@ -137,8 +166,18 @@ pkgs.testers.runNixOSTest {
         except ValueError:
             return code, out
 
-    def gw(method, path, body=None):
-        return curl(f"-X {method} -H 'Authorization: Bearer {token}' 'http://127.0.0.1:8780{path}'", body)
+    def gw(method, path, body=None, tok=None):
+        return curl(f"-X {method} -H 'Authorization: Bearer {tok or token}' 'http://127.0.0.1:8780{path}'", body)
+
+    # The gateway learns agents and grants when it next syncs with the console.
+    def gw_until(path, ok, timeout=60):
+        deadline = time.time() + timeout
+        while True:
+            code, out = gw("GET", path)
+            if ok(code, out):
+                return code, out
+            assert time.time() < deadline, (path, code, out)
+            time.sleep(1)
 
     # The console only admits localhost and the tailnet, so reach it over loopback.
     def console(method, path, body=None, jar="/tmp/jar"):
@@ -152,9 +191,15 @@ pkgs.testers.runNixOSTest {
     def connector_keys(name):
         return json.loads(machine.succeed(connector_get(name, "keys")))
 
-    def recorded():
-        lines = machine.succeed("cat /var/lib/recorder/log.jsonl 2>/dev/null || true").splitlines()
+    def recorded(name="recorder"):
+        lines = machine.succeed(f"cat /var/lib/{name}/log.jsonl 2>/dev/null || true").splitlines()
         return [json.loads(line) for line in lines]
+
+    def rows(out):
+        return [r[0] for r in out["rows"]]
+
+    def bodies(out):
+        return [r[-1] for r in out["rows"]]
 
     def b64(b):
         return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
@@ -187,16 +232,194 @@ pkgs.testers.runNixOSTest {
         return {"id": b64(cred), "rawId": b64(cred), "type": "public-key",
                 "response": {"authenticatorData": b64(auth), "clientDataJSON": b64(cd), "signature": b64(sig)}}
 
-    with subtest("reads are per connector, filtered, and refuse names"):
+    # Signs an agent or a grant on the Access page.
+    def sign(fields, key=passkey, cred=credential, jar="/tmp/jar"):
+        code, ch = console("POST", "/access/challenge", fields, jar=jar)
+        assert code == 200, (code, ch)
+        return console("POST", "/access/approve", {"nonce": ch["nonce"], "assertion": assertion(ch["options"], key=key, cred=cred)}, jar=jar)
+
+    def grant(fields):
+        code, out = sign({"kind": "grant", "agent": agent_id, **fields})
+        assert code == 200 and out["kind"] == "grant", (code, out)
+        return out["id"]
+
+    with subtest("the console admits the admin password, not guesses"):
+        code, _ = console("GET", "/", jar="/tmp/nobody")
+        assert code == 303, code
+        code, _ = console("POST", "/login", {"password": "wrong"}, jar="/tmp/nobody")
+        assert code in (401, 403), code
+        code, out = console("POST", "/login", {"password": admin_password})
+        assert code == 200, (code, out)
+
+    with subtest("the first key is trusted at once and reaches every connector; the password is off"):
+        code, options = console("POST", "/keys/options", {"name": "yubikey"})
+        assert code == 200, (code, options)
+        code, out = console("POST", "/keys", registration(options))
+        assert code == 200 and out["trusted"], (code, out)
+        for name in ["whatsapp", "discord", "http"]:
+            machine.wait_until_succeeds(connector_get(name, "keys") + " | grep -q '\"length\":1'")
+        code, _ = console("GET", "/session")
+        assert code == 401, code
+        code, _ = console("POST", "/login", {"password": admin_password})
+        assert code == 403, code
+        code, options = console("POST", "/login/options", {})
+        code, out = console("POST", "/login", {"assertion": assertion(options)})
+        assert code == 200, (code, out)
+
+    with subtest("the browser makes an agent's token; the console signs only its hash, which the gateway learns"):
+        code, _ = gw("GET", "/v1/connectors")
+        assert code == 401, code
+        made = secrets.token_hex(32)
+        code, out = sign({"kind": "agent", "name": "Grok Bot", "token_sha256": hashlib.sha256(made.encode()).hexdigest()})
+        assert code == 200 and out["kind"] == "agent" and "token" not in out, (code, out)
+        agent_id, token = out["id"], made
+        gw_until("/v1/connectors", lambda code, _: code == 200)
+        code, _ = gw("GET", "/v1/connectors", tok="f" * 64)
+        assert code == 401, code
+        code, page = console("GET", "/access")
+        assert code == 200 and "Grok Bot" in page and token not in page, code
+        machine.fail(f"grep -rq {token} /var/lib/mandate-console")
+        machine.fail("curl -sf http://127.0.0.1:8780/v1/whatsapp/chats")
+
+    with subtest("reads are closed until the owner grants them"):
         machine.succeed(
             "cd /var/lib/mandate-whatsapp && sudo -u mandate-whatsapp sh -c "
             "'umask 0027 && sqlite3 data.db < ${../store/schema.sql} && sqlite3 data.db < ${fixture}'"
         )
         machine.succeed("printf '[whatsapp]\\nhide_containers = [\"hidden@s.whatsapp.net\"]\\n' > /var/lib/mandate-gateway/exposure.toml")
-        code, out = gw("GET", "/v1/whatsapp/chats")
-        assert code == 200 and [r[0] for r in out["rows"]] == ["fam@g.us"], (code, out)
+        for path in ["/v1/whatsapp/chats", "/v1/whatsapp/messages?chat=fam@g.us", "/v1/whatsapp/search?text=dinner",
+                     "/v1/whatsapp/media?chat=fam@g.us&seq=4"]:
+            code, out = gw("GET", path)
+            assert code == 403 and "no read access to whatsapp" in out["error"], (path, code, out)
+            assert out["request"].startswith("mandate request whatsapp"), out
+        code, out = gw("GET", "/v1/forward/http/api/items")
+        assert code == 403, (code, out)
+        for path, body in [("/v1/whatsapp/send", {"args": {"chat": "fam@g.us", "text": "hi"}}),
+                           ("/v1/http/request", {"args": {"service": "api", "method": "POST", "path": "/items", "body": "{}"}})]:
+            code, out = gw("POST", path, body)
+            assert code == 403 and "no read access" in out["error"], (path, code, out)
+
+    with subtest("a grant opens exactly its chats, back to its horizon, for reads and writes"):
+        scoped = grant({"connector": "whatsapp", "chats": ["fam@g.us"], "for": "30m", "horizon": "24h"})
+        _, out = gw_until("/v1/whatsapp/chats", lambda code, _: code == 200)
+        # The thread under the granted group was not checked, so it stays out.
+        assert rows(out) == ["fam@g.us"], out
         code, out = gw("GET", "/v1/whatsapp/messages?chat=fam@g.us")
-        assert [r[-1] for r in out["rows"]] == ["[image/jpeg] look", "[login code hidden]", "dinner at 7?"], out
+        assert code == 200 and bodies(out) == ["fresh family"], (code, out)
+        for chat in ["club@g.us", "sub@g.us"]:
+            code, out = gw("GET", f"/v1/whatsapp/messages?chat={chat}")
+            assert code != 200 and "fresh" not in json.dumps(out), (chat, code, out)
+        code, out = gw("GET", "/v1/whatsapp/search?text=fresh")
+        assert code == 200 and bodies(out) == ["fresh family"], (code, out)
+        code, out = gw("GET", "/v1/whatsapp/search?text=dinner")
+        assert code == 200 and "dinner" not in json.dumps(out["rows"]), (code, out)
+        code, out = gw("GET", "/v1/whatsapp/media?chat=fam@g.us&seq=4")
+        assert code == 404, (code, out)
+        code, out = gw("GET", "/v1/access")
+        assert code == 200 and "Family" in json.dumps(out), (code, out)
+        # Outside the grant a chat is unknown; inside it, the unlinked connector is asked.
+        for chat, want in [("club@g.us", 404), ("hidden@s.whatsapp.net", 404), ("nobody@g.us", 404), ("fam@g.us", 503)]:
+            code, out = gw("POST", "/v1/whatsapp/send", {"args": {"chat": chat, "text": "hi"}})
+            assert code == want, (chat, code, out)
+            assert want == 503 or "unknown chat" in out["error"], (chat, out)
+
+    with subtest("a message past the horizon is unknown, even in a granted chat"):
+        machine.succeed(
+            "cd /var/lib/mandate-fastmail && sudo -u mandate-fastmail sh -c "
+            "'umask 0027 && sqlite3 data.db < ${../store/schema.sql} && sqlite3 data.db < ${fastmailFixture}'"
+        )
+        grant({"connector": "fastmail", "chats": ["inv"], "for": "30m", "horizon": "24h"})
+        gw_until("/v1/fastmail/chats", lambda code, _: code == 200)
+        # The old email and one that doesn't exist get the same 404 before the
+        # connector is asked; the new one reaches it.
+        unknown = []
+        for seq in ["1", "99"]:
+            code, out = gw("POST", "/v1/fastmail/fetch", {"args": {"chat": "inv", "seq": seq}})
+            assert code == 404, (seq, code, out)
+            unknown.append(out["error"].replace(seq, "N"))
+        assert unknown[0] == unknown[1], unknown
+        code, out = gw("POST", "/v1/fastmail/reply", {"args": {"chat": "inv", "seq": "1", "body": "paid"}})
+        assert code == 404, (code, out)
+        code, out = gw("POST", "/v1/fastmail/fetch", {"args": {"chat": "inv", "seq": "2"}})
+        assert code == 503, (code, out)
+
+    with subtest("revoking a grant ends its reads and drops its signature from the console"):
+        signed = machine.succeed(
+            f"sudo -u mandate-console sqlite3 /var/lib/mandate-console/console.db \"SELECT hex(signed) FROM grants WHERE id = '{scoped}'\""
+        ).strip()
+        code, _ = console("POST", f"/access/grants/{scoped}/revoke")
+        assert code == 303, code
+        gw_until("/v1/whatsapp/chats", lambda code, _: code == 403)
+        gone = machine.succeed(
+            f"sudo -u mandate-console sqlite3 /var/lib/mandate-console/console.db \"SELECT signed IS NULL FROM grants WHERE id = '{scoped}'\""
+        )
+        assert gone.strip() == "1", gone
+
+    with subtest("chat terms are checked before anything is looked up"):
+        # A 201-character term is refused alike whether a chat's name holds it.
+        answers = []
+        for term in ["w" * 201, "q" * 201]:
+            code, out = gw("POST", "/v1/access/requests", {"connector": "whatsapp", "chats": [term], "reason": "plan dinner"})
+            assert code == 400, (code, out)
+            answers.append(out)
+        assert answers[0] == answers[1], answers
+
+    with subtest("an agent asks, the owner hears of it, narrows it and approves with the key"):
+        # Durations in nanoseconds, as Go encodes them. Terms that match nothing
+        # get the same answer as those that do.
+        code, ref = gw("POST", "/v1/access/requests", {"connector": "whatsapp", "chats": ["Nobody", "Hidden", "Family", "Book"],
+                                                         "for": 3600 * 10**9, "reason": "plan dinner"})
+        assert code == 202 and set(ref) == {"id", "url"} and ref["url"].startswith("https://${host}/"), (code, ref)
+        rid = ref["id"]
+        code, st = gw("GET", f"/v1/access/requests/{rid}?wait=1")
+        assert code == 200 and st["status"] == "pending", (code, st)
+        code, page = console("GET", "/access")
+        assert "plan dinner" in page and "Book club" in page and "fam@g.us" in page, code
+        assert "no visible chat matched" in page and "Nobody" in page and "hidden@s.whatsapp.net" not in page, code
+        code, page = console("GET", "/")
+        assert "Grok Bot" in page, code
+        machine.wait_until_succeeds("grep -q 'Grok Bot' /var/lib/ntfy/log.jsonl")
+        [note] = recorded("ntfy")
+        assert note["method"] == "POST" and note["path"] == "/mandate", note
+        assert note["headers"]["Title"] == "mandate" and note["headers"]["Click"].startswith("https://${host}/"), note
+        assert note["headers"]["Authorization"] == "Bearer tk_ntfytest", note
+        assert "Family" not in note["body"] and "Book" not in note["body"] and "plan dinner" not in note["body"], note
+
+        code, out = sign({"kind": "grant", "request": rid, "chats": ["fam@g.us"], "for": "10m"})
+        assert code == 200 and out["kind"] == "grant", (code, out)
+        code, st = gw("GET", f"/v1/access/requests/{rid}?wait=5")
+        assert st["status"] == "granted" and st["grant_id"] == out["id"], (code, st)
+        _, out = gw_until("/v1/whatsapp/chats", lambda code, _: code == 200)
+        assert rows(out) == ["fam@g.us"], out
+        # The request's default horizon of 7 days hides the October messages.
+        code, out = gw("GET", "/v1/whatsapp/messages?chat=fam@g.us")
+        assert bodies(out) == ["fresh family"], (code, out)
+
+    with subtest("an agent has at most 3 requests waiting; a denied one grants nothing"):
+        waiting = []
+        for _ in range(3):
+            code, ref = gw("POST", "/v1/access/requests", {"connector": "discord", "reason": "look around"})
+            assert code == 202, (code, ref)
+            waiting.append(ref["id"])
+        # Over the limit, a term that matches and one that doesn't get the same 429.
+        answers = []
+        for term in ["Family", "Nobody"]:
+            code, out = gw("POST", "/v1/access/requests", {"connector": "whatsapp", "chats": [term], "reason": "look around"})
+            assert code == 429, (term, code, out)
+            answers.append(out)
+        assert answers[0] == answers[1], answers
+        for rid in waiting:
+            code, _ = console("POST", f"/access/requests/{rid}/deny")
+            assert code == 303, code
+            code, st = gw("GET", f"/v1/access/requests/{rid}?wait=5")
+            assert st["status"] == "denied", (code, st)
+
+    with subtest("a grant on every chat reads them all, through the hide rules"):
+        grant({"connector": "whatsapp", "for": "30m", "horizon": "0"})
+        _, out = gw_until("/v1/whatsapp/chats", lambda code, out: code == 200 and "club@g.us" in rows(out))
+        assert sorted(rows(out)) == ["club@g.us", "fam@g.us", "long@g.us", "sub@g.us"], out
+        code, out = gw("GET", "/v1/whatsapp/messages?chat=fam@g.us")
+        assert bodies(out) == ["fresh family", "[image/jpeg] look", "[login code hidden]", "dinner at 7?"], out
         code, out = gw("GET", "/v1/whatsapp/messages?chat=hidden@s.whatsapp.net")
         assert code == 404, (code, out)
         code, out = gw("GET", "/v1/whatsapp/messages?chat=Family")
@@ -208,7 +431,9 @@ pkgs.testers.runNixOSTest {
         # Unlinked, so the gateway gets as far as asking whether it is healthy.
         code, out = gw("GET", "/v1/whatsapp/media?chat=fam@g.us&seq=4")
         assert code == 503 and "needs the owner" in out["error"], (code, out)
-        machine.fail("curl -sf http://127.0.0.1:8780/v1/whatsapp/chats")
+        machine.wait_until_succeeds(
+            f"sqlite3 /var/lib/mandate-console/console.db \"SELECT count(*) FROM reads WHERE agent_id = '{agent_id}'\" | grep -qv '^0$'"
+        )
 
     with subtest("broken exposure fails closed"):
         machine.succeed("printf '[whatsap]\\n' > /var/lib/mandate-gateway/exposure.toml")
@@ -225,16 +450,22 @@ pkgs.testers.runNixOSTest {
             health = json.loads(machine.succeed(connector_get(name, "health")))
             assert health == {"state": "setup", "detail": "not linked"}, (name, health)
 
+    with subtest("http grants are for every allowlisted read: no chats, no horizon"):
+        for fields in [{"horizon": "24h"}, {"chats": ["items"], "horizon": "0"}]:
+            code, out = console("POST", "/access/challenge", {"kind": "grant", "agent": agent_id, "connector": "http", "for": "30m", **fields})
+            assert code == 400, (fields, code, out)
+        code, out = gw("POST", "/v1/access/requests", {"connector": "http", "chats": ["items"], "reason": "read items"})
+        assert code == 400, (code, out)
+
     with subtest("the owner sets the API token in the console, which never shows it"):
-        code, _ = console("POST", "/connections/http/setup", {"args": {"api": "${apiToken}"}}, jar="/tmp/linkjar")
+        grant({"connector": "http", "for": "30m", "horizon": "0"})
+        code, _ = console("POST", "/connections/http/setup", {"args": {"api": "${apiToken}"}}, jar="/tmp/nobody")
         assert code == 401, code
-        code, out = gw("GET", "/v1/forward/http/api/items")
-        assert code == 503 and "https://${host}/connections" in out["error"], (code, out)
-        code, out = console("POST", "/login", {"password": admin_password}, jar="/tmp/linkjar")
-        assert code == 200, (code, out)
-        code, out = console("POST", "/connections/http/setup", {"args": {"api": "${apiToken}"}}, jar="/tmp/linkjar")
+        _, out = gw_until("/v1/forward/http/api/items", lambda code, _: code == 503)
+        assert "https://${host}/connections" in out["error"], out
+        code, out = console("POST", "/connections/http/setup", {"args": {"api": "${apiToken}"}})
         assert code == 200 and out["done"], (code, out)
-        code, page = console("GET", "/connections", jar="/tmp/linkjar")
+        code, page = console("GET", "/connections")
         assert code == 200 and "${apiToken}" not in page, code
         assert machine.succeed("stat -c %a /var/lib/mandate-http/private/api").strip() == "600"
         assert recorded() == []
@@ -248,47 +479,20 @@ pkgs.testers.runNixOSTest {
         code, _ = gw("POST", "/v1/forward/http/api/items", {"text": "no approval"})
         assert code == 405, code
 
-    with subtest("a write is a proposal until approved"):
+    with subtest("a write is a proposal until approved, and the owner hears of it"):
         code, p = gw("POST", "/v1/http/request", {"note": "filing it", "args": {
             "service": "api", "method": "POST", "path": "/items", "body": "{\"text\": \"original\"}"}})
-        assert code == 202 and p["status"] == "pending", (code, p)
+        assert code == 202 and set(p) == {"id", "status", "url"} and p["status"] == "pending", (code, p)
         pid = p["id"]
         assert p["url"] == f"https://${host}/r/{pid}", p
         code, p = gw("GET", f"/v1/proposals/{pid}?wait=1")
-        assert p["status"] == "pending", p
+        assert set(p) == {"id", "status", "url"} and p["status"] == "pending", p
         assert len(recorded()) == 1
-
-    with subtest("the console admits the admin password, not guesses"):
-        code, _ = console("GET", "/", jar="/tmp/nobody")
-        assert code == 303, code
-        code, _ = console("POST", "/login", {"password": "wrong"}, jar="/tmp/nobody")
-        assert code in (401, 403), code
-        code, out = console("POST", "/login", {"password": admin_password})
-        assert code == 200, (code, out)
         code, page = console("GET", f"/r/{pid}")
-        assert code == 200 and "filing it" in page, code
-
-    with subtest("a key the console doesn't trust cannot approve"):
-        code, ch = console("POST", f"/r/{pid}/challenge", {"edits": {}})
-        assert code == 200, (code, ch)
-        code, out = console("POST", f"/r/{pid}/approve", {"nonce": ch["nonce"], "assertion": assertion(ch["options"])})
-        assert code == 403, (code, out)
-        assert len(recorded()) == 1
-
-    with subtest("the first key is trusted at once and reaches every connector; the password is off"):
-        code, options = console("POST", "/keys/options", {"name": "yubikey"})
-        assert code == 200, (code, options)
-        code, out = console("POST", "/keys", registration(options))
-        assert code == 200 and out["trusted"], (code, out)
-        for name in ["whatsapp", "discord", "http"]:
-            machine.wait_until_succeeds(connector_get(name, "keys") + " | grep -q '\"length\":1'")
-        code, _ = console("GET", "/session")
-        assert code == 401, code
-        code, _ = console("POST", "/login", {"password": admin_password})
-        assert code == 403, code
-        code, options = console("POST", "/login/options", {})
-        code, out = console("POST", "/login", {"assertion": assertion(options)})
-        assert code == 200, (code, out)
+        assert code == 200 and "filing it" in page and "Grok Bot" in page, code
+        machine.wait_until_succeeds(f"grep -q '/r/{pid}' /var/lib/ntfy/log.jsonl")
+        note = recorded("ntfy")[-1]
+        assert "original" not in note["body"] and "filing it" not in note["body"], note
 
     with subtest("the gateway can reach a connector but cannot make it act or change its keys"):
         forged = {"record": base64.b64encode(b"{}").decode(), "nonce": base64.b64encode(b"0123456789abcdef").decode(),
@@ -332,21 +536,52 @@ pkgs.testers.runNixOSTest {
         assert code == 409, code
         assert len(recorded()) == 2
 
-    with subtest("generated secrets survive restarts and stay root-only"):
+    with subtest("a revoked grant stays revoked, whatever the console says later"):
         machine.wait_for_open_port(8780)
-        code, _ = gw("GET", f"/v1/proposals/{pid}")
-        assert code == 200, code
-        assert machine.succeed("cat /var/lib/mandate/admin-password").strip() == admin_password
-        machine.fail("sudo -u mandate-gateway cat /var/lib/mandate/token")
-        machine.fail("sudo -u mandate-console cat /var/lib/mandate/admin-password")
+        gw_until(f"/v1/proposals/{pid}", lambda code, _: code == 200)
+        machine.succeed(
+            "sudo -u mandate-console sqlite3 /var/lib/mandate-console/console.db "
+            f"\"UPDATE grants SET revoked_at = NULL, signed = CAST(x'{signed}' AS TEXT) WHERE id = '{scoped}'\""
+        )
+        offered = json.loads(machine.succeed(
+            "sudo -u mandate-gateway curl -s --unix-socket /run/mandate-console/proposals.sock http://console/access"))
+        assert any(json.loads(base64.b64decode(r["record"]))["id"] == scoped for r in offered["records"]), offered
+        time.sleep(20)
+        code, out = gw("GET", "/v1/access")
+        assert code == 200 and scoped not in json.dumps(out), (code, out)
 
-    with subtest("signing in with the key works; nothing else reaches console state"):
+    with subtest("generated secrets survive restarts and stay root-only"):
+        assert machine.succeed("cat /var/lib/mandate/admin-password").strip() == admin_password
+        machine.fail("sudo -u mandate-console cat /var/lib/mandate/admin-password")
+        machine.fail("sudo -u mandate-console cat /var/lib/mandate-gateway/access.json")
+
+    with subtest("signing in with the key works; nothing else reaches console state or connector data"):
         code, options = console("POST", "/login/options", {}, jar="/tmp/keyjar")
         code, out = console("POST", "/login", {"assertion": assertion(options)}, jar="/tmp/keyjar")
         assert code == 200, (code, out)
         machine.fail("sudo -u mandate-gateway ls /var/lib/mandate-console")
         machine.fail("sudo -u mandate-gateway cat /var/lib/mandate-http/private/api")
         machine.fail("sudo -u mandate-whatsapp test -w /run/mandate-http/connector.sock")
+        # The console lists chats through the connector, not its data.db.
+        machine.fail("sudo -u mandate-console cat /var/lib/mandate-whatsapp/data.db")
+        for name in ["whatsapp", "discord", "signal", "matrix", "fastmail", "gmessages", "http"]:
+            machine.fail(f"sudo -u mandate-console ls /var/lib/mandate-{name}")
+            sock = f"/run/mandate-{name}/connector.sock"
+            assert machine.succeed(f"stat -c '%G %a' {sock}").strip() == f"mandate-{name}-socket 660", name
+            code = machine.succeed(f"sudo -u mandate-console curl -s -o /dev/null -w '%{{http_code}}' --unix-socket {sock} http://connector/health")
+            assert code == "200", (name, code)
+        containers = "--unix-socket /run/mandate-whatsapp/connector.sock 'http://connector/containers?q=fam@g.us'"
+        assert "fam@g.us" in machine.succeed(f"sudo -u mandate-console curl -s {containers}")
+        code = machine.succeed(f"sudo -u mandate-gateway curl -s -o /dev/null -w '%{{http_code}}' {containers}")
+        assert code == "403", code
+        # Reads, files and forwards are the gateway's alone.
+        for name, method, path in [("whatsapp", "POST", "read"), ("whatsapp", "POST", "media"), ("http", "GET", "forward/api/items")]:
+            code = machine.succeed(
+                f"sudo -u mandate-console curl -s -o /dev/null -w '%{{http_code}}' -X {method} -d '{{}}' "
+                f"--unix-socket /run/mandate-{name}/connector.sock http://connector/{path}"
+            )
+            assert code == "403", (name, path, code)
+        assert len(recorded()) == 2
 
     with subtest("one touch opens an unlock window; the next write needs only the session key"):
         def unb64(s):
@@ -433,12 +668,23 @@ pkgs.testers.runNixOSTest {
         sent = [json.loads(r["body"]) for r in recorded()[2:]]
         assert sent == [{"text": "first"}, {"text": "second"}], sent
 
-    with subtest("a trusted key approves a second one, which reaches every connector and signs in"):
+    with subtest("a key the console doesn't trust yet cannot approve or sign"):
         laptop, laptop_cred = ec.generate_private_key(ec.SECP256R1()), b"mandate-vm-test-laptop"
         code, options = console("POST", "/keys/options", {"name": "laptop"}, jar="/tmp/keyjar")
         assert code == 200, (code, options)
         code, out = console("POST", "/keys", registration(options, laptop, laptop_cred), jar="/tmp/keyjar")
         assert code == 200 and not out["trusted"], (code, out)
+        code, ch = console("POST", f"/r/{third}/challenge", {"edits": {}}, jar="/tmp/keyjar")
+        assert code == 200, (code, ch)
+        code, out = console("POST", f"/r/{third}/approve",
+                            {"nonce": ch["nonce"], "assertion": assertion(ch["options"], key=laptop, cred=laptop_cred)}, jar="/tmp/keyjar")
+        assert code == 403, (code, out)
+        code, out = sign({"kind": "agent", "name": "Laptop Bot", "token_sha256": hashlib.sha256(b"laptop").hexdigest()},
+                         key=laptop, cred=laptop_cred, jar="/tmp/keyjar")
+        assert code == 403, (code, out)
+        assert len(recorded()) == 4
+
+    with subtest("a trusted key approves the second one, which reaches every connector and signs in"):
         code, options = console("POST", "/login/options", {}, jar="/tmp/laptopjar")
         code, _ = console("POST", "/login", {"assertion": assertion(options, key=laptop, cred=laptop_cred)}, jar="/tmp/laptopjar")
         assert code == 403, code
@@ -455,13 +701,15 @@ pkgs.testers.runNixOSTest {
         code, out = console("POST", "/login", {"assertion": assertion(options, key=laptop, cred=laptop_cred)}, jar="/tmp/laptopjar")
         assert code == 200, (code, out)
 
-    with subtest("mandate-reset-keys clears every key list and turns the password back on"):
+    with subtest("mandate-reset-keys clears every key list and the agents they signed; the password is back"):
         machine.succeed("mandate-reset-keys")
         machine.wait_for_open_port(443)
         for name in ["whatsapp", "discord", "http"]:
             machine.wait_until_succeeds(connector_get(name, "keys") + " | grep -q '\"length\":0'")
         code, out = console("POST", "/login", {"password": admin_password}, jar="/tmp/resetjar")
         assert code == 200, (code, out)
+        machine.wait_for_open_port(8780)
+        gw_until("/v1/connectors", lambda code, _: code == 401)
 
     with subtest("outsider cannot reach the gateway or the console"):
         machine.succeed("curl -sf http://127.0.0.1:8780/healthz")

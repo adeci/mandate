@@ -33,7 +33,7 @@ var spec = connector.Spec{
 			Summary: "Read the whole text of an email whose stored body is truncated.",
 			Params: []connector.Param{
 				{Name: "chat", Doc: "thread ID from mandate fastmail chats", Required: true, Container: true},
-				{Name: "seq", Doc: "the email's seq", Required: true},
+				{Name: "seq", Doc: "the email's seq", Required: true, Message: true},
 			},
 		},
 		{
@@ -52,7 +52,7 @@ var spec = connector.Spec{
 			Summary: "Reply to an email in a thread: to its Reply-To or sender, or to the recipients of the owner's own email.",
 			Params: []connector.Param{
 				{Name: "chat", Doc: "thread ID from mandate fastmail chats", Required: true, Container: true},
-				{Name: "seq", Doc: "the email's seq; default the newest one not from the owner"},
+				{Name: "seq", Doc: "the email's seq; default the newest one not from the owner", Message: true},
 				{Name: "body", Doc: "plain text", Required: true, Editable: true},
 				fromParam,
 			},

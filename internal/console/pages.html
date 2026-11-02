@@ -19,6 +19,7 @@
   <nav>
     <a href="/"{{if eq .Nav "inbox"}} aria-current="page"{{end}}>Inbox{{if .Pending}} <span class="count">{{.Pending}}</span>{{end}}</a>
     <a href="/connections"{{if eq .Nav "connections"}} aria-current="page"{{end}}>Connections{{if .Attention}} <span class="count" data-tone="{{.AttentionTone}}">{{.Attention}}</span>{{end}}</a>
+    <a href="/access"{{if eq .Nav "access"}} aria-current="page"{{end}}>Access{{if .Requests}} <span class="count" data-tone="wait">{{.Requests}}</span>{{end}}</a>
     <a href="/keys"{{if eq .Nav "keys"}} aria-current="page"{{end}}>Keys</a>
   </nav>
   {{- end}}
@@ -79,7 +80,7 @@
 {{define "rows"}}
 <ul class="rows">
 {{range .}}
-  <li><a href="/r/{{.ID}}">
+  <li><a href="{{.Href}}">
     <span class="state">{{template "status" .Status}}</span>
     <span class="when muted">{{.When}}</span>
     <span class="line summary"><span class="action">{{.Action}}</span>{{with .Who}} → {{.}}{{end}}</span>
@@ -165,7 +166,7 @@
   <h1>{{.Title}}</h1>
   {{template "status" .Status}}
 </div>
-<p class="muted">{{if .Pending}}expires {{when .ExpiresAt}}{{else if .DecidedBy}}{{if eq .Status "rejected"}}denied{{else}}approved{{end}} by {{.DecidedBy}} {{when .DecidedAt}}{{else}}{{.Status}} {{when .DecidedAt}}{{end}} · asked {{when .CreatedAt}}</p>
+<p class="muted">{{if .Pending}}expires {{when .ExpiresAt}}{{else if .DecidedBy}}{{if eq .Status "rejected"}}denied{{else}}approved{{end}} by {{.DecidedBy}} {{when .DecidedAt}}{{else}}{{.Status}} {{when .DecidedAt}}{{end}} · asked {{when .CreatedAt}}{{with .AgentName}} from {{.}}{{end}}</p>
 
 <section class="panel request">
   {{template "fields" .Fields}}
@@ -206,7 +207,8 @@
     </div>
   </div>
   {{else}}
-  <p class="flash" data-kind="error">No passkeys yet. Add one under <a href="/keys">Keys</a> to approve.</p>
+  {{if .AgentDeleted}}<p class="flash" data-kind="error">The agent that proposed this was deleted, so it can't be approved.</p>
+  {{- else}}<p class="flash" data-kind="error">No passkeys yet. Add one under <a href="/keys">Keys</a> to approve.</p>{{end}}
   <form method="post" action="/r/{{.ID}}/deny" class="actions"><button type="submit" class="danger big">Deny</button></form>
   {{end}}
   <p id="msg" class="msg" role="status"></p>
@@ -366,4 +368,186 @@
 </form>
 <p id="msg" class="msg" role="status"></p>
 </section>
+{{template "bottom" .}}{{end}}
+
+{{define "options"}}{{range .}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}{{end}}
+
+{{define "chattree"}}<ul class="tree">
+{{- range .}}
+<li><label><input type="checkbox" value="{{.ID}}"> <span>{{.Label}}</span>{{if or .Kind .Active}} <span class="muted">{{.Kind}}{{with .Active}} · {{.}}{{end}}</span>{{end}}</label>
+{{- with .Children}}{{template "chattree" .}}{{end}}
+{{- with .More}}<p class="hint">and {{.}} more under it, not shown</p>{{end}}</li>
+{{- end}}
+</ul>{{end}}
+
+{{define "picker"}}<div data-chat-picker hidden>
+  <div class="row"><input type="search" placeholder="search chats" aria-label="Search chats" data-chat-search></div>
+  <ul class="checks" data-chat-results></ul>
+  <div data-picked></div>
+  <p class="hint">Each chat is granted on its own: tick the chats under it you want too. Chats created later are not included.</p>
+</div>{{end}}
+
+{{define "access"}}{{template "top" .}}
+<h1>Access</h1>
+{{with .Data}}
+{{if not .CanSign}}<p class="flash" data-kind="error">No passkeys yet. Add one under <a href="/keys">Keys</a> to create agents and grants.</p>{{end}}
+
+{{with .Requests}}
+<section>
+<h2>Requests</h2>
+{{range .}}
+<section class="panel dashed" id="request-{{.ID}}" data-access-request="{{.ID}}" data-connector="{{.Connector}}"
+  data-chats="{{if .ForwardOnly}}none{{else if .Every}}every{{else}}named{{end}}" data-access>
+  <header><h3>{{.AgentName}} asks to read {{.Connector}}</h3><span class="status" data-tone="wait">{{.Left}}</span></header>
+  <p class="note"><span class="muted">agent's reason</span> <span class="message">{{.Reason}}</span></p>
+  {{if .ForwardOnly}}
+  <p>every allowlisted read{{if or .Chats .Unmatched}} <span class="status" data-tone="alert">but it names chats, which {{.Connector}} doesn't have</span>{{end}}</p>
+  {{else if .Every}}
+  <fieldset class="checks">
+    <legend>chats</legend>
+    <label><input type="radio" name="chats-{{.ID}}" value="every" checked> every chat, as asked</label>
+    <label><input type="radio" name="chats-{{.ID}}" value="pick"> only these</label>
+  </fieldset>
+  {{template "picker"}}
+  {{else}}
+  <fieldset data-tree>
+    <legend>chats <span class="muted">tick each one to grant</span></legend>
+    {{template "chattree" .Chats}}
+    {{range .Unmatched}}<p class="hint">no visible chat matched "{{visible .}}"</p>{{end}}
+    <p class="hint">Chats created later are not included.</p>
+  </fieldset>
+  {{end}}
+  <div class="filters">
+    <label>for <span class="select"><select name="for">{{template "options" .For}}</select></span></label>
+    {{if not .ForwardOnly}}<label>messages from <span class="select"><select name="horizon">{{template "options" .Horizon}}</select></span></label>{{end}}
+  </div>
+  <div class="actions two">
+    {{if .CanApprove}}<button type="button" class="primary" data-approve-access>Approve with passkey →</button>{{end}}
+    <form method="post" action="/access/requests/{{.ID}}/deny"><button type="submit" class="danger">Deny</button></form>
+  </div>
+  <p class="msg" role="status"></p>
+</section>
+{{end}}
+</section>
+{{end}}
+
+<section>
+<h2>Agents</h2>
+{{range .Agents}}
+<section class="panel">
+  <header><h3>{{.Name}}</h3><span class="muted">created {{when .Created}} · {{if .LastRead.IsZero}}no reads yet{{else}}last read {{when .LastRead}}{{end}}</span></header>
+  {{with .Grants}}
+  <table class="stack">
+    <thead><tr><th>Grant</th><th class="width-min">State</th><th class="width-min"></th></tr></thead>
+    <tbody>
+    {{range .}}
+    <tr>
+      <td>{{.Connector}}: {{.Chats}}<br><span class="muted">{{.When}} · {{.Horizon}}</span>{{with .Note}}<br><span class="muted">{{.}}</span>{{end}}</td>
+      <td class="width-min"><span class="status" data-tone="{{.Tone}}">{{.State}}</span></td>
+      <td class="width-min"><form method="post" action="/access/grants/{{.ID}}/revoke"><button type="submit" class="compact" data-confirm="Confirm revoke">Revoke</button></form></td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="muted">No grants: this agent reads nothing.</p>
+  {{end}}
+  <form method="post" action="/access/agents/{{.ID}}/delete" class="actions"><button type="submit" class="compact" data-confirm="Confirm delete">Delete agent</button></form>
+</section>
+{{else}}
+<div class="empty"><p>No agents yet.<br><span class="muted">Each agent gets its own token for the gateway.</span></p></div>
+{{end}}
+{{if .CanSign}}
+<form id="new-agent" class="add" data-access>
+  <label for="agent-name">New agent</label>
+  <div class="row">
+    <input id="agent-name" name="name" required maxlength="64" pattern="[\p{L}\p{N} ._\-]+" placeholder="assistant" autocomplete="off">
+    <button type="submit">+ New agent</button>
+  </div>
+  <p class="hint">This browser makes the token; the console only sees its hash.</p>
+  <p class="msg" role="status"></p>
+</form>
+<section class="panel danger" id="agent-token" hidden>
+  <header><h3>Token for <span data-token-name></span></h3><span class="status" data-tone="alert">shown once</span></header>
+  <div class="row">
+    <input class="token" readonly aria-label="Agent token" data-token>
+    <button type="button" data-copy-token>Copy</button>
+  </div>
+  <p class="hint">Copy it now: it won't be shown again. Give it to the agent as MANDATE_TOKEN.</p>
+  <div class="actions"><button type="button" class="primary" data-token-done>Done</button></div>
+</section>
+{{end}}
+</section>
+
+{{if and .CanSign .Agents}}
+<section>
+<h2>New grant</h2>
+<form id="new-grant" data-access>
+  <div class="filters">
+    <label>agent <span class="select"><select name="agent">{{range .Agents}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select></span></label>
+    <label>connector <span class="select"><select name="connector">{{range .Connectors}}<option{{if index $.Data.ForwardOnly .}} data-forward-only{{end}}>{{.}}</option>{{end}}</select></span></label>
+  </div>
+  <p data-forward-hint hidden>every allowlisted read: this connector keeps no chats</p>
+  <div data-chats-part>
+    <fieldset class="checks">
+      <legend>chats</legend>
+      <label><input type="radio" name="chats" value="all" checked> every chat</label>
+      <label><input type="radio" name="chats" value="pick"> only these</label>
+    </fieldset>
+    {{template "picker"}}
+  </div>
+  <fieldset class="checks">
+    <legend>when</legend>
+    <label><input type="radio" name="when" value="now" checked> now, for</label>
+    <label><input type="radio" name="when" value="schedule"> on a schedule</label>
+  </fieldset>
+  <div class="filters" data-when="now">
+    <label>for <span class="select"><select name="for">{{template "options" .For}}</select></span></label>
+  </div>
+  <div data-when="schedule" hidden>
+    <div class="filters">
+      <label>days <span class="select"><select name="days"><option value="every">every day</option><option value="weekdays">weekdays</option><option value="chosen">chosen days</option></select></span></label>
+      <label>at <input type="time" name="start" value="09:00"></label>
+      <label>for <span class="select"><select name="length">{{template "options" .Length}}</select></span></label>
+    </div>
+    <fieldset class="checks" data-days hidden>
+      <legend>on</legend>
+      <label><input type="checkbox" name="day" value="1"> Mon</label>
+      <label><input type="checkbox" name="day" value="2"> Tue</label>
+      <label><input type="checkbox" name="day" value="3"> Wed</label>
+      <label><input type="checkbox" name="day" value="4"> Thu</label>
+      <label><input type="checkbox" name="day" value="5"> Fri</label>
+      <label><input type="checkbox" name="day" value="6"> Sat</label>
+      <label><input type="checkbox" name="day" value="0"> Sun</label>
+    </fieldset>
+    <p class="hint">in <span data-zone></span></p>
+  </div>
+  <div class="filters">
+    <label data-chats-part>messages from <span class="select"><select name="horizon">{{template "options" .Horizon}}</select></span></label>
+    <label>note <input name="note" maxlength="500" autocomplete="off"></label>
+  </div>
+  <div class="actions"><button type="submit" class="primary">Grant with passkey →</button></div>
+  <p class="msg" role="status"></p>
+</form>
+</section>
+{{end}}
+
+<section>
+<h2>Recent reads</h2>
+{{with .Reads}}
+<table>
+  <thead><tr><th class="width-min">When</th><th>Agent</th><th>Read</th><th class="num">Items</th></tr></thead>
+  <tbody>
+  {{range .}}
+  <tr><td class="width-min">{{when .At}}</td><td>{{.Agent}}</td><td>{{.Connector}} {{.Verb}}{{with .Chat}} <code>{{.}}</code>{{end}}
+    {{- with .Dropped}} <span class="status" data-tone="alert">{{.}} read{{if ne . 1}}s{{end}} not logged</span>{{end}}</td><td class="num">{{.Count}}</td></tr>
+  {{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="muted">No reads in the last 30 days.</p>
+{{end}}
+</section>
+{{end}}
+<p id="msg" class="msg" role="status"></p>
 {{template "bottom" .}}{{end}}

@@ -76,6 +76,11 @@ type Param struct {
 	// Container params name a container (chat, channel, ...); the gateway refuses the op
 	// before it reaches the connector unless the container is stored and not hidden.
 	Container bool `json:"container,omitempty"`
+	// Message params name a stored message by its seq in the container that
+	// the op's one Container param names, e.g. a page anchor or the message
+	// a reply answers. The gateway refuses the op before it reaches the
+	// connector unless the agent may read that message.
+	Message bool `json:"message,omitempty"`
 	// Secret setup inputs are typed hidden and never shown again.
 	Secret bool `json:"secret,omitempty"`
 }

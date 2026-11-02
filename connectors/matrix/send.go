@@ -35,7 +35,7 @@ var spec = connector.Spec{
 			Summary: "Fetch older messages of a room from the homeserver, newest first. Page with before.",
 			Params: []connector.Param{
 				{Name: "chat", Doc: "room ID from mandate matrix chats", Required: true, Container: true},
-				{Name: "before", Doc: "seq; messages before it"},
+				{Name: "before", Doc: "seq; messages before it", Message: true},
 				{Name: "limit", Doc: "1 to 100, default 50"},
 			},
 		},

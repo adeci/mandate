@@ -77,12 +77,12 @@ func (s *Seen) save() error {
 	if err != nil {
 		return err
 	}
-	return writeAtomic(s.path, b)
+	return WriteAtomic(s.path, b)
 }
 
-// writeAtomic replaces path with b, mode 0600, so a crash leaves the old or
-// the new contents and never a mix.
-func writeAtomic(path string, b []byte) error {
+// WriteAtomic replaces path with b, mode 0600, so a crash leaves the old or
+// the new contents and never a mix; the file and its directory are synced.
+func WriteAtomic(path string, b []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
 	if err != nil {
 		return err

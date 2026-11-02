@@ -88,7 +88,7 @@ func (e *Env) Fail(err error) { e.fail(err) }
 // Main runs a connector program:
 //
 //	NAME --socket PATH --state DIR [--config FILE] [--rp-id ID --origin URL]
-//	     [--console-user USER] [--gateway-user USER]
+//	     [--console-user USER] [--gateway-user USER] [--socket-group GROUP]
 //	NAME --check-config FILE
 //
 // It decodes --config strictly into C (no file decodes "{}"), runs its
@@ -96,9 +96,12 @@ func (e *Env) Fail(err error) { e.fail(err) }
 // until SIGINT or SIGTERM. --check-config only decodes and validates.
 // Trusted keys live in DIR/private/keys.json and change through PUT /keys.
 // Without --rp-id and --origin there are none and writes are refused. Only
-// the console user may set up, unlink, execute and push keys; the gateway
-// user may call the rest. Either defaults to the user Main runs as. If the
-// Connector is an io.Closer, it is closed after serving stops.
+// the console user may set up, unlink, execute, push keys and list chats;
+// only the gateway user may read, fetch media and forward; both may fetch
+// the spec, health and key head and prepare. Either defaults to the user
+// Main runs as. --socket-group hands the socket to a group both may be in,
+// apart from the group that may read data.db. If the Connector is an
+// io.Closer, it is closed after serving stops.
 func Main[C any](start func(ctx context.Context, env *Env, cfg C) (Connector, error)) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -121,8 +124,9 @@ func run[C any](ctx context.Context, name string, args []string, start func(cont
 	checkPath := flags.String("check-config", "", "only validate this settings file, then exit")
 	rpID := flags.String("rp-id", "", "WebAuthn relying party ID of the console")
 	origin := flags.String("origin", "", "origin of the console, e.g. https://mandate.example.com")
-	consoleUser := flags.String("console-user", "", "user of the console, which alone may set up, unlink, execute and push keys (default: this process's)")
-	gatewayUser := flags.String("gateway-user", "", "user of the gateway, which may read and prepare (default: this process's)")
+	consoleUser := flags.String("console-user", "", "user of the console, which alone may set up, unlink, execute, push keys and list chats (default: this process's)")
+	gatewayUser := flags.String("gateway-user", "", "user of the gateway, which alone may read, fetch media and forward (default: this process's)")
+	socketGroup := flags.String("socket-group", "", "group to own the socket, for the gateway and console")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -158,7 +162,7 @@ func run[C any](ctx context.Context, name string, args []string, start func(cont
 	if err := os.Chmod(env.PrivateDir(), 0o700); err != nil {
 		return err
 	}
-	srv := &Server{Log: env.Log, Peers: peers}
+	srv := &Server{Log: env.Log, Peers: peers, SocketGroup: *socketGroup}
 	if *rpID == "" {
 		env.Log.Warn("no --rp-id and --origin; writes are refused")
 	} else {
@@ -174,6 +178,10 @@ func run[C any](ctx context.Context, name string, args []string, start func(cont
 	defer env.fail(nil)
 	if srv.Connector, err = start(ctx, env, cfg); err != nil {
 		return err
+	}
+	// A connector that forwards keeps no messages.
+	if _, ok := srv.Connector.(Forwarder); !ok {
+		srv.Data = env.DataPath()
 	}
 	if c, ok := srv.Connector.(io.Closer); ok {
 		defer func() { err = errors.Join(err, c.Close()) }()

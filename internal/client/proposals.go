@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/adeci/mandate/internal/exitcode"
@@ -109,10 +108,7 @@ func (c *client) show(raw []byte) (proposal.Proposal, error) {
 }
 
 func printProposal(w io.Writer, p proposal.Proposal) {
-	fmt.Fprintf(w, "%s %s: %s %s\n", p.ID, p.Status, p.Connector, p.Op)
-	for _, f := range p.Display {
-		fmt.Fprintf(w, "  %s: %s\n", sanitize(f.Label), strings.ReplaceAll(sanitize(f.Value), "\n", "\n    "))
-	}
+	fmt.Fprintf(w, "%s %s\n", p.ID, p.Status)
 	if r := p.Result; r != nil {
 		fmt.Fprintf(w, "result: %s", r.Status)
 		if r.Ref != "" {

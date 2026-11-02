@@ -10,11 +10,12 @@ its spec.
 | `GET /health` | `ok`, `setup` (needs the owner), `connecting` (linked, connecting by itself), `resting`, or `down` |
 | `POST /setup` | linking driven from the console, e.g. a QR code or a pasted token |
 | `POST /unlink` | forget the link, for an `Unlinker` |
-| `POST /read` | read operations, run without approval |
+| `POST /read` | read operations, run without approval inside an agent's read grant |
 | `POST /prepare` | normalize a write and render what the owner will see |
 | `POST /execute` | run a write the owner approved |
 | `GET /forward/…` | relay agents' GETs to an API, for a `Forwarder` |
 | `POST /media` | stream a stored message's file, for a `MediaFetcher` |
+| `GET /containers` | stored chats (`q`, `parent`, `limit`) for the console's chat picker: ID, name, kind, parent and last activity |
 | `GET`, `PUT /keys` | the owner's trusted keys, kept in sync by the console |
 
 `connector.Main` serves all of it. `/execute` checks the owner's passkey
@@ -25,9 +26,10 @@ changed, spends the nonce and the request's ID, and only then calls your
 `Execute`. A request approved twice runs once.
 
 The gateway and the console both reach the socket. `Main` checks the
-caller's uid on every request: `/setup`, `/unlink`, `/execute` and
-`PUT /keys` answer only the console's user, and the gateway's user gets the
-rest.
+caller's uid on every request: `/read`, `/media` and `/forward/…` answer
+only the gateway's user; `/setup`, `/unlink`, `/execute`, `/containers` and
+`PUT /keys` only the console's; `/spec`, `/health`, `/prepare` and
+`GET /keys` both.
 
 ## A webhook connector
 
@@ -178,16 +180,24 @@ func main() {
 - **Name**: `Spec().Name` must match the name you give the connector in Nix.
 - **Reading** is optional. Implement `connector.Reader` for read ops. Write
   messages to `env.DataPath()` with the `store` package and agents get
-  `chats`, `messages` and `search` over them, with the owner's hide rules and
+  `chats`, `messages` and `search` over them, limited to the chats and
+  horizon of the agent's open read grants, with the owner's hide rules and
   login-code redaction applied. The login-code check also reads chat names
   and file names. Deleted messages show as `[deleted]`, and a chat whose
-  stored messages agents may not see is not listed.
+  stored messages agents may not see is not listed. Read ops the connector
+  serves itself need an open grant on the connector, and their results pass
+  the same filters.
 - **Media** is optional; see below.
 - **Chats**: mark a param `Container` and the gateway refuses the op unless
-  it names a stored, visible chat.
+  it names a stored chat the agent's open grants cover.
+- **Messages**: mark a param `Message` when its value is a stored message's
+  seq in the op's chat, such as a page anchor or a reply target. The gateway
+  refuses the op unless the agent may read that message, before your
+  connector is called, and turns your errors about stored messages (no such
+  seq, deleted) into the same 404.
 - **Answering a message**: set `Prepared.Message` to the stored message ID a
-  write answers, and the gateway refuses the proposal unless agents can see
-  that message.
+  write answers, and the gateway refuses the proposal unless the agent's
+  open grants cover that message.
 - **Health and linking** are optional: `connector.Checker`,
   `connector.Setupper` with its inputs declared in `Spec.Setup`, and
   `connector.Unlinker`, which lets the owner unlink and relink. The console
@@ -282,12 +292,15 @@ The module starts it as
 
 ```
 mandate-webhook --socket PATH --state DIR --config FILE --rp-id HOST --origin URL \
-  --console-user mandate-console --gateway-user mandate-gateway
+  --console-user mandate-console --gateway-user mandate-gateway \
+  --socket-group mandate-webhook-socket
 ```
 
 and checks the settings at build time with `mandate-webhook --check-config
-FILE`. `connector.Main` handles both. Secrets belong in `DIR/private`; the
-gateway can read the rest of `DIR`.
+FILE`. `connector.Main` handles both. The socket belongs to the
+`mandate-webhook-socket` group, which the gateway and the console are in.
+Secrets belong in `DIR/private`; the gateway, alone, can read the rest of
+`DIR`.
 
 A connector reaches the internet, but not localhost, the LAN or the tailnet,
 apart from systemd-resolved's stubs at 127.0.0.53 and 127.0.0.54. Allow a
@@ -315,6 +328,7 @@ services.mandate.connectors.http.settings.services.github = {
 };
 ```
 
-`reads` run with the token and without approval. Some APIs write on a GET
-(Slack's `chat.postMessage` takes one), so allow GET only on APIs where it
-reads; anything else belongs in `writes`.
+`reads` run with the token and without approval, while the agent holds an
+open read grant on `http`. Some APIs write on a GET (Slack's
+`chat.postMessage` takes one), so allow GET only on APIs where it reads;
+anything else belongs in `writes`.

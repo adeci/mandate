@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
 	"math"
 	"net/http"
 	"strconv"
@@ -15,7 +14,7 @@ import (
 // media streams a file of a message from its connector. The message is looked
 // up through the same filter as messages, so a hidden chat's or sender's
 // files are as unknown as their messages.
-func (h *handler) media(w http.ResponseWriter, r *http.Request, name string) {
+func (h *handler) media(w http.ResponseWriter, r *http.Request, name string, sc readScope) {
 	start := time.Now()
 	q := r.URL.Query()
 	chat := q.Get("chat")
@@ -40,7 +39,7 @@ func (h *handler) media(w http.ResponseWriter, r *http.Request, name string) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), h.cfg.Timeout)
 	defer cancel()
-	s, ok := h.source(ctx, w, name)
+	s, ok := h.source(ctx, w, name, sc.sql)
 	if !ok {
 		return
 	}
@@ -51,7 +50,7 @@ func (h *handler) media(w http.ResponseWriter, r *http.Request, name string) {
 	m, err := s.mediaMessage(chat, seq, index)
 	s.close()
 	if err != nil {
-		slog.Error("media lookup", "source", name, "err", err)
+		logFor(r.Context()).Error("media lookup", "source", name, "err", err)
 		writeError(w, http.StatusServiceUnavailable, "gateway unavailable; tell the owner")
 		return
 	}
@@ -80,16 +79,17 @@ func (h *handler) media(w http.ResponseWriter, r *http.Request, name string) {
 	}
 
 	resp, err := h.connectors.media[name].Media(r.Context(), m.id, int(index), h.cfg.MaxMedia)
+	log := logFor(r.Context())
 	attrs := []any{"remote", r.RemoteAddr, "connector", name, "seq", seq, "index", index}
 	if err != nil {
-		slog.Info("media", append(attrs, "err", err.Error())...)
-		relay(w, "connector "+name, err)
+		log.Info("media", append(attrs, "err", err.Error())...)
+		relay(w, r, "connector "+name, err)
 		return
 	}
 	defer resp.Body.Close()
 	switch {
 	case resp.ContentLength < 0:
-		slog.Error("media without length", attrs...)
+		log.Error("media without length", attrs...)
 		writeError(w, http.StatusBadGateway, fmt.Sprintf("connector %s sent media without a length; tell the owner", name))
 		return
 	case resp.ContentLength > h.cfg.MaxMedia:
@@ -104,10 +104,11 @@ func (h *handler) media(w http.ResponseWriter, r *http.Request, name string) {
 	n, err := io.Copy(w, resp.Body)
 	attrs = append(attrs, "bytes", n, "duration_ms", time.Since(start).Milliseconds())
 	if err != nil {
-		slog.Warn("media", append(attrs, "err", err)...)
+		log.Warn("media", append(attrs, "err", err)...)
 		return
 	}
-	slog.Info("media", attrs...)
+	log.Info("media", attrs...)
+	h.report(r.Context(), name, "media", chat, sc.grants, 1)
 }
 
 func tooLarge(size, limit int64) string {

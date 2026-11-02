@@ -34,6 +34,8 @@ type row struct {
 	Args      map[string]string
 	DecidedAt time.Time
 	DecidedBy string
+	// AgentID and AgentName are who proposed it, as the gateway says.
+	AgentID, AgentName string
 }
 
 // challenge is one outstanding approval challenge: the exact record bytes the
@@ -77,7 +79,30 @@ func openDB(ctx context.Context, path string) (*db, error) {
 		s.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	if err := migrate(ctx, s); err != nil {
+		s.Close()
+		return nil, fmt.Errorf("migrate schema: %w", err)
+	}
 	return &db{sql: s}, nil
+}
+
+// migrate adds the columns that CREATE TABLE IF NOT EXISTS doesn't give a
+// table created by an older version, and the index on them.
+func migrate(ctx context.Context, s *sql.DB) error {
+	for _, col := range []string{"agent_id", "agent_name"} {
+		var n int
+		err := s.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('proposals') WHERE name = ?`, col).Scan(&n)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := s.ExecContext(ctx, `ALTER TABLE proposals ADD COLUMN `+col+` TEXT NOT NULL DEFAULT ''`); err != nil {
+				return err
+			}
+		}
+	}
+	_, err := s.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS proposals_by_agent ON proposals (agent_id, status)`)
+	return err
 }
 
 func (d *db) Close() error { return d.sql.Close() }
@@ -98,7 +123,8 @@ func ms(t time.Time) int64 { return t.UnixMilli() }
 
 func fromMS(v int64) time.Time { return time.UnixMilli(v).UTC() }
 
-// insert stores a new pending proposal unless limit are already pending.
+// insert stores a new pending proposal unless its agent already has limit
+// pending.
 func (d *db) insert(ctx context.Context, r row, limit int) error {
 	args, err := json.Marshal(r.Args)
 	if err != nil {
@@ -111,8 +137,8 @@ func (d *db) insert(ctx context.Context, r row, limit int) error {
 	return d.tx(ctx, func(tx *sql.Tx) error {
 		var n int
 		err := tx.QueryRowContext(ctx,
-			`SELECT count(*) FROM proposals WHERE status = 'pending' AND expires_at > ?`,
-			ms(r.CreatedAt)).Scan(&n)
+			`SELECT count(*) FROM proposals WHERE agent_id = ? AND status = 'pending' AND expires_at > ?`,
+			r.AgentID, ms(r.CreatedAt)).Scan(&n)
 		if err != nil {
 			return err
 		}
@@ -120,9 +146,9 @@ func (d *db) insert(ctx context.Context, r row, limit int) error {
 			return errTooMany
 		}
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO proposals (id, connector, op, args, display, note, status, created_at, expires_at)
-			VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-			r.ID, r.Connector, r.Op, string(args), string(display), r.Note, ms(r.CreatedAt), ms(r.ExpiresAt))
+			INSERT INTO proposals (id, connector, op, args, display, note, agent_id, agent_name, status, created_at, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+			r.ID, r.Connector, r.Op, string(args), string(display), r.Note, r.AgentID, r.AgentName, ms(r.CreatedAt), ms(r.ExpiresAt))
 		return err
 	})
 }
@@ -197,7 +223,8 @@ func (d *db) pendingCount(ctx context.Context) (int, error) {
 }
 
 // version sums up proposals arriving, leaving pending (decided or expired)
-// and finishing, and key changes being requested or resolved.
+// and finishing, key changes being requested or resolved, and access
+// requests, agents and grants coming and going.
 func (d *db) version(ctx context.Context, now time.Time) (string, error) {
 	var v string
 	err := d.sql.QueryRowContext(ctx, `
@@ -205,13 +232,18 @@ func (d *db) version(ctx context.Context, now time.Time) (string, error) {
 		               coalesce(sum(status = 'pending' AND expires_at > ?1), 0) || '.' || count(result)
 		        FROM proposals) || '.' ||
 		       (SELECT count(*) || '.' || coalesce(max(created_at), 0)
-		        FROM key_requests WHERE expires_at > ?1)`, ms(now)).Scan(&v)
+		        FROM key_requests WHERE expires_at > ?1) || '.' ||
+		       (SELECT count(*) || '.' || coalesce(max(created_at), 0) || '.' ||
+		               coalesce(sum(status = 'pending' AND expires_at > ?1), 0)
+		        FROM access_requests) || '.' ||
+		       (SELECT count(*) || '.' || count(deleted_at) FROM agents) || '.' ||
+		       (SELECT count(*) || '.' || count(revoked_at) FROM grants)`, ms(now)).Scan(&v)
 	return v, err
 }
 
 func (d *db) query(ctx context.Context, where string, args ...any) ([]row, error) {
 	rs, err := d.sql.QueryContext(ctx, `
-		SELECT id, connector, op, args, display, note, status, result,
+		SELECT id, connector, op, args, display, note, agent_id, agent_name, status, result,
 		       created_at, expires_at, decided_at, decided_by
 		FROM proposals `+where, args...)
 	if err != nil {
@@ -228,7 +260,7 @@ func (d *db) query(ctx context.Context, where string, args ...any) ([]row, error
 			decided           sql.NullInt64
 			status            string
 		)
-		if err := rs.Scan(&r.ID, &r.Connector, &r.Op, &argsJSON, &display, &r.Note, &status, &result,
+		if err := rs.Scan(&r.ID, &r.Connector, &r.Op, &argsJSON, &display, &r.Note, &r.AgentID, &r.AgentName, &status, &result,
 			&created, &expires, &decided, &by); err != nil {
 			return nil, err
 		}
@@ -388,8 +420,8 @@ func (d *db) expireDue(ctx context.Context, now time.Time) error {
 	return err
 }
 
-// sweep expires proposals and deletes challenges too old to verify, and
-// sessions and key changes past their lifetime.
+// sweep expires proposals and deletes challenges too old to verify,
+// sessions and key changes past their lifetime, and old access state.
 func (d *db) sweep(ctx context.Context, now time.Time) error {
 	if err := d.expireDue(ctx, now); err != nil {
 		return err
@@ -404,8 +436,10 @@ func (d *db) sweep(ctx context.Context, now time.Time) error {
 	if _, err = d.sql.ExecContext(ctx, `DELETE FROM key_requests WHERE expires_at <= ?`, ms(now)); err != nil {
 		return err
 	}
-	_, err = d.sql.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at <= ?`, ms(now))
-	return err
+	if _, err = d.sql.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at <= ?`, ms(now)); err != nil {
+		return err
+	}
+	return d.sweepAccess(ctx, now)
 }
 
 // recoverInterrupted settles proposals that were executing when the process

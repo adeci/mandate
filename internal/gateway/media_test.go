@@ -75,10 +75,10 @@ func TestMediaFollowsHideRules(t *testing.T) {
 	exposure := filepath.Join(t.TempDir(), "exposure.toml")
 	mustDo(t, os.WriteFile(exposure, []byte(testExposure), 0o600))
 	srv := &connector.Server{Connector: f, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	h := newHandler(Config{
-		Sources: sources, ExposureFile: exposure, Timeout: 2 * time.Second, MaxMedia: 1000,
+	h := testHandler(Config{
+		Sources: sources, ExposureFile: exposure, Timeout: testTimeout, MaxMedia: 1000,
 		Connectors: map[string]string{"whatsapp": serveUnix(t, "whatsapp", srv.Handler())},
-	}, testToken)
+	})
 
 	_, res, _ := getTable(t, h, "/v1/whatsapp/messages?chat=conv-family&limit=3")
 	if got, want := column(t, res, "body"), []any{"[#0 image/png] [#1 application/pdf plan.pdf]", "[video/mp4]", "[image/jpeg cat.jpg] look"}; !slices.Equal(got, want) {

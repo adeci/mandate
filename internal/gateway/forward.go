@@ -3,7 +3,6 @@ package gateway
 import (
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
@@ -40,7 +39,8 @@ func (h *handler) forward(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("connector %s serves no raw reads; see mandate %s --help", name, name))
 		return
 	}
-	if !h.healthy(w, r, name) {
+	sc, ok := h.forwardable(w, r, name)
+	if !ok || !h.healthy(w, r, name) {
 		return
 	}
 	target, ok := strings.CutPrefix(r.URL.EscapedPath(), "/v1/forward/"+name+"/")
@@ -58,15 +58,16 @@ func (h *handler) forward(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	resp, err := h.connectors.reads[name].Forward(r.Context(), r.Method, target, header)
+	log := logFor(r.Context())
 	attrs := []any{"remote", r.RemoteAddr, "method", r.Method, "connector", name}
 	if err != nil {
-		slog.Error("forward", append(attrs, "err", err)...)
+		log.Error("forward", append(attrs, "err", err)...)
 		writeError(w, http.StatusServiceUnavailable, unavailable("connector "+name))
 		return
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxForwardResponse+1))
-	slog.Info("forward", append(attrs, "status", resp.StatusCode, "bytes", len(data), "duration_ms", time.Since(start).Milliseconds())...)
+	log.Info("forward", append(attrs, "status", resp.StatusCode, "bytes", len(data), "duration_ms", time.Since(start).Milliseconds())...)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "read connector response")
 		return
@@ -84,4 +85,7 @@ func (h *handler) forward(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	w.Write(data)
+	if resp.StatusCode < 400 {
+		h.report(r.Context(), name, "get", "", sc.grants, 1)
+	}
 }

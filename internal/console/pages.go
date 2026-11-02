@@ -66,6 +66,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /connections/{name}/setup", s.api(s.setup))
 	mux.HandleFunc("POST /connections/{name}/unlink", s.api(s.unlink))
 	mux.HandleFunc("GET /keys", s.page(s.keysPage))
+	mux.HandleFunc("GET /access", s.page(s.accessPage))
+	mux.HandleFunc("GET /access/chats", s.api(s.searchChats))
+	mux.HandleFunc("GET /access/chats/tree", s.api(s.chatTreeHandler))
+	mux.HandleFunc("POST /access/challenge", s.api(s.accessChallenge))
+	mux.HandleFunc("POST /access/approve", s.api(s.accessApprove))
+	mux.HandleFunc("POST /access/agents/{id}/delete", s.api(s.deleteAgent))
+	mux.HandleFunc("POST /access/grants/{id}/revoke", s.api(s.revokeGrant))
+	mux.HandleFunc("POST /access/requests/{id}/deny", s.api(s.denyAccess))
 	mux.HandleFunc("POST /keys/options", s.api(s.registerOptions))
 	mux.HandleFunc("POST /keys", s.api(s.addKey))
 	mux.HandleFunc("POST /keys/remove", s.api(s.removeKey))
@@ -106,6 +114,8 @@ type page struct {
 	Title   string
 	Nav     string
 	Pending int
+	// Requests counts access requests waiting.
+	Requests int
 	// Attention counts connectors that need a look, in the worst one's tone.
 	Attention     int
 	AttentionTone string
@@ -135,13 +145,18 @@ func (s *Server) renderString(name string, data any) (string, error) {
 }
 
 func (s *Server) owner(w http.ResponseWriter, r *http.Request, sess session, name, title, nav string, data any) {
-	n, err := s.db.pendingCount(r.Context())
+	ctx := r.Context()
+	n, err := s.db.pendingCount(ctx)
 	if err != nil {
 		s.cfg.Log.Error("count pending", "err", err)
 	}
+	requests, err := s.db.pendingAccessCount(ctx, s.now())
+	if err != nil {
+		s.cfg.Log.Error("count access requests", "err", err)
+	}
 	_, attention, worst := s.health()
 	s.render(w, http.StatusOK, name, page{
-		Title: title, Nav: nav, Pending: n, Attention: attention, AttentionTone: worst,
+		Title: title, Nav: nav, Pending: n + requests, Requests: requests, Attention: attention, AttentionTone: worst,
 		Who: sess.who(), Passkey: sess.key.CredentialID != "", Version: sess.version, Data: data,
 	})
 }
@@ -178,10 +193,10 @@ func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
 }
 
 type listItem struct {
-	ID, Action string
-	Who, What  template.HTML
-	Status     proposal.Status
-	When       string
+	Href, Action string
+	Who, What    template.HTML
+	Status       proposal.Status
+	When         string
 }
 
 // item is a request as one row: the first field not tied to a param (e.g.
@@ -197,7 +212,7 @@ func (s *Server) item(pr row) listItem {
 		}
 	}
 	it := listItem{
-		ID: pr.ID, Action: pr.Connector + " " + pr.Op, Status: pr.Status,
+		Href: "/r/" + pr.ID, Action: pr.Connector + " " + pr.Op, Status: pr.Status,
 		Who: visible(oneLine(who, 40)), What: visible(oneLine(what, 80)),
 	}
 	if pr.Status == proposal.Pending {
@@ -273,6 +288,17 @@ func (s *Server) inboxPage(w http.ResponseWriter, r *http.Request, sess session)
 		fail(err)
 		return
 	}
+	requests, err := s.db.pendingAccessRequests(ctx, s.now())
+	if err != nil {
+		fail(err)
+		return
+	}
+	for _, ar := range requests {
+		v.Waiting = append(v.Waiting, listItem{
+			Href: "/access#request-" + ar.ID, Action: oneLine(ar.AgentName, 40) + " asks to read " + ar.Connector,
+			Status: proposal.Pending, What: visible(oneLine(ar.Reason, 80)), When: left(ar.ExpiresAt.Sub(s.now())),
+		})
+	}
 	for _, pr := range waiting {
 		v.Waiting = append(v.Waiting, s.item(pr))
 	}
@@ -337,6 +363,9 @@ type requestView struct {
 	Settled    bool
 	DecidedAt  time.Time
 	DecidedBy  string
+	AgentName  string
+	// AgentDeleted means the agent was deleted after proposing this.
+	AgentDeleted bool
 }
 
 func (s *Server) requestPage(w http.ResponseWriter, r *http.Request, sess session) {
@@ -359,6 +388,10 @@ func (s *Server) requestPage(w http.ResponseWriter, r *http.Request, sess sessio
 		Settled:    pr.Status != proposal.Pending && pr.Status != proposal.Executing,
 		DecidedAt:  pr.DecidedAt,
 		DecidedBy:  pr.DecidedBy,
+		AgentName:  pr.AgentName,
+	}
+	if v.Pending && s.agentGone(r.Context(), pr) != nil {
+		v.AgentDeleted, v.CanApprove = true, false
 	}
 	editable := map[string]bool{}
 	if c, ok := s.conns[pr.Connector]; ok && v.Pending {

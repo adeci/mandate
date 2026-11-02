@@ -62,7 +62,7 @@ func (f *fakeDiscord) Spec() connector.Spec {
 		{Name: "send", Kind: connector.Write, Params: []connector.Param{
 			{Name: "chat", Required: true, Container: true},
 			{Name: "text", Required: true, Editable: true},
-			{Name: "seq"},
+			{Name: "seq", Message: true},
 		}},
 	}}
 }
@@ -88,6 +88,10 @@ type fakeConsole struct {
 	submitted []proposal.Request
 	proposals map[string]proposal.Proposal
 	gets      int
+	requests  []proposal.AccessRequest
+	statuses  map[string]proposal.AccessStatus
+	overQuota atomic.Bool
+	quotas    atomic.Int32
 }
 
 func (a *fakeConsole) set(p proposal.Proposal) {
@@ -117,13 +121,43 @@ func (a *fakeConsole) handler() http.Handler {
 		a.proposals[p.ID] = p
 		connector.WriteJSON(w, http.StatusOK, p)
 	})
+	mux.HandleFunc("GET /access/quota", func(w http.ResponseWriter, r *http.Request) {
+		a.quotas.Add(1)
+		if a.overQuota.Load() || r.URL.Query().Get("agent") != "a1" {
+			connector.WriteJSON(w, http.StatusTooManyRequests, connector.Error{Message: "too many access requests; wait for the owner"})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /access/requests", func(w http.ResponseWriter, r *http.Request) {
+		a.calls.Add(1)
+		var req proposal.AccessRequest
+		if !connector.DecodeJSON(w, r, &req, maxRequestBytes) {
+			return
+		}
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.requests = append(a.requests, req)
+		connector.WriteJSON(w, http.StatusOK, proposal.RequestRef{ID: "r1", URL: "https://console.example/access#r1"})
+	})
+	mux.HandleFunc("GET /access/requests/{id}", func(w http.ResponseWriter, r *http.Request) {
+		a.calls.Add(1)
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		st, ok := a.statuses[r.PathValue("id")]
+		if !ok {
+			writeError(w, http.StatusNotFound, "no such request")
+			return
+		}
+		connector.WriteJSON(w, http.StatusOK, st)
+	})
 	mux.HandleFunc("GET /proposals/{id}", func(w http.ResponseWriter, r *http.Request) {
 		a.calls.Add(1)
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		a.gets++
 		p, ok := a.proposals[r.PathValue("id")]
-		if !ok {
+		if !ok || r.URL.Query().Get("agent") != "a1" {
 			writeError(w, http.StatusNotFound, "no such proposal")
 			return
 		}
@@ -152,17 +186,17 @@ func newRig(t *testing.T, edit func(*Config)) *rig {
 			return connector.Prepared{Args: args, Container: args["chat"]}, nil
 		},
 	}
-	a := &fakeConsole{proposals: map[string]proposal.Proposal{}}
+	a := &fakeConsole{proposals: map[string]proposal.Proposal{}, statuses: map[string]proposal.AccessStatus{}}
 	srv := &connector.Server{Connector: d, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	cfg := Config{
-		Sources: fixture(t), ExposureFile: exposure, Timeout: 2 * time.Second,
+		Sources: fixture(t), ExposureFile: exposure, Timeout: testTimeout,
 		Connectors:    map[string]string{"discord": serveUnix(t, "discord", srv.Handler())},
 		ConsoleSocket: serveUnix(t, "console", a.handler()),
 	}
 	if edit != nil {
 		edit(&cfg)
 	}
-	return &rig{h: newHandler(cfg, testToken), discord: d, console: a}
+	return &rig{h: testHandler(cfg), discord: d, console: a}
 }
 
 func call(h *handler, method, path, body string) *httptest.ResponseRecorder {
@@ -243,7 +277,8 @@ func TestReadOpRunsAndAnswersThroughFilter(t *testing.T) {
 }
 
 // A read op's answer gives away nothing about hidden chats: no upstream total
-// of hits, and a count of only the visible chats a sync stored.
+// of hits, no "more" when hits were filtered, and a count of only the visible
+// chats a sync stored.
 func TestReadOpCountsOnlyVisibleChats(t *testing.T) {
 	t.Parallel()
 	r := newRig(t, nil)
@@ -257,13 +292,13 @@ func TestReadOpCountsOnlyVisibleChats(t *testing.T) {
 	rec := call(r.h, http.MethodPost, "/v1/discord/guild-search", `{"args":{"guild_id":"g-fun","content":"x"}}`)
 	var raw map[string]json.RawMessage
 	mustDo(t, json.Unmarshal(rec.Body.Bytes(), &raw))
-	if keys := slices.Sorted(maps.Keys(raw)); rec.Code != http.StatusOK || !slices.Equal(keys, []string{"columns", "more", "rows"}) {
-		t.Fatalf("guild-search: %d %s, want columns, rows and more only", rec.Code, rec.Body)
+	if keys := slices.Sorted(maps.Keys(raw)); rec.Code != http.StatusOK || !slices.Equal(keys, []string{"columns", "rows"}) {
+		t.Fatalf("guild-search: %d %s, want columns and rows only", rec.Code, rec.Body)
 	}
 	var res table
 	mustDo(t, json.Unmarshal(rec.Body.Bytes(), &res))
-	if got := column(t, res, "body"); !slices.Equal(got, []any{"lol"}) || !res.More {
-		t.Errorf("guild-search bodies %v, more %v; want the one visible hit and more", got, res.More)
+	if got := column(t, res, "body"); !slices.Equal(got, []any{"lol"}) || res.More {
+		t.Errorf("guild-search bodies %v, more %v; want the one visible hit and no more, which would count hidden hits", got, res.More)
 	}
 
 	rec = call(r.h, http.MethodPost, "/v1/discord/sync", `{"args":{}}`)
@@ -342,6 +377,7 @@ func TestWriteOpProposesPreparedArgs(t *testing.T) {
 	got := r.console.submitted
 	r.console.mu.Unlock()
 	if len(got) != 1 || got[0].Connector != "discord" || got[0].Op != "send" || got[0].Note != "asked by Alex" ||
+		got[0].AgentID != "a1" || got[0].AgentName != "Test Agent" ||
 		!maps.Equal(got[0].Args, map[string]string{"chat": "c-memes", "text": "hi"}) {
 		t.Fatalf("submitted %+v", got)
 	}
@@ -421,11 +457,13 @@ func TestUnhealthyConnectorIsNotCalled(t *testing.T) {
 	}
 }
 
-func TestStatusPassThrough(t *testing.T) {
+// Agents see a proposal's state and result, never what the owner was shown:
+// the display may render more than the agent may read.
+func TestStatusHidesDisplayAndNote(t *testing.T) {
 	t.Parallel()
 	r := newRig(t, nil)
 	want := proposal.Proposal{
-		ID: "p7", Connector: "discord", Op: "send", Status: proposal.Done,
+		ID: "p7", Connector: "discord", Op: "send", Status: proposal.Done, Note: "for Alex",
 		Display:   []approval.Field{{Label: "To", Value: "#memes"}},
 		Result:    &connector.Result{Status: connector.Done, Ref: "m9"},
 		CreatedAt: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC),
@@ -434,8 +472,9 @@ func TestStatusPassThrough(t *testing.T) {
 	r.console.set(want)
 
 	rec := call(r.h, http.MethodGet, "/v1/proposals/p7", "")
-	wantJSON, _ := json.Marshal(want)
-	if rec.Code != http.StatusOK || strings.TrimSpace(rec.Body.String()) != string(wantJSON) {
+	wantJSON, _ := json.Marshal(forAgent(want))
+	if rec.Code != http.StatusOK || strings.TrimSpace(rec.Body.String()) != string(wantJSON) ||
+		strings.Contains(rec.Body.String(), "#memes") || strings.Contains(rec.Body.String(), "Alex") {
 		t.Errorf("got %d %s\nwant %s", rec.Code, rec.Body, wantJSON)
 	}
 	if rec := call(r.h, http.MethodGet, "/v1/proposals/p8", ""); rec.Code != http.StatusNotFound {
@@ -512,22 +551,6 @@ func TestStatusLongPollStopsWhenAgentLeaves(t *testing.T) {
 	r.h.ServeHTTP(httptest.NewRecorder(), req)
 	if d := time.Since(start); d > 5*time.Second {
 		t.Errorf("long-poll outlived its client by %v", d)
-	}
-}
-
-func TestWritesDisabledWithoutConsole(t *testing.T) {
-	t.Parallel()
-	r := newRig(t, func(c *Config) { c.ConsoleSocket = "" })
-	for _, rec := range []*httptest.ResponseRecorder{
-		call(r.h, http.MethodPost, "/v1/discord/send", `{"args":{"chat":"c-memes","text":"hi"}}`),
-		call(r.h, http.MethodGet, "/v1/proposals/p1", ""),
-	} {
-		if rec.Code != http.StatusNotFound {
-			t.Errorf("%d %s, want 404", rec.Code, rec.Body)
-		}
-	}
-	if n := r.discord.prepares.Load(); n != 0 {
-		t.Errorf("prepared %d times without the console", n)
 	}
 }
 

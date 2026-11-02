@@ -8,6 +8,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -115,6 +117,21 @@ func (c *Client) PutKeys(ctx context.Context, log []approval.SignedChange) (Keys
 	return h, err
 }
 
+// Containers lists the connector's stored chats matching q, under parent
+// when it is set. A connector that stores no messages answers 404.
+func (c *Client) Containers(ctx context.Context, q, parent string, limit int) ([]Container, error) {
+	v := url.Values{"limit": {strconv.Itoa(limit)}}
+	if q != "" {
+		v.Set("q", q)
+	}
+	if parent != "" {
+		v.Set("parent", parent)
+	}
+	var out []Container
+	err := c.Do(ctx, http.MethodGet, "/containers?"+v.Encode(), nil, &out)
+	return out, err
+}
+
 // Media streams a stored message's file of at most limit bytes; the caller
 // closes the body. Refusals come back as *Error.
 func (c *Client) Media(ctx context.Context, message string, index int, limit int64) (*http.Response, error) {
@@ -160,6 +177,9 @@ func (c *Client) Do(ctx context.Context, method, path string, body, out any) err
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		return refusal(resp)
+	}
+	if out == nil {
+		return nil
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {

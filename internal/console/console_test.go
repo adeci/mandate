@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -25,6 +26,7 @@ import (
 	"github.com/adeci/mandate/approval/approvaltest"
 	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/internal/proposal"
+	"github.com/adeci/mandate/store"
 )
 
 const (
@@ -217,16 +219,45 @@ func emptyKeys(t *testing.T) *approval.Keys {
 	return k
 }
 
-// serveFake runs a fake connector called name that trusts keys.
+// serveFake runs a fake connector called name that trusts keys and stores
+// the chats in fakeChats.
 func serveFake(t *testing.T, sock, name string, keys *approval.Keys) (*fake, func()) {
 	t.Helper()
 	seen, err := approval.OpenSeen(filepath.Join(t.TempDir(), "seen.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	data := filepath.Join(t.TempDir(), "data.db")
+	st, err := store.Open(context.Background(), data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = st.UpsertContainers(context.Background(), fakeChats)
+	st.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
 	f := &fake{name: name}
-	return f, serveSocket(t, sock, (&connector.Server{Connector: f, Keys: keys, Seen: seen, Log: discard}).Handler())
+	return f, serveSocket(t, sock, (&connector.Server{Connector: f, Keys: keys, Seen: seen, Log: discard, Data: data}).Handler())
 }
+
+// fakeChats has a guild with a channel and a thread under it, and a group
+// with more threads under it than an access request shows.
+var fakeChats = append([]store.Container{
+	{ID: "g", Kind: "guild", Name: "Guild"},
+	{ID: "c1", Kind: "channel", ParentID: "g", Name: "family"},
+	{ID: "t1", Kind: "thread", ParentID: "c1", Name: "cats"},
+	{ID: "c2", Kind: "group", Name: "Work"},
+	{ID: "d1", Kind: "dm", Name: "~Mom"},
+}, workThreads...)
+
+var workThreads = func() []store.Container {
+	out := make([]store.Container, treeNodes+10)
+	for i := range out {
+		out[i] = store.Container{ID: fmt.Sprintf("w%02d", i), Kind: "thread", ParentID: "c2", Name: fmt.Sprintf("topic %d", i)}
+	}
+	return out
+}()
 
 // start runs a console whose first key, "phone", was added with the
 // password, and signs in with that key.
@@ -309,7 +340,7 @@ func (h *harness) submitTo(t *testing.T, conn, text string) proposal.Proposal {
 
 func (h *harness) get(t *testing.T, id string) proposal.Proposal {
 	t.Helper()
-	p, err := h.api.Get(context.Background(), id)
+	p, err := h.api.Get(context.Background(), id, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -848,7 +879,7 @@ func TestSubmit(t *testing.T) {
 			t.Errorf("%s: err = %v, want %d %q", tt.name, err, tt.status, tt.msg)
 		}
 	}
-	if _, err := h.api.Get(context.Background(), "nope"); err == nil {
+	if _, err := h.api.Get(context.Background(), "nope", ""); err == nil {
 		t.Fatal("get unknown proposal succeeded")
 	}
 }

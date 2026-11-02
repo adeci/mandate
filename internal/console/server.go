@@ -22,7 +22,8 @@ import (
 )
 
 const (
-	maxPending  = 20
+	// maxPending caps the proposals waiting from one agent.
+	maxPending  = 10
 	proposalTTL = 24 * time.Hour
 	// specTTL bounds how long a connector restart with new ops goes unnoticed.
 	specTTL        = 5 * time.Minute
@@ -39,9 +40,12 @@ type Config struct {
 	// PasswordHash is the bcrypt hash of the admin password.
 	PasswordHash []byte
 	Connectors   map[string]string
-	StateDir     string
-	Log          *slog.Logger
-	Now          func() time.Time
+	// NtfyURL is the ntfy topic notified when something waits for the
+	// owner, NtfyToken its access token; none when empty.
+	NtfyURL, NtfyToken string
+	StateDir           string
+	Log                *slog.Logger
+	Now                func() time.Time
 }
 
 type Server struct {
@@ -56,6 +60,8 @@ type Server struct {
 
 	regMu sync.Mutex
 	regs  map[string]registration
+
+	notify *notifier
 }
 
 type conn struct {
@@ -102,6 +108,9 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		tmpl:     templates,
 		logins:   newLoginChallenges(),
 		regs:     map[string]registration{},
+	}
+	if cfg.NtfyURL != "" {
+		s.notify = &notifier{url: cfg.NtfyURL, token: cfg.NtfyToken, client: &http.Client{}, log: cfg.Log}
 	}
 	for name, sock := range cfg.Connectors {
 		s.conns[name] = &conn{name: name, client: connector.Dial(sock, executeTimeout)}
@@ -186,6 +195,12 @@ func (s *Server) ProposalHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /proposals", s.submit)
 	mux.HandleFunc("GET /proposals/{id}", s.getProposal)
+	mux.HandleFunc("GET /keys", s.keyLog)
+	mux.HandleFunc("GET /access", s.accessRecords)
+	mux.HandleFunc("GET /access/quota", s.accessQuota)
+	mux.HandleFunc("POST /access/requests", s.requestAccess)
+	mux.HandleFunc("GET /access/requests/{id}", s.accessStatus)
+	mux.HandleFunc("POST /access/reads", s.recordRead)
 	return mux
 }
 
@@ -195,6 +210,12 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	if req.AgentID != "" {
+		if _, err := s.db.agent(ctx, req.AgentID); err != nil {
+			connector.WriteError(w, notFound(err))
+			return
+		}
+	}
 	c, ok := s.conns[req.Connector]
 	if !ok {
 		connector.WriteError(w, &connector.Error{Status: http.StatusNotFound, Message: fmt.Sprintf("no connector %q", req.Connector)})
@@ -216,22 +237,41 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			ID: rand.Text(), Connector: req.Connector, Op: req.Op, Display: p.Display, Note: req.Note,
 			Status: proposal.Pending, CreatedAt: now, ExpiresAt: now.Add(proposalTTL),
 		},
-		Args: p.Args,
+		Args:    p.Args,
+		AgentID: req.AgentID, AgentName: req.AgentName,
 	}
 	if err := s.db.insert(ctx, pr, maxPending); err != nil {
 		if errors.Is(err, errTooMany) {
-			err = &connector.Error{Status: http.StatusTooManyRequests, Message: fmt.Sprintf("%d proposals are already waiting for the owner", maxPending)}
+			err = &connector.Error{Status: http.StatusTooManyRequests, Message: fmt.Sprintf("%d of this agent's proposals are already waiting for the owner", maxPending)}
 		}
 		connector.WriteError(w, err)
 		return
 	}
-	s.cfg.Log.Info("proposed", "id", pr.ID, "connector", req.Connector, "op", req.Op)
+	s.cfg.Log.Info("proposed", "id", pr.ID, "connector", req.Connector, "op", req.Op, "agent", req.AgentName)
 	pr.URL = s.url(pr.ID)
+	s.notify.notify(fmt.Sprintf("%s proposes a %s %s", agentName(req.AgentName), req.Connector, req.Op), pr.URL)
 	connector.WriteJSON(w, http.StatusCreated, pr.Proposal)
 }
 
+// agentGone refuses a proposal whose agent was deleted after proposing it.
+func (s *Server) agentGone(ctx context.Context, pr row) error {
+	if pr.AgentID == "" {
+		return nil
+	}
+	_, err := s.db.agent(ctx, pr.AgentID)
+	if errors.Is(err, errNoAgent) {
+		return &connector.Error{Status: http.StatusConflict, Message: "the agent that proposed this was deleted"}
+	}
+	return err
+}
+
+// getProposal answers only the agent that made the proposal; any other gets
+// the same 404 as an unknown ID.
 func (s *Server) getProposal(w http.ResponseWriter, r *http.Request) {
 	pr, err := s.load(r.Context(), r.PathValue("id"))
+	if err == nil && pr.AgentID != r.URL.Query().Get("agent") {
+		err = &connector.Error{Status: http.StatusNotFound, Message: errNotFound.Error()}
+	}
 	if err != nil {
 		connector.WriteError(w, err)
 		return
@@ -313,6 +353,10 @@ func (s *Server) challenge(w http.ResponseWriter, r *http.Request, sess session)
 	}
 	if pr.Status != proposal.Pending {
 		connector.WriteError(w, &connector.Error{Status: http.StatusConflict, Message: "request is " + string(pr.Status)})
+		return
+	}
+	if err := s.agentGone(ctx, pr); err != nil {
+		connector.WriteError(w, err)
 		return
 	}
 	c, ok := s.conns[pr.Connector]
@@ -445,6 +489,10 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request, sess session) {
 	}
 	pr, err := s.load(r.Context(), id)
 	if err != nil {
+		connector.WriteError(w, err)
+		return
+	}
+	if err := s.agentGone(r.Context(), pr); err != nil {
 		connector.WriteError(w, err)
 		return
 	}

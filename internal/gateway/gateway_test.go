@@ -88,6 +88,10 @@ func fixture(t *testing.T) map[string]string {
 	}
 }
 
+// testTimeout bounds a query; it is generous because tests run
+// in parallel with -race on loaded builders.
+const testTimeout = 30 * time.Second
+
 const testExposure = `
 [whatsapp]
 hide_containers = ["conv-private"]
@@ -102,7 +106,7 @@ func sourceHandler(t *testing.T) (*handler, string) {
 	t.Helper()
 	exposure := filepath.Join(t.TempDir(), "exposure.toml")
 	mustDo(t, os.WriteFile(exposure, []byte(testExposure), 0o600))
-	return newHandler(Config{Sources: fixture(t), ExposureFile: exposure, Timeout: 2 * time.Second}, testToken), exposure
+	return testHandler(Config{Sources: fixture(t), ExposureFile: exposure, Timeout: testTimeout}), exposure
 }
 
 func getTable(t *testing.T, h *handler, path string) (int, table, string) {
@@ -280,7 +284,7 @@ func TestVerbsOrderBySentTimeAcrossIngestOrder(t *testing.T) {
 	// The service reports activity newer than anything stored.
 	mustDo(t, st.UpsertContainer(context.Background(), store.Container{ID: "c4", Kind: "dm", LastMessageAt: day.Add(20 * time.Hour)}))
 	mustDo(t, st.Close())
-	h := newHandler(Config{Sources: map[string]string{"wa": path}, ExposureFile: filepath.Join(dir, "exposure.toml"), Timeout: 2 * time.Second}, testToken)
+	h := testHandler(Config{Sources: map[string]string{"wa": path}, ExposureFile: filepath.Join(dir, "exposure.toml"), Timeout: testTimeout})
 
 	for _, verb := range []string{"messages?chat=c1", "search?text=x"} {
 		var got []any
@@ -326,7 +330,7 @@ func TestReadsOnDatabaseOfOlderConnector(t *testing.T) {
 		mustDo(t, err)
 	}
 	mustDo(t, st.Close())
-	h := newHandler(Config{Sources: map[string]string{"wa": path}, ExposureFile: filepath.Join(dir, "exposure.toml"), Timeout: 2 * time.Second}, testToken)
+	h := testHandler(Config{Sources: map[string]string{"wa": path}, ExposureFile: filepath.Join(dir, "exposure.toml"), Timeout: testTimeout})
 
 	status, res, body := getTable(t, h, "/v1/wa/chats")
 	if status != http.StatusOK {
@@ -346,11 +350,11 @@ func TestSourceAppearsOnceItsDatabaseExists(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "late", "data.db")
-	h := newHandler(Config{
+	h := testHandler(Config{
 		Sources:      map[string]string{"late": path},
 		ExposureFile: filepath.Join(dir, "exposure.toml"),
-		Timeout:      2 * time.Second,
-	}, testToken)
+		Timeout:      testTimeout,
+	})
 
 	if code, res, body := getTable(t, h, "/v1/late/chats"); code != http.StatusOK || len(res.Rows) != 0 {
 		t.Fatalf("chats before the database exists: %d %s", code, body)
@@ -442,6 +446,7 @@ func TestFlagNames(t *testing.T) {
 		"auth=/x.db":                  false,
 		"../x=/x.db":                  false,
 		"proposals=/x.db":             false,
+		"access=/x.db":                false,
 	} {
 		if err := (sourceFlag{}).Set(v); (err == nil) != ok {
 			t.Errorf("source %q: err = %v, want ok=%v", v, err, ok)

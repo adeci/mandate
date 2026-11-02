@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"maps"
 	"math"
 	"net/http"
@@ -102,24 +101,27 @@ type connectorInfo struct {
 	Health *connector.Health `json:"health,omitempty"`
 	// Source connectors answer chats, messages and search.
 	Source bool `json:"source"`
+	// Access is the agent's read access now.
+	Access window `json:"access"`
 }
 
 func (h *handler) list(w http.ResponseWriter, r *http.Request) {
+	log, ag, now := logFor(r.Context()), agentOf(r.Context()), time.Now()
 	names := slices.Concat(slices.Collect(maps.Keys(h.cfg.Sources)), slices.Collect(maps.Keys(h.connectors.calls)))
 	slices.Sort(names)
 	out := []connectorInfo{}
 	for _, name := range slices.Compact(names) {
 		_, source := h.cfg.Sources[name]
-		info := connectorInfo{Spec: connector.Spec{Name: name, Ops: []connector.Op{}}, Source: source}
+		info := connectorInfo{Spec: connector.Spec{Name: name, Ops: []connector.Op{}}, Source: source, Access: ag.window(name, now)}
 		if _, ok := h.connectors.calls[name]; ok {
 			info.Health = &connector.Health{State: connector.Broken, Detail: "not answering"}
 			s, err := h.connectors.spec(r.Context(), name)
 			if pe, ok := errors.AsType[*connector.ProtocolError](err); ok {
 				info.Health.Detail = pe.Error()
 			} else if err != nil {
-				slog.Warn("connector spec", "connector", name, "err", err)
+				log.Warn("connector spec", "connector", name, "err", err)
 			} else if hl, err := h.connectors.health(r.Context(), name); err != nil {
-				slog.Warn("connector health", "connector", name, "err", err)
+				log.Warn("connector health", "connector", name, "err", err)
 			} else {
 				info.Spec, info.Health = s, &hl
 			}
@@ -144,7 +146,7 @@ func (h *handler) spec(w http.ResponseWriter, r *http.Request, name string) (con
 		return connector.Spec{}, false
 	}
 	if err != nil {
-		slog.Error("connector spec", "connector", name, "err", err)
+		logFor(r.Context()).Error("connector spec", "connector", name, "err", err)
 		writeError(w, http.StatusServiceUnavailable, unavailable("connector "+name))
 		return connector.Spec{}, false
 	}
@@ -154,7 +156,7 @@ func (h *handler) spec(w http.ResponseWriter, r *http.Request, name string) (con
 func (h *handler) healthy(w http.ResponseWriter, r *http.Request, name string) bool {
 	hl, err := h.connectors.health(r.Context(), name)
 	if err != nil {
-		slog.Error("connector health", "connector", name, "err", err)
+		logFor(r.Context()).Error("connector health", "connector", name, "err", err)
 		writeError(w, http.StatusServiceUnavailable, unavailable("connector "+name))
 		return false
 	}
@@ -220,12 +222,12 @@ func checkArgs(op connector.Op, args map[string]string) error {
 
 // relay passes a connector's or the console's refusal through with its status
 // and message; anything else means the peer is unreachable.
-func relay(w http.ResponseWriter, who string, err error) {
+func relay(w http.ResponseWriter, r *http.Request, who string, err error) {
 	if e, ok := errors.AsType[*connector.Error](err); ok {
 		connector.WriteJSON(w, e.Status, e)
 		return
 	}
-	slog.Error("call failed", "peer", who, "err", err)
+	logFor(r.Context()).Error("call failed", "peer", who, "err", err)
 	writeError(w, http.StatusServiceUnavailable, unavailable(who))
 }
 
@@ -252,8 +254,12 @@ func (h *handler) verb(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	sc, ok := h.readable(w, r, name)
+	if !ok {
+		return
+	}
 	if verb == "media" {
-		h.media(w, r, name)
+		h.media(w, r, name, sc)
 		return
 	}
 	q := r.URL.Query()
@@ -300,7 +306,7 @@ func (h *handler) verb(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), h.cfg.Timeout)
 	defer cancel()
-	s, ok := h.source(ctx, w, name)
+	s, ok := h.source(ctx, w, name, sc.sql)
 	if !ok {
 		return
 	}
@@ -309,20 +315,22 @@ func (h *handler) verb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t, err := run(s)
+	log := logFor(r.Context())
 	attrs := []any{"remote", r.RemoteAddr, "connector", name, "verb", verb, "duration_ms", time.Since(start).Milliseconds()}
 	if err != nil {
-		slog.Error("verb", append(attrs, "err", err)...)
+		log.Error("verb", append(attrs, "err", err)...)
 		writeError(w, http.StatusServiceUnavailable, "gateway unavailable; try again, and tell the owner if it persists")
 		return
 	}
-	slog.Info("verb", append(attrs, "rows", len(t.Rows))...)
+	log.Info("verb", append(attrs, "rows", len(t.Rows))...)
 	connector.WriteJSON(w, http.StatusOK, t)
+	h.report(r.Context(), name, verb, chat, sc.grants, len(t.Rows))
 }
 
-func (h *handler) source(ctx context.Context, w http.ResponseWriter, name string) (*source, bool) {
-	s, err := h.openSource(ctx, name)
+func (h *handler) source(ctx context.Context, w http.ResponseWriter, name, scope string) (*source, bool) {
+	s, err := h.openSource(ctx, name, scope)
 	if err != nil {
-		slog.Error("open source", "source", name, "err", err)
+		logFor(ctx).Error("open source", "source", name, "err", err)
 		writeError(w, http.StatusServiceUnavailable, "gateway unavailable; tell the owner")
 		return nil, false
 	}
@@ -332,7 +340,7 @@ func (h *handler) source(ctx context.Context, w http.ResponseWriter, name string
 func (s *source) check(w http.ResponseWriter, name, chat string) bool {
 	ok, err := s.visible(chat)
 	if err != nil {
-		slog.Error("chat lookup", "source", name, "err", err)
+		s.log.Error("chat lookup", "source", name, "err", err)
 		writeError(w, http.StatusServiceUnavailable, "gateway unavailable; tell the owner")
 		return false
 	}
@@ -342,9 +350,9 @@ func (s *source) check(w http.ResponseWriter, name, chat string) bool {
 	return ok
 }
 
-// chatsVisible refuses unless every id is a visible chat of the connector's
-// source. Without a source every id is refused.
-func (h *handler) chatsVisible(w http.ResponseWriter, r *http.Request, name string, ids []string) bool {
+// chatsVisible refuses unless every id is a chat of the connector's source
+// visible in scope. Without a source every id is refused.
+func (h *handler) chatsVisible(w http.ResponseWriter, r *http.Request, name, scope string, ids []string) bool {
 	if len(ids) == 0 {
 		return true
 	}
@@ -354,7 +362,7 @@ func (h *handler) chatsVisible(w http.ResponseWriter, r *http.Request, name stri
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), h.cfg.Timeout)
 	defer cancel()
-	s, ok := h.source(ctx, w, name)
+	s, ok := h.source(ctx, w, name, scope)
 	if !ok {
 		return false
 	}
@@ -402,12 +410,14 @@ func (h *handler) op(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("no command %q; %s commands: %s", opName, name, strings.Join(cmds, " ")))
 		return
 	}
-	if op.Kind == connector.Write && h.console == nil {
-		writeError(w, http.StatusNotFound, "proposals are not enabled on this gateway")
-		return
-	}
 	if err := checkArgs(op, req.Args); err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("%s; see mandate %s --help", err, name))
+		return
+	}
+	// Writes need a grant too: what a write may target or answer is what the
+	// agent may read.
+	sc, ok := h.readable(w, r, name)
+	if !ok {
 		return
 	}
 	var ids []string
@@ -416,113 +426,211 @@ func (h *handler) op(w http.ResponseWriter, r *http.Request) {
 			ids = append(ids, id)
 		}
 	}
-	if !h.chatsVisible(w, r, name, ids) || !h.healthy(w, r, name) {
+	if !h.chatsVisible(w, r, name, sc.sql, ids) || !h.messagesVisible(w, r, name, sc.sql, op, req.Args, ids) ||
+		!h.healthy(w, r, name) {
 		return
 	}
 	if op.Kind == connector.Read {
-		h.read(w, r, name, opName, req.Args)
+		h.read(w, r, name, op, req.Args, sc, ids)
 		return
 	}
-	h.propose(w, r, name, op, req)
+	h.propose(w, r, name, op, req, sc)
 }
 
-func (h *handler) read(w http.ResponseWriter, r *http.Request, name, op string, args map[string]string) {
+// read runs a connector's read op and answers what it stored, as far as sc
+// shows it. ids are the chats the op was asked about.
+func (h *handler) read(w http.ResponseWriter, r *http.Request, name string, op connector.Op, args map[string]string, sc readScope, ids []string) {
 	start := time.Now()
-	raw, err := h.connectors.reads[name].Read(r.Context(), op, args)
-	attrs := []any{"remote", r.RemoteAddr, "connector", name, "op", op, "duration_ms", time.Since(start).Milliseconds()}
+	log := logFor(r.Context())
+	raw, err := h.connectors.reads[name].Read(r.Context(), op.Name, args)
+	attrs := []any{"remote", r.RemoteAddr, "connector", name, "op", op.Name, "duration_ms", time.Since(start).Milliseconds()}
 	if err != nil {
-		slog.Info("read", append(attrs, "err", err.Error())...)
-		relay(w, "connector "+name, err)
+		log.Info("read", append(attrs, "err", err.Error())...)
+		relayOp(w, r, name, op, args, err)
 		return
 	}
 	var res connector.ReadResult
 	if err := json.Unmarshal(raw, &res); err != nil {
-		slog.Error("decode read result", "connector", name, "err", err)
+		log.Error("decode read result", "connector", name, "err", err)
 		writeError(w, http.StatusBadGateway, "connector returned an invalid read result")
 		return
 	}
-	slog.Info("read", append(attrs, "messages", len(res.MessageIDs), "containers", len(res.ContainerIDs))...)
+	log.Info("read", append(attrs, "messages", len(res.MessageIDs), "containers", len(res.ContainerIDs))...)
+	// A grant revoked or closed while the connector worked shows nothing.
+	sc, ok := h.readable(w, r, name)
+	if !ok {
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), h.cfg.Timeout)
 	defer cancel()
-	s, ok := h.source(ctx, w, name)
+	s, ok := h.source(ctx, w, name, sc.sql)
 	if !ok {
 		return
 	}
 	defer s.close()
 	t, err := s.byID(res.MessageIDs)
 	if err != nil {
-		slog.Error("read back messages", "source", name, "err", err)
+		log.Error("read back messages", "source", name, "err", err)
 		writeError(w, http.StatusServiceUnavailable, "gateway unavailable; tell the owner")
 		return
 	}
 	if t.Containers, err = s.visibleCount(res.ContainerIDs); err != nil {
-		slog.Error("count chats", "source", name, "err", err)
+		log.Error("count chats", "source", name, "err", err)
 		writeError(w, http.StatusServiceUnavailable, "gateway unavailable; tell the owner")
 		return
 	}
-	t.More = res.More
+	// An upstream "more" past rows filtered out would count hits the agent
+	// may not see, page by page.
+	t.More = res.More && len(t.Rows) == len(res.MessageIDs) && t.Containers == len(res.ContainerIDs)
 	connector.WriteJSON(w, http.StatusOK, t)
+	var chat string
+	if len(ids) > 0 {
+		chat = ids[0]
+	}
+	h.report(r.Context(), name, op.Name, chat, sc.grants, len(t.Rows))
 }
 
-func (h *handler) propose(w http.ResponseWriter, r *http.Request, name string, op connector.Op, req opRequest) {
+// agentProposal is what agents see of a proposal. The display and note
+// render what the write targets, which may hold more than the agent may read.
+type agentProposal struct {
+	ID     string            `json:"id"`
+	Status proposal.Status   `json:"status"`
+	URL    string            `json:"url"`
+	Result *connector.Result `json:"result,omitempty"`
+}
+
+func forAgent(p proposal.Proposal) agentProposal {
+	return agentProposal{ID: p.ID, Status: p.Status, URL: p.URL, Result: p.Result}
+}
+
+// propose prepares a write op and submits it to the console. The chat and
+// message the connector resolved must be readable under sc, like the args.
+func (h *handler) propose(w http.ResponseWriter, r *http.Request, name string, op connector.Op, req opRequest, sc readScope) {
 	start := time.Now()
+	log := logFor(r.Context())
 	attrs := []any{"remote", r.RemoteAddr, "connector", name, "op", op.Name}
 	prepared, err := h.connectors.calls[name].Prepare(r.Context(), op.Name, req.Args)
 	if err != nil {
-		slog.Info("propose", append(attrs, "err", err.Error())...)
-		relay(w, "connector "+name, err)
+		log.Info("propose", append(attrs, "err", err.Error())...)
+		relayOp(w, r, name, op, req.Args, err)
 		return
 	}
-	if prepared.Container != "" && !h.chatsVisible(w, r, name, []string{prepared.Container}) {
-		slog.Info("propose", append(attrs, "refused", "prepared container")...)
+	if prepared.Container != "" && !h.chatsVisible(w, r, name, sc.sql, []string{prepared.Container}) {
+		log.Info("propose", append(attrs, "refused", "prepared container")...)
 		return
 	}
-	if prepared.Message != "" && !h.messageVisible(w, r, name, op, req.Args, prepared.Message) {
-		slog.Info("propose", append(attrs, "refused", "prepared message")...)
+	if prepared.Message != "" && !h.messageVisible(w, r, name, sc.sql, op, req.Args, prepared.Message) {
+		log.Info("propose", append(attrs, "refused", "prepared message")...)
 		return
 	}
+	ag := agentOf(r.Context())
 	p, err := h.console.Submit(r.Context(), proposal.Request{
-		Connector: name, Op: op.Name, Args: prepared.Args, Note: req.Note,
+		Connector: name, Op: op.Name, Args: prepared.Args, Note: req.Note, AgentID: ag.ID, AgentName: ag.Name,
 	})
 	if err != nil {
-		slog.Info("propose", append(attrs, "err", err.Error())...)
-		relay(w, "console", err)
+		log.Info("propose", append(attrs, "err", err.Error())...)
+		relay(w, r, "console", err)
 		return
 	}
-	slog.Info("propose", append(attrs, "id", p.ID, "duration_ms", time.Since(start).Milliseconds())...)
-	connector.WriteJSON(w, http.StatusAccepted, p)
+	log.Info("propose", append(attrs, "id", p.ID, "duration_ms", time.Since(start).Milliseconds())...)
+	connector.WriteJSON(w, http.StatusAccepted, forAgent(p))
 }
 
-// messageVisible refuses unless agents see message id. The refusal names
-// only what the agent passed, so it reveals nothing of the stored message.
-func (h *handler) messageVisible(w http.ResponseWriter, r *http.Request, name string, op connector.Op, args map[string]string, id string) bool {
+// messageVisible refuses unless message id is visible in scope. The refusal
+// names only what the agent passed, so it reveals nothing of the stored
+// message.
+func (h *handler) messageVisible(w http.ResponseWriter, r *http.Request, name, scope string, op connector.Op, args map[string]string, id string) bool {
 	if _, ok := h.cfg.Sources[name]; !ok {
 		writeError(w, http.StatusForbidden, fmt.Sprintf("connector %s has no data source on this gateway, so it cannot answer messages", name))
 		return false
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), h.cfg.Timeout)
 	defer cancel()
-	s, ok := h.source(ctx, w, name)
+	s, ok := h.source(ctx, w, name, scope)
 	if !ok {
 		return false
 	}
 	defer s.close()
 	ok, err := s.messageVisible(id)
 	if err != nil {
-		slog.Error("message lookup", "source", name, "err", err)
+		s.log.Error("message lookup", "source", name, "err", err)
 		writeError(w, http.StatusServiceUnavailable, "gateway unavailable; tell the owner")
 		return false
 	}
 	if !ok {
-		var passed []string
-		for _, p := range op.Params {
-			if v := args[p.Name]; v != "" && (p.Container || p.Name == "seq") {
-				passed = append(passed, p.Name+"="+v)
-			}
-		}
-		writeError(w, http.StatusNotFound, fmt.Sprintf("no message to answer at %s; see mandate %s messages", strings.Join(passed, " "), name))
+		noMessage(w, name, op, args)
 	}
 	return ok
+}
+
+// messagesVisible refuses unless every message param names a message the
+// agent may read in the op's chat, before the connector looks it up.
+func (h *handler) messagesVisible(w http.ResponseWriter, r *http.Request, name, scope string, op connector.Op, args map[string]string, chats []string) bool {
+	var seqs []int64
+	for _, p := range op.Params {
+		v := args[p.Name]
+		if !p.Message || v == "" {
+			continue
+		}
+		seq, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || seq < 1 {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("%s must be a seq from mandate %s messages", p.Name, name))
+			return false
+		}
+		seqs = append(seqs, seq)
+	}
+	if len(seqs) == 0 {
+		return true
+	}
+	if _, ok := h.cfg.Sources[name]; !ok || len(chats) == 0 {
+		noMessage(w, name, op, args)
+		return false
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), h.cfg.Timeout)
+	defer cancel()
+	s, ok := h.source(ctx, w, name, scope)
+	if !ok {
+		return false
+	}
+	defer s.close()
+	for _, seq := range seqs {
+		ok, err := s.seqVisible(chats[0], seq)
+		if err != nil {
+			s.log.Error("message lookup", "source", name, "err", err)
+			writeError(w, http.StatusServiceUnavailable, "gateway unavailable; tell the owner")
+			return false
+		}
+		if !ok {
+			noMessage(w, name, op, args)
+			return false
+		}
+	}
+	return true
+}
+
+// noMessage is the one answer for a message the agent may not name: one
+// unknown, hidden, deleted or past the horizon. It repeats only what the agent
+// passed.
+func noMessage(w http.ResponseWriter, name string, op connector.Op, args map[string]string) {
+	var passed []string
+	for _, p := range op.Params {
+		if v := args[p.Name]; v != "" && (p.Container || p.Message) {
+			passed = append(passed, p.Name+"="+v)
+		}
+	}
+	writeError(w, http.StatusNotFound, fmt.Sprintf("no message at %s; see mandate %s messages", strings.Join(passed, " "), name))
+}
+
+// relayOp relays a connector's refusal of op. For an op that names messages,
+// a refusal that depends on what is stored (no such seq, deleted) answers as
+// noMessage, so it tells nothing the agent may not read.
+func relayOp(w http.ResponseWriter, r *http.Request, name string, op connector.Op, args map[string]string, err error) {
+	if e, ok := errors.AsType[*connector.Error](err); ok && (e.Status == http.StatusBadRequest || e.Status == http.StatusGone) &&
+		slices.ContainsFunc(op.Params, func(p connector.Param) bool { return p.Message }) {
+		noMessage(w, name, op, args)
+		return
+	}
+	relay(w, r, "connector "+name, err)
 }
 
 var proposalID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
@@ -531,33 +639,24 @@ var proposalID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 // console until the proposal is settled or the wait is over, so an agent can
 // block in one call instead of spending a turn per poll.
 func (h *handler) status(w http.ResponseWriter, r *http.Request) {
-	if h.console == nil {
-		writeError(w, http.StatusNotFound, "proposals are not enabled on this gateway")
-		return
-	}
 	id := r.PathValue("id")
 	if !proposalID.MatchString(id) {
 		writeError(w, http.StatusBadRequest, "invalid proposal id")
 		return
 	}
-	var wait time.Duration
-	if v := r.URL.Query().Get("wait"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			writeError(w, http.StatusBadRequest, "wait must be whole seconds, e.g. wait=600")
-			return
-		}
-		wait = min(time.Duration(n)*time.Second, maxWait)
+	wait, ok := waitParam(w, r)
+	if !ok {
+		return
 	}
 	deadline := time.Now().Add(wait)
 	for {
-		p, err := h.console.Get(r.Context(), id)
+		p, err := h.console.Get(r.Context(), id, agentOf(r.Context()).ID)
 		if err != nil {
-			relay(w, "console", err)
+			relay(w, r, "console", err)
 			return
 		}
 		if settled(p.Status) || !time.Now().Before(deadline) {
-			connector.WriteJSON(w, http.StatusOK, p)
+			connector.WriteJSON(w, http.StatusOK, forAgent(p))
 			return
 		}
 		t := time.NewTimer(min(pollInterval, time.Until(deadline)))
@@ -568,6 +667,20 @@ func (h *handler) status(w http.ResponseWriter, r *http.Request) {
 		case <-t.C:
 		}
 	}
+}
+
+// waitParam reads wait=SECONDS, capped at maxWait.
+func waitParam(w http.ResponseWriter, r *http.Request) (time.Duration, bool) {
+	v := r.URL.Query().Get("wait")
+	if v == "" {
+		return 0, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		writeError(w, http.StatusBadRequest, "wait must be whole seconds, e.g. wait=600")
+		return 0, false
+	}
+	return min(time.Duration(n)*time.Second, maxWait), true
 }
 
 func settled(s proposal.Status) bool {

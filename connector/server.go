@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/user"
 	"slices"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/adeci/mandate/approval"
+	"github.com/adeci/mandate/store"
 )
 
 const maxBody = 1 << 20
@@ -35,34 +37,53 @@ type Server struct {
 	// call every route.
 	Peers *Peers
 	Log   *slog.Logger
+	// Data is the connector's message store, which GET /containers lists
+	// for the console; empty for a connector that keeps no messages.
+	Data string
+	// SocketGroup, if set, owns the socket Serve listens on.
+	SocketGroup string
 
 	mediaFetches atomic.Int32
 }
 
-// Peers names the uids that may call a Server over its socket. The console
-// may call every route; the gateway, which agents talk to, everything but
-// setup, unlink, execute and replacing the keys.
+// Peers names the uids that may call a Server over its socket. Each route
+// answers one of them or both, as callers says.
 type Peers struct {
 	Console, Gateway uint32
 }
 
+// callers says who may use a route. Only the gateway, which enforces
+// agents' grants, reads stored messages, files and forwarded APIs; only the
+// console, which holds the owner's approvals, changes the connector or lists
+// its chats.
+type callers int
+
+const (
+	gatewayOnly callers = iota
+	either
+	consoleOnly
+)
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /spec", s.allow(false, s.spec))
-	mux.HandleFunc("GET /health", s.allow(false, s.health))
-	mux.HandleFunc("POST /setup", s.allow(true, s.setup))
-	mux.HandleFunc("POST /unlink", s.allow(true, s.unlink))
-	mux.HandleFunc("POST /read", s.allow(false, s.read))
-	mux.HandleFunc("POST /prepare", s.allow(false, s.prepare))
-	mux.HandleFunc("POST /execute", s.allow(true, s.execute))
-	mux.HandleFunc("GET /keys", s.allow(false, s.keysHead))
-	mux.HandleFunc("PUT /keys", s.allow(true, s.putKeys))
-	mux.HandleFunc("POST /media", s.allow(false, s.media))
+	mux.HandleFunc("GET /spec", s.allow(either, s.spec))
+	mux.HandleFunc("GET /health", s.allow(either, s.health))
+	mux.HandleFunc("POST /setup", s.allow(consoleOnly, s.setup))
+	mux.HandleFunc("POST /unlink", s.allow(consoleOnly, s.unlink))
+	mux.HandleFunc("POST /read", s.allow(gatewayOnly, s.read))
+	mux.HandleFunc("POST /prepare", s.allow(either, s.prepare))
+	mux.HandleFunc("POST /execute", s.allow(consoleOnly, s.execute))
+	mux.HandleFunc("GET /keys", s.allow(either, s.keysHead))
+	mux.HandleFunc("PUT /keys", s.allow(consoleOnly, s.putKeys))
+	mux.HandleFunc("POST /media", s.allow(gatewayOnly, s.media))
+	if s.Data != "" {
+		mux.HandleFunc("GET /containers", s.allow(consoleOnly, s.containers))
+	}
 	f, ok := s.Connector.(Forwarder)
 	if !ok {
 		return mux
 	}
-	forward := s.allow(false, func(w http.ResponseWriter, r *http.Request) {
+	forward := s.allow(gatewayOnly, func(w http.ResponseWriter, r *http.Request) {
 		// Route on the raw request target: ServeMux would clean "..", "//"
 		// and redirect instead of refusing, and the decoded URL loses %2F.
 		raw, _, _ := strings.Cut(r.RequestURI, "?")
@@ -83,15 +104,16 @@ func (s *Server) Handler() http.Handler {
 	})
 }
 
-// allow lets the console call h, and the gateway too unless h is a control
-// route.
-func (s *Server) allow(control bool, h http.HandlerFunc) http.HandlerFunc {
+// allow lets who call h.
+func (s *Server) allow(who callers, h http.HandlerFunc) http.HandlerFunc {
 	if s.Peers == nil {
 		return h
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid, ok := r.Context().Value(peerKey{}).(uint32)
-		if !ok || uid != s.Peers.Console && (control || uid != s.Peers.Gateway) {
+		console, gateway := ok && uid == s.Peers.Console, ok && uid == s.Peers.Gateway
+		allowed := console && who != gatewayOnly || gateway && who != consoleOnly
+		if !allowed {
 			s.Log.Warn("caller refused", "uid", uid, "known", ok, "method", r.Method, "path", r.URL.Path)
 			WriteError(w, &Error{Status: http.StatusForbidden, Message: "this caller may not use " + r.Method + " " + r.URL.Path})
 			return
@@ -127,7 +149,29 @@ func peerUID(c net.Conn) (uint32, error) {
 }
 
 func (s *Server) Serve(ctx context.Context, path string) error {
-	return ServeUnix(ctx, path, s.Handler())
+	ln, err := ListenUnix(path)
+	if err != nil {
+		return err
+	}
+	if s.SocketGroup != "" {
+		if err := chgrp(path, s.SocketGroup); err != nil {
+			ln.Close()
+			return fmt.Errorf("--socket-group: %w", err)
+		}
+	}
+	return serveOn(ctx, ln, s.Handler())
+}
+
+func chgrp(path, group string) error {
+	g, err := user.LookupGroup(group)
+	if err != nil {
+		return err
+	}
+	gid, err := strconv.Atoi(g.Gid)
+	if err != nil {
+		return err
+	}
+	return os.Chown(path, -1, gid)
 }
 
 // ServeUnix serves h on a Unix socket at path until ctx is done. Requests
@@ -137,6 +181,10 @@ func ServeUnix(ctx context.Context, path string, h http.Handler) error {
 	if err != nil {
 		return err
 	}
+	return serveOn(ctx, ln, h)
+}
+
+func serveOn(ctx context.Context, ln net.Listener, h http.Handler) error {
 	srv := &http.Server{
 		Handler:           h,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -413,4 +461,44 @@ func (s *Server) putKeys(w http.ResponseWriter, r *http.Request) {
 	n, head := s.Keys.Head()
 	s.Log.Info("key log updated", "length", n, "head", head)
 	WriteJSON(w, http.StatusOK, KeysHead{Length: n, Head: head})
+}
+
+// Container is a chat as the connector's store keeps it, name included as
+// stored (a "~" marks one not from the owner's address book).
+type Container struct {
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	Kind         string    `json:"kind"`
+	ParentID     string    `json:"parent_id,omitempty"`
+	LastActivity time.Time `json:"last_activity,omitzero"`
+}
+
+const (
+	defaultContainers = 50
+	maxContainers     = 500
+)
+
+// containers serves the console's chat picker, so the console needs no
+// read access to the store itself.
+func (s *Server) containers(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit := defaultContainers
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			WriteError(w, Invalid("limit must be a positive number"))
+			return
+		}
+		limit = min(n, maxContainers)
+	}
+	listed, err := store.ListContainers(r.Context(), s.Data, q.Get("q"), q.Get("parent"), limit)
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	out := make([]Container, len(listed))
+	for i, c := range listed {
+		out[i] = Container{ID: c.ID, Name: c.Name, Kind: c.Kind, ParentID: c.ParentID, LastActivity: c.LastActivity}
+	}
+	WriteJSON(w, http.StatusOK, out)
 }

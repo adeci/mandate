@@ -177,7 +177,7 @@ func TestRequests(t *testing.T) {
 
 func TestSendPrintsProposal(t *testing.T) {
 	t.Parallel()
-	const reply = `{"id":"p1","connector":"whatsapp","op":"send","status":"pending","display":[{"label":"To","value":"Farid"}],"url":"https://console/p/p1"}`
+	const reply = `{"id":"p1","status":"pending","url":"https://console/p/p1"}`
 	srv, _ := gateway(t, http.StatusAccepted, reply)
 	c, out, errOut := testClient(t, srv.URL, false)
 	if err := c.connector(t.Context(), "whatsapp", []string{"send", "1@s.whatsapp.net", "hi"}); err != nil {
@@ -201,12 +201,12 @@ func TestOutputEscapesControlCharacters(t *testing.T) {
 		t.Errorf("TSV %q, want %q", out, want)
 	}
 
-	srv, _ = gateway(t, http.StatusAccepted, `{"id":"p1","status":"pending","display":[{"label":"To","value":"~Mom\u001b[2K (+1 555)"},{"label":"Text","value":"hi\nthere"}]}`)
+	srv, _ = gateway(t, http.StatusAccepted, `{"id":"p1","status":"failed","result":{"status":"failed","detail":"~Mom\u001b[2K (+1 555)"}}`)
 	c, out, _ = testClient(t, srv.URL, false)
 	if err := c.connector(t.Context(), "whatsapp", []string{"send", "1@s.whatsapp.net", "hi"}); err != nil {
 		t.Fatal(err)
 	}
-	if want := "  To: ~Mom\\x1b[2K (+1 555)\n  Text: hi\n    there\n"; !strings.Contains(out.String(), want) {
+	if want := "(~Mom\\x1b[2K (+1 555))"; !strings.Contains(out.String(), want) {
 		t.Errorf("proposal %q, want it to contain %q", out, want)
 	}
 }

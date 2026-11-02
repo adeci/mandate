@@ -478,7 +478,7 @@ func (s *Server) keysProblems() []connProblem {
 }
 
 func notFound(err error) error {
-	if errors.Is(err, errNoKeyChange) {
+	if errors.Is(err, errNoKeyChange) || errors.Is(err, errNoAgent) || errors.Is(err, errNotFound) {
 		return &connector.Error{Status: http.StatusNotFound, Message: err.Error()}
 	}
 	return err

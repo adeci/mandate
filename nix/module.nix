@@ -13,6 +13,8 @@ let
   json = pkgs.formats.json { };
   names = lib.attrNames cfg.connectors;
   connectorGroups = map (n: "mandate-${n}") names;
+  socketGroup = name: "mandate-${name}-socket";
+  socketGroups = map socketGroup names;
   accounts = [
     "mandate-gateway"
     "mandate-console"
@@ -27,15 +29,13 @@ let
   ]) names;
 
   generated = "/var/lib/mandate";
-  tokenFile = if cfg.tokenFile != null then cfg.tokenFile else "${generated}/token";
   hashFile =
     if cfg.adminPasswordHashFile != null then
       cfg.adminPasswordHashFile
     else
       "${generated}/admin-password-hash";
-  secretsUnit = lib.optional (
-    cfg.tokenFile == null || cfg.adminPasswordHashFile == null
-  ) "mandate-secrets.service";
+  secretsUnit = lib.optional (cfg.adminPasswordHashFile == null) "mandate-secrets.service";
+  ntfy = cfg.notify.ntfy;
   acmeUnit = lib.optional (cfg.useACMEHost != null) "acme-${cfg.useACMEHost}.service";
   acmeDir = config.security.acme.certs.${cfg.useACMEHost}.directory;
   connectorUnits = map (g: "${g}.service") connectorGroups;
@@ -51,13 +51,14 @@ let
 
   # Deletes every key so the admin password can sign in and add a first one
   # again. The console, finding no keys on start, drops pending key requests
-  # and passkey sessions.
+  # and passkey sessions. Agents and grants signed by the old keys stop
+  # verifying at the gateway.
   resetKeys = pkgs.writeShellApplication {
     name = "mandate-reset-keys";
     text = ''
-      units=(mandate-console ${toString connectorGroups})
+      units=(mandate-gateway mandate-console ${toString connectorGroups})
       systemctl stop "''${units[@]}"
-      rm -f ${state "console"}/keys.json ${
+      rm -f ${state "console"}/keys.json ${state "gateway"}/keys.json ${
         lib.concatMapStringsSep " " (n: "${state n}/private/keys.json") names
       }
       systemctl start "''${units[@]}"
@@ -168,7 +169,14 @@ let
           "mandate-console"
           "--gateway-user"
           "mandate-gateway"
+          "--socket-group"
+          (socketGroup name)
         ];
+        # The console reaches the socket through its group, so it must cross
+        # the runtime directory without the data group.
+        RuntimeDirectoryMode = "0751";
+        # Handing the socket to its group takes chown, which ~@privileged drops.
+        SystemCallFilter = hardening.SystemCallFilter ++ [ "@chown" ];
         RestartSec = "30s";
         # A connector buffers whole media files; a cap keeps a runaway one
         # from taking the host's memory with it.
@@ -262,15 +270,25 @@ in
       description = "TLS key for the hostname. Defaults to the one of {option}`services.mandate.useACMEHost`.";
     };
 
-    tokenFile = lib.mkOption {
-      type = lib.types.nullOr lib.types.externalPath;
-      default = null;
-      example = "/run/secrets/mandate-token";
-      description = ''
-        File with the bearer token agents use, at least 32 characters.
-        If null, one is generated on first start; read it with
-        `sudo cat ${generated}/token`.
-      '';
+    notify.ntfy = {
+      url = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "http://ntfy.example.ts.net/mandate";
+        description = ''
+          ntfy topic URL the console posts to when a write or an access
+          request waits for you. The post names the agent and connector,
+          never message text or chats. The console reaches only localhost and
+          the tailnet.
+        '';
+      };
+
+      tokenFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.externalPath;
+        default = null;
+        example = "/run/secrets/mandate-ntfy-token";
+        description = "File with an ntfy access token that may publish to the topic.";
+      };
     };
 
     adminPasswordHashFile = lib.mkOption {
@@ -320,12 +338,13 @@ in
     assertions = map (name: {
       assertion =
         builtins.match "[a-z][a-z0-9-]*" name != null
+        && builtins.match ".*-socket" name == null
         && !lib.elem name [
           "gateway"
           "console"
           "secrets"
         ];
-      message = "services.mandate.connectors.${name}: names are lowercase letters, digits and dashes, and not gateway, console or secrets";
+      message = "services.mandate.connectors.${name}: names are lowercase letters, digits and dashes, don't end in -socket, and are not gateway, console or secrets";
     }) names;
 
     services.mandate = lib.mkIf (cfg.useACMEHost != null) {
@@ -353,14 +372,21 @@ in
         isSystemUser = true;
         group = user;
       }))
-      (lib.mapAttrs' (n: _: lib.nameValuePair "mandate-${n}" { home = state n; }) cfg.connectors)
-      # Connector groups grant read access to each data.db (0640) and socket (0660).
+      (lib.mapAttrs' (
+        n: _:
+        lib.nameValuePair "mandate-${n}" {
+          home = state n;
+          extraGroups = [ (socketGroup n) ];
+        }
+      ) cfg.connectors)
+      # A connector's group reads its data.db (0640); its socket group connects
+      # to its socket (0660). The console gets the sockets only.
       {
-        mandate-gateway.extraGroups = [ "mandate-console" ] ++ connectorGroups;
-        mandate-console.extraGroups = connectorGroups;
+        mandate-gateway.extraGroups = [ "mandate-console" ] ++ connectorGroups ++ socketGroups;
+        mandate-console.extraGroups = socketGroups;
       }
     ];
-    users.groups = lib.genAttrs accounts (_: { });
+    users.groups = lib.genAttrs (accounts ++ socketGroups) (_: { });
 
     systemd.services =
       lib.mapAttrs' (n: c: lib.nameValuePair "mandate-${n}" (connectorService n c)) cfg.connectors
@@ -369,34 +395,42 @@ in
           service "gateway" (
             tailnetOnly
             // {
-              LoadCredential = [ "token:${tokenFile}" ];
-              ExecStart =
-                utils.escapeSystemdExecArgs (
-                  [
-                    exe
-                    "gateway"
-                    "--listen"
-                    ":${toString cfg.port}"
-                    "--exposure"
-                    "${state "gateway"}/exposure.toml"
-                    "--console-socket"
-                    proposalSocket
-                    "--console-url"
-                    origin
-                  ]
-                  # A connector is a source once it has written a data.db.
-                  ++ lib.concatMap (n: [
-                    "--source"
-                    "${n}=${state n}/data.db"
-                  ]) names
-                  ++ connectorArgs
-                )
-                + credential "--token-file" "token";
+              ExecStart = utils.escapeSystemdExecArgs (
+                [
+                  exe
+                  "gateway"
+                  "--listen"
+                  ":${toString cfg.port}"
+                  "--state"
+                  (state "gateway")
+                  "--exposure"
+                  "${state "gateway"}/exposure.toml"
+                  "--console-socket"
+                  proposalSocket
+                  "--console-url"
+                  origin
+                  "--rp-id"
+                  cfg.hostname
+                  "--origin"
+                  origin
+                ]
+                # A connector is a source once it has written a data.db.
+                ++ lib.concatMap (n: [
+                  "--source"
+                  "${n}=${state n}/data.db"
+                ]) names
+                ++ connectorArgs
+              );
             }
           )
           // {
-            requires = secretsUnit;
-            after = [ "network.target" ] ++ secretsUnit ++ connectorUnits;
+            # Agents and grants come from the console.
+            wants = [ "mandate-console.service" ];
+            after = [
+              "network.target"
+              "mandate-console.service"
+            ]
+            ++ connectorUnits;
           };
 
         mandate-console =
@@ -410,7 +444,8 @@ in
                 "tls-cert:${cfg.tlsCertFile}"
                 "tls-key:${cfg.tlsKeyFile}"
                 "admin-password-hash:${hashFile}"
-              ];
+              ]
+              ++ lib.optional (ntfy.tokenFile != null) "ntfy-token:${ntfy.tokenFile}";
               ExecStart =
                 utils.escapeSystemdExecArgs (
                   [
@@ -425,11 +460,16 @@ in
                     "--socket"
                     proposalSocket
                   ]
+                  ++ lib.optionals (ntfy.url != null) [
+                    "--ntfy-url"
+                    ntfy.url
+                  ]
                   ++ connectorArgs
                 )
                 + credential "--tls-cert" "tls-cert"
                 + credential "--tls-key" "tls-key"
-                + credential "--admin-password-hash-file" "admin-password-hash";
+                + credential "--admin-password-hash-file" "admin-password-hash"
+                + lib.optionalString (ntfy.tokenFile != null) (credential "--ntfy-token-file" "ntfy-token");
             }
           )
           // {
@@ -446,19 +486,11 @@ in
           ];
           script = ''
             cd ${generated}
-            ${lib.optionalString (cfg.tokenFile == null) ''
-              if [ ! -e token ]; then
-                openssl rand -hex 32 > token.tmp
-                mv token.tmp token
-              fi
-            ''}
-            ${lib.optionalString (cfg.adminPasswordHashFile == null) ''
-              if [ ! -e admin-password-hash ]; then
-                openssl rand -hex 16 > admin-password
-                mkpasswd -m bcrypt -s < admin-password > admin-password-hash.tmp
-                mv admin-password-hash.tmp admin-password-hash
-              fi
-            ''}
+            if [ ! -e admin-password-hash ]; then
+              openssl rand -hex 16 > admin-password
+              mkpasswd -m bcrypt -s < admin-password > admin-password-hash.tmp
+              mv admin-password-hash.tmp admin-password-hash
+            fi
           '';
           serviceConfig = hardening // {
             Type = "oneshot";

@@ -5,6 +5,8 @@ CREATE TABLE IF NOT EXISTS proposals (
     args       TEXT NOT NULL,     -- JSON; the prepared args, replaced by the approved ones
     display    TEXT NOT NULL,     -- JSON []approval.Field
     note       TEXT NOT NULL DEFAULT '',
+    agent_id   TEXT NOT NULL DEFAULT '',  -- who proposed it, as the gateway knows them
+    agent_name TEXT NOT NULL DEFAULT '',
     status     TEXT NOT NULL,
     created_at INTEGER NOT NULL,  -- unix ms
     expires_at INTEGER NOT NULL,  -- unix ms
@@ -56,3 +58,68 @@ CREATE TABLE IF NOT EXISTS key_requests (
     created_at    INTEGER NOT NULL,
     expires_at    INTEGER NOT NULL
 ) STRICT;
+
+-- Agents and grants are stored as the signed records the gateway verifies.
+-- Deleting or revoking drops the signature and keeps the row, so a
+-- compromised console has nothing to serve again.
+CREATE TABLE IF NOT EXISTS agents (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    token_sha256 TEXT NOT NULL,
+    signed       TEXT,            -- JSON approval.Signed; NULL once deleted
+    created_at   INTEGER NOT NULL,
+    deleted_at   INTEGER
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS grants (
+    id         TEXT PRIMARY KEY,
+    agent      TEXT NOT NULL REFERENCES agents (id),
+    connector  TEXT NOT NULL,
+    signed     TEXT,              -- JSON approval.Signed; NULL once revoked
+    created_at INTEGER NOT NULL,
+    revoked_at INTEGER
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS access_requests (
+    id         TEXT PRIMARY KEY,
+    agent_id   TEXT NOT NULL,
+    agent_name TEXT NOT NULL,
+    connector  TEXT NOT NULL,
+    chats      TEXT NOT NULL,     -- JSON []proposal.Chat
+    unmatched  TEXT NOT NULL,     -- JSON []string, terms no chat matched
+    for_ns     INTEGER NOT NULL,
+    horizon_ns INTEGER NOT NULL,
+    reason     TEXT NOT NULL,
+    status     TEXT NOT NULL,     -- pending | granted | denied | expired
+    grant_id   TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    decided_at INTEGER
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS access_requests_by_status ON access_requests (status, expires_at);
+CREATE INDEX IF NOT EXISTS access_requests_by_agent ON access_requests (agent_id, created_at);
+
+-- Outstanding access record challenges; request is the access request a
+-- grant answers, or ''.
+CREATE TABLE IF NOT EXISTS access_challenges (
+    nonce     BLOB PRIMARY KEY,
+    kind      TEXT NOT NULL,
+    record    BLOB NOT NULL,
+    issued_at INTEGER NOT NULL,   -- unix ns
+    session   BLOB NOT NULL,
+    request   TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS reads (
+    at        INTEGER NOT NULL,
+    agent_id  TEXT NOT NULL,
+    connector TEXT NOT NULL,
+    verb      TEXT NOT NULL,
+    chat      TEXT NOT NULL,
+    grants    TEXT NOT NULL,      -- JSON []string
+    count     INTEGER NOT NULL,
+    dropped   INTEGER NOT NULL    -- earlier events the gateway couldn't log
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS reads_by_at ON reads (at);

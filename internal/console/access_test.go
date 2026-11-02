@@ -1,0 +1,541 @@
+package console
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/adeci/mandate/approval"
+	"github.com/adeci/mandate/connector"
+	"github.com/adeci/mandate/internal/proposal"
+)
+
+func (h *harness) accessChallenge(t *testing.T, req accessChallengeRequest) (int, accessChallengeResponse, []byte) {
+	t.Helper()
+	status, body := h.post(t, "/access/challenge", req)
+	var res accessChallengeResponse
+	if status == http.StatusOK {
+		if err := json.Unmarshal(body, &res); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return status, res, body
+}
+
+func (h *harness) accessApprove(t *testing.T, session string, res accessChallengeResponse) (int, []byte) {
+	t.Helper()
+	c, err := base64.RawURLEncoding.DecodeString(res.Options.Challenge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h.call(t, http.MethodPost, "/access/approve", session, accessApproveRequest{Nonce: res.Nonce, Assertion: h.key.Assert(c)})
+}
+
+// sign signs req with the harness key and fails the test unless it is
+// stored.
+func (h *harness) sign(t *testing.T, req accessChallengeRequest) (accessApproveResponse, accessChallengeResponse) {
+	t.Helper()
+	status, res, body := h.accessChallenge(t, req)
+	if status != http.StatusOK {
+		t.Fatalf("challenge %+v: %d %s", req, status, body)
+	}
+	status, body = h.accessApprove(t, h.session, res)
+	var out accessApproveResponse
+	if status != http.StatusOK || json.Unmarshal(body, &out) != nil {
+		t.Fatalf("approve %+v: %d %s", req, status, body)
+	}
+	return out, res
+}
+
+// newTokenHash is the hash of a token as the browser makes it; the console
+// only ever sees that.
+func newTokenHash() string {
+	sum := sha256.Sum256([]byte(rand.Text()))
+	return hex.EncodeToString(sum[:])
+}
+
+func (h *harness) agent(t *testing.T, name string) string {
+	t.Helper()
+	hash := newTokenHash()
+	out, _ := h.sign(t, accessChallengeRequest{Kind: approval.KindAgent, Name: name, TokenSHA256: hash})
+	return out.ID
+}
+
+func (h *harness) records(t *testing.T) (agents []approval.Agent, grants []approval.Grant) {
+	t.Helper()
+	recs, err := h.api.Access(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range recs {
+		switch s.Kind {
+		case approval.KindAgent:
+			a, err := h.srv.verifier.VerifyAgent(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			agents = append(agents, a)
+		case approval.KindGrant:
+			g, err := h.srv.verifier.VerifyGrant(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			grants = append(grants, g)
+		}
+	}
+	return agents, grants
+}
+
+func (h *harness) requestAccess(t *testing.T, req proposal.AccessRequest) proposal.RequestRef {
+	t.Helper()
+	ref, err := h.api.RequestAccess(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ref
+}
+
+// named asks agent for chats of the fake connector, one term matching
+// nothing.
+func named(agent string) proposal.AccessRequest {
+	return proposal.AccessRequest{
+		AgentID: agent, Connector: "fake",
+		Terms:     []string{"family", "Mom", "lawyer"},
+		Chats:     []proposal.Chat{{ID: "c1", Name: "Guild / family"}, {ID: "d1", Name: "~Mom"}},
+		Unmatched: []string{"lawyer"},
+		For:       2 * time.Hour, Horizon: 7 * 24 * time.Hour, Reason: "summarise the week",
+	}
+}
+
+// forwarding forwards raw reads, so it keeps no chats.
+type forwarding struct{ *fake }
+
+func (forwarding) Forward(w http.ResponseWriter, _ *http.Request, _ string) {
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *harness) accessStatus(t *testing.T, id string) proposal.AccessStatus {
+	t.Helper()
+	st, err := h.api.AccessStatus(context.Background(), id, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+func TestAgentTokenNeverReachesConsole(t *testing.T) {
+	h := start(t)
+	hash := newTokenHash()
+	for _, bad := range []string{"", strings.ToUpper(hash), hash[:62]} {
+		if status, _, _ := h.accessChallenge(t, accessChallengeRequest{Kind: approval.KindAgent, Name: "bot", TokenSHA256: bad}); status != http.StatusBadRequest {
+			t.Errorf("token_sha256 %q: %d", bad, status)
+		}
+	}
+	status, res, body := h.accessChallenge(t, accessChallengeRequest{Kind: approval.KindAgent, Name: "Grok Bot", TokenSHA256: hash})
+	if status != http.StatusOK {
+		t.Fatalf("challenge: %d %s", status, body)
+	}
+	if status, _ := h.accessApprove(t, h.login(t, h.key), res); status != http.StatusForbidden {
+		t.Fatalf("approve from another session: %d", status)
+	}
+	status, body = h.accessApprove(t, h.session, res)
+	if status != http.StatusOK || bytes.Contains(body, []byte("token")) {
+		t.Fatalf("approve: %d %s", status, body)
+	}
+	if status, _ := h.accessApprove(t, h.session, res); status != http.StatusConflict {
+		t.Fatalf("approve again: %d", status)
+	}
+	agents, _ := h.records(t)
+	if len(agents) != 1 || agents[0].Name != "Grok Bot" || agents[0].TokenSHA256 != hash {
+		t.Fatalf("agents = %+v", agents)
+	}
+}
+
+func TestAccessRequestLifecycle(t *testing.T) {
+	notes := make(chan *http.Request, 4)
+	ntfy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		notes <- r
+	}))
+	t.Cleanup(ntfy.Close)
+	h := startWith(t, func(cfg *Config, _ string) { cfg.NtfyURL, cfg.NtfyToken = ntfy.URL, "tk" })
+	agent := h.agent(t, "Grok Bot")
+
+	ref := h.requestAccess(t, named(agent))
+	note := <-notes
+	text, _ := io.ReadAll(note.Body)
+	if string(text) != "Grok Bot asks to read fake" || note.Header.Get("Title") != "mandate" ||
+		note.Header.Get("Click") != ref.URL || note.Header.Get("Authorization") != "Bearer tk" {
+		t.Fatalf("notification %q %v", text, note.Header)
+	}
+	if st := h.accessStatus(t, ref.ID); st.Status != proposal.AccessPending || st.AgentID != agent {
+		t.Fatalf("status = %+v", st)
+	}
+	if _, page := h.page(t, "/"); !strings.Contains(page, "Grok Bot asks to read fake") {
+		t.Fatal("inbox doesn't list the request")
+	}
+	_, page := h.page(t, "/access")
+	for _, want := range []string{`id="request-` + ref.ID + `"`, `<input type="checkbox" value="t1"> <span>cats (t1)</span>`, `~Mom (d1)`, `no visible chat matched "lawyer"`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("access page lacks %s", want)
+		}
+	}
+	if strings.Contains(page, "checked> <span>") {
+		t.Error("a requested chat starts ticked")
+	}
+
+	for name, req := range map[string]accessChallengeRequest{
+		"no choice":     {},
+		"no chats":      {Chats: []string{}},
+		"another chat":  {Chats: []string{"c2"}},
+		"longer":        {Chats: []string{"c1"}, For: "4h"},
+		"more history":  {Chats: []string{"c1"}, Horizon: "720h"},
+		"every message": {Chats: []string{"c1"}, Horizon: "0s"},
+	} {
+		req.Kind, req.Request = approval.KindGrant, ref.ID
+		if status, _, _ := h.accessChallenge(t, req); status != http.StatusBadRequest {
+			t.Errorf("%s: %d", name, status)
+		}
+	}
+	granted, res := h.sign(t, accessChallengeRequest{Kind: approval.KindGrant, Request: ref.ID, Chats: []string{"c1", "t1"}, For: "1h", Horizon: "24h"})
+	if !strings.Contains(string(res.Summary), "family (c1), cats (t1) (chats created later are not included)") {
+		t.Errorf("summary %q", res.Summary)
+	}
+	st := h.accessStatus(t, ref.ID)
+	_, grants := h.records(t)
+	if st.Status != proposal.AccessGranted || st.GrantID != granted.ID || len(grants) != 1 {
+		t.Fatalf("status = %+v, grants = %+v", st, grants)
+	}
+	g := grants[0]
+	if g.Agent != agent || !slices.Equal(g.Chats, []string{"c1", "t1"}) || g.Horizon != 24*time.Hour ||
+		g.Until.Sub(g.From) != time.Hour || !st.Until.Equal(g.Until) {
+		t.Fatalf("grant = %+v", g)
+	}
+
+	p, err := h.api.Submit(context.Background(), proposal.Request{
+		Connector: "fake", Op: "send", Args: map[string]string{"to": "Farid", "text": "secret"}, AgentID: agent, AgentName: "Grok Bot",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	note = <-notes
+	if text, _ := io.ReadAll(note.Body); string(text) != "Grok Bot proposes a fake send" || note.Header.Get("Click") != p.URL {
+		t.Fatalf("proposal notification %q %v", text, note.Header)
+	}
+	if _, page := h.page(t, "/r/"+p.ID); !strings.Contains(page, "from Grok Bot") {
+		t.Fatal("proposal page doesn't name the agent")
+	}
+	if _, err := h.api.Get(context.Background(), p.ID, agent); err != nil {
+		t.Fatal(err)
+	}
+	var e *connector.Error
+	if _, err := h.api.Get(context.Background(), p.ID, "other"); !errors.As(err, &e) || e.Status != http.StatusNotFound {
+		t.Fatalf("another agent's proposal: %v", err)
+	}
+
+	denied := h.requestAccess(t, named(agent))
+	<-notes
+	waited := make(chan proposal.AccessStatus)
+	go func() {
+		st, err := h.api.AccessStatus(context.Background(), denied.ID, 30*time.Second)
+		if err != nil {
+			t.Error(err)
+		}
+		waited <- st
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if status, _ := h.post(t, "/access/requests/"+denied.ID+"/deny", nil); status != http.StatusSeeOther {
+		t.Fatalf("deny: %d", status)
+	}
+	select {
+	case st := <-waited:
+		if st.Status != proposal.AccessDenied {
+			t.Fatalf("waited for %+v", st)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("long poll didn't end on the decision")
+	}
+
+	expired := h.requestAccess(t, named(agent))
+	<-notes
+	h.clock.advance(accessRequestTTL)
+	if st := h.accessStatus(t, expired.ID); st.Status != proposal.AccessExpired {
+		t.Fatalf("after an hour: %+v", st)
+	}
+	if status, _, _ := h.accessChallenge(t, accessChallengeRequest{Kind: approval.KindGrant, Request: expired.ID, Chats: []string{"c1"}}); status != http.StatusConflict {
+		t.Fatalf("approve expired: %d", status)
+	}
+}
+
+func TestAccessRequestLimits(t *testing.T) {
+	h := start(t)
+	ctx := context.Background()
+	busy, other := h.agent(t, "busy"), h.agent(t, "other")
+	// tooMany asks for the quota and then requests, as the gateway does; both
+	// must agree.
+	tooMany := func(agent string) bool {
+		quota := h.api.AccessQuota(ctx, agent)
+		_, err := h.api.RequestAccess(ctx, named(agent))
+		for _, err := range []error{quota, err} {
+			var e *connector.Error
+			if err != nil && (!errors.As(err, &e) || e.Status != http.StatusTooManyRequests) {
+				t.Fatal(err)
+			}
+		}
+		if (quota == nil) != (err == nil) {
+			t.Fatalf("quota %v, request %v", quota, err)
+		}
+		return err != nil
+	}
+	var waiting []string
+	for range maxWaitingRequests {
+		waiting = append(waiting, h.requestAccess(t, named(busy)).ID)
+	}
+	if !tooMany(busy) || tooMany(other) {
+		t.Fatal("the waiting cap isn't per agent")
+	}
+	for i := maxWaitingRequests; i < maxHourlyRequests; i++ {
+		if status, _ := h.post(t, "/access/requests/"+waiting[0]+"/deny", nil); status != http.StatusSeeOther {
+			t.Fatalf("deny: %d", status)
+		}
+		waiting = append(waiting[1:], h.requestAccess(t, named(busy)).ID)
+	}
+	for _, id := range waiting {
+		h.post(t, "/access/requests/"+id+"/deny", nil)
+	}
+	if !tooMany(busy) {
+		t.Fatal("the hourly cap doesn't hold")
+	}
+	h.clock.advance(time.Hour)
+	if tooMany(busy) {
+		t.Fatal("the hourly cap doesn't roll")
+	}
+	var e *connector.Error
+	if err := h.api.AccessQuota(ctx, "nobody"); !errors.As(err, &e) || e.Status != http.StatusNotFound {
+		t.Fatalf("quota of an unknown agent: %v", err)
+	}
+}
+
+func TestAccessTermsCheckedAsGiven(t *testing.T) {
+	long := strings.Repeat("x", maxTerm+1)
+	base := proposal.AccessRequest{For: time.Hour, Reason: "r"}
+	for name, tc := range map[string]struct {
+		terms, unmatched []string
+		chats            []proposal.Chat
+		ok               bool
+	}{
+		"matched":               {[]string{"fam"}, nil, []proposal.Chat{{ID: "c1"}}, true},
+		"unmatched":             {[]string{"fam"}, []string{"fam"}, nil, true},
+		"long and matched":      {[]string{long}, nil, []proposal.Chat{{ID: "c1"}}, false},
+		"long and unmatched":    {[]string{long}, []string{long}, nil, false},
+		"duplicate":             {[]string{"fam", "fam"}, nil, []proposal.Chat{{ID: "c1"}}, false},
+		"untrimmed":             {[]string{" fam"}, nil, []proposal.Chat{{ID: "c1"}}, false},
+		"unmatched not given":   {[]string{"fam"}, []string{"work"}, []proposal.Chat{{ID: "c1"}}, false},
+		"chats without terms":   {nil, nil, []proposal.Chat{{ID: "c1"}}, false},
+		"terms without results": {[]string{"fam"}, nil, nil, false},
+		"too many chats":        {[]string{"fam"}, nil, slices.Repeat([]proposal.Chat{{ID: "c1"}}, chatsPerTerm+1), false},
+	} {
+		req := base
+		req.Terms, req.Unmatched, req.Chats = tc.terms, tc.unmatched, tc.chats
+		if err := checkAccessRequest(req); (err == nil) != tc.ok {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+func TestEveryChatRequestNarrows(t *testing.T) {
+	h := start(t)
+	agent := h.agent(t, "bot")
+	ref := h.requestAccess(t, proposal.AccessRequest{AgentID: agent, Connector: "fake", Horizon: 24 * time.Hour, Reason: "find the invite"})
+	_, res := h.sign(t, accessChallengeRequest{Kind: approval.KindGrant, Request: ref.ID, Chats: []string{"c2"}})
+	_, grants := h.records(t)
+	if len(grants) != 1 || !slices.Equal(grants[0].Chats, []string{"c2"}) || !strings.Contains(string(res.Summary), "Work (c2)") {
+		t.Fatalf("grants %+v, summary %q", grants, res.Summary)
+	}
+}
+
+func TestRequestShowsBoundedTree(t *testing.T) {
+	h := start(t)
+	agent := h.agent(t, "bot")
+	ref := h.requestAccess(t, proposal.AccessRequest{
+		AgentID: agent, Connector: "fake", Terms: []string{"Work"}, Chats: []proposal.Chat{{ID: "c2", Name: "Work"}},
+		For: time.Hour, Reason: "r",
+	})
+	_, page := h.page(t, "/access")
+	if more := len(workThreads) - (treeNodes - 1); !strings.Contains(page, fmt.Sprintf("and %d more under it", more)) {
+		t.Fatal("the request doesn't say how many chats it leaves out")
+	}
+	last := workThreads[len(workThreads)-1].ID
+	if status, _, _ := h.accessChallenge(t, accessChallengeRequest{Kind: approval.KindGrant, Request: ref.ID, Chats: []string{last}}); status != http.StatusBadRequest {
+		t.Fatalf("granting a chat left out: %d", status)
+	}
+	h.sign(t, accessChallengeRequest{Kind: approval.KindGrant, Request: ref.ID, Chats: []string{"c2", workThreads[0].ID}})
+}
+
+func TestDeletedAgentsProposalsEnd(t *testing.T) {
+	h := start(t)
+	ctx := context.Background()
+	agent := h.agent(t, "bot")
+	submit := func() (proposal.Proposal, error) {
+		return h.api.Submit(ctx, proposal.Request{
+			Connector: "fake", Op: "send", Args: map[string]string{"to": "Farid", "text": "hi"}, AgentID: agent, AgentName: "bot",
+		})
+	}
+	waiting, err := submit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := h.post(t, "/access/agents/"+agent+"/delete", nil); status != http.StatusSeeOther {
+		t.Fatalf("delete: %d", status)
+	}
+	if p, err := h.api.Get(ctx, waiting.ID, agent); err != nil || p.Status != proposal.Rejected {
+		t.Fatalf("waiting proposal after delete: %+v %v", p, err)
+	}
+	if _, err := submit(); err == nil {
+		t.Fatal("a deleted agent proposed")
+	}
+	// One that slipped in as the agent was deleted can't be approved.
+	_, err = h.srv.db.sql.ExecContext(ctx, `UPDATE proposals SET status = 'pending', decided_at = NULL WHERE id = ?`, waiting.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := h.post(t, "/r/"+waiting.ID+"/challenge", challengeRequest{}); status != http.StatusConflict {
+		t.Fatalf("challenge: %d", status)
+	}
+	if _, page := h.page(t, "/r/"+waiting.ID); !strings.Contains(page, "was deleted") || strings.Contains(page, "data-review") {
+		t.Fatal("the request page offers approval")
+	}
+}
+
+func TestForwardOnlyConnector(t *testing.T) {
+	h := startWith(t, func(cfg *Config, dir string) {
+		web, old := filepath.Join(dir, "web.sock"), filepath.Join(dir, "old.sock")
+		serveSocket(t, web, (&connector.Server{Connector: forwarding{&fake{name: "web"}}, Log: discard}).Handler())
+		// old neither forwards nor lists chats.
+		serveSocket(t, old, (&connector.Server{Connector: &fake{name: "old"}, Log: discard}).Handler())
+		cfg.Connectors["web"], cfg.Connectors["old"] = web, old
+	})
+	if status, _ := h.call(t, http.MethodGet, "/access/chats?connector=old", h.session, nil); status == http.StatusOK {
+		t.Fatal("a connector without /containers listed no chats")
+	}
+	agent := h.agent(t, "bot")
+	for name, req := range map[string]accessChallengeRequest{
+		"horizon": {Horizon: "24h", For: "1h"},
+		"chats":   {Chats: []string{"x"}, For: "1h"},
+	} {
+		req.Kind, req.Agent, req.Connector = approval.KindGrant, agent, "web"
+		if status, _, _ := h.accessChallenge(t, req); status != http.StatusBadRequest {
+			t.Errorf("%s: %d", name, status)
+		}
+	}
+	_, res := h.sign(t, accessChallengeRequest{Kind: approval.KindGrant, Agent: agent, Connector: "web", For: "1h"})
+	if !strings.Contains(string(res.Summary), "every allowlisted read on web") {
+		t.Errorf("summary %q", res.Summary)
+	}
+	if _, err := h.api.RequestAccess(context.Background(), proposal.AccessRequest{
+		AgentID: agent, Connector: "web", Terms: []string{"x"}, Chats: []proposal.Chat{{ID: "x"}}, Reason: "r",
+	}); err == nil {
+		t.Fatal("a request naming chats on a forward-only connector was taken")
+	}
+	ref := h.requestAccess(t, proposal.AccessRequest{AgentID: agent, Connector: "web", Horizon: 7 * 24 * time.Hour, Reason: "r"})
+	h.sign(t, accessChallengeRequest{Kind: approval.KindGrant, Request: ref.ID})
+	_, grants := h.records(t)
+	for _, g := range grants {
+		if g.Chats != nil || g.Horizon != 0 {
+			t.Fatalf("forward-only grant %+v", g)
+		}
+	}
+	if len(grants) != 2 {
+		t.Fatalf("grants = %+v", grants)
+	}
+}
+
+func TestAccessRecordsLeaveWhenEnded(t *testing.T) {
+	h := start(t)
+	kept, gone := h.agent(t, "kept"), h.agent(t, "gone")
+	routine, _ := h.sign(t, accessChallengeRequest{
+		Kind: approval.KindGrant, Agent: kept, Connector: "fake", Horizon: "24h",
+		Schedule: &scheduleRequest{Days: []time.Weekday{time.Monday}, Start: "07:00", Length: "1h", Zone: "Europe/Berlin"},
+	})
+	revoked, _ := h.sign(t, accessChallengeRequest{Kind: approval.KindGrant, Agent: kept, Connector: "fake", For: "1h"})
+	h.sign(t, accessChallengeRequest{Kind: approval.KindGrant, Agent: gone, Connector: "fake", For: "1h"})
+	if status, _, _ := h.accessChallenge(t, accessChallengeRequest{
+		Kind: approval.KindGrant, Agent: kept, Connector: "fake",
+		Schedule: &scheduleRequest{Start: "07:00", Length: "1h", Zone: "Local"},
+	}); status != http.StatusBadRequest {
+		t.Fatalf("schedule without a zone: %d", status)
+	}
+
+	if status, _ := h.post(t, "/access/grants/"+revoked.ID+"/revoke", nil); status != http.StatusSeeOther {
+		t.Fatalf("revoke: %d", status)
+	}
+	if status, _ := h.post(t, "/access/agents/"+gone+"/delete", nil); status != http.StatusSeeOther {
+		t.Fatalf("delete: %d", status)
+	}
+	agents, grants := h.records(t)
+	if len(agents) != 1 || agents[0].ID != kept || len(grants) != 1 || grants[0].ID != routine.ID {
+		t.Fatalf("live: agents %+v, grants %+v", agents, grants)
+	}
+	var signed int
+	err := h.srv.db.sql.QueryRowContext(context.Background(), `SELECT (SELECT count(signed) FROM agents) + (SELECT count(signed) FROM grants)`).Scan(&signed)
+	if err != nil || signed != 2 {
+		t.Fatalf("signatures kept: %d %v", signed, err)
+	}
+	if _, page := h.page(t, "/access"); !strings.Contains(page, "Mon at 07:00 for 1 hour (Europe/Berlin)") {
+		t.Fatal("access page doesn't describe the schedule")
+	}
+}
+
+func TestReadsAndChatPicker(t *testing.T) {
+	h := start(t)
+	status, body := h.call(t, http.MethodGet, "/access/chats?connector=fake&q=FAM", h.session, nil)
+	var chats chatsResponse
+	if err := json.Unmarshal(body, &chats); status != http.StatusOK || err != nil ||
+		len(chats.Chats) != 1 || chats.Chats[0].ID != "c1" || chats.Chats[0].Label != "family (c1)" {
+		t.Fatalf("chats: %d %s", status, body)
+	}
+	status, body = h.call(t, http.MethodGet, "/access/chats/tree?connector=fake&id=g", h.session, nil)
+	var tree chatNode
+	if err := json.Unmarshal(body, &tree); status != http.StatusOK || err != nil || len(tree.Children) != 1 ||
+		tree.Children[0].ID != "c1" || len(tree.Children[0].Children) != 1 || tree.Children[0].Children[0].ID != "t1" {
+		t.Fatalf("tree: %d %s", status, body)
+	}
+
+	agent := h.agent(t, "bot")
+	err := h.api.Read(context.Background(), proposal.ReadEvent{
+		AgentID: agent, Connector: "fake", Verb: "messages", Chat: "c1", Grants: []string{"g1"}, Count: 3, Dropped: 4, At: h.clock.now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, page := h.page(t, "/access"); !strings.Contains(page, "fake messages <code>c1</code>") || !strings.Contains(page, "4 reads not logged") {
+		t.Fatal("access page doesn't show the read")
+	}
+	ref := h.requestAccess(t, named(agent))
+	h.post(t, "/access/requests/"+ref.ID+"/deny", nil)
+	ctx := context.Background()
+	if err := h.srv.db.sweep(ctx, h.clock.now().Add(accessKept+time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if reads, err := h.srv.db.reads(ctx, 10); err != nil || len(reads) != 0 {
+		t.Fatalf("reads after 30 days: %v %v", reads, err)
+	}
+	if _, err := h.srv.db.accessRequest(ctx, ref.ID, h.clock.now()); !errors.Is(err, errNotFound) {
+		t.Fatalf("decided request after 30 days: %v", err)
+	}
+}

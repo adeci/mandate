@@ -86,7 +86,9 @@ func KeyChallenge(change []byte) []byte {
 	return hashParts([]byte("mandate-key-change-v1"), change)
 }
 
-func changeHash(change []byte) string {
+// ChangeHash is what the next change's Prev names, and what Head reports
+// for a log ending in change.
+func ChangeHash(change []byte) string {
 	h := sha256.Sum256(change)
 	return hex.EncodeToString(h[:])
 }
@@ -176,7 +178,7 @@ func (k *Keys) commit(next keyState) error {
 	if err != nil {
 		return err
 	}
-	if err := writeAtomic(k.path, b); err != nil {
+	if err := WriteAtomic(k.path, b); err != nil {
 		return err
 	}
 	k.st = next
@@ -234,7 +236,7 @@ func (st *keyState) head() string {
 	if len(st.log) == 0 {
 		return ""
 	}
-	return changeHash(st.log[len(st.log)-1].Change)
+	return ChangeHash(st.log[len(st.log)-1].Change)
 }
 
 func (st *keyState) find(credentialID string) (Key, bool) {

@@ -39,6 +39,10 @@ func run() int {
 	switch cmd {
 	case "status":
 		err = client.Status(ctx, args)
+	case "access":
+		err = client.Access(ctx, args)
+	case "request":
+		err = client.Request(ctx, args)
 	case "gateway":
 		err = gateway.Command(ctx, args)
 	case "console":

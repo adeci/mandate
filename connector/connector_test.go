@@ -9,7 +9,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,6 +20,7 @@ import (
 	"github.com/adeci/mandate/approval"
 	"github.com/adeci/mandate/approval/approvaltest"
 	"github.com/adeci/mandate/connector"
+	"github.com/adeci/mandate/store"
 )
 
 const (
@@ -102,12 +105,28 @@ func start(t *testing.T, peers *connector.Peers) *harness {
 	}
 	f := &fake{contacts: map[string]string{"Farid": "id-farid", "Mallory": "id-mallory"}}
 	keys := approvaltest.Keys(t, key)
+	data := filepath.Join(dir, "data.db")
+	st, err := store.Open(context.Background(), data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = st.UpsertContainer(context.Background(), store.Container{ID: "fam@g.us", Kind: "group", Name: "~Family"})
+	st.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, err := user.LookupGroupId(strconv.Itoa(os.Getgid()))
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := &connector.Server{
-		Connector: f,
-		Keys:      keys,
-		Seen:      seen,
-		Peers:     peers,
-		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Connector:   f,
+		Keys:        keys,
+		Seen:        seen,
+		Peers:       peers,
+		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Data:        data,
+		SocketGroup: group.Name,
 	}
 	sock := filepath.Join(dir, "c.sock")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -202,10 +221,11 @@ func TestControlRoutesOnlyFromConsole(t *testing.T) {
 		t.Fatal("media of another message served")
 	}
 	for name, call := range map[string]func() error{
-		"execute":  func() error { _, err := h.client.Execute(ctx, h.approved(t, nil)); return err },
-		"setup":    func() error { _, err := h.client.Setup(ctx, nil); return err },
-		"unlink":   func() error { return h.client.Unlink(ctx) },
-		"put keys": func() error { _, err := h.client.PutKeys(ctx, h.keys.Log()); return err },
+		"execute":    func() error { _, err := h.client.Execute(ctx, h.approved(t, nil)); return err },
+		"setup":      func() error { _, err := h.client.Setup(ctx, nil); return err },
+		"unlink":     func() error { return h.client.Unlink(ctx) },
+		"put keys":   func() error { _, err := h.client.PutKeys(ctx, h.keys.Log()); return err },
+		"containers": func() error { _, err := h.client.Containers(ctx, "fam", "", 10); return err },
 	} {
 		if err := call(); status(err) != http.StatusForbidden || !strings.Contains(err.Error(), "may not use") {
 			t.Errorf("gateway %s: %v", name, err)
@@ -221,6 +241,16 @@ func TestControlRoutesOnlyFromConsole(t *testing.T) {
 	}
 	if res, err := h.client.Execute(ctx, h.approved(t, nil)); err != nil || res.Status != connector.Done {
 		t.Fatalf("console execute: %+v %v", res, err)
+	}
+	if cs, err := h.client.Containers(ctx, "FAM", "", 10); err != nil || len(cs) != 1 || cs[0].Name != "~Family" || cs[0].Kind != "group" {
+		t.Fatalf("console containers: %+v %v", cs, err)
+	}
+	// The console lists chats but never reads messages or their files.
+	if _, err := h.client.Read(ctx, "history", nil); status(err) != http.StatusForbidden {
+		t.Fatalf("console read: %v", err)
+	}
+	if mediaStatus(h, "m1") != http.StatusForbidden {
+		t.Fatal("console got media")
 	}
 
 	h = start(t, &connector.Peers{Console: self + 1, Gateway: self + 2})

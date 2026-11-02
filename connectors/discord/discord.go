@@ -546,9 +546,9 @@ var spec = connector.Spec{
 			Summary: "Fetch messages of a channel, thread or DM from Discord, newest first. Page with one of before, after or around.",
 			Params: []connector.Param{
 				{Name: "channel_id", Doc: "channel, thread or DM ID", Required: true, Container: true},
-				{Name: "before", Doc: "seq; older messages"},
-				{Name: "after", Doc: "seq; newer messages"},
-				{Name: "around", Doc: "seq; messages around it"},
+				{Name: "before", Doc: "seq; older messages", Message: true},
+				{Name: "after", Doc: "seq; newer messages", Message: true},
+				{Name: "around", Doc: "seq; messages around it", Message: true},
 				{Name: "limit", Doc: "1 to 100, default 50"},
 			},
 		},

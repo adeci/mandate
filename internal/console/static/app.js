@@ -336,6 +336,194 @@ async function approveKey(panel) {
   await reload();
 }
 
+// Access records take a passkey touch each time: an unlock window's
+// session key can't sign them.
+async function signAccess(body, msg) {
+  const res = await call("POST", "/access/challenge", body);
+  // Server-rendered: names escaped and hidden characters marked there.
+  msg.innerHTML = `${res.summary}. Waiting for your passkey…`;
+  msg.dataset.kind = "";
+  const assertion = await getAssertion(res.options);
+  say("Saving…", false, msg);
+  const out = await call("POST", "/access/approve", { nonce: res.nonce, assertion });
+  say("", false, msg);
+  return out;
+}
+
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+// The token is made and shown here; the console only signs its hash.
+async function newAgent(form) {
+  const name = form.elements.name.value;
+  const token = hex(crypto.getRandomValues(new Uint8Array(32)));
+  const tokenSHA256 = hex(await crypto.subtle.digest("SHA-256", utf8(token)));
+  await signAccess({ kind: "agent", name, token_sha256: tokenSHA256 }, $(".msg", form));
+  const panel = $("#agent-token");
+  form.hidden = true;
+  $("[data-token-name]", panel).textContent = name;
+  // A changed input also keeps watch() from reloading the token away.
+  $("[data-token]", panel).value = token;
+  panel.hidden = false;
+}
+
+// tree builds nested checkboxes for a chat and the chats under it, with
+// labels the server escaped.
+function tree(nodes, checkFirst) {
+  const ul = document.createElement("ul");
+  ul.className = "tree";
+  nodes.forEach((n, i) => {
+    const li = document.createElement("li");
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.value = n.id;
+    box.checked = checkFirst && i === 0;
+    const text = document.createElement("span");
+    text.innerHTML = n.label;
+    label.append(box, " ", text);
+    if (n.kind || n.active) {
+      const meta = document.createElement("span");
+      meta.className = "muted";
+      meta.textContent = ` ${[n.kind, n.active].filter(Boolean).join(" · ")}`;
+      label.append(meta);
+    }
+    li.append(label);
+    if (n.children && n.children.length) li.append(tree(n.children, false));
+    if (n.more) {
+      const more = document.createElement("p");
+      more.className = "hint";
+      more.textContent = `and ${n.more} more under it, not shown`;
+      li.append(more);
+    }
+    ul.append(li);
+  });
+  return ul;
+}
+
+const checked = (root) => $$("input[type=checkbox]:checked", root).map((b) => b.value);
+
+// picker searches a connector's chats and adds each picked one, with the
+// chats under it unticked.
+function picker(root, connector, msg) {
+  const results = $("[data-chat-results]", root);
+  const picked = $("[data-picked]", root);
+  const search = $("[data-chat-search]", root);
+  const fail = (e) => say(e.message, true, msg);
+  const pick = async (id) => {
+    if ($$("input", picked).some((b) => b.value === id)) return;
+    const q = new URLSearchParams({ connector: connector(), id });
+    picked.append(tree([await call("GET", `/access/chats/tree?${q}`)], true));
+  };
+  const find = async () => {
+    const q = new URLSearchParams({ connector: connector(), q: search.value });
+    const res = await call("GET", `/access/chats?${q}`);
+    say("", false, msg);
+    results.replaceChildren(
+      ...res.chats.map((c) => {
+        const li = document.createElement("li");
+        const add = document.createElement("button");
+        add.type = "button";
+        add.className = "compact";
+        add.innerHTML = `+ ${c.label}`;
+        add.addEventListener("click", () => pick(c.id).catch(fail));
+        li.append(add);
+        return li;
+      }),
+    );
+  };
+  let timer = 0;
+  search.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => find().catch(fail), 250);
+  });
+  return {
+    show: (on) => {
+      const was = !root.hidden;
+      root.hidden = !on;
+      if (on && !was) find().catch(fail);
+    },
+    clear: () => {
+      picked.replaceChildren();
+      results.replaceChildren();
+    },
+    chats: () => checked(picked),
+  };
+}
+
+async function approveAccess(panel) {
+  const body = { kind: "grant", request: panel.dataset.accessRequest, for: $("select[name=for]", panel).value };
+  const horizon = $("select[name=horizon]", panel);
+  if (horizon) body.horizon = horizon.value;
+  if (panel.dataset.chats === "named") {
+    body.chats = checked($("[data-tree]", panel));
+    if (!body.chats.length) throw new Error("tick the chats to grant");
+  } else if (panel.picker && $("input[value=pick]", panel).checked) {
+    body.chats = panel.picker.chats();
+    if (!body.chats.length) throw new Error("pick at least one chat");
+  }
+  await signAccess(body, $(".msg", panel));
+  await reload();
+}
+
+// requestPanel lets a request for every chat be narrowed with the picker.
+function requestPanel(panel) {
+  if (panel.dataset.chats !== "every") return;
+  const p = picker($("[data-chat-picker]", panel), () => panel.dataset.connector, $(".msg", panel));
+  panel.picker = p;
+  for (const radio of $$("input[type=radio]", panel)) {
+    radio.addEventListener("change", () => p.show($("input[value=pick]", panel).checked));
+  }
+}
+
+const timeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+async function newGrant(form) {
+  const f = form.elements;
+  const body = { kind: "grant", agent: f.agent.value, connector: f.connector.value, note: f.note.value };
+  if (!form.forwardOnly()) {
+    body.horizon = f.horizon.value;
+    if (f.chats.value === "pick") {
+      body.chats = form.picker.chats();
+      if (!body.chats.length) throw new Error("pick at least one chat");
+    }
+  }
+  if (f.when.value === "schedule") {
+    const chosen = $$("input[name=day]:checked", form).map((b) => Number(b.value));
+    const days = { every: [], weekdays: [1, 2, 3, 4, 5], chosen }[f.days.value];
+    if (f.days.value === "chosen" && !days.length) throw new Error("choose at least one day");
+    // f.length is the number of controls; the field is only reachable by name.
+    body.schedule = { days, start: f.start.value, length: f.namedItem("length").value, zone: timeZone() };
+  } else {
+    body.for = f.for.value;
+  }
+  await signAccess(body, $(".msg", form));
+  await reload();
+}
+
+// grantForm shows the parts of the new-grant form that apply to the
+// chosen connector and timing.
+function grantForm(form) {
+  const f = form.elements;
+  form.forwardOnly = () => "forwardOnly" in f.connector.selectedOptions[0].dataset;
+  form.picker = picker($("[data-chat-picker]", form), () => f.connector.value, $(".msg", form));
+  const show = () => {
+    const fo = form.forwardOnly();
+    $("[data-forward-hint]", form).hidden = !fo;
+    for (const el of $$("[data-chats-part]", form)) el.hidden = fo;
+    form.picker.show(!fo && f.chats.value === "pick");
+    for (const el of $$("[data-when]", form)) el.hidden = el.dataset.when !== f.when.value;
+    $("[data-days]", form).hidden = f.days.value !== "chosen";
+  };
+  f.connector.addEventListener("change", () => {
+    form.picker.clear();
+    show();
+  });
+  for (const radio of [...f.chats, ...f.when]) radio.addEventListener("change", show);
+  f.days.addEventListener("change", show);
+  $("[data-zone]", form).textContent = timeZone();
+  show();
+}
+
 const POLL_MS = 2000;
 
 function linkConnection(panel, args) {
@@ -453,7 +641,7 @@ function busy(el, action) {
     try {
       await action();
     } catch (e) {
-      const box = el.closest("[data-connection], [data-change]");
+      const box = el.closest("[data-connection], [data-change], [data-access]");
       say(e.message || String(e), true, box ? $(".msg", box) : $("#msg"));
     } finally {
       el.disabled = false;
@@ -590,6 +778,23 @@ function bind() {
       const again = $("[data-relink]", panel);
       again.addEventListener("click", confirmFirst(again, "Confirm relink", () => relink(panel)));
     }
+  }
+
+  const agentForm = $("#new-agent");
+  if (agentForm) agentForm.addEventListener("submit", busy(agentForm, () => newAgent(agentForm)));
+  const copy = $("[data-copy-token]");
+  if (copy) copy.addEventListener("click", () => navigator.clipboard.writeText($("[data-token]").value));
+  const done = $("[data-token-done]");
+  if (done) done.addEventListener("click", () => location.reload());
+  for (const panel of $$("[data-access-request]")) {
+    requestPanel(panel);
+    const button = $("[data-approve-access]", panel);
+    if (button) button.addEventListener("click", busy(button, () => approveAccess(panel)));
+  }
+  const grant = $("#new-grant");
+  if (grant) {
+    grantForm(grant);
+    grant.addEventListener("submit", busy(grant, () => newGrant(grant)));
   }
 
   for (const button of $$("button[data-confirm]")) {

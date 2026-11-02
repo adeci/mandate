@@ -18,16 +18,19 @@ type connectorInfo struct {
 	connector.Spec
 	Health *connector.Health `json:"health"`
 	Source bool              `json:"source"`
+	Access window            `json:"access"`
 }
 
 // Help prints the agent commands, with the connectors the gateway serves when
 // it can reach one.
 func Help(ctx context.Context, w io.Writer) {
-	fmt.Fprint(w, `mandate reads the owner's accounts. Anything that writes is a proposal the
-owner approves first.
+	fmt.Fprint(w, `mandate reads the owner's accounts. Reads need access the owner grants;
+anything that writes is a proposal the owner approves first.
 
 usage:
   mandate <connector> <command> [args]
+  mandate access
+  `+requestUsage+`
   mandate status ID [--wait DUR]
 
 `)
@@ -42,7 +45,7 @@ usage:
 		fmt.Fprintln(w, "connectors:")
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 		for _, ci := range list {
-			fmt.Fprintf(tw, "  %s\t%s\t%s\n", ci.Name, health(ci.Health), strings.Join(commands(ci), " "))
+			fmt.Fprintf(tw, "  %s\t%s\tread %s\t%s\n", ci.Name, health(ci.Health), ci.Access, strings.Join(commands(ci), " "))
 		}
 		_ = tw.Flush()
 	}
@@ -54,10 +57,19 @@ TSV escapes backslash, tab, newline and CR in values as \\, \t, \n and \r, and
 other control characters as \xHH or \uHHHH. Times are UTC.
 After proposing, tell the owner it is waiting, then run mandate status ID --wait 15m.
 
+Reading a connector needs an open grant: mandate access lists yours. So does
+proposing a write, which may only target or answer chats and messages the
+grant lets you read. Without one, commands answer "no read access" (or
+"unknown chat" for a chat outside it). If the task needs it, ask once with
+mandate request: the fewest chats (--chat matches chat names), the shortest
+--for, a --since that covers only what the task needs, and a --reason the
+owner can judge. Recurring work runs in windows the owner schedules; don't
+request in a loop.
+
 exit codes:
-  0   done
+  0   done, or access granted
   75  not yet: pending, rate limited, or --wait ran out
-  1   rejected, expired, failed, or unknown (it may have been sent; don't resend)
+  1   rejected, denied, expired, failed, or unknown (it may have been sent; don't resend)
   2   usage
 `)
 }
@@ -104,7 +116,7 @@ func (c *client) connectorHelp(ctx context.Context, name string) error {
 }
 
 func writeConnectorHelp(w io.Writer, ci connectorInfo) {
-	fmt.Fprintf(w, "%s: %s\n", ci.Name, health(ci.Health))
+	fmt.Fprintf(w, "%s: %s; read access %s\n", ci.Name, health(ci.Health), ci.Access)
 	if doc := strings.TrimSpace(ci.Doc); doc != "" {
 		fmt.Fprintf(w, "\n%s\n", doc)
 	}

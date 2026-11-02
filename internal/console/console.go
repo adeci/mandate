@@ -25,7 +25,8 @@ import (
 )
 
 const usage = "usage: mandate console --hostname HOST --tls-cert FILE --tls-key FILE --state DIR " +
-	"--socket PATH --admin-password-hash-file FILE [--listen ADDR] [--connector NAME=SOCKET ...]"
+	"--socket PATH --admin-password-hash-file FILE [--listen ADDR] [--connector NAME=SOCKET ...] " +
+	"[--ntfy-url URL [--ntfy-token-file FILE]]"
 
 type connectorFlags map[string]string
 
@@ -54,10 +55,13 @@ func Command(ctx context.Context, args []string) error {
 	hashFile := flags.String("admin-password-hash-file", "", "bcrypt hash of the admin password (required)")
 	conns := connectorFlags{}
 	flags.Var(conns, "connector", "NAME=SOCKET of a connector; repeatable")
+	ntfyURL := flags.String("ntfy-url", "", "ntfy topic URL to notify when something waits for the owner")
+	ntfyTokenFile := flags.String("ntfy-token-file", "", "file holding the ntfy access token")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *hostname == "" || *certFile == "" || *keyFile == "" || *stateDir == "" || *socket == "" || *hashFile == "" {
+	if *hostname == "" || *certFile == "" || *keyFile == "" || *stateDir == "" || *socket == "" || *hashFile == "" ||
+		*ntfyTokenFile != "" && *ntfyURL == "" {
 		return errors.New(usage)
 	}
 	if flags.NArg() > 0 {
@@ -81,12 +85,22 @@ func Command(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("load TLS certificate: %w", err)
 	}
+	var ntfyToken string
+	if *ntfyTokenFile != "" {
+		b, err := os.ReadFile(*ntfyTokenFile)
+		if err != nil {
+			return fmt.Errorf("read ntfy token: %w", err)
+		}
+		ntfyToken = string(bytes.TrimSpace(b))
+	}
 	origin := originOf(*hostname, port)
 	srv, err := New(ctx, Config{
 		RPID:         *hostname,
 		Origin:       origin,
 		PasswordHash: hash,
 		Connectors:   conns,
+		NtfyURL:      *ntfyURL,
+		NtfyToken:    ntfyToken,
 		StateDir:     *stateDir,
 		Log:          log,
 	})

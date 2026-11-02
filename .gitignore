@@ -1,2 +1,10 @@
 result
 result-*
+# go build in a connector's directory leaves a binary named after it.
+/connectors/discord/discord
+/connectors/fastmail/fastmail
+/connectors/gmessages/gmessages
+/connectors/http/http
+/connectors/matrix/matrix
+/connectors/signal/signal
+/connectors/whatsapp/whatsapp
