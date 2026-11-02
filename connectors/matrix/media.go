@@ -99,15 +99,23 @@ func (c *mxConnector) Media(ctx context.Context, message string, index int) (con
 	} else if err != nil {
 		return connector.MediaFile{}, upstream("download the file", err)
 	}
+	limit := connector.MediaLimit(ctx)
+	if resp.ContentLength > limit {
+		resp.Body.Close()
+		return connector.MediaFile{}, connector.TooLarge(limit)
+	}
 	file := connector.MediaFile{Type: item.Type, Name: item.Name, Size: resp.ContentLength, Body: resp.Body}
 	if ref.File == nil && resp.ContentLength >= 0 {
 		return file, nil
 	}
 	// An encrypted file is checked against its hash before any of it is
 	// passed on.
-	data, err := io.ReadAll(resp.Body)
+	data, err := connector.ReadMedia(ctx, resp.Body)
 	resp.Body.Close()
-	if err != nil {
+	var ce *connector.Error
+	if errors.As(err, &ce) {
+		return connector.MediaFile{}, err
+	} else if err != nil {
 		return connector.MediaFile{}, upstream("download the file", err)
 	}
 	if ref.File != nil {
@@ -121,10 +129,13 @@ func (c *mxConnector) Media(ctx context.Context, message string, index int) (con
 	return file, nil
 }
 
-// refetch reads message from its room again for the file it carries.
+// refetch reads message from its room again for the file it carries. The
+// homeserver answers, so the event must be the stored one and pass the trust
+// rules ingest marks: encrypted with a key from a cross-signed device of the
+// sender in rooms that are encrypted.
 func (c *mxConnector) refetch(ctx context.Context, a *account, message string) (store.Media, error) {
-	var room string
-	err := c.st.DB().QueryRowContext(ctx, `SELECT container_id FROM messages WHERE id = ?1`, message).Scan(&room)
+	var room, sender string
+	err := c.st.DB().QueryRowContext(ctx, `SELECT container_id, COALESCE(sender_id, '') FROM messages WHERE id = ?1`, message).Scan(&room, &sender)
 	if errors.Is(err, sql.ErrNoRows) {
 		return store.Media{}, errNoFile
 	} else if err != nil {
@@ -136,11 +147,19 @@ func (c *mxConnector) refetch(ctx context.Context, a *account, message string) (
 	} else if err != nil {
 		return store.Media{}, upstream("read the message", err)
 	}
+	if evt.ID.String() != message || (evt.RoomID != "" && evt.RoomID.String() != room) || evt.Sender.String() != sender {
+		return store.Media{}, &connector.Error{Status: http.StatusBadGateway, Message: "the homeserver returned a different message than the one stored"}
+	}
 	prepare(evt, id.RoomID(room))
 	if evt.Type == event.EventEncrypted {
 		if evt, err = a.mach.DecryptMegolmEvent(ctx, evt); err != nil {
 			return store.Media{}, &connector.Error{Status: http.StatusNotFound, Message: "the message cannot be decrypted yet, so its file cannot be fetched"}
 		}
+	}
+	if mark, err := a.mark(ctx, evt); err != nil {
+		return store.Media{}, err
+	} else if mark != "" {
+		return store.Media{}, &connector.Error{Status: http.StatusBadGateway, Message: "the room's encryption does not vouch for this message's sender, so its file is not fetched"}
 	}
 	if m, ok := attachmentOf(evt.Type, evt.Content.AsMessage()); ok {
 		return m, nil

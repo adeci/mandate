@@ -72,6 +72,7 @@ type homeserver struct {
 	history map[id.RoomID][]map[string]any // newest first, for /messages
 	members map[id.RoomID][]map[string]any // lazy-loaded members for /messages
 	media   map[string][]byte              // by mxc:// URI
+	events  map[string]map[string]any      // served by /event in place of the history's
 
 	sends    []sentEvent
 	sendMode string // "", "forbidden", "hangup"
@@ -457,6 +458,10 @@ func (h *homeserver) context(w http.ResponseWriter, r *http.Request, _ device) {
 func (h *homeserver) event(w http.ResponseWriter, r *http.Request, _ device) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if evt, ok := h.events[r.PathValue("event")]; ok {
+		writeJSON(w, http.StatusOK, evt)
+		return
+	}
 	for _, evt := range h.history[id.RoomID(r.PathValue("room"))] {
 		if evt["event_id"] == r.PathValue("event") {
 			writeJSON(w, http.StatusOK, evt)
