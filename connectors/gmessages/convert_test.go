@@ -172,9 +172,15 @@ func TestContainer(t *testing.T) {
 		conv *gmproto.Conversation
 		want store.Container
 	}{
-		{faridDM(), store.Container{ID: "1", Kind: "dm", Name: "Farid Haddad", LastMessageAt: t0.Add(2 * time.Minute)}},
+		{faridDM(), store.Container{
+			ID: "1", Kind: "dm", Name: "Farid Haddad", LastMessageAt: t0.Add(2 * time.Minute),
+			Participants: []store.Participant{{ID: "+15551230001", Name: "Farid Haddad"}},
+		}},
 		// The name a stranger's RCS profile gives is not the chat's name.
-		{strangerDM(), store.Container{ID: "2", Kind: "dm", Name: "(555) 999-0002", LastMessageAt: t0.Add(time.Minute)}},
+		{strangerDM(), store.Container{
+			ID: "2", Kind: "dm", Name: "(555) 999-0002", LastMessageAt: t0.Add(time.Minute),
+			Participants: []store.Participant{{ID: "+15559990002", Name: "(555) 999-0002"}},
+		}},
 		{family(), store.Container{
 			ID: "3", Kind: "group", IsGroup: true, Name: "Family", LastMessageAt: t0.Add(3 * time.Minute),
 			Participants: []store.Participant{{ID: "+15551230001", Name: "Farid Haddad"}, {ID: "+15551230003", Name: "Mina"}},

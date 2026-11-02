@@ -5,11 +5,14 @@ import (
 	"errors"
 	"net/http"
 	"reflect"
+	"sync/atomic"
 	"testing"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+	"go.mau.fi/util/exhttp"
 
 	"github.com/adeci/mandate/approval"
 	"github.com/adeci/mandate/connector"
@@ -136,5 +139,32 @@ func TestExecute(t *testing.T) {
 	}
 	if n := len(f.phone.sent); n != 4 {
 		t.Fatalf("%d requests sent", n)
+	}
+}
+
+// roundTrip is libgm's HTTP transport in tests.
+type roundTrip func(*http.Request) (*http.Response, error)
+
+func (f roundTrip) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// libgm resends a request answered with a server error; an approved
+// message goes to Google once.
+func TestSendNotResent(t *testing.T) {
+	t.Parallel()
+	var requests atomic.Int32
+	s := exhttp.SensibleClientSettings
+	s.TransportOverride = func(exhttp.ClientSettings) http.RoundTripper {
+		return onceTransport{roundTrip(func(req *http.Request) (*http.Response, error) {
+			requests.Add(1)
+			return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: http.NoBody, Header: http.Header{}, Request: req}, nil
+		})}
+	}
+	cli := libgm.NewClient(libgm.NewAuthData(), nil, zerolog.Nop(), s)
+	req := sendRequest(faridDM(), nil, "on my way", "tmp")
+	if _, err := cli.SendMessage(singleAttempt(context.Background()), req); !errors.Is(err, errNotResent) {
+		t.Errorf("SendMessage = %v, want %v", err, errNotResent)
+	}
+	if n := requests.Load(); n != 1 {
+		t.Errorf("%d requests, want 1", n)
 	}
 }

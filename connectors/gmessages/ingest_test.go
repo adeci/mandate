@@ -9,6 +9,8 @@ import (
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+
+	"github.com/adeci/mandate/store"
 )
 
 type row struct {
@@ -144,5 +146,39 @@ func TestLiveEvents(t *testing.T) {
 	}
 	if got := chats(t, f); got["1"] != "dm Farid Haddad 2026-10-01T12:02:00.000Z" || got["3"] != "group Family 2026-10-01T12:03:00.000Z" {
 		t.Fatalf("chats %v", got)
+	}
+}
+
+// A DM with only the owner's messages names no sender, so hide_senders
+// matches it by its stored participant, as the gateway does; DMs stored
+// without one get it from the phone.
+func TestDMHiddenByNumber(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, true)
+	ctx := context.Background()
+	if err := f.st.UpsertContainer(ctx, store.Container{ID: "1", Kind: "dm", Name: "Farid Haddad"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.UpsertMessage(ctx, store.Message{ID: "m3", ContainerID: "1", SentAt: t0, IsFromMe: true, Body: "sure"}); err != nil {
+		t.Fatal(err)
+	}
+	hidden := func(chat, number string) bool {
+		var n int
+		if err := f.st.DB().QueryRow(`SELECT count(*) FROM containers AS c, json_each(c.participants_json) AS p
+WHERE c.id = ? AND c.kind = 'dm' AND p.value ->> 'id' = ?`, chat, number).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n == 1
+	}
+	f.phone.setConvs(faridDM())
+	if err := f.c.in.fillDMs(ctx, f.cli()); err != nil {
+		t.Fatal(err)
+	}
+	if !hidden("1", "+15551230001") {
+		t.Error("stored DM not matched by its number")
+	}
+	f.cli().emit(strangerDM())
+	if !hidden("2", "+15559990002") {
+		t.Error("new DM not matched by its number")
 	}
 }

@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 
 	"github.com/rs/zerolog"
@@ -34,13 +35,13 @@ func start(ctx context.Context, env *connector.Env, _ struct{}) (connector.Conne
 	util.BrowserDetailsMessage.OS = "mandate"
 	log := zerolog.New(os.Stderr).Level(zerolog.InfoLevel).With().Timestamp().Str("module", "libgm").Logger()
 	newClient := func(auth *libgm.AuthData, onEvent func(any)) gmClient {
-		cli := libgm.NewClient(auth, nil, log, exhttp.SensibleClientSettings)
+		cli := libgm.NewClient(auth, nil, log, httpSettings())
 		cli.SetPingInterval(pingInterval)
 		cli.SetEventHandler(onEvent)
 		return libgmClient{cli}
 	}
 	newPairing := func(auth *libgm.AuthData, paired func()) pairClient {
-		cli := libgm.NewClient(auth, nil, log, exhttp.SensibleClientSettings)
+		cli := libgm.NewClient(auth, nil, log, httpSettings())
 		cli.SetEventHandler(func(any) {})
 		cb := func(*gmproto.PairedData) { paired() }
 		cli.PairCallback.Store(&cb)
@@ -70,3 +71,11 @@ func (p *program) Close() error {
 type libgmClient struct{ *libgm.Client }
 
 func (c libgmClient) Account() string { return c.Config.GetDeviceInfo().GetEmail() }
+
+func httpSettings() exhttp.ClientSettings {
+	s := exhttp.SensibleClientSettings
+	s.TransportOverride = func(cs exhttp.ClientSettings) http.RoundTripper {
+		return onceTransport{cs.Configure(&http.Transport{})}
+	}
+	return s
+}
