@@ -295,7 +295,10 @@ func (c *fmConnector) put(ctx context.Context, cn *conn, e email) error {
 	}
 	if len(e.From) > 0 {
 		msg.SenderID, msg.SenderName = strings.ToLower(e.From[0].Email), e.From[0].Name
-		_, msg.IsFromMe = cn.identity(e.From[0].Email)
+		// From is the sender's claim; mail in Sent is what the owner, or
+		// mandate on their behalf, actually sent.
+		_, own := cn.identity(e.From[0].Email)
+		msg.IsFromMe = own && e.MailboxIDs[cn.roles["sent"]]
 	}
 	if len(e.InReplyTo) > 0 {
 		err := c.st.DB().QueryRowContext(ctx, `SELECT id FROM fastmail_emails WHERE message_id = ?1 AND id != ?2 LIMIT 1`,

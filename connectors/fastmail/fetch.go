@@ -29,11 +29,15 @@ func (c *fmConnector) Read(ctx context.Context, op string, args map[string]strin
 		return nil, err
 	}
 	var id string
-	err = c.st.DB().QueryRowContext(ctx, `SELECT id FROM messages WHERE seq = ?1 AND container_id = ?2`, seq, args["chat"]).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
+	var deleted bool
+	err = c.st.DB().QueryRowContext(ctx, `SELECT id, deleted FROM messages WHERE seq = ?1 AND container_id = ?2`, seq, args["chat"]).Scan(&id, &deleted)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
 		return nil, connector.Invalid("no email with seq %d in chat %s", seq, args["chat"])
-	} else if err != nil {
+	case err != nil:
 		return nil, err
+	case deleted:
+		return nil, errDeleted
 	}
 	list, err := c.getEmails(ctx, a, cn, []string{id}, emailProperties, 4*maxFetch)
 	if err != nil {
