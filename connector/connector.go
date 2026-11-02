@@ -186,6 +186,12 @@ func MediaLimit(ctx context.Context) int64 {
 	return DefaultMediaLimit
 }
 
+// WithMediaLimit sets the limit MediaLimit reports, as Server does from each
+// request.
+func WithMediaLimit(ctx context.Context, limit int64) context.Context {
+	return context.WithValue(ctx, mediaLimitKey{}, limit)
+}
+
 // ReadMedia reads all of r, refusing it once it passes MediaLimit(ctx).
 func ReadMedia(ctx context.Context, r io.Reader) ([]byte, error) {
 	limit := MediaLimit(ctx)

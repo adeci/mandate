@@ -294,7 +294,7 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 	defer s.mediaFetches.Add(-1)
 	ctx := r.Context()
 	if req.Limit > 0 {
-		ctx = context.WithValue(ctx, mediaLimitKey{}, req.Limit)
+		ctx = WithMediaLimit(ctx, req.Limit)
 	}
 	f, err := m.Media(ctx, req.Message, req.Index)
 	if err != nil {
