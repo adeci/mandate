@@ -14,10 +14,6 @@ import (
 	"github.com/adeci/mandate/store"
 )
 
-// maxMedia is the most fetched into memory when Fastmail does not say how
-// large a file is; the gateway refuses larger files anyway.
-const maxMedia = 100 << 20
-
 // media is the files of parts; Ref is the blob ID.
 func media(parts []bodyPart) []store.Media {
 	files := make([]store.Media, 0, len(parts))
@@ -70,10 +66,17 @@ func (c *fmConnector) Media(ctx context.Context, message string, index int) (con
 		return connector.MediaFile{}, &connector.Error{Status: http.StatusBadGateway, Message: "download from Fastmail: " + resp.Status}
 	}
 	file := connector.MediaFile{Type: item.Type, Name: item.Name, Size: resp.ContentLength, Body: resp.Body}
+	if limit := connector.MediaLimit(ctx); file.Size > limit {
+		resp.Body.Close()
+		return connector.MediaFile{}, connector.TooLarge(limit)
+	}
 	if file.Size < 0 {
 		defer resp.Body.Close()
-		data, err := io.ReadAll(io.LimitReader(resp.Body, maxMedia+1))
-		if err != nil {
+		data, err := connector.ReadMedia(ctx, resp.Body)
+		var ce *connector.Error
+		if errors.As(err, &ce) {
+			return connector.MediaFile{}, err
+		} else if err != nil {
 			return connector.MediaFile{}, &connector.Error{Status: http.StatusBadGateway, Message: "download from Fastmail: " + err.Error()}
 		}
 		file.Size, file.Body = int64(len(data)), io.NopCloser(bytes.NewReader(data))

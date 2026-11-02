@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -405,6 +406,7 @@ func TestPrepare(t *testing.T) {
 					{Label: "Text", Value: "Great", Param: "body"},
 				},
 				Container: "t1",
+				Message:   "e1",
 			},
 		},
 		"reply to Reply-To from the alias it was sent to": {
@@ -422,6 +424,20 @@ func TestPrepare(t *testing.T) {
 					{Label: "Text", Value: "Stop", Param: "body"},
 				},
 				Container: "t2",
+				Message:   "e3",
+			},
+		},
+		"look-alike domain shows its ASCII form": {
+			op:   "send",
+			args: map[string]string{"to": "alice@gооgle.com", "subject": "Hi", "body": "b"},
+			want: connector.Prepared{
+				Args: map[string]string{"from": "owner@fastmail.com", "to": "alice@gооgle.com", "subject": "Hi", "body": "b"},
+				Display: []approval.Field{
+					{Label: "From", Value: "owner@fastmail.com"},
+					{Label: "To", Value: "alice@gооgle.com (alice@xn--ggle-55da.com)"},
+					{Label: "Subject", Value: "Hi", Param: "subject"},
+					{Label: "Text", Value: "b", Param: "body"},
+				},
 			},
 		},
 	} {
@@ -451,6 +467,7 @@ func TestPrepare(t *testing.T) {
 		"reply to unknown":  {"reply", map[string]string{"chat": "t9", "body": "b"}, "unknown chat"},
 		"seq of another":    {"reply", map[string]string{"chat": "t1", "seq": f.seq("e3"), "body": "b"}, "no email with seq"},
 		"subject rewritten": {"reply", map[string]string{"chat": "t1", "body": "b", "subject": "Urgent"}, "use send"},
+		"look-alike local":  {"send", map[string]string{"to": "аlice@example.com", "subject": "s", "body": "b"}, "only ASCII"},
 	} {
 		_, err := f.c.Prepare(ctx, tc.op, tc.args)
 		var ce *connector.Error
@@ -664,6 +681,66 @@ func TestMedia(t *testing.T) {
 	}
 	if _, _, err := fetch(2); !errors.As(err, &ce) || ce.Status != http.StatusNotFound {
 		t.Fatalf("no such index: %v", err)
+	}
+
+	// The gateway's limit, not the stored size, bounds the download.
+	h := (&connector.Server{Connector: f.c, Log: f.env.Log}).Handler()
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/media", strings.NewReader(`{"message":"e1","index":0,"limit":3}`)))
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("4 bytes past a limit of 3: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestDeletedMail(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t)
+	seed(f.jm)
+	f.link()
+	seqE1 := f.seq("e1")
+	f.jm.update("e1", func(e *email) { e.MailboxIDs = map[string]bool{"mb-trash": true} })
+	f.synced()
+
+	var ce *connector.Error
+	if _, err := f.c.Read(ctx, "fetch", map[string]string{"chat": "t1", "seq": seqE1}); !errors.As(err, &ce) || ce.Status != http.StatusGone {
+		t.Fatalf("fetch of trashed mail: %v", err)
+	}
+	_, err := f.c.Prepare(ctx, "reply", map[string]string{"chat": "t1", "seq": seqE1, "body": "b"})
+	if !errors.As(err, &ce) || ce.Status != http.StatusGone {
+		t.Fatalf("reply to trashed mail: %v", err)
+	}
+	if p, err := f.c.Prepare(ctx, "reply", map[string]string{"chat": "t1", "body": "b"}); err != nil || p.Message != "e2" {
+		t.Fatalf("default reply target %+v %v, want e2 past the trashed e1", p, err)
+	}
+
+	// The agent may not see e3; its stored address and subject stay out of
+	// the refusals.
+	for _, args := range []map[string]string{
+		{"chat": "t2", "body": "b", "to": "x@example.com"},
+		{"chat": "t2", "body": "b", "subject": "x"},
+	} {
+		_, err := f.c.Prepare(ctx, "reply", args)
+		if err == nil || strings.Contains(err.Error(), "shop.example") || strings.Contains(err.Error(), "Deals") {
+			t.Fatalf("%v: %v", args, err)
+		}
+	}
+}
+
+func TestUntrustedHeaders(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	spoof := textEmail("spoof", "t1", owner, []address{owner}, "Hi", "x", now, "mb-inbox")
+	spoof.MessageID = []string{"a@b\r\nBcc: mallory@example.com"}
+	f.jm.add(spoof)
+	f.link()
+	if f.message("spoof").FromMe {
+		t.Fatal("mail outside Sent with the owner's From is the owner's")
+	}
+	_, err := f.c.Prepare(context.Background(), "reply", map[string]string{"chat": "t1", "seq": f.seq("spoof"), "body": "b"})
+	var ce *connector.Error
+	if !errors.As(err, &ce) || ce.Status != http.StatusBadRequest || !strings.Contains(ce.Message, "malformed") {
+		t.Fatalf("reply to a Message-ID with CR/LF: %v", err)
 	}
 }
 
