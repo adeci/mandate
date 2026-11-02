@@ -439,7 +439,7 @@ func TestExecute(t *testing.T) {
 			cli.sendErr, cli.failMembers = tt.sendErr, tt.failMembers
 			if !tt.connected {
 				cli.emit(signalmeow.SignalConnectionStatus{Event: signalmeow.SignalConnectionEventDisconnected})
-				eventually(t, func() bool { return f.c.Health(context.Background()).State == connector.Broken })
+				eventually(t, func() bool { return f.c.Health(context.Background()).State == connector.Connecting })
 			}
 			rec := approval.Record{
 				ID: "p1", Connector: "signal", Op: "send",

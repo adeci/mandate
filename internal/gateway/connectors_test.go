@@ -370,6 +370,13 @@ func TestUnhealthyConnectorIsNotCalled(t *testing.T) {
 		}
 	}
 
+	r.discord.health = connector.Health{State: connector.Connecting, Detail: "connecting…"}
+	for name, rec := range map[string]*httptest.ResponseRecorder{"read": read(), "send": send()} {
+		if body := rec.Body.String(); rec.Code != http.StatusServiceUnavailable || !strings.Contains(body, "try again") || strings.Contains(body, "needs the owner") {
+			t.Errorf("%s while connecting: %d %s", name, rec.Code, body)
+		}
+	}
+
 	r.discord.health = connector.Health{State: connector.Resting, Detail: "daily budget used", Until: time.Now().Add(90 * time.Second)}
 	for name, rec := range map[string]*httptest.ResponseRecorder{"read": read(), "send": send()} {
 		var e connector.Error

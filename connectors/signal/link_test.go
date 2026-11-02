@@ -85,7 +85,7 @@ func TestLinkFromConsole(t *testing.T) {
 	setupUntil(t, f.c, func(s connector.SetupStep, _ error) bool { return s.Done })
 	_, err := f.c.Setup(ctx, nil)
 	wantStatus(t, err, http.StatusConflict)
-	if h := f.c.Health(ctx); h.State != connector.Broken || h.Detail != "connecting…" {
+	if h := f.c.Health(ctx); h.State != connector.Connecting || h.Detail != "connecting…" {
 		t.Fatalf("health %+v", h)
 	}
 	cli := f.cli()
@@ -180,7 +180,7 @@ func TestLoggedOutFromPhone(t *testing.T) {
 		}
 		// A late status from the replaced client must not unlink the new session.
 		f.c.status(old, signalmeow.SignalConnectionStatus{Event: signalmeow.SignalConnectionEventLoggedOut})
-		wantHealth(t, f.c, connector.Broken)
+		wantHealth(t, f.c, connector.Connecting)
 	}
 }
 
@@ -241,7 +241,7 @@ func TestHealthReconnecting(t *testing.T) {
 	f := newFixture(t)
 	f.cli().emit(signalmeow.SignalConnectionStatus{Event: signalmeow.SignalConnectionEventDisconnected, Err: errors.New("eof")})
 	eventually(t, func() bool { return f.c.Health(ctx).Detail == "reconnecting…" })
-	wantHealth(t, f.c, connector.Broken)
+	wantHealth(t, f.c, connector.Connecting)
 	f.cli().emit(signalmeow.SignalConnectionStatus{Event: signalmeow.SignalConnectionEventConnected})
 	eventually(t, func() bool { return f.c.Health(ctx).State == connector.Healthy })
 	cli := f.cli()

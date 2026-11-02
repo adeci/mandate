@@ -114,7 +114,7 @@ func (c *waConnector) Health(context.Context) connector.Health {
 	case c.cli.IsConnected() && c.cli.IsLoggedIn():
 		return connector.Health{State: connector.Healthy}
 	default:
-		return connector.Health{State: connector.Broken, Detail: "connecting…"}
+		return connector.Health{State: connector.Connecting, Detail: "connecting…"}
 	}
 }
 

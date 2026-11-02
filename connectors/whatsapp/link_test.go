@@ -88,7 +88,7 @@ func TestLinkFromConsole(t *testing.T) {
 	_, err = f.c.Setup(ctx, nil)
 	wantStatus(t, err, http.StatusConflict)
 	// The pairing connection carries on as the session; no restart.
-	wantHealth(t, f.c, connector.Broken)
+	wantHealth(t, f.c, connector.Connecting)
 	f.cli.mu.Lock()
 	f.cli.loggedIn = true
 	f.cli.mu.Unlock()
@@ -192,10 +192,10 @@ func TestLoggedOutFromPhone(t *testing.T) {
 	f.pair(t, f.c.dev)
 	f.client(1).qr(whatsmeow.QRChannelSuccess)
 	setupUntil(t, f.c, nil, func(s connector.SetupStep) bool { return s.Done })
-	wantHealth(t, f.c, connector.Broken)
+	wantHealth(t, f.c, connector.Connecting)
 	// A late logout from the replaced client must not unlink the new session.
 	f.c.event(f.cli, &events.LoggedOut{Reason: events.ConnectFailureLoggedOut})
-	wantHealth(t, f.c, connector.Broken)
+	wantHealth(t, f.c, connector.Connecting)
 }
 
 func TestUnlink(t *testing.T) {
@@ -266,7 +266,7 @@ func TestHealthDown(t *testing.T) {
 	f.cli.mu.Lock()
 	f.cli.connected = false
 	f.cli.mu.Unlock()
-	wantHealth(t, f.c, connector.Broken)
+	wantHealth(t, f.c, connector.Connecting)
 
 	for _, evt := range []any{&events.ClientOutdated{}, &events.StreamReplaced{}, &events.TemporaryBan{Code: events.TempBanBlockedByUsers}} {
 		f := newFixture(t)

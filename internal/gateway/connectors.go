@@ -174,6 +174,9 @@ func (h *handler) healthy(w http.ResponseWriter, r *http.Request, name string) b
 			Message: fmt.Sprintf("%s is resting: %s", name, detail), RetryAfter: retry,
 		})
 		return false
+	case connector.Connecting:
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("%s is %s; try again in a minute", name, detail))
+		return false
 	}
 	console := "the console"
 	if h.cfg.ConsoleURL != "" {

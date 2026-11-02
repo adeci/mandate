@@ -209,9 +209,9 @@ func (c *gmConnector) state() (gmClient, connector.Health) {
 			Detail: "the phone is not responding; it needs to be on and online",
 		}
 	case c.listenErr != nil:
-		return c.cli, connector.Health{State: connector.Broken, Detail: "reconnecting to Google Messages: " + c.listenErr.Error()}
+		return c.cli, connector.Health{State: connector.Connecting, Detail: "reconnecting to Google Messages: " + c.listenErr.Error()}
 	case !c.active:
-		return c.cli, connector.Health{State: connector.Broken, Detail: "connecting…"}
+		return c.cli, connector.Health{State: connector.Connecting, Detail: "connecting…"}
 	}
 	return c.cli, connector.Health{State: connector.Healthy}
 }

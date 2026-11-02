@@ -7,7 +7,7 @@ its spec.
 | Route | |
 |---|---|
 | `GET /spec` | name, protocol version, operations and their parameters |
-| `GET /health` | `ok`, `setup` (needs the owner), `resting`, or `down` |
+| `GET /health` | `ok`, `setup` (needs the owner), `connecting` (linked, connecting by itself), `resting`, or `down` |
 | `POST /setup` | linking driven from the console, e.g. a QR code or a pasted token |
 | `POST /unlink` | forget the link, for an `Unlinker` |
 | `POST /read` | read operations, run without approval |
@@ -188,7 +188,9 @@ func main() {
   `connector.Unlinker`, which lets the owner unlink and relink. The console
   calls `Setup` every 2s until it is done; a step can show a QR code or a
   code, and `Confirm` asks a yes-or-no question, such as whether the code
-  matches another device. The answer comes as the `confirm` arg alone.
+  matches another device. The answer comes as the `confirm` arg alone. After
+  linking, and while reconnecting, report `connecting` until the service
+  answers; the console watches it settle, and agents are told to retry.
 - **Secrets** such as API tokens come from the owner through `Setup`: mark
   the input `Secret` and keep it with `env.Secret`. Settings come only from
   the typed config, which `Main` decodes strictly and the build checks with

@@ -480,7 +480,7 @@ func TestPairFromConsole(t *testing.T) {
 		t.Fatalf("pairing client: %+v", p)
 	}
 	eventually(t, "connect", f.client(0).isConnected)
-	if h := wantHealth(t, f.c, connector.Broken); h.Detail != "connecting…" {
+	if h := wantHealth(t, f.c, connector.Connecting); h.Detail != "connecting…" {
 		t.Fatalf("health %+v", h)
 	}
 	f.activate()
@@ -532,11 +532,11 @@ func TestHealth(t *testing.T) {
 	}{
 		{&events.PhoneNotResponding{}, connector.Broken, false},
 		{&events.PhoneRespondingAgain{}, connector.Healthy, false},
-		{&events.ListenTemporaryError{Error: errors.New("timeout")}, connector.Broken, false},
+		{&events.ListenTemporaryError{Error: errors.New("timeout")}, connector.Connecting, false},
 		{&events.ListenRecovered{}, connector.Healthy, false},
 		{&gmproto.UserAlertEvent{AlertType: gmproto.AlertType_BROWSER_INACTIVE}, connector.Broken, false},
 		{&gmproto.UserAlertEvent{AlertType: gmproto.AlertType_BROWSER_ACTIVE}, connector.Healthy, false},
-		{&gmproto.UserAlertEvent{AlertType: gmproto.AlertType_BROWSER_INACTIVE_FROM_TIMEOUT}, connector.Broken, true},
+		{&gmproto.UserAlertEvent{AlertType: gmproto.AlertType_BROWSER_INACTIVE_FROM_TIMEOUT}, connector.Connecting, true},
 	} {
 		cli.emit(tc.evt)
 		if h := f.c.Health(context.Background()); h.State != tc.state || (h.State != connector.Healthy && h.Detail == "") {
@@ -585,7 +585,7 @@ func TestUnpairedFromPhone(t *testing.T) {
 		setupUntil(t, f.c, nil, func(s connector.SetupStep) bool { return s.Done })
 		// A late event from the old client leaves the new session alone.
 		old.emit(&gmproto.RevokePairData{})
-		wantHealth(t, f.c, connector.Broken)
+		wantHealth(t, f.c, connector.Connecting)
 	}
 }
 
@@ -659,7 +659,7 @@ func TestPairWithGoogleAccount(t *testing.T) {
 		t.Fatalf("stored session: google account %v, cookies %v", auth.IsGoogleAccount(), auth.Cookies)
 	}
 	eventually(t, "connect", f.client(0).isConnected)
-	wantHealth(t, f.c, connector.Broken)
+	wantHealth(t, f.c, connector.Connecting)
 	f.activate()
 
 	// Unlinking unpairs and forgets the cookies with the session.

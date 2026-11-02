@@ -194,6 +194,7 @@ func health(h *connector.Health) string {
 	switch h.State {
 	case connector.Healthy:
 		return s
+	case connector.Connecting:
 	case connector.Resting:
 		if !h.Until.IsZero() {
 			s += " until " + h.Until.UTC().Format(time.RFC3339)

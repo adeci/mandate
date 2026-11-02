@@ -177,7 +177,9 @@ const (
 	NeedsSetup HealthState = "setup"
 	// Resting means reads are refused for pacing until Health.Until.
 	Resting HealthState = "resting"
-	Broken  HealthState = "down"
+	// Connecting means the connector is linked and (re)connecting by itself.
+	Connecting HealthState = "connecting"
+	Broken     HealthState = "down"
 )
 
 type Health struct {

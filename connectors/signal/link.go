@@ -139,9 +139,9 @@ func (c *sgConnector) Health(context.Context) connector.Health {
 	case c.connected:
 		return connector.Health{State: connector.Healthy}
 	case c.everConnected:
-		return connector.Health{State: connector.Broken, Detail: "reconnecting…"}
+		return connector.Health{State: connector.Connecting, Detail: "reconnecting…"}
 	default:
-		return connector.Health{State: connector.Broken, Detail: "connecting…"}
+		return connector.Health{State: connector.Connecting, Detail: "connecting…"}
 	}
 }
 
