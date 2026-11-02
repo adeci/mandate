@@ -186,11 +186,13 @@ func main() {
 - **Health and linking** are optional: `connector.Checker`,
   `connector.Setupper` with its inputs declared in `Spec.Setup`, and
   `connector.Unlinker`, which lets the owner unlink and relink. The console
-  calls `Setup` every 2s until it is done; a step can show a QR code or a
-  code, and `Confirm` asks a yes-or-no question, such as whether the code
-  matches another device. The answer comes as the `confirm` arg alone. After
-  linking, and while reconnecting, report `connecting` until the service
-  answers; the console watches it settle, and agents are told to retry.
+  calls `Setup` with the owner's inputs once, then without args every 2s
+  until it is done, so keep the linking in progress between calls; a step
+  can show a QR code or a code, and `Confirm` asks a yes-or-no question, such
+  as whether the code matches another device. The answer comes as the
+  `confirm` arg alone. After linking, and while reconnecting, report
+  `connecting` until the service answers; the console watches it settle, and
+  agents are told to retry.
 - **Secrets** such as API tokens come from the owner through `Setup`: mark
   the input `Secret` and keep it with `env.Secret`. Settings come only from
   the typed config, which `Main` decodes strictly and the build checks with

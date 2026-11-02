@@ -362,6 +362,8 @@ function linkConnection(panel, args) {
     try {
       const sent = answer;
       const s = await call("POST", `/connections/${name}/setup`, { args: sent ? { confirm: sent } : args });
+      // The owner's inputs go once; the connector keeps the linking in progress.
+      args = {};
       if (answer === sent) answer = null;
       if (s.done) return finish();
       box.hidden = false;
@@ -567,6 +569,14 @@ function bind() {
     if (link) link.addEventListener("click", busy(link, () => linkConnection(panel, {})));
     for (const form of $$("[data-setup]", panel)) {
       form.addEventListener("submit", busy(form, () => linkConnection(panel, Object.fromEntries(new FormData(form)))));
+      for (const ta of $$("textarea.secret", form)) {
+        ta.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") {
+            ev.preventDefault();
+            form.requestSubmit();
+          }
+        });
+      }
     }
     const unlink = $("[data-unlink]", panel);
     if (unlink) {

@@ -199,6 +199,9 @@ type pairing struct {
 	phoneCode string
 }
 
+// Setup links by QR code, or by a pairing code when given a phone number.
+// Calls without args, as the console polls, continue the pairing in progress
+// and keep showing its pairing code.
 func (c *waConnector) Setup(ctx context.Context, args map[string]string) (connector.SetupStep, error) {
 	var phone string
 	for k, v := range args {
@@ -231,6 +234,9 @@ func (c *waConnector) Setup(ctx context.Context, args map[string]string) (connec
 		}
 		if p, step, err := c.pairingFor(); p == nil {
 			return step, err
+		}
+		if phone == "" {
+			phone = p.requestedPhone()
 		}
 		if phone == "" {
 			return connector.SetupStep{QR: qr, Instructions: qrInstructions}, nil
@@ -355,6 +361,13 @@ func (c *waConnector) phoneCode(ctx context.Context, p *pairing, phone string) (
 	}
 	p.phone, p.phoneCode = phone, code
 	return code, nil
+}
+
+// requestedPhone is the number a pairing code was requested for, if any.
+func (p *pairing) requestedPhone() string {
+	p.phoneMu.Lock()
+	defer p.phoneMu.Unlock()
+	return p.phone
 }
 
 // phoneDigits accepts an E.164 number or bare digits including the country

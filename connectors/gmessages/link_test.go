@@ -425,8 +425,7 @@ func wantStatus(t *testing.T, err error, status int) {
 	}
 }
 
-// setupUntil polls Setup with args like the console does until ok accepts
-// the step.
+// setupUntil polls Setup with args until ok accepts the step.
 func setupUntil(t *testing.T, c *gmConnector, args map[string]string, ok func(connector.SetupStep) bool) connector.SetupStep {
 	t.Helper()
 	var step connector.SetupStep
@@ -637,12 +636,11 @@ func TestPairWithGoogleAccount(t *testing.T) {
 		t.Fatal("incomplete cookies started pairing")
 	}
 
-	// The console repeats the same cookies while it polls.
-	args := map[string]string{"cookies": "Cookie: " + jar}
-	for range 2 {
+	// The console sends the cookies once, then polls without them.
+	for _, args := range []map[string]string{{"cookies": "Cookie: " + jar}, nil} {
 		step, err := f.c.Setup(ctx, args)
 		if err != nil || step.Code != "🦊" || step.Instructions != emojiInstructions || step.QR != "" {
-			t.Fatalf("step %+v, %v", step, err)
+			t.Fatalf("step with %v: %+v, %v", args, step, err)
 		}
 	}
 	if n := f.pairingCount(); n != 1 {
@@ -653,7 +651,7 @@ func TestPairWithGoogleAccount(t *testing.T) {
 	}
 
 	f.pairing(0).answer <- nil
-	setupUntil(t, f.c, args, func(s connector.SetupStep) bool { return s.Done })
+	setupUntil(t, f.c, nil, func(s connector.SetupStep) bool { return s.Done })
 	auth := storedSession(t, f.session)
 	if !auth.IsGoogleAccount() || auth.Cookies["OSID"] != "osid=1" || auth.Cookies["NID"] != "" {
 		t.Fatalf("stored session: google account %v, cookies %v", auth.IsGoogleAccount(), auth.Cookies)
@@ -695,15 +693,17 @@ func TestGoogleAccountPairingFails(t *testing.T) {
 		if tc.phone != nil {
 			f.phone.set(tc.phone)
 		}
+		poll := args
 		if tc.answer != nil {
 			if step, err := f.c.Setup(ctx, args); err != nil || step.Code != "🦊" {
 				t.Fatalf("%s: step %+v, %v", name, step, err)
 			}
 			f.pairing(0).answer <- tc.answer
+			poll = nil
 		}
 		var err error
 		eventually(t, name, func() bool {
-			_, err = f.c.Setup(ctx, args)
+			_, err = f.c.Setup(ctx, poll)
 			return err != nil
 		})
 		if !strings.Contains(err.Error(), tc.says) {

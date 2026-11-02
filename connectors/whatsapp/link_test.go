@@ -69,10 +69,11 @@ func TestLinkFromConsole(t *testing.T) {
 	f.cli.qr(whatsmeow.QRChannelItem{Event: whatsmeow.QRChannelEventCode, Code: "qr-1-2"})
 	setupUntil(t, f.c, nil, func(s connector.SetupStep) bool { return s.QR == "qr-1-2" })
 
-	for range 2 {
-		step, err = f.c.Setup(ctx, map[string]string{"phone": "+1 555 123 4567"})
+	// The console sends the number once, then polls without it.
+	for _, args := range []map[string]string{{"phone": "+1 555 123 4567"}, nil} {
+		step, err = f.c.Setup(ctx, args)
 		if err != nil || step.Code != "ABCD-EFGH" || step.QR != "" {
-			t.Fatalf("phone step %+v, %v", step, err)
+			t.Fatalf("phone step with %v: %+v, %v", args, step, err)
 		}
 	}
 	if f.cli.phones[0] != "+15551234567" || len(f.cli.phones) != 1 {

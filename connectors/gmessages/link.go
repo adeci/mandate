@@ -415,7 +415,8 @@ type pairing struct {
 func (p *pairing) shown() bool { return p.qr != "" || p.emoji != "" }
 
 // Setup pairs through the Google account when given cookies, else by QR
-// code. The console repeats the same args while it polls.
+// code. Calls without args, as the console polls, continue the pairing in
+// progress either way.
 func (c *gmConnector) Setup(ctx context.Context, args map[string]string) (connector.SetupStep, error) {
 	var cookies map[string]string
 	for k, v := range args {
@@ -475,6 +476,9 @@ func (c *gmConnector) pairingFor(key string, cookies map[string]string) (*pairin
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	p := c.pairing
+	if cookies == nil && p != nil && !p.expired {
+		key = p.key
+	}
 	switch {
 	case p != nil && p.done:
 		c.pairing = nil
