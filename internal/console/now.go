@@ -28,9 +28,13 @@ type nowData struct {
 	Routines []grantView `json:"routines"`
 	Stopped  []grantView `json:"stopped"`
 	// Day names the day Today shows ("Today", "Yesterday", "Sun 1 Nov");
-	// Older and Newer link to the days around it.
+	// Older and Newer link to the days around it. Today holds at most
+	// maxSessions read sessions; Hidden counts the earlier ones left out
+	// and More continues with them.
 	Day     string  `json:"day"`
 	Today   []event `json:"today"`
+	Hidden  int     `json:"hidden,omitempty"`
+	More    string  `json:"more,omitempty"`
 	Older   string  `json:"older"`
 	Newer   string  `json:"newer,omitempty"`
 	CanSign bool    `json:"can_sign"`
@@ -124,9 +128,9 @@ func (s *Server) nowJSON(w http.ResponseWriter, r *http.Request, _ session) {
 	connector.WriteJSON(w, http.StatusOK, d)
 }
 
-// nowData answers ?day=YYYY-MM-DD with that day's activity, and
-// ?stopped=GRANTS.REQUESTS or ?denied=PROPOSAL with a notice of what the
-// owner just did.
+// nowData answers ?day=YYYY-MM-DD with that day's activity, continued
+// before=UNIXMS within it, and ?stopped=STOP or ?denied=PROPOSAL with a
+// notice of what the owner just did.
 func (s *Server) nowData(ctx context.Context, r *http.Request) (nowData, error) {
 	now := s.now()
 	q := r.URL.Query()
@@ -147,15 +151,24 @@ func (s *Server) nowData(ctx context.Context, r *http.Request) (nowData, error) 
 		day = t
 	}
 	next := day.AddDate(0, 0, 1)
+	dayLink := func(day time.Time) string {
+		if day.Equal(today) {
+			return "/#today"
+		}
+		return "/?day=" + day.Format(time.DateOnly) + "#today"
+	}
 	d.Day = dayName(day, today)
-	d.Older = "/?day=" + day.AddDate(0, 0, -1).Format(time.DateOnly) + "#today"
-	switch {
-	case next.Equal(today):
-		d.Newer = "/#today"
-	case next.Before(today):
-		d.Newer = "/?day=" + next.Format(time.DateOnly) + "#today"
+	d.Older = dayLink(day.AddDate(0, 0, -1))
+	if next.Before(today) || next.Equal(today) {
+		d.Newer = dayLink(next)
 	}
 	to := earlier(next, now)
+	until := to
+	if v, err := strconv.ParseInt(q.Get("before"), 10, 64); err == nil {
+		if t := fromMS(v); t.After(day) && t.Before(to) {
+			until, d.Newer = t, dayLink(day)
+		}
+	}
 
 	grants, err := s.db.grantsSince(ctx, earlier(now.Add(-stoppedKept), day))
 	if err != nil {
@@ -195,23 +208,31 @@ func (s *Server) nowData(ctx context.Context, r *http.Request) (nowData, error) 
 	}
 	slices.SortStableFunc(d.Waiting, func(a, b card) int { return b.CreatedAt.Compare(a.CreatedAt) })
 
-	reads, err := s.db.reads(ctx, day, to)
+	reads, hidden, err := s.db.readSessions(ctx, day, to, until, maxSessions)
 	if err != nil {
 		return d, err
 	}
-	decided, err := s.db.decidedBetween(ctx, day, to)
+	from := day
+	if hidden > 0 {
+		// The next page holds everything before the oldest session shown;
+		// this one, everything from it on.
+		from = reads[len(reads)-1].First
+		d.Hidden = hidden
+		d.More = fmt.Sprintf("/?day=%s&before=%d#today", day.Format(time.DateOnly), ms(from))
+	}
+	decided, err := s.db.decidedBetween(ctx, from, until)
 	if err != nil {
 		return d, err
 	}
-	asked, err := s.db.accessRequestsDecided(ctx, day, to, now)
+	asked, err := s.db.accessRequestsDecided(ctx, from, until, now)
 	if err != nil {
 		return d, err
 	}
-	stops, err := s.db.stopsBetween(ctx, day, to)
+	stops, err := s.db.stopsBetween(ctx, from, until)
 	if err != nil {
 		return d, err
 	}
-	d.Today = activity(reads, decided, asked, grants, stops, names, fo, day, to)
+	d.Today = activity(reads, decided, asked, grants, stops, names, fo, from, until)
 	d.Notice = s.notice(ctx, q)
 	return d, nil
 }
@@ -325,6 +346,8 @@ func endedState(g grantRow) string {
 		return "extended"
 	case g.EndedBy == "agent deleted":
 		return "agent deleted"
+	case g.EndedBy == "ran out":
+		return "ended"
 	case g.Schedule != nil:
 		return "paused"
 	}
@@ -383,8 +406,10 @@ func (s *Server) requestCard(ctx context.Context, ar accessRequest, grants map[s
 				tree = append(tree, chatNodeOf(connector.Container{ID: ch.ID, Name: ch.Name}))
 			}
 		}
-		if len(ar.Chats) == 1 && len(ar.Unmatched) == 0 && len(tree) == 1 &&
-			tree[0].Kind == "dm" && !strings.HasPrefix(tree[0].Name, "~") {
+		// A name with no ~ is one the owner gave; with no name at all, who
+		// named the chat is unknown.
+		if len(ar.Chats) == 1 && len(ar.Unmatched) == 0 && len(tree) == 1 && tree[0].Kind == "dm" &&
+			strings.TrimSpace(tree[0].Name) != "" && !strings.HasPrefix(tree[0].Name, "~") {
 			tree[0].Ticked = true
 		}
 		c.Chats = tree

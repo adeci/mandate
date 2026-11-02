@@ -378,6 +378,7 @@ async function newAgent(form) {
       await navigator.clipboard.writeText(text);
       b.textContent = "Copied";
       setTimeout(() => (b.textContent = label), 2000);
+      if (text.includes(token)) $("[data-clipboard-warning]", sheet).hidden = false;
     });
     return b;
   };

@@ -366,7 +366,7 @@
   </div>
   {{- end}}
   <div class="actions card-actions">
-    {{if .CanApprove}}<button type="button" class="primary content" data-approve-access data-span="{{.Window}}"{{if not .Ready}} disabled{{end}}>{{.Approve}}</button>{{end}}
+    {{if .CanApprove}}<button type="button" class="primary content" data-approve-access data-span="{{.Window}}"{{if not .Ready}} disabled{{end}}>{{visible .Approve}}</button>{{end}}
     {{if ne .Kind "extend"}}<button type="button" data-adjust>Adjust</button>{{end}}
     <form method="post" action="/access/requests/{{.ID}}/deny"><button type="submit" class="danger">Deny</button></form>
   </div>
@@ -450,14 +450,15 @@
 {{with .Today}}
 <ul class="timeline">
 {{range .}}<li data-kind="{{.Kind}}"><span class="meta">{{clock .At}}{{with .Actor}} · <span class="actor" data-actor="{{.}}">{{.}}</span>{{end}}</span>
-  {{if .URL}}<a class="content" href="{{.URL}}">{{.Text}}</a>{{else}}<span class="content">{{.Text}}</span>{{end}}
+  {{if .URL}}<a class="content" href="{{.URL}}">{{visible .Text}}</a>{{else}}<span class="content">{{visible .Text}}</span>{{end}}
   {{- with .Dropped}} <span class="status" data-tone="alert">{{.}} read{{if ne . 1}}s{{end}} not logged</span>{{end}}</li>
 {{end}}
 </ul>
 {{else}}
 <p class="muted">Nothing happened.</p>
 {{end}}
-<nav class="pager">{{with .Newer}}<a href="{{.}}">← newer</a>{{end}}<a href="{{.Older}}" class="older">Show more →</a></nav>
+{{with .Hidden}}<p class="status" data-tone="alert">{{.}} earlier session{{if ne . 1}}s{{end}} not shown</p>{{end}}
+<nav class="pager">{{with .Newer}}<a href="{{.}}">← newer</a>{{end}}<a href="{{or .More .Older}}" class="older">Show more →</a></nav>
 </section>
 {{end}}
 <p id="msg" class="msg" role="status"></p>
@@ -508,6 +509,7 @@
   <header><h3>Set up <span class="content" data-setup-name></span></h3><span class="status" data-tone="alert">token shown once</span></header>
   <div data-setup-values></div>
   <p class="hint">Copy the token now: it won't be shown again.</p>
+  <p class="status" data-tone="alert" data-clipboard-warning hidden>The token is on this device's clipboard now, and in its clipboard history if it keeps one.</p>
   <p class="meta" data-setup-state>Waiting for <span data-setup-name></span> to connect…</p>
   <div class="actions"><button type="button" class="primary" data-setup-done>Done</button></div>
 </section>

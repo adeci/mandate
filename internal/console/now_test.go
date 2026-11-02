@@ -121,14 +121,11 @@ func TestActivityInOwnersTerms(t *testing.T) {
 			Status:        proposal.AccessGranted, GrantID: "g3", DecidedAt: at(8, 0),
 		},
 	}
-	reads := []proposal.ReadEvent{
-		{AgentID: "a", Connector: "signal", Verb: "messages", Chat: "fam", ChatName: "Family", Count: 50, At: at(22, 3)},
-		{AgentID: "a", Connector: "signal", Verb: "messages", Chat: "fam", ChatName: "Family", Count: 30, At: at(22, 30), Dropped: 2},
-		{AgentID: "a", Connector: "signal", Verb: "messages", Chat: "fam", ChatName: "Family", Count: 20, At: at(22, 12)},
-		{AgentID: "a", Connector: "signal", Verb: "messages", Chat: "fam", ChatName: "Family", Count: 40, At: at(22, 21)},
-		{AgentID: "a", Connector: "signal", Verb: "chats", Count: 9, At: at(21, 5)},
-		{AgentID: "a", Connector: "signal", Verb: "search", Count: 3, At: at(21, 6)},
-		{AgentID: "a", Connector: "signal", Verb: "media", Chat: "fam", ChatName: "Family", Count: 1, At: at(21, 7)},
+	reads := []readSession{
+		{AgentID: "a", Connector: "signal", Chat: "fam", ChatName: "Family", Kind: "read", First: at(22, 3), Last: at(22, 30), Reads: 4, Items: 140, Dropped: 2},
+		{AgentID: "a", Connector: "signal", Kind: "list", First: at(21, 5), Last: at(21, 5), Reads: 1, Items: 9},
+		{AgentID: "a", Connector: "signal", Kind: "search", First: at(21, 6), Last: at(21, 6), Reads: 1, Items: 3},
+		{AgentID: "a", Connector: "signal", Chat: "fam", ChatName: "Family", Kind: "media", First: at(21, 7), Last: at(21, 7), Reads: 1, Items: 1},
 	}
 	decided := []row{
 		{

@@ -769,11 +769,20 @@ pkgs.testers.runNixOSTest {
         code, out = console("POST", "/login", {"assertion": assertion(options, key=laptop, cred=laptop_cred)}, jar="/tmp/laptopjar")
         assert code == 200, (code, out)
 
-    with subtest("Stop all closes every grant and denies every request, and leaves writes alone"):
+    with subtest("Stop all closes every grant, denies every request, cancels approvals under way, and leaves writes alone"):
         code, ref = gw("POST", "/v1/access/requests", {"connector": "discord", "reason": "look around"})
         assert code == 202, (code, ref)
+        # The owner has started approving the request and a +30m when Stop all comes.
+        started = []
+        for fields in [{"kind": "grant", "request": ref["id"]}, {"kind": "extend", "grant": mail, "for": "30m"}]:
+            code, ch = console("POST", "/access/challenge", fields)
+            assert code == 200, (fields, code, ch)
+            started.append(ch)
         code, _ = console("POST", "/access/stop-all")
         assert code == 303, code
+        for ch in started:
+            code, out = console("POST", "/access/approve", {"nonce": ch["nonce"], "assertion": assertion(ch["options"])})
+            assert code == 409, (code, out)
         for path in ["/v1/whatsapp/chats", "/v1/signal/chats", "/v1/fastmail/chats", "/v1/forward/http/api/items"]:
             gw_until(path, lambda code, _: code == 403)
         code, st = gw("GET", f"/v1/access/requests/{ref['id']}?wait=5")
@@ -788,6 +797,7 @@ pkgs.testers.runNixOSTest {
     with subtest("writes may follow a grant for a day after it ends, unless it was closed"):
         grant({"connector": "signal", "chats": ["sfam"], "for": "10m", "horizon": "0"})
         closed = grant({"connector": "signal", "chats": ["swork"], "for": "10m", "horizon": "0"})
+        grant({"connector": "fastmail", "chats": ["inv"], "for": "10m", "horizon": "0"})
         code, _ = console("POST", f"/access/grants/{closed}/close")
         assert code == 303, code
         gw_until("/v1/signal/chats", lambda code, out: code == 200 and rows(out) == ["sfam"])
@@ -797,6 +807,17 @@ pkgs.testers.runNixOSTest {
         assert code == 503 and "needs the owner" in out["error"], (code, out)
         code, out = gw("POST", "/v1/signal/send", {"args": {"chat": "swork", "text": "on my way"}})
         assert code == 404 and "unknown chat" in out["error"], (code, out)
+        # A reply may answer an email from before the grant ended (seq 2), not one
+        # that arrived after (seq 3).
+        machine.succeed(
+            "sudo -u mandate-fastmail sqlite3 /var/lib/mandate-fastmail/data.db \"INSERT INTO messages "
+            "(id, container_id, sender_id, sent_at, body, ingested_at) VALUES ('inv/c', 'inv', 'billing@example.com', "
+            "strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'late invoice', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\""
+        )
+        code, out = gw("POST", "/v1/fastmail/reply", {"args": {"chat": "inv", "seq": "3", "body": "paid"}})
+        assert code == 404, (code, out)
+        code, out = gw("POST", "/v1/fastmail/reply", {"args": {"chat": "inv", "seq": "2", "body": "paid"}})
+        assert code == 503 and "needs the owner" in out["error"], (code, out)
 
     with subtest("mandate-reset-keys clears every key list and the agents they signed; the password is back"):
         machine.succeed("mandate-reset-keys")

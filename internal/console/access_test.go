@@ -540,7 +540,7 @@ func TestReadsAndChatPicker(t *testing.T) {
 	if err := h.srv.db.sweep(ctx, h.clock.now().Add(accessKept+time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if reads, err := h.srv.db.reads(ctx, time.Time{}, h.clock.now().Add(accessKept+time.Minute)); err != nil || len(reads) != 0 {
+	if reads, _, err := h.srv.db.readSessions(ctx, time.Time{}, h.clock.now().Add(accessKept+time.Minute), h.clock.now().Add(accessKept+time.Minute), 10); err != nil || len(reads) != 0 {
 		t.Fatalf("reads after 30 days: %v %v", reads, err)
 	}
 	if _, err := h.srv.db.accessRequest(ctx, ref.ID, h.clock.now()); !errors.Is(err, errNotFound) {
@@ -568,15 +568,18 @@ func ids(gs []grantView) []string {
 
 func TestPreTicking(t *testing.T) {
 	h := start(t)
-	agent := h.agent(t, "bot")
+	agents := []string{h.agent(t, "bot"), h.agent(t, "other")}
+	i := 0
 	for term, chat := range map[string]proposal.Chat{
-		"Dad":  {ID: "d2", Name: "Dad"},
-		"Mom":  {ID: "d1", Name: "~Mom"},
-		"Work": {ID: "c2", Name: "Work"},
+		"Dad":      {ID: "d2", Name: "Dad"},
+		"Mom":      {ID: "d1", Name: "~Mom"},
+		"Work":     {ID: "c2", Name: "Work"},
+		"stranger": {ID: "d3"},
 	} {
 		h.requestAccess(t, proposal.AccessRequest{
-			AgentID: agent, Connector: "fake", Terms: []string{term}, Chats: []proposal.Chat{chat}, For: time.Hour, Reason: "r",
+			AgentID: agents[i%2], Connector: "fake", Terms: []string{term}, Chats: []proposal.Chat{chat}, For: time.Hour, Reason: "r",
 		})
+		i++
 	}
 	ticked := map[string]string{}
 	for _, c := range h.nowJSON(t).Waiting {
@@ -586,7 +589,8 @@ func TestPreTicking(t *testing.T) {
 			}
 		}
 	}
-	// Only the DM under a name the owner gave it, the one chat that matched.
+	// Only the DM under a name the owner gave it, the one chat that matched;
+	// a DM with no name may have been named by anyone.
 	if len(ticked) != 1 || ticked["d2"] != "Approve · 1 hour · Dad · all history" {
 		t.Fatalf("ticked = %v", ticked)
 	}
@@ -729,5 +733,121 @@ func TestSeen(t *testing.T) {
 	if status != http.StatusOK || json.Unmarshal(body, &d) != nil || len(d.Agents) != 1 ||
 		!d.Agents[0].FirstSeen.Equal(first) || !d.Agents[0].LastSeen.Equal(first.Add(time.Minute)) {
 		t.Fatalf("agents.json: %d %s", status, body)
+	}
+}
+
+// An approval under way ends with the grant it would extend, with Stop all,
+// and with its agent.
+func TestApprovalsUnderWayEnd(t *testing.T) {
+	h := start(t)
+	agent := h.agent(t, "bot")
+	challenge := func(req accessChallengeRequest) accessChallengeResponse {
+		t.Helper()
+		status, res, body := h.accessChallenge(t, req)
+		if status != http.StatusOK {
+			t.Fatalf("challenge %+v: %d %s", req, status, body)
+		}
+		return res
+	}
+	refused := func(what string, res accessChallengeResponse) {
+		t.Helper()
+		if status, body := h.accessApprove(t, h.session, res); status != http.StatusConflict {
+			t.Errorf("%s: %d %s", what, status, body)
+		}
+	}
+	closeGrant := func(id string) {
+		t.Helper()
+		if status, _ := h.post(t, "/access/grants/"+id+"/close", nil); status != http.StatusSeeOther {
+			t.Fatalf("close: %d", status)
+		}
+	}
+	window := accessChallengeRequest{Kind: approval.KindGrant, Agent: agent, Connector: "fake", Chats: []string{"c2"}, For: "1h"}
+
+	g, _ := h.sign(t, window)
+	more := challenge(accessChallengeRequest{Kind: kindExtend, Grant: g.ID, For: "30m"})
+	closeGrant(g.ID)
+	refused("+30m after Close", more)
+
+	g, _ = h.sign(t, window)
+	ref := h.requestAccess(t, proposal.AccessRequest{AgentID: agent, Connector: "fake", Extend: true, For: 30 * time.Minute, Reason: "more"})
+	asked := challenge(accessChallengeRequest{Kind: approval.KindGrant, Request: ref.ID})
+	closeGrant(g.ID)
+	refused("the agent's extension after Close", asked)
+
+	g, _ = h.sign(t, window)
+	routine, _ := h.sign(t, accessChallengeRequest{
+		Kind: approval.KindGrant, Agent: agent, Connector: "fake",
+		Schedule: &scheduleRequest{Start: "07:00", Length: "1h", Zone: "UTC"},
+	})
+	closeGrant(routine.ID)
+	read := h.requestAccess(t, named(agent))
+	underway := map[string]accessChallengeResponse{
+		"a new grant": challenge(window),
+		"a request":   challenge(accessChallengeRequest{Kind: approval.KindGrant, Request: read.ID, Chats: []string{"c1"}}),
+		"+30m":        challenge(accessChallengeRequest{Kind: kindExtend, Grant: g.ID, For: "30m"}),
+		"a resume":    challenge(accessChallengeRequest{Kind: kindResume, Grant: routine.ID}),
+	}
+	if status, _ := h.post(t, "/access/stop-all", nil); status != http.StatusSeeOther {
+		t.Fatalf("stop all: %d", status)
+	}
+	for what, res := range underway {
+		refused(what+" after Stop all", res)
+	}
+
+	pending := challenge(window)
+	if status, _ := h.post(t, "/access/agents/"+agent+"/delete", nil); status != http.StatusSeeOther {
+		t.Fatalf("delete: %d", status)
+	}
+	refused("a grant after its agent was deleted", pending)
+	if _, grants := h.records(t); len(grants) != 0 {
+		t.Fatalf("grants = %+v", grants)
+	}
+}
+
+// Today shows the newest read sessions of a day however many came before
+// them, and continues with the earlier ones within the day.
+func TestTodayShowsNewestSessions(t *testing.T) {
+	h := start(t)
+	ctx := context.Background()
+	agent := h.agent(t, "bot")
+	day := startOfDay(h.clock.now())
+	if h.clock.now().Sub(day) < 3*time.Hour {
+		h.clock.advance(3 * time.Hour)
+	}
+	tx, err := h.srv.db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert := func(at time.Time, verb, chat string) {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO reads (at, agent_id, connector, verb, chat, chat_name, grants, count, dropped)
+			VALUES (?, ?, 'fake', ?, ?, ?, '[]', 1, 0)`, ms(at), agent, verb, chat, chat); err != nil {
+			t.Fatal(err)
+		}
+	}
+	noise := h.clock.now().Add(-2 * time.Hour)
+	for i := range 20000 {
+		insert(noise.Add(time.Duration(i)*time.Millisecond), "chats", "")
+	}
+	// More sessions than a page holds, one chat each.
+	for i := range maxSessions + 5 {
+		insert(noise.Add(time.Hour+time.Duration(i)*time.Millisecond), "messages", fmt.Sprintf("chat %d", i))
+	}
+	insert(h.clock.now().Add(-time.Minute), "messages", "Dad")
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	d := h.nowJSON(t)
+	if len(d.Today) == 0 || d.Today[0].Text != "bot read Dad on fake · 1 message" || d.Hidden != 7 || d.More == "" {
+		t.Fatalf("today: %d lines, hidden %d, more %q", len(d.Today), d.Hidden, d.More)
+	}
+	status, body := h.call(t, http.MethodGet, strings.Replace(d.More, "/?", "/now.json?", 1), h.session, nil)
+	var rest nowData
+	if status != http.StatusOK || json.Unmarshal(body, &rest) != nil {
+		t.Fatalf("more: %d %s", status, body)
+	}
+	if len(rest.Today) != 7 || rest.Hidden != 0 || rest.Today[6].Text != "bot listed fake chats" {
+		t.Fatalf("earlier sessions: %+v", rest.Today)
 	}
 }

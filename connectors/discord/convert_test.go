@@ -229,7 +229,7 @@ func TestChannelContainer(t *testing.T) {
 			name: "dm uses the recipient's name and is dated by its last message",
 			in:   &apiChannel{ID: "d", Type: channelDM, Recipients: []apiUser{*alice}, LastMessageID: "175928847299117063"},
 			want: store.Container{
-				ID: "d", Kind: "dm", Name: "Alice A", Participants: []store.Participant{{ID: "200", Name: "Alice A", Handle: "alice"}},
+				ID: "d", Kind: "dm", Name: "~Alice A", Participants: []store.Participant{{ID: "200", Name: "Alice A", Handle: "alice"}},
 				LastMessageAt: time.Date(2016, 4, 30, 11, 18, 25, 796e6, time.UTC),
 			}, wantOK: true,
 		},

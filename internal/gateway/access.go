@@ -356,21 +356,30 @@ func (ag *agent) window(connector string, now time.Time) window {
 	return w
 }
 
-// scope is the SQL filter's ?3: one rule per open grant. A rule without chats
-// covers every chat; cutoff is the earliest sent_at it shows, "" for all.
+// scope is the SQL filter's ?3: one rule per grant. A rule without chats
+// covers every chat; cutoff is the earliest sent_at it shows, "" for all,
+// and until the latest, "" for no bound.
 type rule struct {
 	Chats  []string `json:"chats,omitempty"`
 	Cutoff string   `json:"cutoff"`
+	Until  string   `json:"until,omitempty"`
 }
 
-// everything is the scope of writes, which grants do not limit.
+// everything shows every chat the hide rules leave visible, for finding the
+// chats an agent asks for.
 const everything = `[{"cutoff":""}]`
 
-func scope(grants []approval.Grant, at []time.Time) (string, error) {
+// scope shows what grants show at now. A grant whose window ended, at
+// ends[i], shows what it showed then; a zero end is a grant open now.
+func scope(grants []approval.Grant, ends []time.Time, now time.Time) (string, error) {
 	rules := make([]rule, len(grants))
 	for i, g := range grants {
 		rules[i].Chats = g.Chats
-		if c := g.Cutoff(at[i]); !c.IsZero() {
+		at := now
+		if end := ends[i]; !end.IsZero() {
+			at, rules[i].Until = end, end.UTC().Format(sentAtFormat)
+		}
+		if c := g.Cutoff(at); !c.IsZero() {
 			rules[i].Cutoff = c.UTC().Format(sentAtFormat)
 		}
 	}

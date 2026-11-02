@@ -854,8 +854,8 @@ func (g *gateway) storeCreated(ctx context.Context, d json.RawMessage, selfID st
 		return
 	}
 	if c.Kind == kindDM && m.Author != nil && m.Author.ID != selfID && isSnowflake(m.Author.ID) {
-		c.Name = displayName(m.Author)
-		c.Participants = []store.Participant{{ID: m.Author.ID, Name: c.Name, Handle: handle(m.Author)}}
+		c.Participants = []store.Participant{{ID: m.Author.ID, Name: displayName(m.Author), Handle: handle(m.Author)}}
+		c.Name = dmName(c.Participants[0].Name)
 	}
 	if err := g.store.UpsertContainer(ctx, c); err != nil {
 		g.log.Error("store chat", "id", c.ID, "err", err)

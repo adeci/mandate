@@ -34,16 +34,19 @@ type accessRequest struct {
 }
 
 // accessChallenge is an access record waiting for the passkey: the exact
-// bytes it signs, the access request a grant answers, the grant it
-// replaces, and the names of its chats as the owner saw them.
+// bytes it signs, the agent a grant is for, the access request it answers,
+// the grant it replaces and whether as a resume, and the names of its chats
+// as the owner saw them.
 type accessChallenge struct {
 	Nonce    []byte
 	Kind     string
 	Record   []byte
 	IssuedAt time.Time
 	Session  []byte
+	Agent    string
 	Request  string
 	Replaces string
+	Resume   bool
 	Names    map[string]string
 }
 
@@ -69,9 +72,9 @@ func (d *db) addAccessChallenge(ctx context.Context, c accessChallenge) error {
 		return err
 	}
 	_, err = d.sql.ExecContext(ctx, `
-		INSERT INTO access_challenges (nonce, kind, record, issued_at, session, request, replaces, names)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.Nonce, c.Kind, c.Record, c.IssuedAt.UnixNano(), c.Session, c.Request, c.Replaces, string(names))
+		INSERT INTO access_challenges (nonce, kind, record, issued_at, session, agent, request, replaces, resume, names)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.Nonce, c.Kind, c.Record, c.IssuedAt.UnixNano(), c.Session, c.Agent, c.Request, c.Replaces, c.Resume, string(names))
 	return err
 }
 
@@ -81,9 +84,10 @@ func (d *db) accessChallenge(ctx context.Context, nonce []byte) (accessChallenge
 		issued int64
 		names  string
 	)
-	err := d.sql.QueryRowContext(ctx,
-		`SELECT kind, record, issued_at, session, request, replaces, names FROM access_challenges WHERE nonce = ?`, nonce).
-		Scan(&c.Kind, &c.Record, &issued, &c.Session, &c.Request, &c.Replaces, &names)
+	err := d.sql.QueryRowContext(ctx, `
+		SELECT kind, record, issued_at, session, agent, request, replaces, resume, names
+		FROM access_challenges WHERE nonce = ?`, nonce).
+		Scan(&c.Kind, &c.Record, &issued, &c.Session, &c.Agent, &c.Request, &c.Replaces, &c.Resume, &names)
 	if errors.Is(err, sql.ErrNoRows) {
 		return accessChallenge{}, errNoChallenge
 	}
@@ -119,8 +123,9 @@ func (d *db) addAgent(ctx context.Context, c accessChallenge, a approval.Agent, 
 }
 
 // addGrant stores g for a live agent. When c answers an access request it
-// marks it granted while it is still pending; when c replaces a grant, the
-// old one is revoked and replaced, once.
+// marks it granted while it is still waiting. When c replaces a grant, the
+// old one is replaced once: an extension only while it is unrevoked, a
+// resume only while it is paused or stopped.
 func (d *db) addGrant(ctx context.Context, c accessChallenge, g approval.Grant, signed []byte, now time.Time) error {
 	names, err := json.Marshal(c.Names)
 	if err != nil {
@@ -139,10 +144,15 @@ func (d *db) addGrant(ctx context.Context, c accessChallenge, g approval.Grant, 
 			}
 		}
 		if c.Replaces != "" {
-			res, err := tx.ExecContext(ctx, `
-				UPDATE grants SET revoked_at = coalesce(revoked_at, ?1), signed = NULL, replaced_by = ?2,
-				       ended_by = iif(revoked_at IS NULL, 'replaced', ended_by)
-				WHERE id = ?3 AND replaced_by = ''`, ms(now), g.ID, c.Replaces)
+			replace := `
+				UPDATE grants SET revoked_at = ?1, signed = NULL, replaced_by = ?2, ended_by = 'replaced'
+				WHERE id = ?3 AND replaced_by = '' AND revoked_at IS NULL`
+			if c.Resume {
+				replace = `
+					UPDATE grants SET replaced_by = ?2
+					WHERE id = ?3 AND replaced_by = '' AND revoked_at IS NOT NULL AND ended_by IN ('close', 'stop', '')`
+			}
+			res, err := tx.ExecContext(ctx, replace, ms(now), g.ID, c.Replaces)
 			if err != nil {
 				return err
 			}
@@ -161,7 +171,7 @@ func (d *db) addGrant(ctx context.Context, c accessChallenge, g approval.Grant, 
 	})
 }
 
-var errReplaced = errors.New("that grant was already extended or resumed")
+var errReplaced = errors.New("that grant was closed, extended or resumed meanwhile")
 
 // deleteAgent ends the agent and its grants, dropping their signatures, and
 // refuses its waiting access requests and proposals.
@@ -195,17 +205,29 @@ func (d *db) deleteAgent(ctx context.Context, id string, now time.Time) error {
 		}
 		_, err = tx.ExecContext(ctx, `
 			DELETE FROM challenges WHERE proposal IN (SELECT id FROM proposals WHERE agent_id = ? AND status != 'pending')`, id)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `DELETE FROM access_challenges WHERE agent = ?`, id)
 		return err
 	})
 }
 
+// revokeGrant closes a window or pauses a routine, and cancels approvals
+// under way that would extend or resume it.
 func (d *db) revokeGrant(ctx context.Context, id string, now time.Time) error {
-	res, err := d.sql.ExecContext(ctx, `
-		UPDATE grants SET revoked_at = ?, signed = NULL, ended_by = 'close' WHERE id = ? AND revoked_at IS NULL`, ms(now), id)
-	if err != nil {
+	return d.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE grants SET revoked_at = ?, signed = NULL, ended_by = 'close' WHERE id = ? AND revoked_at IS NULL`, ms(now), id)
+		if err != nil {
+			return err
+		}
+		if err := oneRow(res, errNoGrant); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `DELETE FROM access_challenges WHERE replaces = ?`, id)
 		return err
-	}
-	return oneRow(res, errNoGrant)
+	})
 }
 
 // stop is one Stop all: when, and what it ended.
@@ -215,9 +237,10 @@ type stop struct {
 	Grants, Requests int
 }
 
-// stopAll revokes every grant open now or still to run and denies every
-// access request still waiting, and records that it did. Grants that ran
-// out stay as they ended.
+// stopAll revokes every grant, denies every access request still waiting,
+// cancels every grant approval under way, and records that it did. It
+// counts only grants open now or still to run: one that ran out ends quietly,
+// along with the writes it still allowed.
 func (d *db) stopAll(ctx context.Context, now time.Time) (stop, error) {
 	st := stop{At: now}
 	err := d.tx(ctx, func(tx *sql.Tx) error {
@@ -232,6 +255,13 @@ func (d *db) stopAll(ctx context.Context, now time.Time) (stop, error) {
 			}
 		}
 		st.Grants = len(live)
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE grants SET revoked_at = ?, signed = NULL, ended_by = 'ran out' WHERE revoked_at IS NULL`, ms(now)); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM access_challenges WHERE kind = ?`, approval.KindGrant); err != nil {
+			return err
+		}
 		res, err := tx.ExecContext(ctx, `
 			UPDATE access_requests SET status = 'denied', decided_at = ?1, decided_by = 'stop'
 			WHERE status = 'pending' AND expires_at > ?1`, ms(now))
@@ -623,35 +653,73 @@ func (d *db) addRead(ctx context.Context, e proposal.ReadEvent) error {
 	return err
 }
 
-// maxReads bounds the reads one Today page groups.
-const maxReads = 20000
+// readSession is a run of one agent's reads of one kind of one chat with
+// gaps under sessionGap: list, search, media or read.
+type readSession struct {
+	AgentID, Connector, Chat, ChatName, Kind string
+	First, Last                              time.Time
+	Reads, Items, Dropped                    int
+}
 
-// reads returns the reads in [from, to), oldest first.
-func (d *db) reads(ctx context.Context, from, to time.Time) ([]proposal.ReadEvent, error) {
+// readSessions groups the reads in [from, to) into sessions and returns
+// the newest that started before before, at most limit, newest first, and
+// how many earlier ones it left out. Sessions that started in the same
+// millisecond stay together, so a page that leaves some out ends before
+// them all.
+func (d *db) readSessions(ctx context.Context, from, to, before time.Time, limit int) ([]readSession, int, error) {
 	rs, err := d.sql.QueryContext(ctx, `
-		SELECT at, agent_id, connector, verb, chat, chat_name, grants, count, dropped FROM reads
-		WHERE at >= ? AND at < ? ORDER BY at LIMIT ?`, ms(from), ms(to), maxReads)
+		WITH r AS (
+			SELECT at, agent_id, connector, chat, chat_name, count, dropped,
+			       CASE WHEN verb IN ('chats', 'sync') THEN 'list'
+			            WHEN verb IN ('search', 'guild-search') THEN 'search'
+			            WHEN verb = 'media' THEN 'media'
+			            ELSE 'read' END AS kind
+			FROM reads WHERE at >= ?1 AND at < ?2
+		), marked AS (
+			SELECT *, coalesce(at - lag(at) OVER run >= ?3, 1) AS starts
+			FROM r WINDOW run AS (PARTITION BY agent_id, connector, chat, kind ORDER BY at)
+		), numbered AS (
+			SELECT *, sum(starts) OVER (PARTITION BY agent_id, connector, chat, kind ORDER BY at ROWS UNBOUNDED PRECEDING) AS session
+			FROM marked
+		), sessions AS (
+			SELECT agent_id, connector, chat, max(chat_name) AS chat_name, kind,
+			       min(at) AS first, max(at) AS last, count(*) AS reads, sum(count) AS items, sum(dropped) AS dropped
+			FROM numbered GROUP BY agent_id, connector, chat, kind, session
+		)
+		SELECT agent_id, connector, chat, chat_name, kind, first, last, reads, items, dropped, count(*) OVER ()
+		FROM sessions WHERE first < ?4 ORDER BY first DESC LIMIT ?5`,
+		ms(from), ms(to), sessionGap.Milliseconds(), ms(before), limit+1)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rs.Close()
-	var out []proposal.ReadEvent
+	var (
+		out   []readSession
+		total int
+	)
 	for rs.Next() {
 		var (
-			e      proposal.ReadEvent
-			at     int64
-			grants string
+			s           readSession
+			first, last int64
 		)
-		if err := rs.Scan(&at, &e.AgentID, &e.Connector, &e.Verb, &e.Chat, &e.ChatName, &grants, &e.Count, &e.Dropped); err != nil {
-			return nil, err
+		if err := rs.Scan(&s.AgentID, &s.Connector, &s.Chat, &s.ChatName, &s.Kind, &first, &last,
+			&s.Reads, &s.Items, &s.Dropped, &total); err != nil {
+			return nil, 0, err
 		}
-		if err := json.Unmarshal([]byte(grants), &e.Grants); err != nil {
-			return nil, fmt.Errorf("decode read grants: %w", err)
-		}
-		e.At = fromMS(at)
-		out = append(out, e)
+		s.First, s.Last = fromMS(first), fromMS(last)
+		out = append(out, s)
 	}
-	return out, rs.Err()
+	if err := rs.Err(); err != nil {
+		return nil, 0, err
+	}
+	if len(out) > limit {
+		next := out[limit].First
+		out = out[:limit]
+		for len(out) > 1 && out[len(out)-1].First.Equal(next) {
+			out = out[:len(out)-1]
+		}
+	}
+	return out, total - len(out), nil
 }
 
 // sweepAccess expires access requests, and deletes challenges too old to

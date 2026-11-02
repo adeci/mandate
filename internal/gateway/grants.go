@@ -3,6 +3,7 @@ package gateway
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -48,19 +49,20 @@ func (h *handler) readable(w http.ResponseWriter, r *http.Request, name string) 
 // can limit, so only a grant on every chat with whole history opens them.
 func (h *handler) forwardable(w http.ResponseWriter, r *http.Request, name string) (readScope, bool) {
 	return h.scoped(w, r, name, func(g approval.Grant, now time.Time) (time.Time, bool) {
-		at, ok := openAt(g, now)
-		return at, ok && len(g.Chats) == 0 && g.Horizon == 0
+		end, ok := openAt(g, now)
+		return end, ok && len(g.Chats) == 0 && g.Horizon == 0
 	}, "; raw reads need a grant on every chat with whole history")
 }
 
 // writable is the scope writes go by: grants open now, or whose last window
 // closed within writeGrace, so an agent can answer what it read once its
-// window is over. Each grant shows what it showed when it closed.
+// window is over. A grant that has ended shows what it showed when it
+// closed: messages from its cutoff then up to its end.
 func (h *handler) writable(w http.ResponseWriter, r *http.Request, name string) (readScope, bool) {
 	return h.scoped(w, r, name, func(g approval.Grant, now time.Time) (time.Time, bool) {
 		end, ok := lastEnd(g, now)
 		if end.After(now) {
-			end = now
+			end = time.Time{}
 		}
 		return end, ok
 	}, "")
@@ -70,18 +72,24 @@ func (h *handler) writable(w http.ResponseWriter, r *http.Request, name string) 
 // propose writes within it.
 const writeGrace = 24 * time.Hour
 
-// openAt applies g when it is open now, with its cutoff taken now.
+// openAt applies g when it is open now.
 func openAt(g approval.Grant, now time.Time) (time.Time, bool) {
 	open, _ := g.Open(now)
-	return now, open
+	return time.Time{}, open
 }
 
 // lastEnd is when the latest window of g that was open within writeGrace
-// before now closes, which is after now while it is still open.
+// before now closes, which is after now while it is still open. Windows
+// before the grant was signed don't count, so a new or resumed routine has
+// no grace until its first window has run.
 func lastEnd(g approval.Grant, now time.Time) (time.Time, bool) {
 	var end time.Time
+	from := now.Add(-writeGrace)
+	if g.CreatedAt.After(from) {
+		from = g.CreatedAt
+	}
 	// A grant has at most one window a day, so a few steps cover the span.
-	for t, i := now.Add(-writeGrace), 0; i < 8; i++ {
+	for t, i := from, 0; i < 8; i++ {
 		open, at := g.Open(t)
 		switch {
 		case open:
@@ -99,16 +107,17 @@ func lastEnd(g approval.Grant, now time.Time) (time.Time, bool) {
 }
 
 // scoped answers the agent's grants on name that pick applies, each with
-// the time its cutoff is taken at, or refuses with how to ask for one.
+// when its window ended (zero while open), or refuses with how to ask for
+// one.
 func (h *handler) scoped(w http.ResponseWriter, r *http.Request, name string, pick func(approval.Grant, time.Time) (time.Time, bool), why string) (readScope, bool) {
 	now := time.Now()
 	ag := h.access.byID(agentOf(r.Context()).ID)
 	var grants []approval.Grant
-	var at []time.Time
+	var ends []time.Time
 	if ag != nil {
 		for _, g := range ag.grants {
-			if t, ok := pick(g, now); ok && g.Connector == name {
-				grants, at = append(grants, g), append(at, t)
+			if end, ok := pick(g, now); ok && g.Connector == name {
+				grants, ends = append(grants, g), append(ends, end)
 			}
 		}
 	}
@@ -125,7 +134,7 @@ func (h *handler) scoped(w http.ResponseWriter, r *http.Request, name string, pi
 		connector.WriteJSON(w, http.StatusForbidden, noAccess{Error: msg, Request: cmd})
 		return readScope{}, false
 	}
-	sql, err := scope(grants, at)
+	sql, err := scope(grants, ends, now)
 	if err != nil {
 		logFor(r.Context()).Error("scope", "connector", name, "err", err)
 		writeError(w, http.StatusServiceUnavailable, "gateway unavailable; tell the owner")
@@ -158,6 +167,7 @@ func (h *handler) grants(w http.ResponseWriter, r *http.Request) {
 	ag, now := agentOf(r.Context()), time.Now()
 	out := []grantInfo{}
 	chats := map[string][]string{}
+	listed := map[string][]rule{}
 	for _, g := range ag.grants {
 		var win window
 		win.add(g, now)
@@ -172,6 +182,7 @@ func (h *handler) grants(w http.ResponseWriter, r *http.Request) {
 			info.Chats = append(info.Chats, chatRef{ID: id})
 		}
 		chats[g.Connector] = append(chats[g.Connector], g.Chats...)
+		listed[g.Connector] = append(listed[g.Connector], rule{Chats: g.Chats})
 		out = append(out, info)
 	}
 	names := map[string]map[string]string{}
@@ -181,7 +192,15 @@ func (h *handler) grants(w http.ResponseWriter, r *http.Request) {
 		if _, ok := h.cfg.Sources[name]; !ok || len(ids) == 0 {
 			continue
 		}
-		s, ok := h.source(ctx, w, name, everything)
+		// Named as the grants show them, so an ancestor no grant covers
+		// isn't named.
+		sc, err := json.Marshal(listed[name])
+		if err != nil {
+			logFor(ctx).Error("scope", "connector", name, "err", err)
+			writeError(w, http.StatusServiceUnavailable, "gateway unavailable; tell the owner")
+			return
+		}
+		s, ok := h.source(ctx, w, name, string(sc))
 		if !ok {
 			return
 		}

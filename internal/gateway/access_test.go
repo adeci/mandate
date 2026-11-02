@@ -436,13 +436,14 @@ func TestAccessListsOpenAndComingGrants(t *testing.T) {
 	r := newRig(t, nil)
 	ended := oneOff("g-ended", "discord", 0)
 	ended.From, ended.Until = ended.From.Add(-2*time.Hour), ended.From.Add(-time.Hour)
-	r.h.access = testAccess(oneOff("g-memes", "discord", 24*time.Hour, "c-memes", "c-secret"), ended)
+	r.h.access = testAccess(oneOff("g-memes", "discord", 24*time.Hour, "c-memes", "c-secret", "t-cats"), ended)
 	rec := call(r.h, http.MethodGet, "/v1/access", "")
 	var got []grantInfo
 	mustDo(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	// The guild is not granted, so it is not named.
 	if len(got) != 1 || got[0].ID != "g-memes" || !got[0].Now.Open || got[0].Horizon != 24*time.Hour ||
-		!slices.Equal(got[0].Chats, []chatRef{{ID: "c-memes", Name: "Fun / memes"}, {ID: "c-secret"}}) {
-		t.Errorf("access = %d %s, want the open grant with its visible chat named", rec.Code, rec.Body)
+		!slices.Equal(got[0].Chats, []chatRef{{ID: "c-memes", Name: "memes"}, {ID: "c-secret"}, {ID: "t-cats", Name: "memes / cats"}}) {
+		t.Errorf("access = %d %s, want the open grant with its visible chats named as granted", rec.Code, rec.Body)
 	}
 }
 
@@ -699,6 +700,30 @@ func TestWritesAfterTheWindow(t *testing.T) {
 	if code, _, _ := getTable(t, r.h, "/v1/discord/messages?chat=c-memes"); code != http.StatusForbidden {
 		t.Errorf("read after the window: %d, want 403", code)
 	}
+	// A reply may answer what the grant showed, not what came after it ended.
+	st, err := store.Open(t.Context(), r.h.cfg.Sources["discord"])
+	mustDo(t, err)
+	for _, m := range []store.Message{
+		{ID: "d-inside", ContainerID: "c-memes", SenderID: "u2", Body: "inside", SentAt: time.Now().Add(-150 * time.Minute)},
+		{ID: "d-after", ContainerID: "c-memes", SenderID: "u2", Body: "after", SentAt: time.Now().Add(-time.Hour)},
+	} {
+		mustDo(t, st.UpsertMessage(t.Context(), m))
+	}
+	mustDo(t, st.Close())
+	reply := func(seq string) int {
+		return call(r.h, http.MethodPost, "/v1/discord/send", `{"args":{"chat":"c-memes","seq":"`+seq+`","text":"hi"}}`).Code
+	}
+	prepares := r.discord.prepares.Load()
+	if code := reply("9"); code != http.StatusNotFound {
+		t.Errorf("reply to a message sent after the window: %d, want 404", code)
+	}
+	if n := r.discord.prepares.Load(); n != prepares {
+		t.Error("the connector was asked about a message sent after the window")
+	}
+	if code := reply("8"); code != http.StatusAccepted {
+		t.Errorf("reply to a message sent inside the window: %d, want 202", code)
+	}
+
 	// Revoking drops the grant from the snapshot.
 	r.h.access = testAccess(ended("g-cats", 25*time.Hour, "t-cats"), oneOff("g-other", "discord", 0, "t-cats"))
 	if code := send("c-memes"); code != http.StatusNotFound {
@@ -714,6 +739,11 @@ func TestLastEnd(t *testing.T) {
 	}}
 	if end, ok := lastEnd(daily, now); !ok || !end.Equal(now.Add(-2*time.Hour)) {
 		t.Errorf("daily routine that ran until 2h ago: %v %v", end, ok)
+	}
+	// Signed or resumed after that window, it has no grace until it runs.
+	daily.CreatedAt = now.Add(-time.Hour)
+	if end, ok := lastEnd(daily, now); ok {
+		t.Errorf("routine signed after its last window: grace until %v", end)
 	}
 	open := oneOff("g", "c", 0)
 	if end, ok := lastEnd(open, now); !ok || !end.Equal(open.Until) {

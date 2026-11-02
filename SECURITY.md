@@ -12,11 +12,13 @@ checked channel, are not included. Outside every open grant, reads answer
 403 and the agent can only ask you for one. Hide rules apply on top of
 grants.
 
-An agent may also propose writes, under an open grant on the connector that
-covers the chat a write names and, for a reply, the message it answers. A
-chat or message outside its grants answers the same as one that doesn't
-exist, and the agent sees only the proposal's status and result, never how
-the connector rendered it. A write runs only when the connector holding that
+An agent may also propose writes, under a grant on the connector that is
+open, or that ended in the last 24 hours and was not closed. The grant must
+cover the chat a write names and, for a reply, the message it answers; once
+a grant has ended, only messages from before its end count. A chat or
+message outside its grants answers the same as one that doesn't exist, and
+the agent sees only the proposal's status and result, never how the
+connector rendered it. A write runs only when the connector holding that
 account verifies your passkey's signature over the exact request it will
 run, or a signature from a tab you unlocked with your passkey in the last 10
 minutes. Each request runs at most once.
@@ -61,8 +63,9 @@ What each part is trusted with:
   other machines, so a prompt-injected agent can do no more than its token
   and grants allow.
 - Grant narrowly: the chats a task needs, the shortest window, a short
-  horizon. Revoke a grant you no longer need. The Access page lists recent
-  reads per agent, and counts the reads it could not log.
+  horizon. Close a grant you no longer need, which also ends its day of
+  writes. Today, on Now, shows who read what, and counts the reads it could
+  not log.
 - Keep extensions off the console's site, apart from your passkey manager:
   set their site access to "on click", or use a browser profile without them.
 - Read recipients by their ID. A name starting with `~` was chosen by that
@@ -110,8 +113,15 @@ What each part is trusted with:
   hide one from the gateway by never sending it, so a grant revoked on a
   compromised console may stay open until it ends.
 - **Waiting writes** stay approvable after the grant that admitted them
-  closes or is revoked, and the agent can still read their result.
-  Deleting the agent denies them.
+  closes or is revoked, and after Stop all, and the agent can still read
+  their result. Deleting the agent denies them. Stop all cancels the agent
+  and grant approvals you had started but not finished; agents keep their
+  tokens and can ask again.
+- **Writes after a window**: for 24 hours after a grant's window ends, the
+  agent may still propose the writes it covered, including writes that name
+  no chat, such as Fastmail's `send` or `http` requests. A routine's day of
+  writes comes back after each window. An ended one-off grant leaves Open
+  now but keeps this until the 24 hours pass, you close it, or you Stop all.
 - **Console outages**: while the gateway can't reach the console, it keeps
   serving the last agents and grants it verified, and recurring grants keep
   opening on schedule.
@@ -130,12 +140,23 @@ What each part is trusted with:
 - **`http` grants** cover every allowlisted read of every configured
   service, and let the agent propose `http` writes; chats and horizon don't
   apply. There is no write-only grant.
-- **Writes that name no chat**, such as Fastmail's `send`, need only an open
-  grant on the connector: a grant on one email thread lets the agent
-  propose mail to any address. You still approve the recipients.
+- **Writes that name no chat**, such as Fastmail's `send`, need only a grant
+  on the connector: a grant on one email thread lets the agent propose mail
+  to any address. You still approve the recipients.
+- **One-tap approvals**: Approve signs what the card shows, with the
+  agent's duration and horizon preselected; a request for every chat is a
+  single tap. A single matched contact starts ticked when its name wasn't
+  chosen by that person, which relies on each connector marking such names
+  with `~`. One-off summaries give times in the server's time zone. An agent
+  can send you up to 10 high-priority notifications an hour.
 - **The read log** is best effort: the console counts the reads it could
   not log, not which they were, and loses the count when the gateway
-  restarts. It records no search terms or forwarded paths.
+  restarts. It records no search terms or forwarded paths, and a search
+  across chats is logged without the chats it touched.
+- **Agent setup**: a token copied from the setup sheet lands in your
+  clipboard history. The install line checks the binary against
+  `SHA256SUMS` from the same release, which catches a broken download, not a
+  forged release.
 - **Access requests** carry the agent's own words in the reason. Read the
   connector, chats, duration and horizon on the request, not the reason.
   Chat terms are resolved only once a request fits the agent's limits (3
@@ -168,7 +189,7 @@ the session at the service. To end each one there:
 
 | What | Where to end it |
 |---|---|
-| Agent token | delete the agent on the Access page and create a new one |
+| Agent token | delete the agent under Agents and create a new one |
 | Passkeys | remove them under Keys, or `sudo mandate-reset-keys` |
 | WhatsApp | phone: Settings → Linked devices → mandate → Log out |
 | Signal | phone: Settings → Linked devices → mandate → Unlink |

@@ -139,6 +139,15 @@ func displayName(u *apiUser) string {
 	return u.Username
 }
 
+// dmName names a DM after the other person's own display name, marked ~
+// as chosen by them, as the other connectors mark contact-chosen names.
+func dmName(display string) string {
+	if display == "" {
+		return ""
+	}
+	return "~" + strings.TrimLeft(display, "~")
+}
+
 // handle is the unique @name Discord shows for u; accounts not yet moved to
 // unique usernames, such as bots, keep a #discriminator.
 func handle(u *apiUser) string {
@@ -202,6 +211,7 @@ func channelContainer(c *apiChannel) (store.Container, bool) {
 		if name == "" && len(ps) > 0 {
 			name = ps[0].Name
 		}
+		name = dmName(name)
 		return store.Container{ID: c.ID, Kind: kindDM, Name: name, Participants: ps, LastMessageAt: last}, true
 	case c.Type == channelGroupDM:
 		ps := participants(c)

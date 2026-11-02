@@ -494,7 +494,7 @@ func TestSyncCounts(t *testing.T) {
 	if len(resp.ContainerIDs) != 2 { // guild + DM
 		t.Errorf("sync upserted %v", resp.ContainerIDs)
 	}
-	if row := h.queryRow(`SELECT kind, name, participants_json FROM containers WHERE id = ?`, dmID); row[0] != "dm" || row[1] != "Alice A" ||
+	if row := h.queryRow(`SELECT kind, name, participants_json FROM containers WHERE id = ?`, dmID); row[0] != "dm" || row[1] != "~Alice A" ||
 		!strings.Contains(fmt.Sprint(row[2]), aliceUser) {
 		t.Errorf("dm row %v", row)
 	}
@@ -556,7 +556,7 @@ func TestFetchUpsertsMessages(t *testing.T) {
 	if got := m.header.Get("Referer"); got != "https://discord.com/channels/@me/"+dmID {
 		t.Errorf("referer %q", got)
 	}
-	if row := h.queryRow(`SELECT kind, name FROM containers WHERE id = ?`, dmID); row[0] != "dm" || row[1] != "Alice A" {
+	if row := h.queryRow(`SELECT kind, name FROM containers WHERE id = ?`, dmID); row[0] != "dm" || row[1] != "~Alice A" {
 		t.Errorf("dm row %v", row)
 	}
 	if row := h.queryRow(`SELECT container_id, is_from_me, body FROM messages WHERE id = ?`, msg4); row[0] != dmID || row[1] != int64(1) || row[2] != "see you" {

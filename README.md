@@ -69,8 +69,9 @@ chat or the ones you check, during a window:
 and a horizon: messages older than 24 hours, 7 days or 30 days stay hidden,
 or none with all history. Checked chats are exact: a thread or channel
 created later is not included. A grant also lets the agent propose writes
-to the chats it covers, while it is open and for 24 hours after it ends
-unless you closed it. Grants on `http` cover every allowlisted read, with no
+to the chats it covers, while it is open and for 24 hours after its window
+ends unless you close it; a reply then may only answer a message from
+before the end. Grants on `http` cover every allowlisted read, with no
 chats or horizon.
 
 The console's home, Now, shows:
@@ -79,16 +80,18 @@ The console's home, Now, shows:
   extend an open grant, and their proposed writes, each naming the agent,
   the chats, the time and the agent's reason. Adjust a request's chats,
   time or horizon before you approve it with your passkey, or deny it.
-  Chats start unticked unless the request matched a single contact.
+  Chats start unticked unless the request matched a single contact whose
+  name that person didn't choose.
 - **Open now**: grants that are open, with the time left, `+30m`
   (passkey) and `Close`.
 - **Routines**, with `Pause`; `Resume` signs the same routine again.
 - **Today**: who read what and when, and what was proposed, approved or
   closed.
 
-Closing, pausing, denying and `Stop all`, which closes every grant and
-denies every waiting request, need no passkey and take effect within 15
-seconds. Agents lists each agent with when it was last seen and its grants;
+Closing, pausing, denying and `Stop all`, which closes every grant, denies
+every waiting request and cancels approvals you started, need no passkey
+and take effect within 15 seconds; writes already waiting stay for you to
+review. Agents lists each agent with when it was last seen and its grants;
 grants you make yourself start there.
 
 An agent without a grant gets a 403 that tells it to run `mandate request`.

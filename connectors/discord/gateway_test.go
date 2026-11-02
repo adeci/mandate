@@ -518,7 +518,7 @@ func TestGatewayStoresLiveMessages(t *testing.T) {
 		row[1] != msg1 || row[2] != secretBody || row[3] != "Alice A" || row[4] != int64(0) {
 		t.Fatalf("DM messages %v", row)
 	}
-	if row := h.queryRow(`SELECT kind, name, last_message_at FROM containers WHERE id = ?`, dmID); row[0] != kindDM || row[1] != "Alice A" ||
+	if row := h.queryRow(`SELECT kind, name, last_message_at FROM containers WHERE id = ?`, dmID); row[0] != kindDM || row[1] != "~Alice A" ||
 		row[2] != snowflakeTimeString(msg1) {
 		t.Errorf("DM row %v", row)
 	}

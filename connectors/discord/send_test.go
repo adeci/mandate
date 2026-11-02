@@ -37,8 +37,8 @@ func newSendHarness(t *testing.T, seed func(*state)) *harness {
 		{ID: guildID, Kind: kindGuild, Name: "Club"},
 		{ID: chanGeneral, Kind: kindChannel, ParentID: guildID, Name: "#general"},
 		{ID: threadID, Kind: kindThread, ParentID: chanGeneral, Name: "rig thread"},
-		{ID: dmID, Kind: kindDM, Name: "Alice A", Participants: []store.Participant{{ID: aliceUser, Name: "Alice A", Handle: "alice"}}},
-		{ID: dm2ID, Kind: kindDM, Name: "Alice A", Participants: []store.Participant{{ID: "1000000000000000007", Name: "Alice A", Handle: "mallory"}}},
+		{ID: dmID, Kind: kindDM, Name: "~Alice A", Participants: []store.Participant{{ID: aliceUser, Name: "Alice A", Handle: "alice"}}},
+		{ID: dm2ID, Kind: kindDM, Name: "~Alice A", Participants: []store.Participant{{ID: "1000000000000000007", Name: "Alice A", Handle: "mallory"}}},
 		{ID: groupID, Kind: kindGroup, Name: "crew", IsGroup: true},
 	} {
 		if err := h.st.UpsertContainer(context.Background(), c); err != nil {

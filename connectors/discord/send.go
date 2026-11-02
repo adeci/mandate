@@ -124,11 +124,12 @@ FROM containers WHERE id = ?1`, chat).Scan(&kind, &name, &parent, &parts)
 	return approval.Field{}, connector.Invalid("cannot send to a %s; pick a channel, thread or DM", kind)
 }
 
+// withID marks name ~ as chosen by others, once, beside id.
 func withID(name, id string) string {
 	if name == "" {
 		return id
 	}
-	return "~" + name + " (" + id + ")"
+	return "~" + strings.TrimLeft(name, "~") + " (" + id + ")"
 }
 
 // Execute runs on the worker like a read, so a stopped or unlinked connector

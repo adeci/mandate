@@ -26,6 +26,9 @@ import (
 // chats they checked. A chat's cutoff is the earliest of its covering
 // rules', and chats leaves out a chat no rule covers. msgs leaves out
 // messages sent before their chat's cutoff, which makes the grants a union.
+// A rule with an until, a grant whose window has ended, shows only messages
+// sent from its cutoff up to until; bounded marks the chats such a rule
+// covers, so reads, which never carry one, skip the per-rule check.
 // An ancestor's name prefixes a chat's only when the scope covers the
 // ancestor too, so a grant on a thread does not name its channel.
 //
@@ -56,7 +59,7 @@ hidden(id) AS (
   UNION SELECT container_id FROM messages
     WHERE sender_id IN (SELECT id FROM hidden_sender) AND NOT is_from_me
       AND +container_id IN (SELECT id FROM containers WHERE kind = 'dm')),
-rule(cutoff, chats) AS (SELECT value ->> 'cutoff', value ->> 'chats' FROM json_each(?3)),
+rule(cutoff, until, chats) AS (SELECT value ->> 'cutoff', COALESCE(value ->> 'until', ''), value ->> 'chats' FROM json_each(?3)),
 granted(id) AS (SELECT k.value FROM rule AS g CROSS JOIN json_each(g.chats) AS k WHERE g.chats IS NOT NULL),
 named AS (
   SELECT c.id, c.kind, c.last_message_at, c.name AS own,
@@ -77,10 +80,12 @@ covered AS (
   SELECT n.id, n.kind, n.last_message_at,
          iif(n.prefix = '', n.own, n.prefix || ' / ' || COALESCE(n.own, n.id)) AS name,
          (SELECT min(g.cutoff) FROM rule AS g
-          WHERE g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value = n.id)) AS cutoff
+          WHERE g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value = n.id)) AS cutoff,
+         EXISTS (SELECT 1 FROM rule AS g
+          WHERE g.until != '' AND (g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value = n.id))) AS bounded
   FROM named AS n),
 chats AS (
-  SELECT id, kind, last_message_at, cutoff, iif(name_auth, '[login code hidden]', name) AS name, name_auth
+  SELECT id, kind, last_message_at, cutoff, bounded, iif(name_auth, '[login code hidden]', name) AS name, name_auth
   FROM (SELECT *, name IS NOT NULL AND is_auth('', name) AS name_auth FROM covered WHERE cutoff IS NOT NULL)),
 stored AS (
   SELECT m.*, COALESCE(
@@ -89,7 +94,10 @@ stored AS (
      FROM media WHERE message_id = m.id),
     '[' || m.media_type || ']') AS files
   FROM messages AS m JOIN chats AS c ON c.id = m.container_id
-  WHERE COALESCE(m.sender_id, '') NOT IN (SELECT id FROM hidden_sender) AND m.sent_at >= c.cutoff),
+  WHERE COALESCE(m.sender_id, '') NOT IN (SELECT id FROM hidden_sender) AND m.sent_at >= c.cutoff
+    AND (NOT c.bounded OR EXISTS (SELECT 1 FROM rule AS g
+      WHERE (g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value = c.id))
+        AND m.sent_at >= g.cutoff AND (g.until = '' OR m.sent_at <= g.until)))),
 visible AS (
   SELECT *, is_auth(sender_id, concat_ws(' ', files, body)) AS auth FROM stored),
 msgs AS (

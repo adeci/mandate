@@ -68,12 +68,16 @@ type accessChallengeResponse struct {
 	Summary template.HTML `json:"summary"`
 }
 
-// signing is what a challenge kind prepares: the record, what it says, and
-// the grant it replaces and chat names, if any.
+// signing is what a challenge kind prepares: the record, what it says, the
+// agent a grant is for, the access request it answers, the grant it
+// replaces and whether as a resume, and chat names, if any.
 type signing struct {
 	record   []byte
 	summary  template.HTML
+	agent    string
+	request  string
 	replaces string
+	resume   bool
 	names    map[string]string
 }
 
@@ -102,6 +106,7 @@ func (s *Server) accessChallenge(w http.ResponseWriter, r *http.Request, sess se
 	case approval.KindGrant:
 		if req.Request != "" {
 			sg, err = s.requestGrant(ctx, req, now)
+			sg.request = req.Request
 		} else {
 			sg, err = s.newGrant(ctx, req, now)
 		}
@@ -114,7 +119,7 @@ func (s *Server) accessChallenge(w http.ResponseWriter, r *http.Request, sess se
 	}
 	ch := accessChallenge{
 		Nonce: make([]byte, 16), Kind: kind, Record: sg.record, IssuedAt: s.cfg.Now().UTC(), Session: sess.hash,
-		Request: req.Request, Replaces: sg.replaces, Names: sg.names,
+		Agent: sg.agent, Request: sg.request, Replaces: sg.replaces, Resume: sg.resume, Names: sg.names,
 	}
 	rand.Read(ch.Nonce)
 	if err == nil {
@@ -382,7 +387,9 @@ func (s *Server) resumeGrant(ctx context.Context, req accessChallengeRequest, no
 	}
 	next := g.Grant
 	next.ID, next.CreatedAt = rand.Text(), now
-	return s.grantSigning(ctx, a.Name, next, fo, g.Names, g.ID)
+	sg, err := s.grantSigning(ctx, a.Name, next, fo, g.Names, g.ID)
+	sg.resume = true
+	return sg, err
 }
 
 func (s *Server) grantSigning(ctx context.Context, agent string, g approval.Grant, fo bool, names map[string]string, replaces string) (signing, error) {
@@ -390,7 +397,7 @@ func (s *Server) grantSigning(ctx context.Context, agent string, g approval.Gran
 	if err != nil {
 		return signing{}, connector.Invalid("%v", err)
 	}
-	return signing{record: rec, summary: grantSummary(agent, g, fo, names), replaces: replaces, names: names}, nil
+	return signing{record: rec, summary: grantSummary(agent, g, fo, names), agent: g.Agent, replaces: replaces, names: names}, nil
 }
 
 // names reports whether the request named chats, matched or not; one that

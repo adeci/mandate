@@ -1,7 +1,6 @@
 package console
 
 import (
-	"cmp"
 	"fmt"
 	"slices"
 	"strings"
@@ -12,6 +11,9 @@ import (
 
 // sessionGap splits a run of reads of one chat into sessions.
 const sessionGap = 10 * time.Minute
+
+// maxSessions bounds the read sessions one Today page shows.
+const maxSessions = 500
 
 // event is one line of the activity timeline, newest first. Actor is who
 // acted: "you", "agent", "system" for a connector's outcome, or empty for
@@ -28,9 +30,8 @@ type event struct {
 
 // activity says what happened in [from, to) in the owner's terms, one line
 // per event: a request and the grant answering it are one line, a Stop all
-// is one line, and reads are grouped into sessions per agent, connector,
-// chat and kind of read.
-func activity(reads []proposal.ReadEvent, decided []row, asked []accessRequest, grants []grantRow, stops []stop,
+// is one line, and each read session is one line.
+func activity(reads []readSession, decided []row, asked []accessRequest, grants []grantRow, stops []stop,
 	names map[string]string, fo map[string]bool, from, to time.Time,
 ) []event {
 	in := func(t time.Time) bool { return !t.Before(from) && t.Before(to) }
@@ -138,80 +139,42 @@ func activity(reads []proposal.ReadEvent, decided []row, asked []accessRequest, 
 		out = append(out, e)
 	}
 
-	out = append(out, sessions(reads, agent)...)
+	for _, s := range reads {
+		out = append(out, sessionEvent(s, agent(s.AgentID)))
+	}
 	slices.SortStableFunc(out, func(a, b event) int { return b.At.Compare(a.At) })
 	return out
 }
 
-// readKind groups the verbs a read event may carry.
-func readKind(verb string) string {
-	switch verb {
-	case "chats", "sync":
-		return "list"
-	case "search", "guild-search":
-		return "search"
+// sessionEvent says what who did in s; the range shows only for several
+// reads spanning a minute or more.
+func sessionEvent(s readSession, who string) event {
+	conn := connectorTitle(s.Connector)
+	chat := cmpOr(s.ChatName, "a hidden chat")
+	var text string
+	switch s.Kind {
+	case "list":
+		text = fmt.Sprintf("%s listed %s chats", who, conn)
+	case "search":
+		text = fmt.Sprintf("%s searched %s · %s", who, conn, count(s.Items, "result"))
 	case "media":
-		return "media"
+		text = fmt.Sprintf("%s opened %s in %s", who, count(s.Reads, "file"), chat)
+		if s.Reads == 1 {
+			text = fmt.Sprintf("%s opened a file in %s", who, chat)
+		}
+	default:
+		if s.Chat == "" {
+			text = fmt.Sprintf("%s read %s · %s", who, conn, count(s.Items, "item"))
+		} else {
+			text = fmt.Sprintf("%s read %s on %s · %s", who, chat, conn, count(s.Items, "message"))
+		}
 	}
-	return "read"
-}
-
-// sessions groups reads into runs per agent, connector, chat and kind with
-// gaps under sessionGap.
-func sessions(reads []proposal.ReadEvent, agent func(string) string) []event {
-	slices.SortStableFunc(reads, func(a, b proposal.ReadEvent) int {
-		return cmp.Or(cmp.Compare(a.AgentID, b.AgentID), cmp.Compare(a.Connector, b.Connector),
-			cmp.Compare(a.Chat, b.Chat), cmp.Compare(readKind(a.Verb), readKind(b.Verb)), a.At.Compare(b.At))
-	})
-	var out []event
-	var first proposal.ReadEvent
-	var n, items, dropped int
-	var last time.Time
-	flush := func() {
-		if n == 0 {
-			return
-		}
-		who, conn := agent(first.AgentID), connectorTitle(first.Connector)
-		chat := cmpOr(first.ChatName, "a hidden chat")
-		var text string
-		switch readKind(first.Verb) {
-		case "list":
-			text = fmt.Sprintf("%s listed %s chats", who, conn)
-		case "search":
-			text = fmt.Sprintf("%s searched %s · %s", who, conn, count(items, "result"))
-		case "media":
-			text = fmt.Sprintf("%s opened %s in %s", who, count(n, "file"), chat)
-			if n == 1 {
-				text = fmt.Sprintf("%s opened a file in %s", who, chat)
-			}
-		default:
-			if first.Chat == "" {
-				text = fmt.Sprintf("%s read %s · %s", who, conn, count(items, "item"))
-			} else {
-				text = fmt.Sprintf("%s read %s on %s · %s", who, chat, conn, count(items, "message"))
-			}
-		}
-		e := event{At: first.At, Kind: "read", Actor: "agent", Text: text, Dropped: dropped}
-		if n > 1 && last.Sub(first.At) >= time.Minute {
-			e.End = last
-			e.Text += fmt.Sprintf(" · %s–%s", first.At.Local().Format("15:04"), last.Local().Format("15:04"))
-		}
-		out = append(out, e)
+	e := event{At: s.First, Kind: "read", Actor: "agent", Text: text, Dropped: s.Dropped}
+	if s.Reads > 1 && s.Last.Sub(s.First) >= time.Minute {
+		e.End = s.Last
+		e.Text += fmt.Sprintf(" · %s–%s", s.First.Local().Format("15:04"), s.Last.Local().Format("15:04"))
 	}
-	for i, e := range reads {
-		same := i > 0 && e.AgentID == first.AgentID && e.Connector == first.Connector && e.Chat == first.Chat &&
-			readKind(e.Verb) == readKind(first.Verb) && e.At.Sub(last) < sessionGap
-		if !same {
-			flush()
-			first, n, items, dropped = e, 0, 0, 0
-		}
-		n++
-		items += e.Count
-		dropped += e.Dropped
-		last = e.At
-	}
-	flush()
-	return out
+	return e
 }
 
 // sendText names a proposal in sentences: "Grok Bot's WhatsApp message to
