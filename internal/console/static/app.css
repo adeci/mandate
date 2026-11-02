@@ -328,7 +328,9 @@ legend { padding: 0; font-weight: var(--w-medium); color: var(--fg-strong); }
 .meta { font-size: .875em; color: var(--fg-alt); overflow-wrap: anywhere; }
 /* Inputs, selects and buttons share one height, so a row of them lines up. */
 button, .button, .compact, select, input:not([type=checkbox]):not([type=radio]) { min-height: 44px; vertical-align: middle; }
-select { height: auto; }
+/* A fixed height with no vertical padding centres a select's text the way
+   inputs centre theirs. */
+select, input:not([type=checkbox]):not([type=radio]) { height: max(44px, calc(var(--lh) * 2)); padding-block: 0; }
 input[type=checkbox], input[type=radio] { min-width: 22px; min-height: 22px; }
 .tree label, .checks label { min-height: 44px; }
 button, .button { white-space: normal; text-align: center; }
@@ -349,7 +351,7 @@ button.content, .button.content { text-transform: none; font-weight: var(--w-med
 .grantline summary { width: auto; }
 .grantline summary > * { min-width: 0; overflow-wrap: anywhere; }
 /* The proposal's own words, like the cards. */
-dl.fields .message, dl.fields textarea { font-family: var(--content); }
+dl.fields .message, textarea[data-param] { font-family: var(--content); }
 .page-heading { flex-direction: row; flex-wrap: nowrap; align-items: start; }
 .stop-all > summary { width: auto; color: var(--error); border-color: var(--error); }
 .stop-all > summary::before { content: none; }

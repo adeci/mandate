@@ -669,6 +669,10 @@ func TestStopAll(t *testing.T) {
 	ctx := context.Background()
 	agent := h.agent(t, "bot")
 	h.sign(t, accessChallengeRequest{Kind: approval.KindGrant, Agent: agent, Connector: "fake", For: "1h"})
+	h.requestAccess(t, named(agent))
+	h.clock.advance(2 * time.Hour)
+	// Only what is still open, due, or waiting counts.
+	h.sign(t, accessChallengeRequest{Kind: approval.KindGrant, Agent: agent, Connector: "fake", For: "1h"})
 	routine, _ := h.sign(t, accessChallengeRequest{
 		Kind: approval.KindGrant, Agent: agent, Connector: "fake",
 		Schedule: &scheduleRequest{Start: "07:00", Length: "1h", Zone: "UTC"},
@@ -681,11 +685,11 @@ func TestStopAll(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if status, _ := h.post(t, "/access/stop-all", nil); status != http.StatusSeeOther {
-		t.Fatalf("stop all: %d", status)
-	}
-	if _, grants := h.records(t); len(grants) != 0 {
-		t.Fatalf("grants after stop all: %+v", grants)
+	resp := h.do(t, http.MethodPost, "/access/stop-all", h.session, nil)
+	resp.Body.Close()
+	where := resp.Header.Get("Location")
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("stop all: %d", resp.StatusCode)
 	}
 	if st := h.accessStatus(t, ref.ID); st.Status != proposal.AccessDenied {
 		t.Fatalf("request after stop all: %+v", st)
@@ -696,6 +700,17 @@ func TestStopAll(t *testing.T) {
 	d := h.nowJSON(t)
 	if len(d.Waiting) != 1 || d.Waiting[0].Kind != "send" || len(d.Open) != 0 || !slices.Equal(ids(d.Stopped), []string{routine.ID}) {
 		t.Fatalf("now after stop all: %+v", d)
+	}
+	const notice = "Stopped: 2 grants closed, 1 request denied"
+	if _, page := h.page(t, where); !strings.Contains(page, notice) {
+		t.Errorf("%s lacks %q", where, notice)
+	}
+	if _, page := h.page(t, "/?stopped=99"); strings.Contains(page, "Stopped:") {
+		t.Error("a notice for a Stop all that never happened")
+	}
+	h.clock.advance(noticeFor)
+	if _, page := h.page(t, where); strings.Contains(page, "Stopped:") {
+		t.Error("an old Stop all's notice still shows")
 	}
 }
 

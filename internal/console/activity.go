@@ -13,9 +13,9 @@ import (
 // sessionGap splits a run of reads of one chat into sessions.
 const sessionGap = 10 * time.Minute
 
-// event is one line of the activity timeline, newest first. Actor is "you"
-// for what the owner did, else the agent's name, or empty for what simply
-// ran out.
+// event is one line of the activity timeline, newest first. Actor is who
+// acted: "you", "agent", "system" for a connector's outcome, or empty for
+// what simply ran out.
 type event struct {
 	At      time.Time `json:"at"`
 	End     time.Time `json:"end,omitzero"`
@@ -90,7 +90,7 @@ func activity(reads []proposal.ReadEvent, decided []row, asked []accessRequest, 
 			case g.Schedule != nil:
 				add(g.CreatedAt, "grant", "you", fmt.Sprintf("You set up %s's routine: %s", who, grantText(g, fo[g.Connector])))
 			default:
-				add(g.CreatedAt, "grant", "you", fmt.Sprintf("You opened %s for %s", grantText(g, fo[g.Connector]), who))
+				add(g.CreatedAt, "grant", "you", fmt.Sprintf("You opened %s's access to %s", who, grantText(g, fo[g.Connector])))
 			}
 		}
 		switch {
@@ -124,12 +124,12 @@ func activity(reads []proposal.ReadEvent, decided []row, asked []accessRequest, 
 				e.Actor, e.Text = "you", "You denied "+what
 			}
 		case proposal.Failed:
-			e.Actor, e.Text = "you", upperFirst(what)+" failed"
+			e.Actor, e.Text = "system", upperFirst(what)+" failed"
 			if pr.Result != nil && pr.Result.Detail != "" {
 				e.Text += ": " + cut(pr.Result.Detail, 60)
 			}
 		case proposal.Unknown:
-			e.Actor, e.Text = "you", upperFirst(what)+" may or may not have gone out"
+			e.Actor, e.Text = "system", upperFirst(what)+" may or may not have gone out"
 		case proposal.Expired:
 			e.Text = upperFirst(what) + " expired"
 		default:
@@ -191,7 +191,7 @@ func sessions(reads []proposal.ReadEvent, agent func(string) string) []event {
 				text = fmt.Sprintf("%s read %s on %s · %s", who, chat, conn, count(items, "message"))
 			}
 		}
-		e := event{At: first.At, Kind: "read", Actor: who, Text: text, Dropped: dropped}
+		e := event{At: first.At, Kind: "read", Actor: "agent", Text: text, Dropped: dropped}
 		if n > 1 && last.Sub(first.At) >= time.Minute {
 			e.End = last
 			e.Text += fmt.Sprintf(" · %s–%s", first.At.Local().Format("15:04"), last.Local().Format("15:04"))

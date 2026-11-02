@@ -564,9 +564,10 @@ function requestCard(card) {
 function countdowns() {
   for (const el of $$("[data-left]")) {
     const s = Math.max(0, Math.round((Date.parse(el.dataset.left) - Date.now()) / 1000));
-    const h = Math.floor(s / 3600);
+    const d = Math.floor(s / 86400);
+    const h = Math.floor(s / 3600) % 24;
     const m = Math.floor(s / 60) % 60;
-    el.textContent = s ? `${h ? `${h}h ` : ""}${m}m left` : "closed";
+    el.textContent = !s ? "closed" : d ? `${d}d ${h}h left` : `${h ? `${h}h ` : ""}${m}m left`;
   }
   for (const el of $$("[data-ago]")) {
     const m = Math.floor((Date.now() - Date.parse(el.dataset.ago)) / 60000);

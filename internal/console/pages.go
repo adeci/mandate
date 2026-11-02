@@ -35,6 +35,7 @@ var templates = template.Must(template.New("").Funcs(template.FuncMap{
 	"shortID": shortID,
 	"visible": visible,
 	"tone":    tone,
+	"word":    statusWord,
 }).Parse(pagesHTML))
 
 // csp allows only the embedded script and stylesheet: no inline code, no

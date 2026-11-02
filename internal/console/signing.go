@@ -558,7 +558,7 @@ func (s *Server) stopAll(w http.ResponseWriter, r *http.Request, sess session) {
 		return
 	}
 	s.cfg.Log.Info("stopped all access", "grants", st.Grants, "requests", st.Requests, "by", sess.who())
-	http.Redirect(w, r, fmt.Sprintf("/?stopped=%d.%d", st.Grants, st.Requests), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/?stopped=%d", st.ID), http.StatusSeeOther)
 }
 
 // endAccess answers a session-only change by going back to the page it

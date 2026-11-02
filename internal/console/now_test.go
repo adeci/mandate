@@ -106,6 +106,10 @@ func TestActivityInOwnersTerms(t *testing.T) {
 		Schedule:  &approval.Schedule{Days: []time.Weekday{1, 2, 3, 4, 5}, Start: "07:00", Length: 20 * time.Minute, Zone: "UTC"},
 		CreatedAt: at(8, 0),
 	}, Names: map[string]string{"in": "Inbox"}, RevokedAt: at(9, 0), EndedBy: "close"}
+	opened := grantRow{Grant: approval.Grant{
+		ID: "g4", Agent: "a", Connector: "signal", Chats: []string{"fam", "pr"},
+		Horizon: 7 * 24 * time.Hour, From: at(20, 0), Until: at(24, 0), CreatedAt: at(20, 0),
+	}, Names: map[string]string{"fam": "Family", "pr": "Priya Raman"}}
 	asked := []accessRequest{
 		{AccessRequest: proposal.AccessRequest{AgentName: "Grok Bot", Connector: "signal"}, Status: proposal.AccessGranted, GrantID: "g1", DecidedAt: at(21, 0)},
 		{AccessRequest: proposal.AccessRequest{AgentName: "Grok Bot", Connector: "signal", Extend: true}, Extends: "g1", Status: proposal.AccessGranted, GrantID: "g2", DecidedAt: at(21, 30)},
@@ -147,7 +151,7 @@ func TestActivityInOwnersTerms(t *testing.T) {
 		},
 	}
 	stops := []stop{{At: at(12, 0), Grants: 3, Requests: 1}}
-	got := activity(reads, decided, asked, []grantRow{window, longer, routine}, stops, names, map[string]bool{}, day, day.Add(24*time.Hour))
+	got := activity(reads, decided, asked, []grantRow{window, longer, routine, opened}, stops, names, map[string]bool{}, day, day.Add(24*time.Hour))
 	var texts []string
 	for _, e := range got {
 		texts = append(texts, e.Text)
@@ -160,6 +164,7 @@ func TestActivityInOwnersTerms(t *testing.T) {
 		"Grok Bot searched Signal · 3 results",
 		"Grok Bot listed Signal chats",
 		"You let Grok Bot read Signal · Family · 1 hour · last 7 days",
+		"You opened Grok Bot's access to Signal · Family, Priya Raman · 4 hours · last 7 days",
 		"Grok Bot's WhatsApp message to ~Lena failed: not on WhatsApp",
 		"You denied Grok Bot's WhatsApp message to ~Lena",
 		"You sent Grok Bot's WhatsApp message to ~Lena",
@@ -176,6 +181,9 @@ func TestActivityInOwnersTerms(t *testing.T) {
 		if e.Text == want[1] && e.Dropped != 2 {
 			t.Errorf("session dropped = %d", e.Dropped)
 		}
+		if strings.HasSuffix(e.Text, "failed: not on WhatsApp") && e.Actor != "system" {
+			t.Errorf("a failed send is marked %q", e.Actor)
+		}
 	}
 }
 
@@ -186,6 +194,7 @@ func TestWords(t *testing.T) {
 		"+4915123456789":               "+49 151 2345 6789",
 		"120363041234567890@g.us":      "…567890",
 		"1234567890123456789":          "…456789",
+		"AbCdEfGhIjKlAxOQ==":           "…KlAxOQ",
 		"c1":                           "c1",
 	} {
 		if got := shortID(id); got != want {

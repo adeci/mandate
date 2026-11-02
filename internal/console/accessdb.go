@@ -210,17 +210,31 @@ func (d *db) revokeGrant(ctx context.Context, id string, now time.Time) error {
 
 // stop is one Stop all: when, and what it ended.
 type stop struct {
+	ID               int64
 	At               time.Time
 	Grants, Requests int
 }
 
-// stopAll revokes every live grant and denies every waiting access request,
-// and records that it did.
+// stopAll revokes every grant open now or still to run and denies every
+// access request still waiting, and records that it did. Grants that ran
+// out stay as they ended.
 func (d *db) stopAll(ctx context.Context, now time.Time) (stop, error) {
 	st := stop{At: now}
 	err := d.tx(ctx, func(tx *sql.Tx) error {
+		live, err := liveGrantIDs(ctx, tx, now)
+		if err != nil {
+			return err
+		}
+		for _, id := range live {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE grants SET revoked_at = ?, signed = NULL, ended_by = 'stop' WHERE id = ?`, ms(now), id); err != nil {
+				return err
+			}
+		}
+		st.Grants = len(live)
 		res, err := tx.ExecContext(ctx, `
-			UPDATE grants SET revoked_at = ?, signed = NULL, ended_by = 'stop' WHERE revoked_at IS NULL`, ms(now))
+			UPDATE access_requests SET status = 'denied', decided_at = ?1, decided_by = 'stop'
+			WHERE status = 'pending' AND expires_at > ?1`, ms(now))
 		if err != nil {
 			return err
 		}
@@ -228,26 +242,64 @@ func (d *db) stopAll(ctx context.Context, now time.Time) (stop, error) {
 		if err != nil {
 			return err
 		}
-		st.Grants = int(n)
-		res, err = tx.ExecContext(ctx, `
-			UPDATE access_requests SET status = 'denied', decided_at = ?, decided_by = 'stop'
-			WHERE status = 'pending'`, ms(now))
+		st.Requests = int(n)
+		res, err = tx.ExecContext(ctx, `INSERT INTO stops (at, grants, requests) VALUES (?, ?, ?)`, ms(now), st.Grants, st.Requests)
 		if err != nil {
 			return err
 		}
-		if n, err = res.RowsAffected(); err != nil {
-			return err
-		}
-		st.Requests = int(n)
-		_, err = tx.ExecContext(ctx, `INSERT INTO stops (at, grants, requests) VALUES (?, ?, ?)`, ms(now), st.Grants, st.Requests)
+		st.ID, err = res.LastInsertId()
 		return err
 	})
 	return st, err
 }
 
+// liveGrantIDs returns the unrevoked grants open at now or due to open
+// later.
+func liveGrantIDs(ctx context.Context, tx *sql.Tx, now time.Time) ([]string, error) {
+	rs, err := tx.QueryContext(ctx, `SELECT id, record FROM grants WHERE revoked_at IS NULL AND record IS NOT NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rs.Close()
+	var ids []string
+	for rs.Next() {
+		var (
+			id     string
+			record []byte
+		)
+		if err := rs.Scan(&id, &record); err != nil {
+			return nil, err
+		}
+		g, err := approval.DecodeGrant(record)
+		if err != nil {
+			return nil, fmt.Errorf("grant %s: %w", id, err)
+		}
+		if open, at := g.Open(now); open || !at.IsZero() {
+			ids = append(ids, id)
+		}
+	}
+	return ids, rs.Err()
+}
+
 // stopsBetween returns the Stop alls in [from, to).
 func (d *db) stopsBetween(ctx context.Context, from, to time.Time) ([]stop, error) {
-	rs, err := d.sql.QueryContext(ctx, `SELECT at, grants, requests FROM stops WHERE at >= ? AND at < ?`, ms(from), ms(to))
+	return d.queryStops(ctx, `at >= ? AND at < ?`, ms(from), ms(to))
+}
+
+// stopByID returns one Stop all, or errNotFound.
+func (d *db) stopByID(ctx context.Context, id int64) (stop, error) {
+	stops, err := d.queryStops(ctx, `rowid = ?`, id)
+	if err != nil {
+		return stop{}, err
+	}
+	if len(stops) == 0 {
+		return stop{}, errNotFound
+	}
+	return stops[0], nil
+}
+
+func (d *db) queryStops(ctx context.Context, cond string, args ...any) ([]stop, error) {
+	rs, err := d.sql.QueryContext(ctx, `SELECT rowid, at, grants, requests FROM stops WHERE `+cond, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -258,7 +310,7 @@ func (d *db) stopsBetween(ctx context.Context, from, to time.Time) ([]stop, erro
 			st stop
 			at int64
 		)
-		if err := rs.Scan(&at, &st.Grants, &st.Requests); err != nil {
+		if err := rs.Scan(&st.ID, &at, &st.Grants, &st.Requests); err != nil {
 			return nil, err
 		}
 		st.At = fromMS(at)

@@ -238,8 +238,12 @@ func dayName(day, today time.Time) string {
 	return day.Format("Mon 2 Jan")
 }
 
-// notice says what the owner just did, from what the redirect after it
-// carries; it reads only numbers and IDs from the URL, never text.
+// noticeFor is how long after an action its notice still shows.
+const noticeFor = 10 * time.Minute
+
+// notice says what the owner just did. The redirect after it carries only
+// the ID of what changed; the words come from what is stored, and only
+// while it is recent.
 func (s *Server) notice(ctx context.Context, q map[string][]string) string {
 	get := func(k string) string {
 		if v := q[k]; len(v) > 0 {
@@ -247,16 +251,15 @@ func (s *Server) notice(ctx context.Context, q map[string][]string) string {
 		}
 		return ""
 	}
-	if v := get("stopped"); v != "" {
-		g, r, _ := strings.Cut(v, ".")
-		grants, err1 := strconv.Atoi(g)
-		requests, err2 := strconv.Atoi(r)
-		if err1 == nil && err2 == nil {
-			return fmt.Sprintf("Stopped: %s closed, %s denied", count(grants, "grant"), count(requests, "request"))
+	now := s.now()
+	recent := func(t time.Time) bool { return !t.IsZero() && now.Sub(t) < noticeFor }
+	if id, err := strconv.ParseInt(get("stopped"), 10, 64); err == nil {
+		if st, err := s.db.stopByID(ctx, id); err == nil && recent(st.At) {
+			return fmt.Sprintf("Stopped: %s closed, %s denied", count(st.Grants, "grant"), count(st.Requests, "request"))
 		}
 	}
 	if id := get("denied"); id != "" {
-		if pr, err := s.db.get(ctx, id); err == nil {
+		if pr, err := s.db.get(ctx, id); err == nil && pr.Status == proposal.Rejected && pr.DecidedBy != "agent deleted" && recent(pr.DecidedAt) {
 			return "You denied " + sendText(pr) + "."
 		}
 	}
@@ -328,12 +331,17 @@ func endedState(g grantRow) string {
 	return "closed"
 }
 
-// moment is a time as a clock today and with its date otherwise.
+// moment is a time as a clock today, with its weekday within the week
+// around now, and with its date otherwise.
 func moment(t, now time.Time) string {
-	if startOfDay(t).Equal(startOfDay(now)) {
+	day, today := startOfDay(t), startOfDay(now)
+	switch {
+	case day.Equal(today):
 		return t.Local().Format("15:04")
+	case day.After(today.AddDate(0, 0, -7)) && day.Before(today.AddDate(0, 0, 7)):
+		return t.Local().Format("Mon 15:04")
 	}
-	return t.Local().Format(stamp)
+	return t.Local().Format("Mon 2 Jan 15:04")
 }
 
 // requestCard shows an access request. Only an unambiguous request starts

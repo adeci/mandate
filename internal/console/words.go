@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/adeci/mandate/approval"
 	"github.com/adeci/mandate/internal/proposal"
@@ -88,20 +89,35 @@ func span(d time.Duration) string {
 }
 
 // shortID is enough of a chat's ID to tell two chats of one name apart: a
-// DM's phone number, or the last 6 characters.
+// DM's phone number, or the last 6 letters and digits, past any base64
+// padding.
 func shortID(id string) string {
 	local, domain, _ := strings.Cut(id, "@")
 	if phone := strings.TrimPrefix(local, "+"); isDigits(phone) && len(phone) >= 8 && len(phone) <= 15 &&
 		(domain == "" && phone != local || domain == "s.whatsapp.net" || domain == "c.us") {
 		return formatPhone(phone)
 	}
-	if domain != "" && len(local) > 6 {
-		return "…" + local[len(local)-6:]
+	base := id
+	if domain != "" {
+		base = local
 	}
-	if r := []rune(id); len(r) > 6 {
+	r := []rune(strings.TrimRightFunc(base, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }))
+	if len(r) > 6 {
 		return "…" + string(r[len(r)-6:])
 	}
 	return id
+}
+
+// statusWord says a proposal status in the owner's words.
+func statusWord(status any) string {
+	switch s := fmt.Sprint(status); s {
+	case "rejected":
+		return "denied"
+	case "pending":
+		return "waiting"
+	default:
+		return s
+	}
 }
 
 func isDigits(s string) bool {

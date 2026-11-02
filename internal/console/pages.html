@@ -49,7 +49,7 @@
 </html>
 {{end}}
 
-{{define "status"}}<span class="status" data-tone="{{tone .}}">{{.}}</span>{{end}}
+{{define "status"}}<span class="status" data-tone="{{tone .}}">{{word .}}</span>{{end}}
 
 {{define "error"}}{{template "top" .}}
 <h1>Error</h1>
@@ -99,7 +99,7 @@
   <h1>{{.Title}}</h1>
   {{template "status" .Status}}
 </div>
-<p class="muted">{{if .Pending}}expires {{when .ExpiresAt}}{{else if .DecidedBy}}{{if eq .Status "rejected"}}denied{{else}}approved{{end}} by {{.DecidedBy}} {{when .DecidedAt}}{{else}}{{.Status}} {{when .DecidedAt}}{{end}} · asked {{when .CreatedAt}}{{with .AgentName}} from {{.}}{{end}}</p>
+<p class="muted">{{if .Pending}}expires {{when .ExpiresAt}}{{else if .DecidedBy}}{{if eq .Status "rejected"}}denied{{else}}approved{{end}} by {{.DecidedBy}} {{when .DecidedAt}}{{else}}{{word .Status}} {{when .DecidedAt}}{{end}} · asked {{when .CreatedAt}}{{with .AgentName}} from {{.}}{{end}}</p>
 
 <section class="panel request">
   {{template "fields" .Fields}}
@@ -449,7 +449,7 @@
 <h2>{{.Day}}</h2>
 {{with .Today}}
 <ul class="timeline">
-{{range .}}<li data-kind="{{.Kind}}"><span class="meta">{{clock .At}}{{if eq .Actor "you"}} · <span class="actor" data-actor="you">you</span>{{else if .Actor}} · <span class="actor" data-actor="agent">agent</span>{{end}}</span>
+{{range .}}<li data-kind="{{.Kind}}"><span class="meta">{{clock .At}}{{with .Actor}} · <span class="actor" data-actor="{{.}}">{{.}}</span>{{end}}</span>
   {{if .URL}}<a class="content" href="{{.URL}}">{{.Text}}</a>{{else}}<span class="content">{{.Text}}</span>{{end}}
   {{- with .Dropped}} <span class="status" data-tone="alert">{{.}} read{{if ne . 1}}s{{end}} not logged</span>{{end}}</li>
 {{end}}
