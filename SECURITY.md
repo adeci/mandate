@@ -25,9 +25,10 @@ What each part is trusted with:
 ## What to do as the owner
 
 - Hide chats that carry login codes or anything agents shouldn't read. The
-  login-code filter is a heuristic. The gateway logs hidden IDs that match
-  nothing, which catches typos and WhatsApp's two IDs per contact (phone
-  number and LID).
+  login-code filter is a heuristic over message text, chat names and file
+  names; a code inside a picture gets through. The gateway logs hidden IDs
+  that match nothing, which catches typos and WhatsApp's two IDs per contact
+  (phone number and LID).
 - Run agents on a machine that has no SSH keys, ssh-agent or secrets for your
   other machines, so a prompt-injected agent can do no more than the token
   allows.
@@ -36,17 +37,18 @@ What each part is trusted with:
 - Read recipients by their ID. A name starting with `~` was chosen by that
   person or a group member, not by you.
 - Back up `/var/lib/mandate-*` encrypted. The databases hold your full message
-  history in plain text, and the keys to fetch its photos and files.
+  history in plain text, and per-file keys to fetch its photos and files;
+  clearing the `media` table's `ref` column in the copies keeps those out.
 
 ## Known limits
 
 - **Script on the console origin**, for example from a browser extension,
   can do whatever your session can: approve anything while the tab is
-  unlocked, read pending requests, unlink accounts, or replace a linking QR
-  code. A passkey prompt names the site, not the action, so the script can
-  also turn your next touch into approving a key it registered, which lasts
-  until you remove it. Your passkey manager is trusted further still: it
-  holds the keys.
+  unlocked, read pending requests, unlink accounts, replace a linking QR
+  code, or read a token or Google cookies as you paste them. A passkey prompt
+  names the site, not the action, so the script can also turn your next touch
+  into approving a key it registered, which lasts until you remove it. Your
+  passkey manager is trusted further still: it holds the keys.
 - **First key.** A connector with no key log, after a fresh install or
   `mandate-reset-keys`, accepts the first log the console sends it.
 - **One token** gives every agent the same access, with no per-agent scope.
@@ -55,6 +57,11 @@ What each part is trusted with:
 - **Identity key changes** on WhatsApp and Signal are accepted as the
   official apps accept them. A change in the last 7 days shows on the
   approval, and a change after you approve makes the send refuse.
+- **Email senders**: a From header proves nothing. Fastmail mail counts as
+  yours only when it sits in Sent.
+- **Google Messages** pairs with a Google session. Pair it with a Google
+  account that holds nothing else, set in Messages on the phone; its cookies
+  can act as that account.
 - **Matrix**: messages under keys that don't trace back to a cross-signed
   device start with `[unverified]`, and plaintext in encrypted rooms with
   `[unencrypted]`. mandate shares room keys only with cross-signed devices
