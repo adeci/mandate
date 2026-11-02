@@ -101,6 +101,8 @@ var columns = []struct{ table, name, decl string }{
 	{"access_challenges", "names", "TEXT NOT NULL DEFAULT '{}'"},
 	{"access_challenges", "replaces", "TEXT NOT NULL DEFAULT ''"},
 	{"reads", "chat_name", "TEXT NOT NULL DEFAULT ''"},
+	{"grants", "ended_by", "TEXT NOT NULL DEFAULT ''"},
+	{"access_requests", "decided_by", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // migrate adds columns, the indexes on them, and the grant records that

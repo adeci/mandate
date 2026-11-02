@@ -551,14 +551,14 @@ func (s *Server) denyAccess(w http.ResponseWriter, r *http.Request, sess session
 // stopAll closes every grant and denies every access request; proposals
 // each still wait for a passkey.
 func (s *Server) stopAll(w http.ResponseWriter, r *http.Request, sess session) {
-	grants, requests, err := s.db.stopAll(r.Context(), s.now())
+	st, err := s.db.stopAll(r.Context(), s.now())
 	if err != nil {
 		s.cfg.Log.Error("stop all", "err", err)
 		s.errorPage(w, http.StatusInternalServerError, "Couldn't stop everything.")
 		return
 	}
-	s.cfg.Log.Info("stopped all access", "grants", grants, "requests", requests, "by", sess.who())
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	s.cfg.Log.Info("stopped all access", "grants", st.Grants, "requests", st.Requests, "by", sess.who())
+	http.Redirect(w, r, fmt.Sprintf("/?stopped=%d.%d", st.Grants, st.Requests), http.StatusSeeOther)
 }
 
 // endAccess answers a session-only change by going back to the page it

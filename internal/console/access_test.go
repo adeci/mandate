@@ -190,7 +190,7 @@ func TestAccessRequestLifecycle(t *testing.T) {
 	for _, want := range []string{
 		`id="request-` + ref.ID + `"`, `<strong class="content">Grok Bot</strong> wants to read`,
 		`<input type="checkbox" value="t1"> <span class="content">cats</span>`, `~Mom`, `no visible chat matched "lawyer"`,
-		"summarise the week", "Approve · 2h · no chats yet · 7d",
+		"summarise the week", `data-span="2 hours" disabled>Approve</button>`, "tick the chats to grant",
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("Now lacks %s", want)
@@ -587,7 +587,7 @@ func TestPreTicking(t *testing.T) {
 		}
 	}
 	// Only the DM under a name the owner gave it, the one chat that matched.
-	if len(ticked) != 1 || ticked["d2"] != "Approve · 1h · Dad · all" {
+	if len(ticked) != 1 || ticked["d2"] != "Approve · 1 hour · Dad · all history" {
 		t.Fatalf("ticked = %v", ticked)
 	}
 }
@@ -633,7 +633,7 @@ func TestRoutinePauseResume(t *testing.T) {
 		Schedule: &proposal.RequestSchedule{Days: []time.Weekday{1, 2, 3, 4, 5}, Start: "07:00", Length: 20 * time.Minute},
 		Reason:   "morning summary",
 	})
-	if w := h.nowJSON(t).Waiting; len(w) != 1 || w[0].Kind != "routine" || w[0].When != "weekdays at 07:00 for 20 minutes (your time zone)" {
+	if w := h.nowJSON(t).Waiting; len(w) != 1 || w[0].Kind != "routine" || w[0].When != "weekdays 07:00 for 20 min (your time zone)" {
 		t.Fatalf("waiting = %+v", w)
 	}
 	if status, _, _ := h.accessChallenge(t, accessChallengeRequest{Kind: approval.KindGrant, Request: ref.ID, Chats: []string{"c2"}}); status != http.StatusBadRequest {

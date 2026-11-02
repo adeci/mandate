@@ -12,6 +12,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"sync"
 	"time"
@@ -591,7 +592,7 @@ func (s *Server) deny(w http.ResponseWriter, r *http.Request, sess session) {
 		return
 	}
 	s.cfg.Log.Info("denied", "id", id, "by", sess.who())
-	http.Redirect(w, r, "/r/"+id, http.StatusSeeOther)
+	http.Redirect(w, r, "/?denied="+url.QueryEscape(id), http.StatusSeeOther)
 }
 
 func (s *Server) remove(w http.ResponseWriter, r *http.Request, sess session) {

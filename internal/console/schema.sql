@@ -123,3 +123,10 @@ CREATE TABLE IF NOT EXISTS reads (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS reads_by_at ON reads (at);
+
+-- Each Stop all, for the activity timeline.
+CREATE TABLE IF NOT EXISTS stops (
+    at       INTEGER NOT NULL,
+    grants   INTEGER NOT NULL,
+    requests INTEGER NOT NULL
+) STRICT;

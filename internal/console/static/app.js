@@ -361,30 +361,42 @@ async function newAgent(form) {
   const res = await signAccess({ kind: "agent", name, token_sha256: tokenSHA256 }, $(".msg", form));
   const sheet = $("#agent-setup");
   const d = sheet.dataset;
-  const values = [];
-  if (d.gatewayUrl) values.push(`MANDATE_URL=${d.gatewayUrl}`);
-  values.push(`MANDATE_TOKEN=${token}`);
-  values.push(
-    `curl -LO ${d.releaseUrl}/mandate-linux-amd64 && curl -LO ${d.releaseUrl}/SHA256SUMS && sha256sum --ignore-missing -c SHA256SUMS`,
-  );
-  values.push(d.skillUrl);
-  $("[data-setup-values]", sheet).replaceChildren(
-    ...values.map((v) => {
+  const install =
+    `curl -LO ${d.releaseUrl}/mandate-linux-amd64 && curl -LO ${d.releaseUrl}/SHA256SUMS && ` +
+    "sha256sum --ignore-missing -c SHA256SUMS && install -m755 mandate-linux-amd64 ~/bin/mandate";
+  const rows = [];
+  if (d.gatewayUrl) rows.push(["URL", `MANDATE_URL=${d.gatewayUrl}`]);
+  rows.push(["Token", `MANDATE_TOKEN=${token}`], ["Install", install], ["Skill", d.skillUrl]);
+  const all = [];
+  if (d.gatewayUrl) all.push(`MANDATE_URL=${d.gatewayUrl}`);
+  all.push(`MANDATE_TOKEN=${token}`, "# install", install, "# skill", d.skillUrl);
+  const copyButton = (text, label = "Copy") => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    b.addEventListener("click", async () => {
+      await navigator.clipboard.writeText(text);
+      b.textContent = "Copied";
+      setTimeout(() => (b.textContent = label), 2000);
+    });
+    return b;
+  };
+  const list = $("[data-setup-values]", sheet);
+  list.replaceChildren(
+    ...rows.map(([name, value]) => {
       const row = document.createElement("div");
-      row.className = "row";
-      const input = document.createElement("input");
-      input.readOnly = true;
-      input.className = "copy";
-      // A changed input also keeps watch() from reloading the token away.
-      input.value = v;
-      const copy = document.createElement("button");
-      copy.type = "button";
-      copy.textContent = "Copy";
-      copy.addEventListener("click", () => navigator.clipboard.writeText(v));
-      row.append(input, copy);
+      row.className = "setup-row";
+      const label = document.createElement("span");
+      label.className = "setup-label";
+      label.textContent = name;
+      const code = document.createElement("code");
+      code.className = "setup-value";
+      code.textContent = value;
+      row.append(label, code, copyButton(value));
       return row;
     }),
   );
+  list.append(copyButton(all.join("\n"), "Copy all"));
   for (const el of $$("[data-setup-name]", sheet)) el.textContent = name;
   form.hidden = true;
   sheet.hidden = false;
@@ -419,8 +431,8 @@ function tree(nodes, checkFirst) {
     text.innerHTML = n.label;
     const meta = document.createElement("span");
     meta.className = "meta";
-    const when = n.last_activity ? new Date(n.last_activity).toLocaleString() : "";
-    meta.textContent = [n.kind, when, n.id].filter(Boolean).join(" · ");
+    meta.title = n.id;
+    meta.textContent = n.meta;
     label.append(box, " ", text, " ", meta);
     li.append(label);
     if (n.children && n.children.length) li.append(tree(n.children, false));
@@ -509,44 +521,42 @@ async function approveAccess(card) {
   await reload();
 }
 
-// goShort turns a Go duration such as 168h0m0s into the server's short
-// form, 7d; zero is all history.
-function goShort(v) {
-  const h = Number((v.match(/(\d+)h/) || [0, 0])[1]);
-  const m = Number((v.match(/(\d+)m/) || [0, 0])[1]);
-  if (!h && !m) return "all";
-  if (!m && h % 24 === 0) return `${h / 24}d`;
-  return m ? `${h * 60 + m}m` : `${h}h`;
-}
-
 // requestCard wires Adjust, the picker for a request for every chat, and
-// keeps the Approve button naming what it signs.
+// keeps the Approve button naming what it signs; with no chat ticked it
+// stays off.
 function requestCard(card) {
   const approve = $("[data-approve-access]", card);
   const adjust = $("[data-adjust]", card);
   const panel = $("[data-adjust-panel]", card);
   if (adjust && panel) adjust.addEventListener("click", () => (panel.hidden = !panel.hidden));
-  if (card.dataset.chats === "every") {
-    card.picker = picker($("[data-chat-picker]", card), () => card.dataset.connector, $(".msg", card));
+  const pickerRoot = $("[data-chat-picker]", card);
+  if (card.dataset.chats === "every" && pickerRoot) {
+    card.picker = picker(pickerRoot, () => card.dataset.connector, $(".msg", card));
     for (const radio of $$("input[type=radio]", card)) {
       radio.addEventListener("change", () => card.picker.show($("input[value=pick]", card).checked));
     }
   }
   if (!approve || card.dataset.card === "extend") return;
+  const hint = $("[data-tick-hint]", card);
+  const optionText = (sel) => sel.selectedOptions[0].textContent;
   const label = () => {
     const forSel = $("select[name=for]", card);
-    const parts = ["Approve", forSel ? goShort(forSel.value) : approve.dataset.window];
+    const parts = ["Approve", forSel ? optionText(forSel) : approve.dataset.span];
     const chats = cardChats(card);
+    const ready = chats === undefined || chats.length > 0;
     if (card.dataset.chats === "none") parts.push("allowlisted reads");
     else if (chats === undefined) parts.push("every chat");
     else if (chats.length === 1) parts.push($(`input[value="${CSS.escape(chats[0])}"]`, card).closest("label").querySelector(".content").textContent);
-    else parts.push(chats.length ? `${chats.length} chats` : "no chats yet");
+    else parts.push(`${chats.length} chats`);
     const horizon = $("select[name=horizon]", card);
-    if (horizon) parts.push(goShort(horizon.value));
-    approve.textContent = parts.join(" · ");
+    if (horizon) parts.push(optionText(horizon));
+    approve.textContent = ready ? parts.join(" · ") : "Approve";
+    approve.disabled = !ready;
+    if (hint) hint.hidden = ready;
   };
   card.addEventListener("change", label);
   card.addEventListener("click", (ev) => ev.target.closest("[data-picked]") && label());
+  approve.label = label;
 }
 
 // countdowns shows time left on open windows and how long ago agents were
@@ -752,7 +762,10 @@ function busy(el, action) {
 // The owner is in the middle of something a reload would lose.
 const engaged = () =>
   pending !== null ||
-  $("#review:not([hidden]), .linking:not([hidden]), button:disabled, input:focus, textarea:focus, select:focus") ||
+  $(
+    "#review:not([hidden]), .linking:not([hidden]), #agent-setup:not([hidden]), details.stop-all[open], " +
+      "button:disabled:not([data-approve-access]), input:focus, textarea:focus, select:focus",
+  ) ||
   $$("input:not([type=hidden]), textarea").some((el) => el.value !== el.defaultValue);
 
 // Reloads after something changed elsewhere, e.g. a key approved on another
@@ -883,37 +896,51 @@ function bind() {
     }
   }
 
-  const agentForm = $("#new-agent");
-  if (agentForm) agentForm.addEventListener("submit", busy(agentForm, () => newAgent(agentForm)));
-  const done = $("[data-setup-done]");
-  if (done) done.addEventListener("click", () => location.reload());
-  for (const card of $$("[data-card]")) {
-    if (card.dataset.card === "send") continue;
+  each($$("#new-agent"), (form) => form.addEventListener("submit", busy(form, () => newAgent(form))));
+  each($$("[data-setup-done]"), (b) => b.addEventListener("click", () => location.reload()));
+  each($$("[data-cancel-stop]"), (b) => b.addEventListener("click", () => (b.closest("details").open = false)));
+  each($$("[data-card]"), (card) => {
+    if (card.dataset.card === "send") return;
     requestCard(card);
     const button = $("[data-approve-access]", card);
-    if (button) button.addEventListener("click", busy(button, () => approveAccess(card)));
-  }
-  for (const button of $$("[data-extend]")) {
+    if (button) {
+      button.addEventListener("click", busy(button, () => approveAccess(card)));
+      // busy enables it again afterwards; the ticks decide.
+      button.addEventListener("click", () => setTimeout(() => button.label && button.label(), 0));
+    }
+  });
+  each($$("[data-extend]"), (button) => {
     const body = { kind: "extend", grant: button.dataset.extend, for: "30m" };
     button.addEventListener("click", busy(button, async () => {
       await signAccess(body, $(".msg", button.closest("[data-access]")));
       await reload();
     }));
-  }
-  for (const button of $$("[data-resume]")) {
+  });
+  each($$("[data-resume]"), (button) => {
     const body = { kind: "resume", grant: button.dataset.resume };
     button.addEventListener("click", busy(button, async () => {
       await signAccess(body, $(".msg", button.closest("[data-access]")));
       await reload();
     }));
-  }
-  const grant = $("#new-grant");
-  if (grant) {
-    grantForm(grant);
-    grant.addEventListener("submit", busy(grant, () => newGrant(grant)));
-  }
+  });
+  each($$("#new-grant"), (form) => {
+    grantForm(form);
+    form.addEventListener("submit", busy(form, () => newGrant(form)));
+  });
 
-  for (const button of $$("button[data-confirm]")) {
+  each($$("button[data-confirm]"), (button) => {
     button.addEventListener("click", confirmFirst(button, button.dataset.confirm, async () => button.form.submit()));
+  });
+}
+
+// each sets up every element on its own, so one that fails leaves the
+// rest of the page working.
+function each(els, fn) {
+  for (const el of els) {
+    try {
+      fn(el);
+    } catch (e) {
+      console.error(e);
+    }
   }
 }

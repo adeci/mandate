@@ -37,6 +37,8 @@ type chatNode struct {
 	More int `json:"more,omitempty"`
 	// Ticked starts ticked on an approval card.
 	Ticked bool `json:"ticked,omitempty"`
+	// Meta is its kind, last activity and short ID, as rows show them.
+	Meta string `json:"meta"`
 }
 
 // chatLabel is a chat's name and ID for the passkey summary, escaped with
@@ -46,7 +48,18 @@ func chatLabel(name, id string) template.HTML {
 }
 
 func chatNodeOf(c connector.Container) chatNode {
-	return chatNode{ID: c.ID, Name: c.Name, Label: visible(cmpOr(c.Name, c.ID)), Kind: c.Kind, LastActivity: c.LastActivity}
+	meta := []string{}
+	if c.Kind != "" {
+		meta = append(meta, c.Kind)
+	}
+	if !c.LastActivity.IsZero() {
+		meta = append(meta, c.LastActivity.Local().Format(stamp))
+	}
+	meta = append(meta, shortID(c.ID))
+	return chatNode{
+		ID: c.ID, Name: c.Name, Label: visible(cmpOr(c.Name, c.ID)), Kind: c.Kind, LastActivity: c.LastActivity,
+		Meta: strings.Join(meta, " · "),
+	}
 }
 
 func (s *Server) conn(name string) (*conn, error) {
@@ -126,7 +139,7 @@ func (s *Server) children(ctx context.Context, name, parent string, depth int, b
 // chatTree is chat id with the chats under it, at most budget of them;
 // known is its name if the connector no longer has it.
 func (s *Server) chatTree(ctx context.Context, name, id, known string, budget *int) (chatNode, error) {
-	n := chatNode{ID: id, Name: known, Label: visible(cmpOr(known, id))}
+	n := chatNodeOf(connector.Container{ID: id, Name: known})
 	if c, ok := s.chat(ctx, name, id); ok {
 		n = chatNodeOf(c)
 	}

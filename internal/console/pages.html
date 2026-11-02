@@ -305,7 +305,7 @@
 
 {{define "options"}}{{range .}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}{{end}}
 
-{{define "chatmeta"}}<span class="meta">{{with .Kind}}{{.}} · {{end}}{{if not .LastActivity.IsZero}}{{when .LastActivity}} · {{end}}{{shortID .ID}}</span>{{end}}
+{{define "chatmeta"}}<span class="meta" title="{{.ID}}">{{.Meta}}</span>{{end}}
 
 {{define "chattree"}}<ul class="tree">
 {{- range .}}
@@ -328,7 +328,7 @@
 
 {{define "card"}}
 <section class="panel card" id="request-{{.ID}}" data-card="{{.Kind}}" data-id="{{.ID}}" data-connector="{{.Connector}}"
-  {{- if ne .Kind "send"}} data-chats="{{if .ForwardOnly}}none{{else if .Every}}every{{else}}named{{end}}"{{end}} data-access>
+  {{- if or (eq .Kind "read") (eq .Kind "routine")}} data-chats="{{if .ForwardOnly}}none{{else if .Every}}every{{else}}named{{end}}"{{end}} data-access>
   <p class="who"><strong class="content">{{.Agent}}</strong>
     {{- if eq .Kind "send"}} wants to send{{else if eq .Kind "extend"}} asks for {{.When}}{{else}} wants to read{{end}}</p>
   {{- if eq .Kind "send"}}
@@ -345,7 +345,7 @@
   <ul class="chats">{{range .Chats}}<li><span class="chat-name content">{{.Label}}</span> {{template "chatmeta" .}}</li>{{end}}</ul>
   {{- range .Unmatched}}<p class="hint">no visible chat matched "{{visible .}}"</p>{{end}}
   {{- end}}
-  <p class="window">{{.When}} · {{.HorizonText}}</p>
+  <p class="card-when">{{.When}} · {{.HorizonText}}</p>
   {{template "reason" .Reason}}
   {{- if ne .Kind "extend"}}
   <div class="adjust" data-adjust-panel{{if or .Every .ForwardOnly}} hidden{{else}}{{$ticked := false}}{{range .Chats}}{{if .Ticked}}{{$ticked = true}}{{end}}{{end}}{{if $ticked}} hidden{{end}}{{end}}>
@@ -365,11 +365,12 @@
     </div>
   </div>
   {{- end}}
-  <div class="actions">
-    {{if .CanApprove}}<button type="button" class="primary" data-approve-access data-window="{{.Window}}">{{.Approve}}</button>{{end}}
+  <div class="actions card-actions">
+    {{if .CanApprove}}<button type="button" class="primary content" data-approve-access data-span="{{.Window}}"{{if not .Ready}} disabled{{end}}>{{.Approve}}</button>{{end}}
     {{if ne .Kind "extend"}}<button type="button" data-adjust>Adjust</button>{{end}}
     <form method="post" action="/access/requests/{{.ID}}/deny"><button type="submit" class="danger">Deny</button></form>
   </div>
+  {{if .CanApprove}}<p class="hint" data-tick-hint{{if .Ready}} hidden{{end}}>tick the chats to grant</p>{{end}}
   {{- end}}
   <p class="msg" role="status"></p>
 </section>
@@ -379,8 +380,18 @@
 {{with .Data}}
 <div class="page-heading">
   <h1>Now</h1>
-  <form method="post" action="/access/stop-all"><button type="submit" class="danger" data-confirm="Stop all reading">Stop all</button></form>
+  <details class="stop-all">
+    <summary class="button danger">Stop all</summary>
+    <div class="panel danger">
+      <p>Close every grant and pause every routine? Waiting sends stay.</p>
+      <div class="actions">
+        <form method="post" action="/access/stop-all"><button type="submit" class="danger">Stop all</button></form>
+        <button type="button" data-cancel-stop>Cancel</button>
+      </div>
+    </div>
+  </details>
 </div>
+{{with .Notice}}<p class="flash" data-kind="ok" role="status">{{.}}</p>{{end}}
 {{if not .CanSign}}<p class="flash" data-kind="error">No passkeys yet. Add one under <a href="/keys">Keys</a> to approve.</p>{{end}}
 
 <section>
@@ -395,7 +406,7 @@
 <h2>Open now</h2>
 {{range .}}
 <section class="panel grant" data-grant="{{.ID}}" data-access>
-  <header><h3><span class="content">{{.Agent}}</span> · {{.Connector}}</h3><span class="status" data-tone="ok"><span data-left="{{iso .Closes}}">{{.State}}</span></span></header>
+  <header><h3><span class="content">{{.Agent}}</span> · {{.Connector}}</h3><span class="status" data-tone="ok">{{.State}} · <span data-left="{{iso .Closes}}"></span></span></header>
   <p class="content">{{template "grantchats" .}}</p>
   <p class="meta">{{.HorizonText}}</p>
   <div class="actions">
@@ -434,18 +445,19 @@
 </section>
 {{end}}
 
-<section>
-<h2>Today</h2>
+<section id="today">
+<h2>{{.Day}}</h2>
 {{with .Today}}
 <ul class="timeline">
-{{range .}}<li data-kind="{{.Kind}}"><span class="meta">{{clock .At}}</span> {{if .URL}}<a class="content" href="{{.URL}}">{{.Text}}</a>{{else}}<span class="content">{{.Text}}</span>{{end}}
+{{range .}}<li data-kind="{{.Kind}}"><span class="meta">{{clock .At}}{{if eq .Actor "you"}} · <span class="actor" data-actor="you">you</span>{{else if .Actor}} · <span class="actor" data-actor="agent">agent</span>{{end}}</span>
+  {{if .URL}}<a class="content" href="{{.URL}}">{{.Text}}</a>{{else}}<span class="content">{{.Text}}</span>{{end}}
   {{- with .Dropped}} <span class="status" data-tone="alert">{{.}} read{{if ne . 1}}s{{end}} not logged</span>{{end}}</li>
 {{end}}
 </ul>
 {{else}}
 <p class="muted">Nothing happened.</p>
 {{end}}
-<p><a href="{{.Older}}">Show more →</a></p>
+<nav class="pager">{{with .Newer}}<a href="{{.}}">← newer</a>{{end}}<a href="{{.Older}}" class="older">Show more →</a></nav>
 </section>
 {{end}}
 <p id="msg" class="msg" role="status"></p>

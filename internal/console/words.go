@@ -30,7 +30,12 @@ func windowText(g approval.Grant) string {
 // routineText says when a requested routine runs; the zone is the
 // approver's.
 func routineText(sc proposal.RequestSchedule) string {
-	return fmt.Sprintf("%s at %s for %s (your time zone)", daysText(sc.Days), sc.Start, span(sc.Length))
+	return scheduleWords(sc) + " (your time zone)"
+}
+
+// scheduleWords says a routine's runs: "weekdays 07:00 for 20 min".
+func scheduleWords(sc proposal.RequestSchedule) string {
+	return daysText(sc.Days) + " " + sc.Start + " for " + span(sc.Length)
 }
 
 func daysText(days []time.Weekday) string {
@@ -51,14 +56,19 @@ func daysText(days []time.Weekday) string {
 	return strings.Join(out, ", ")
 }
 
+// horizonText says how far back a grant reads: "last day", "last 7 days",
+// "all history".
 func horizonText(h time.Duration) string {
-	if h == 0 {
+	switch h {
+	case 0:
 		return "all history"
+	case 24 * time.Hour:
+		return "last day"
 	}
-	return "the last " + span(h)
+	return "last " + span(h)
 }
 
-// span says d in the largest whole unit.
+// span says d in the largest whole unit: "20 min", "1 hour", "7 days".
 func span(d time.Duration) string {
 	unit := func(n int64, name string) string {
 		if n == 1 {
@@ -72,31 +82,60 @@ func span(d time.Duration) string {
 	case d%time.Hour == 0:
 		return unit(int64(d/time.Hour), "hour")
 	case d%time.Minute == 0:
-		return unit(int64(d/time.Minute), "minute")
+		return strconv.FormatInt(int64(d/time.Minute), 10) + " min"
 	}
 	return d.String()
 }
 
-// short is a span for buttons: 30m, 2h, 7d.
-func short(d time.Duration) string {
-	switch {
-	case d == 0:
-		return "all"
-	case d%(24*time.Hour) == 0:
-		return strconv.FormatInt(int64(d/(24*time.Hour)), 10) + "d"
-	case d%time.Hour == 0:
-		return strconv.FormatInt(int64(d/time.Hour), 10) + "h"
-	}
-	return strconv.FormatInt(int64(d/time.Minute), 10) + "m"
-}
-
-// shortID is the end of an ID, enough to tell two chats of one name apart.
+// shortID is enough of a chat's ID to tell two chats of one name apart: a
+// DM's phone number, or the last 6 characters.
 func shortID(id string) string {
-	if r := []rune(id); len(r) > 12 {
-		return "…" + string(r[len(r)-10:])
+	local, domain, _ := strings.Cut(id, "@")
+	if phone := strings.TrimPrefix(local, "+"); isDigits(phone) && len(phone) >= 8 && len(phone) <= 15 &&
+		(domain == "" && phone != local || domain == "s.whatsapp.net" || domain == "c.us") {
+		return formatPhone(phone)
+	}
+	if domain != "" && len(local) > 6 {
+		return "…" + local[len(local)-6:]
+	}
+	if r := []rune(id); len(r) > 6 {
+		return "…" + string(r[len(r)-6:])
 	}
 	return id
 }
+
+func isDigits(s string) bool {
+	return s != "" && strings.Trim(s, "0123456789") == ""
+}
+
+// formatPhone groups an international number: the country code, three
+// digits, the middle, and the last four, e.g. +49 151 2345 6789.
+func formatPhone(digits string) string {
+	cc := 3
+	switch {
+	case digits[0] == '1' || digits[0] == '7':
+		cc = 1
+	case slices.Contains(twoDigitCodes, digits[:2]):
+		cc = 2
+	}
+	rest := digits[cc:]
+	if len(rest) <= 7 {
+		return "+" + digits[:cc] + " " + rest
+	}
+	return "+" + digits[:cc] + " " + rest[:3] + " " + rest[3:len(rest)-4] + " " + rest[len(rest)-4:]
+}
+
+// twoDigitCodes are the two-digit country calling codes; 1 and 7 have one
+// digit and the rest three.
+var twoDigitCodes = strings.Fields("20 27 30 31 32 33 34 36 39 40 41 43 44 45 46 47 48 49 51 52 53 54 55 56 57 58 60 61 62 63 64 65 66 81 82 84 86 90 91 92 93 94 95 98")
+
+// connectorTitles name the built-in connectors in sentences.
+var connectorTitles = map[string]string{
+	"whatsapp": "WhatsApp", "signal": "Signal", "discord": "Discord", "fastmail": "Fastmail",
+	"gmessages": "Google Messages", "matrix": "Matrix", "http": "HTTP",
+}
+
+func connectorTitle(name string) string { return cmpOr(connectorTitles[name], name) }
 
 // option is a choice in a select.
 type option struct {

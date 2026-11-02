@@ -1,7 +1,6 @@
 package console
 
 import (
-	"cmp"
 	"context"
 	"fmt"
 	"net/http"
@@ -9,32 +8,32 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/adeci/mandate/approval"
 	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/internal/proposal"
 )
 
-const (
-	// todayWindow is how far back one page of Today goes.
-	todayWindow = 24 * time.Hour
-	// sessionGap splits a run of reads of one chat into sessions.
-	sessionGap = 10 * time.Minute
-	// stoppedKept is how long a closed routine stays offered for resuming.
-	stoppedKept = 30 * 24 * time.Hour
-)
+// stoppedKept is how long a closed routine stays offered for resuming.
+const stoppedKept = 30 * 24 * time.Hour
 
 // nowData is the Now screen: what waits for the owner, what is open, and
-// what happened. The page renders it and /now.json serves it.
+// what happened on Day. The page renders it and /now.json serves it.
 type nowData struct {
+	// Notice reports what the owner just did, e.g. Stop all.
+	Notice   string      `json:"notice,omitempty"`
 	Waiting  []card      `json:"waiting"`
 	Open     []grantView `json:"open"`
 	Routines []grantView `json:"routines"`
 	Stopped  []grantView `json:"stopped"`
-	Today    []event     `json:"today"`
-	// Older is the link to the day before Today.
-	Older   string `json:"older"`
-	CanSign bool   `json:"can_sign"`
+	// Day names the day Today shows ("Today", "Yesterday", "Sun 1 Nov");
+	// Older and Newer link to the days around it.
+	Day     string  `json:"day"`
+	Today   []event `json:"today"`
+	Older   string  `json:"older"`
+	Newer   string  `json:"newer,omitempty"`
+	CanSign bool    `json:"can_sign"`
 }
 
 // card is something waiting for the owner. Kind is read, routine or extend
@@ -50,8 +49,9 @@ type card struct {
 	// Reason is the agent's own words.
 	Reason string `json:"reason,omitempty"`
 
-	// Access requests: the chats named and those under them (Every when it
-	// named none), the terms that matched nothing, and the window.
+	// Access requests: the chats named and those under them (Every when a
+	// read or routine named none), the terms that matched nothing, and the
+	// window.
 	Chats       []chatNode                `json:"chats,omitempty"`
 	Unmatched   []string                  `json:"unmatched,omitempty"`
 	Every       bool                      `json:"every,omitempty"`
@@ -62,15 +62,17 @@ type card struct {
 	Extends     *grantView                `json:"extends,omitempty"`
 	When        string                    `json:"when,omitempty"`
 	HorizonText string                    `json:"horizon_text,omitempty"`
-	// Window is the window in the Approve button's short words.
+	// Window is the window as the Approve button says it.
 	Window string `json:"window,omitempty"`
-	// Approve names what the passkey signs as the card first shows.
+	// Approve names what the passkey signs as the card first shows; Ready
+	// is whether a chat is ticked yet.
 	Approve        string   `json:"approve,omitempty"`
+	Ready          bool     `json:"ready"`
 	CanApprove     bool     `json:"can_approve"`
 	ForOptions     []option `json:"for_options,omitempty"`
 	HorizonOptions []option `json:"horizon_options,omitempty"`
 
-	// Proposals: the op, its recipient and the first line it sends.
+	// Proposals: the op, its recipient, and its subject and first line.
 	Op   string `json:"op,omitempty"`
 	To   string `json:"to,omitempty"`
 	Text string `json:"text,omitempty"`
@@ -103,19 +105,8 @@ type grantView struct {
 	Tone        string `json:"tone"`
 }
 
-// event is one line of Today, newest first.
-type event struct {
-	At      time.Time `json:"at"`
-	End     time.Time `json:"end,omitzero"`
-	Kind    string    `json:"kind"` // read, send, grant, request
-	Agent   string    `json:"agent"`
-	Text    string    `json:"text"`
-	Dropped int       `json:"dropped,omitempty"`
-	URL     string    `json:"url,omitempty"`
-}
-
 func (s *Server) nowPage(w http.ResponseWriter, r *http.Request, sess session) {
-	d, err := s.nowData(r.Context(), before(r))
+	d, err := s.nowData(r.Context(), r)
 	if err != nil {
 		s.cfg.Log.Error("load now", "err", err)
 		s.errorPage(w, http.StatusInternalServerError, "Couldn't load what's going on.")
@@ -125,7 +116,7 @@ func (s *Server) nowPage(w http.ResponseWriter, r *http.Request, sess session) {
 }
 
 func (s *Server) nowJSON(w http.ResponseWriter, r *http.Request, _ session) {
-	d, err := s.nowData(r.Context(), before(r))
+	d, err := s.nowData(r.Context(), r)
 	if err != nil {
 		connector.WriteError(w, err)
 		return
@@ -133,19 +124,12 @@ func (s *Server) nowJSON(w http.ResponseWriter, r *http.Request, _ session) {
 	connector.WriteJSON(w, http.StatusOK, d)
 }
 
-// before is where Today ends: now, or the ?before= of an older page.
-func before(r *http.Request) time.Time {
-	if v, err := strconv.ParseInt(r.URL.Query().Get("before"), 10, 64); err == nil {
-		return time.UnixMilli(v).UTC()
-	}
-	return time.Time{}
-}
-
-func (s *Server) nowData(ctx context.Context, until time.Time) (nowData, error) {
+// nowData answers ?day=YYYY-MM-DD with that day's activity, and
+// ?stopped=GRANTS.REQUESTS or ?denied=PROPOSAL with a notice of what the
+// owner just did.
+func (s *Server) nowData(ctx context.Context, r *http.Request) (nowData, error) {
 	now := s.now()
-	if until.IsZero() || until.After(now) {
-		until = now
-	}
+	q := r.URL.Query()
 	d := nowData{CanSign: len(s.keys.Trusted()) > 0}
 	agents, err := s.db.agents(ctx)
 	if err != nil {
@@ -157,7 +141,23 @@ func (s *Server) nowData(ctx context.Context, until time.Time) (nowData, error) 
 	}
 	fo := s.forwardOnlyAll(ctx)
 
-	grants, err := s.db.grantsSince(ctx, now.Add(-max(stoppedKept, now.Sub(until)+todayWindow)))
+	today := startOfDay(now)
+	day := today
+	if t, err := time.ParseInLocation(time.DateOnly, q.Get("day"), time.Local); err == nil && t.Before(today) {
+		day = t
+	}
+	next := day.AddDate(0, 0, 1)
+	d.Day = dayName(day, today)
+	d.Older = "/?day=" + day.AddDate(0, 0, -1).Format(time.DateOnly) + "#today"
+	switch {
+	case next.Equal(today):
+		d.Newer = "/#today"
+	case next.Before(today):
+		d.Newer = "/?day=" + next.Format(time.DateOnly) + "#today"
+	}
+	to := earlier(next, now)
+
+	grants, err := s.db.grantsSince(ctx, earlier(now.Add(-stoppedKept), day))
 	if err != nil {
 		return d, err
 	}
@@ -195,22 +195,80 @@ func (s *Server) nowData(ctx context.Context, until time.Time) (nowData, error) 
 	}
 	slices.SortStableFunc(d.Waiting, func(a, b card) int { return b.CreatedAt.Compare(a.CreatedAt) })
 
-	from := until.Add(-todayWindow)
-	reads, err := s.db.reads(ctx, from, until)
+	reads, err := s.db.reads(ctx, day, to)
 	if err != nil {
 		return d, err
 	}
-	decided, err := s.db.decidedBetween(ctx, from, until)
+	decided, err := s.db.decidedBetween(ctx, day, to)
 	if err != nil {
 		return d, err
 	}
-	asked, err := s.db.accessRequestsBetween(ctx, from, until, now)
+	asked, err := s.db.accessRequestsDecided(ctx, day, to, now)
 	if err != nil {
 		return d, err
 	}
-	d.Today = today(reads, decided, asked, grants, names, from, until)
-	d.Older = "/?before=" + strconv.FormatInt(from.UnixMilli(), 10)
+	stops, err := s.db.stopsBetween(ctx, day, to)
+	if err != nil {
+		return d, err
+	}
+	d.Today = activity(reads, decided, asked, grants, stops, names, fo, day, to)
+	d.Notice = s.notice(ctx, q)
 	return d, nil
+}
+
+func earlier(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
+}
+
+func startOfDay(t time.Time) time.Time {
+	y, m, d := t.Local().Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.Local)
+}
+
+func dayName(day, today time.Time) string {
+	switch {
+	case day.Equal(today):
+		return "Today"
+	case day.Equal(today.AddDate(0, 0, -1)):
+		return "Yesterday"
+	}
+	return day.Format("Mon 2 Jan")
+}
+
+// notice says what the owner just did, from what the redirect after it
+// carries; it reads only numbers and IDs from the URL, never text.
+func (s *Server) notice(ctx context.Context, q map[string][]string) string {
+	get := func(k string) string {
+		if v := q[k]; len(v) > 0 {
+			return v[0]
+		}
+		return ""
+	}
+	if v := get("stopped"); v != "" {
+		g, r, _ := strings.Cut(v, ".")
+		grants, err1 := strconv.Atoi(g)
+		requests, err2 := strconv.Atoi(r)
+		if err1 == nil && err2 == nil {
+			return fmt.Sprintf("Stopped: %s closed, %s denied", count(grants, "grant"), count(requests, "request"))
+		}
+	}
+	if id := get("denied"); id != "" {
+		if pr, err := s.db.get(ctx, id); err == nil {
+			return "You denied " + sendText(pr) + "."
+		}
+	}
+	return ""
+}
+
+// count is n things in words: "1 grant", "3 grants".
+func count(n int, thing string) string {
+	if n == 1 {
+		return "1 " + thing
+	}
+	return strconv.Itoa(n) + " " + thing + "s"
 }
 
 // forwardOnlyAll says which connectors keep no chats; one whose spec can't
@@ -242,17 +300,40 @@ func grantViewOf(g grantRow, agent string, fo bool, now time.Time) grantView {
 	open, at := g.Open(now)
 	switch {
 	case !g.RevokedAt.IsZero():
-		v.State, v.Tone = "closed "+g.RevokedAt.Local().Format(stamp), "muted"
+		v.State, v.Tone = endedState(g), "muted"
 	case open:
 		v.Open, v.Closes = true, at
-		v.State, v.Tone = "open until "+at.Local().Format(stamp), "ok"
+		v.State, v.Tone = "until "+moment(at, now), "ok"
 	case !at.IsZero():
 		v.Next = at
-		v.State, v.Tone = "next "+at.Local().Format(stamp), "wait"
+		v.State, v.Tone = "next "+moment(at, now), "wait"
 	default:
 		v.State, v.Tone = "ended", "muted"
 	}
 	return v
+}
+
+// endedState says how a revoked grant ended.
+func endedState(g grantRow) string {
+	switch {
+	case g.EndedBy == "stop":
+		return "stopped by Stop all"
+	case g.EndedBy == "replaced" && g.Schedule == nil:
+		return "extended"
+	case g.EndedBy == "agent deleted":
+		return "agent deleted"
+	case g.Schedule != nil:
+		return "paused"
+	}
+	return "closed"
+}
+
+// moment is a time as a clock today and with its date otherwise.
+func moment(t, now time.Time) string {
+	if startOfDay(t).Equal(startOfDay(now)) {
+		return t.Local().Format("15:04")
+	}
+	return t.Local().Format(stamp)
 }
 
 // requestCard shows an access request. Only an unambiguous request starts
@@ -264,24 +345,24 @@ func (s *Server) requestCard(ctx context.Context, ar accessRequest, grants map[s
 		CreatedAt: ar.CreatedAt, ExpiresAt: ar.ExpiresAt, Reason: ar.Reason,
 		Unmatched: ar.Unmatched, Every: !ar.names(), ForwardOnly: fo,
 		For: ar.For, Horizon: ar.Horizon, Schedule: ar.Schedule,
-		When: "for " + span(ar.For), HorizonText: horizonText(ar.Horizon), Window: short(ar.For),
+		When: "for " + span(ar.For), HorizonText: horizonText(ar.Horizon), Window: span(ar.For),
 		ForOptions:     spanOptions(forChoices, ar.For, ar.For, span),
 		HorizonOptions: spanOptions(horizonChoices, ar.Horizon, ar.Horizon, horizonText),
 	}
 	switch {
 	case ar.Extends != "":
-		c.Kind, c.When, c.ForOptions, c.HorizonOptions = "extend", span(ar.For)+" more", nil, nil
+		c.Kind, c.Every, c.When = "extend", false, span(ar.For)+" more"
+		c.ForOptions, c.HorizonOptions = nil, nil
 		if g, ok := grants[ar.Extends]; ok {
 			v := grantViewOf(g, ar.AgentName, fo, now)
 			c.Extends, c.HorizonText = &v, v.HorizonText
 		}
-		c.Approve = "Approve +" + short(ar.For)
+		c.Approve, c.Ready = "Approve · "+span(ar.For)+" more", true
 		c.CanApprove = canSign && c.Extends != nil && c.Extends.RevokedAt.IsZero()
 		return c
 	case ar.Schedule != nil:
-		sc := ar.Schedule
-		c.Kind, c.When, c.ForOptions = "routine", routineText(*sc), nil
-		c.Window = daysText(sc.Days) + " " + sc.Start + " · " + short(sc.Length)
+		c.Kind, c.When, c.ForOptions = "routine", routineText(*ar.Schedule), nil
+		c.Window = scheduleWords(*ar.Schedule)
 	}
 	if fo {
 		c.HorizonText, c.HorizonOptions = "every allowlisted read", nil
@@ -291,7 +372,7 @@ func (s *Server) requestCard(ctx context.Context, ar accessRequest, grants map[s
 		if err != nil {
 			s.cfg.Log.Warn("chats under requested chats", "connector", ar.Connector, "err", err)
 			for _, ch := range ar.Chats {
-				tree = append(tree, chatNode{ID: ch.ID, Name: ch.Name, Label: visible(cmpOr(ch.Name, ch.ID))})
+				tree = append(tree, chatNodeOf(connector.Container{ID: ch.ID, Name: ch.Name}))
 			}
 		}
 		if len(ar.Chats) == 1 && len(ar.Unmatched) == 0 && len(tree) == 1 &&
@@ -300,18 +381,18 @@ func (s *Server) requestCard(ctx context.Context, ar accessRequest, grants map[s
 		}
 		c.Chats = tree
 	}
-	c.Approve = approveLabel(c)
+	c.Approve, c.Ready = approveLabel(c)
 	c.CanApprove = canSign && (c.Every || len(c.Chats) > 0) && (!fo || !ar.names())
 	return c
 }
 
 // approveLabel names what approving signs before any adjusting: the window,
-// the chats ticked, and the horizon.
-func approveLabel(c card) string {
+// the chats ticked, and the horizon. ready is false while no chat is.
+func approveLabel(c card) (label string, ready bool) {
 	parts := []string{"Approve", c.Window}
 	switch {
 	case c.ForwardOnly:
-		return strings.Join(append(parts, "allowlisted reads"), " · ")
+		return strings.Join(append(parts, "allowlisted reads"), " · "), true
 	case c.Every:
 		parts = append(parts, "every chat")
 	default:
@@ -323,119 +404,73 @@ func approveLabel(c card) string {
 		})
 		switch len(ticked) {
 		case 0:
-			parts = append(parts, "no chats yet")
+			return "Approve", false
 		case 1:
 			parts = append(parts, ticked[0])
 		default:
 			parts = append(parts, fmt.Sprintf("%d chats", len(ticked)))
 		}
 	}
-	return strings.Join(append(parts, short(c.Horizon)), " · ")
+	return strings.Join(append(parts, horizonText(c.Horizon)), " · "), true
 }
 
-// sendCard shows a proposal by its recipient, the first field not tied to
-// a param, and the first line of the first field that is.
+// sendCard shows a proposal by its recipient and, for email, its subject,
+// then its first line past any greeting.
 func sendCard(pr row) card {
-	c := card{
+	to, subject, text := sendParts(pr)
+	if subject != "" && text != "" {
+		text = subject + " — " + text
+	} else if subject != "" {
+		text = subject
+	}
+	return card{
 		Kind: "send", ID: pr.ID, AgentID: pr.AgentID, Agent: agentName(pr.AgentName), Connector: pr.Connector,
 		CreatedAt: pr.CreatedAt, ExpiresAt: pr.ExpiresAt, Reason: pr.Note, Op: pr.Op, URL: "/r/" + pr.ID,
+		To: to, Text: text,
 	}
-	for _, f := range pr.Display {
-		switch {
-		case f.Param == "" && c.To == "":
-			c.To = f.Value
-		case f.Param != "" && c.Text == "":
-			c.Text, _, _ = strings.Cut(f.Value, "\n")
-		}
-	}
-	return c
 }
 
-// today is what happened in [from, to), newest first: reads grouped into
-// sessions per agent, connector and chat, proposals decided, grants opened,
-// closed and run out, and requests made.
-func today(reads []proposal.ReadEvent, decided []row, asked []accessRequest, grants []grantRow,
-	names map[string]string, from, to time.Time,
-) []event {
-	var out []event
-	agent := func(id string) string { return cmpOr(names[id], "a deleted agent") }
-
-	slices.SortStableFunc(reads, func(a, b proposal.ReadEvent) int {
-		return cmp.Or(cmp.Compare(a.AgentID, b.AgentID), cmp.Compare(a.Connector, b.Connector),
-			cmp.Compare(a.Chat, b.Chat), a.At.Compare(b.At))
-	})
-	var cur *event
-	var count int
-	var chat string
-	flush := func() {
-		if cur == nil {
-			return
-		}
-		what := "items"
-		if chat != "" {
-			what = "messages"
-		}
-		cur.Text = fmt.Sprintf("%s · %d %s · %s–%s", cur.Text, count, what,
-			cur.At.Local().Format("15:04"), cur.End.Local().Format("15:04"))
-		out = append(out, *cur)
-	}
-	var prev proposal.ReadEvent
-	for i, e := range reads {
-		same := i > 0 && e.AgentID == prev.AgentID && e.Connector == prev.Connector && e.Chat == prev.Chat &&
-			e.At.Sub(prev.At) < sessionGap
-		if !same {
-			flush()
-			subject := "chats"
-			if e.Chat != "" {
-				subject = cmpOr(e.ChatName, "a hidden chat")
-			}
-			cur = &event{
-				At: e.At, Kind: "read", Agent: agent(e.AgentID),
-				Text: fmt.Sprintf("%s read %s on %s", agent(e.AgentID), subject, e.Connector),
-			}
-			count, chat = 0, e.Chat
-		}
-		cur.End = e.At
-		cur.Dropped += e.Dropped
-		count += e.Count
-		prev = e
-	}
-	flush()
-
-	for _, pr := range decided {
-		out = append(out, event{
-			At: pr.DecidedAt, Kind: "send", Agent: agentName(pr.AgentName), URL: "/r/" + pr.ID,
-			Text: fmt.Sprintf("%s's %s %s: %s", agentName(pr.AgentName), pr.Connector, pr.Op, pr.Status),
-		})
-	}
-	for _, ar := range asked {
-		out = append(out, event{
-			At: ar.CreatedAt, Kind: "request", Agent: ar.AgentName,
-			Text: fmt.Sprintf("%s asked to read %s: %s", ar.AgentName, ar.Connector, ar.Status),
-		})
-	}
-	in := func(t time.Time) bool { return !t.Before(from) && t.Before(to) }
-	for _, g := range grants {
-		who := agent(g.Agent)
-		if in(g.CreatedAt) {
-			out = append(out, event{
-				At: g.CreatedAt, Kind: "grant", Agent: who,
-				Text: fmt.Sprintf("%s may read %s, %s", who, g.Connector, windowText(g.Grant)),
-			})
-		}
+// sendParts reads a proposal's display: whom it goes to (the field naming
+// the recipient, else the first not tied to a param), its subject, and the
+// first line of its text that isn't a greeting.
+func sendParts(pr row) (to, subject, text string) {
+	var first string
+	for _, f := range pr.Display {
 		switch {
-		case !g.RevokedAt.IsZero() && in(g.RevokedAt) && g.ReplacedBy == "" && (g.Schedule != nil || g.RevokedAt.Before(g.Until)):
-			out = append(out, event{
-				At: g.RevokedAt, Kind: "grant", Agent: who,
-				Text: fmt.Sprintf("Closed %s's access to %s", who, g.Connector),
-			})
-		case g.Schedule == nil && in(g.Until) && (g.RevokedAt.IsZero() || g.RevokedAt.After(g.Until)):
-			out = append(out, event{
-				At: g.Until, Kind: "grant", Agent: who,
-				Text: fmt.Sprintf("%s's access to %s ran out", who, g.Connector),
-			})
+		case f.Label == "To" || f.Label == "Group" || f.Label == "Room" || f.Label == "Chat":
+			if to == "" {
+				to = f.Value
+			}
+		case f.Label == "Subject":
+			subject = f.Value
+		case f.Param != "" && text == "":
+			text = firstLine(f.Value)
+		case f.Param == "" && first == "":
+			first = f.Value
 		}
 	}
-	slices.SortStableFunc(out, func(a, b event) int { return b.At.Compare(a.At) })
-	return out
+	return cmpOr(to, first), subject, text
+}
+
+// greetings start the lines firstLine skips, with a short line ending in a
+// comma or colon.
+var greetings = []string{"hi", "hello", "hey", "dear", "hallo", "liebe", "lieber", "moin", "guten", "good morning", "good afternoon", "good evening"}
+
+// firstLine is the first line of text that isn't blank or a greeting, cut
+// to a phrase.
+func firstLine(text string) string {
+	for line := range strings.Lines(text) {
+		line = strings.TrimSpace(line)
+		lower := strings.ToLower(line)
+		greeting := len(strings.Fields(line)) <= 4 && (strings.HasSuffix(line, ",") || strings.HasSuffix(line, ":")) ||
+			slices.ContainsFunc(greetings, func(g string) bool { return lower == g || strings.HasPrefix(lower, g+" ") && len(line) < 30 })
+		if line == "" || greeting {
+			continue
+		}
+		if utf8.RuneCountInString(line) > 80 {
+			line = string([]rune(line)[:80]) + "…"
+		}
+		return line
+	}
+	return ""
 }

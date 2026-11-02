@@ -22,11 +22,13 @@ var (
 )
 
 // accessRequest is a stored access request. Extends is the grant an extend
-// request would lengthen.
+// request would lengthen; DecidedBy is "owner", "stop" or "agent deleted"
+// for a denial.
 type accessRequest struct {
 	proposal.AccessRequest
 	ID, Status, GrantID  string
 	Extends              string
+	DecidedBy            string
 	CreatedAt, ExpiresAt time.Time
 	DecidedAt            time.Time
 }
@@ -51,12 +53,14 @@ type agentRow struct {
 }
 
 // grantRow is a stored grant: its record, kept after the signature is
-// dropped, and the chat names the owner saw when signing it.
+// dropped, and the chat names the owner saw when signing it. EndedBy says
+// how it was revoked: "close", "stop", "replaced" or "agent deleted".
 type grantRow struct {
 	approval.Grant
 	Names      map[string]string
 	RevokedAt  time.Time
 	ReplacedBy string
+	EndedBy    string
 }
 
 func (d *db) addAccessChallenge(ctx context.Context, c accessChallenge) error {
@@ -136,8 +140,9 @@ func (d *db) addGrant(ctx context.Context, c accessChallenge, g approval.Grant, 
 		}
 		if c.Replaces != "" {
 			res, err := tx.ExecContext(ctx, `
-				UPDATE grants SET revoked_at = coalesce(revoked_at, ?), signed = NULL, replaced_by = ?
-				WHERE id = ? AND replaced_by = ''`, ms(now), g.ID, c.Replaces)
+				UPDATE grants SET revoked_at = coalesce(revoked_at, ?1), signed = NULL, replaced_by = ?2,
+				       ended_by = iif(revoked_at IS NULL, 'replaced', ended_by)
+				WHERE id = ?3 AND replaced_by = ''`, ms(now), g.ID, c.Replaces)
 			if err != nil {
 				return err
 			}
@@ -170,12 +175,14 @@ func (d *db) deleteAgent(ctx context.Context, id string, now time.Time) error {
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `
-			UPDATE grants SET revoked_at = coalesce(revoked_at, ?), signed = NULL WHERE agent = ?`, ms(now), id)
+			UPDATE grants SET revoked_at = coalesce(revoked_at, ?1), signed = NULL,
+			       ended_by = iif(revoked_at IS NULL, 'agent deleted', ended_by)
+			WHERE agent = ?2`, ms(now), id)
 		if err != nil {
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `
-			UPDATE access_requests SET status = 'denied', decided_at = ?
+			UPDATE access_requests SET status = 'denied', decided_at = ?, decided_by = 'agent deleted'
 			WHERE agent_id = ? AND status = 'pending'`, ms(now), id)
 		if err != nil {
 			return err
@@ -193,32 +200,71 @@ func (d *db) deleteAgent(ctx context.Context, id string, now time.Time) error {
 }
 
 func (d *db) revokeGrant(ctx context.Context, id string, now time.Time) error {
-	res, err := d.sql.ExecContext(ctx, `UPDATE grants SET revoked_at = ?, signed = NULL WHERE id = ? AND revoked_at IS NULL`, ms(now), id)
+	res, err := d.sql.ExecContext(ctx, `
+		UPDATE grants SET revoked_at = ?, signed = NULL, ended_by = 'close' WHERE id = ? AND revoked_at IS NULL`, ms(now), id)
 	if err != nil {
 		return err
 	}
 	return oneRow(res, errNoGrant)
 }
 
-// stopAll revokes every live grant and denies every waiting access request.
-func (d *db) stopAll(ctx context.Context, now time.Time) (grants, requests int64, err error) {
-	err = d.tx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `UPDATE grants SET revoked_at = ?, signed = NULL WHERE revoked_at IS NULL`, ms(now))
+// stop is one Stop all: when, and what it ended.
+type stop struct {
+	At               time.Time
+	Grants, Requests int
+}
+
+// stopAll revokes every live grant and denies every waiting access request,
+// and records that it did.
+func (d *db) stopAll(ctx context.Context, now time.Time) (stop, error) {
+	st := stop{At: now}
+	err := d.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE grants SET revoked_at = ?, signed = NULL, ended_by = 'stop' WHERE revoked_at IS NULL`, ms(now))
 		if err != nil {
 			return err
 		}
-		if grants, err = res.RowsAffected(); err != nil {
+		n, err := res.RowsAffected()
+		if err != nil {
 			return err
 		}
+		st.Grants = int(n)
 		res, err = tx.ExecContext(ctx, `
-			UPDATE access_requests SET status = 'denied', decided_at = ? WHERE status = 'pending'`, ms(now))
+			UPDATE access_requests SET status = 'denied', decided_at = ?, decided_by = 'stop'
+			WHERE status = 'pending'`, ms(now))
 		if err != nil {
 			return err
 		}
-		requests, err = res.RowsAffected()
+		if n, err = res.RowsAffected(); err != nil {
+			return err
+		}
+		st.Requests = int(n)
+		_, err = tx.ExecContext(ctx, `INSERT INTO stops (at, grants, requests) VALUES (?, ?, ?)`, ms(now), st.Grants, st.Requests)
 		return err
 	})
-	return grants, requests, err
+	return st, err
+}
+
+// stopsBetween returns the Stop alls in [from, to).
+func (d *db) stopsBetween(ctx context.Context, from, to time.Time) ([]stop, error) {
+	rs, err := d.sql.QueryContext(ctx, `SELECT at, grants, requests FROM stops WHERE at >= ? AND at < ?`, ms(from), ms(to))
+	if err != nil {
+		return nil, err
+	}
+	defer rs.Close()
+	var out []stop
+	for rs.Next() {
+		var (
+			st stop
+			at int64
+		)
+		if err := rs.Scan(&at, &st.Grants, &st.Requests); err != nil {
+			return nil, err
+		}
+		st.At = fromMS(at)
+		out = append(out, st)
+	}
+	return out, rs.Err()
 }
 
 // liveRecords returns the signed agents and grants not deleted or revoked,
@@ -331,7 +377,7 @@ func (d *db) grantsSince(ctx context.Context, since time.Time) ([]grantRow, erro
 // left out.
 func (d *db) queryGrants(ctx context.Context, cond string, args ...any) ([]grantRow, error) {
 	rs, err := d.sql.QueryContext(ctx, `
-		SELECT id, record, names, revoked_at, replaced_by FROM grants
+		SELECT id, record, names, revoked_at, replaced_by, ended_by FROM grants
 		WHERE record IS NOT NULL AND (`+cond+`) ORDER BY created_at, id`, args...)
 	if err != nil {
 		return nil, err
@@ -345,7 +391,7 @@ func (d *db) queryGrants(ctx context.Context, cond string, args ...any) ([]grant
 			revoked   sql.NullInt64
 			g         grantRow
 		)
-		if err := rs.Scan(&id, &record, &names, &revoked, &g.ReplacedBy); err != nil {
+		if err := rs.Scan(&id, &record, &names, &revoked, &g.ReplacedBy, &g.EndedBy); err != nil {
 			return nil, err
 		}
 		if g.Grant, err = approval.DecodeGrant(record); err != nil {
@@ -434,9 +480,9 @@ func (d *db) pendingAccessRequests(ctx context.Context, now time.Time) ([]access
 	return d.queryAccessRequests(ctx, now, `WHERE status = 'pending' ORDER BY created_at DESC`)
 }
 
-// accessRequestsBetween returns the requests made in [from, to).
-func (d *db) accessRequestsBetween(ctx context.Context, from, to, now time.Time) ([]accessRequest, error) {
-	return d.queryAccessRequests(ctx, now, `WHERE created_at >= ? AND created_at < ?`, ms(from), ms(to))
+// accessRequestsDecided returns the requests decided in [from, to).
+func (d *db) accessRequestsDecided(ctx context.Context, from, to, now time.Time) ([]accessRequest, error) {
+	return d.queryAccessRequests(ctx, now, `WHERE decided_at >= ? AND decided_at < ?`, ms(from), ms(to))
 }
 
 func (d *db) pendingAccessCount(ctx context.Context, now time.Time) (int, error) {
@@ -453,7 +499,7 @@ func (d *db) queryAccessRequests(ctx context.Context, now time.Time, where strin
 		return nil, err
 	}
 	rs, err := d.sql.QueryContext(ctx, `
-		SELECT id, agent_id, agent_name, connector, chats, unmatched, for_ns, horizon_ns, reason, schedule, extends,
+		SELECT id, agent_id, agent_name, connector, chats, unmatched, for_ns, horizon_ns, reason, schedule, extends, decided_by,
 		       status, grant_id, created_at, expires_at, decided_at
 		FROM access_requests `+where, args...)
 	if err != nil {
@@ -471,7 +517,7 @@ func (d *db) queryAccessRequests(ctx context.Context, now time.Time, where strin
 			decided          sql.NullInt64
 		)
 		if err := rs.Scan(&r.ID, &r.AgentID, &r.AgentName, &r.Connector, &chats, &unmatched, &forNS, &horizonNS, &r.Reason,
-			&schedule, &r.Extends, &r.Status, &r.GrantID, &created, &expires, &decided); err != nil {
+			&schedule, &r.Extends, &r.DecidedBy, &r.Status, &r.GrantID, &created, &expires, &decided); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(chats), &r.Chats); err != nil {
@@ -498,7 +544,7 @@ func (d *db) queryAccessRequests(ctx context.Context, now time.Time, where strin
 
 func (d *db) denyAccessRequest(ctx context.Context, id string, now time.Time) error {
 	res, err := d.sql.ExecContext(ctx, `
-		UPDATE access_requests SET status = 'denied', decided_at = ?
+		UPDATE access_requests SET status = 'denied', decided_at = ?, decided_by = 'owner'
 		WHERE id = ? AND status = 'pending' AND expires_at > ?`, ms(now), id, ms(now))
 	if err != nil {
 		return err
