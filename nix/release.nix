@@ -29,8 +29,13 @@ let
           inherit (native.${name}) goModules;
           doCheck = false;
         };
-      # Pure Go, so static already.
-      go = release p { };
+      # Pure Go, so Go's own linker makes them static; the cross Go would
+      # otherwise link through the target's C compiler, dynamically.
+      go =
+        name:
+        (release p { } name).overrideAttrs (old: {
+          ldflags = old.ldflags ++ [ "-linkmode=internal" ];
+        });
       # Signal links libsignal-ffi, whose own tests don't link statically.
       libsignal-ffi = s.libsignal-ffi.overrideAttrs { doCheck = false; };
       signal = (release s { inherit libsignal-ffi; } "mandate-signal").overrideAttrs (old: {
