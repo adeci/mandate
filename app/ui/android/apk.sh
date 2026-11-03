@@ -22,8 +22,10 @@ cp "../../target/$triple/release/libmandate_app.so" "$out/lib/$abi/"
 "$tools/aapt2" compile --dir res -o "$out/res.zip"
 "$tools/aapt2" link -o "$out/unaligned.apk" --manifest AndroidManifest.xml -I "$android" \
 	--java "$out/gen" "$out/res.zip"
-javac --release 11 -classpath "$android" -d "$out/classes" $(find java "$out/gen" -name '*.java')
-"$tools/d8" --release --min-api 30 --lib "$android" --output "$out" $(find "$out/classes" -name '*.class')
+mapfile -t sources < <(find java "$out/gen" -name '*.java')
+javac --release 11 -classpath "$android" -d "$out/classes" "${sources[@]}"
+mapfile -t classes < <(find "$out/classes" -name '*.class')
+"$tools/d8" --release --min-api 30 --lib "$android" --output "$out" "${classes[@]}"
 (cd "$out" && zip -qr unaligned.apk lib classes.dex)
 "$tools/zipalign" -f -P 16 4 "$out/unaligned.apk" "$out/mandate.apk"
 [ -f build/debug.keystore ] || keytool -genkeypair -keystore build/debug.keystore \
