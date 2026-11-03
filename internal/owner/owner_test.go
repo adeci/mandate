@@ -426,8 +426,11 @@ func TestChallengeRules(t *testing.T) {
 	agent := h.agent(owner)
 
 	req := h.request(agent)
-	if st := h.do("POST", "/owner/v1/requests/"+req+"/challenge", owner.token, map[string]any{"chats": []string{"c3"}}, nil); st != http.StatusBadRequest {
-		t.Errorf("narrowing to a chat not asked for = %d", st)
+	if picked := h.challenge(owner, "/owner/v1/requests/"+req+"/challenge", map[string]any{"chats": []string{"c3"}}); !bytes.Contains(picked.Record, []byte(`"chats":["c3"]`)) {
+		t.Errorf("a chat the owner picked = %s", picked.Record)
+	}
+	if st := h.do("POST", "/owner/v1/requests/"+req+"/challenge", owner.token, map[string]any{"horizon": 0}, nil); st != http.StatusBadRequest {
+		t.Errorf("widening the history = %d", st)
 	}
 	first := h.challenge(owner, "/owner/v1/requests/"+req+"/challenge", map[string]any{"chats": []string{"c1"}})
 	other := h.challenge(owner, "/owner/v1/requests/"+req+"/challenge", nil)

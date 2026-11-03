@@ -88,7 +88,7 @@ Chat names that start with `~` were chosen by other people. The app shows chat I
 | route | |
 |---|---|
 | `GET /owner/v1/now` | What waits (access requests and proposals), open grants, routines, stopped routines, and one day's activity: each read and write by an identity, with time, connector, chats and message count, never message text. `?day=YYYY-MM-DD&before=<RFC 3339 time>` pages back. |
-| `POST /owner/v1/requests/{id}/challenge` | `{chats?, for?, horizon?, zone?}`: a grant answering the request, narrowed by the owner. `zone` is the device's IANA zone, for a routine. |
+| `POST /owner/v1/requests/{id}/challenge` | `{chats?, for?, horizon?, zone?}`: a grant answering the request. `chats`: any chats of the connector, chosen by the owner; the matched ones are a suggestion. `for` and `horizon` at most what was asked. `zone` is the device's IANA zone, for a routine. |
 | `POST /owner/v1/requests/{id}/deny` | |
 | `GET /owner/v1/proposals/{id}` | The display fields, which of them can be edited, and the agent's note. |
 | `POST /owner/v1/proposals/{id}/challenge` | `{edits: {param: value}}`: the write record. |

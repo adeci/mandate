@@ -223,7 +223,9 @@ func (s *Server) grantFor(req *request, n narrowing) (record.Grant, map[string]s
 	chats := offered
 	if n.Chats != nil {
 		for _, c := range n.Chats {
-			if offered != nil && !slices.Contains(offered, c) || c == "" {
+			// The matched chats only suggest: the owner may pick any chat
+			// of the connector, except that an extend keeps its chats.
+			if req.Kind == "extend" && offered != nil && !slices.Contains(offered, c) || c == "" {
 				return record.Grant{}, nil, nil, errorf(http.StatusBadRequest, "chat %q was not asked for", c)
 			}
 		}
