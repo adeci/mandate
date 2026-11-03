@@ -44,6 +44,7 @@
         // prefix "lint" (lib.mapAttrs (_: lint) packages)
         // {
           treefmt = (treefmtFor pkgs).config.build.check self;
+          conformance = import ./nix/conformance.nix { inherit self pkgs; };
         }
         // lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
           vm = pkgs.testers.runNixOSTest (import ./nix/vm-test.nix { inherit self pkgs; });

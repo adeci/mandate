@@ -11,6 +11,7 @@ import (
 
 	"github.com/adeci/mandate/internal/cli"
 	"github.com/adeci/mandate/internal/config"
+	"github.com/adeci/mandate/internal/conformance"
 	"github.com/adeci/mandate/internal/front"
 	"github.com/adeci/mandate/internal/gateway"
 	"github.com/adeci/mandate/internal/owner"
@@ -21,7 +22,8 @@ const usage = `usage:
   mandate serve gateway
   mandate serve owner
   sudo mandate setup
-  sudo mandate reset`
+  sudo mandate reset
+  mandate conformance PROGRAM [--config FILE] [--store FILE]`
 
 var errUsage = errors.New("bad usage")
 
@@ -55,6 +57,8 @@ func run(ctx context.Context, args []string) error {
 			return owner.Setup(ctx, cfg, os.Stdout)
 		}
 		return owner.Reset(ctx, cfg, os.Stdout)
+	case len(args) > 0 && args[0] == "conformance":
+		return conformance.Run(ctx, args[1:], os.Stdout)
 	}
 	return cli.Run(ctx, args)
 }

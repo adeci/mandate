@@ -1,0 +1,58 @@
+package conformance
+
+import (
+	"context"
+	"database/sql"
+	"io"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/adeci/mandate/store"
+)
+
+func TestStoreRules(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, sql string
+		check     func(context.Context, *sql.DB) error
+	}{
+		{"times", `UPDATE messages SET edited_at = '2026-11-02T14:05:09Z'`, checkTimes},
+		{"nesting", `UPDATE containers SET parent_id = 'c3' WHERE id = 'c0'`, checkNesting},
+		{"depth", `INSERT INTO containers (id, kind, parent_id, updated_at) VALUES ('c4', 'thread', 'c3', '')`, checkNesting},
+		{"names", `UPDATE containers SET name = '~ Sam' WHERE id = 'c1'`, checkNames},
+		{"participants", `UPDATE containers SET participants_json = '[{"id":"p","name":"~~Sam"}]' WHERE id = 'c1'`, checkNames},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "data.db")
+			st, err := store.Open(ctx, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			for i, parent := range []string{"", "c0", "c1", "c2"} {
+				c := store.Container{ID: "c" + string(rune('0'+i)), Kind: "group", ParentID: parent, Name: "~Sam"}
+				if err := st.UpsertContainer(ctx, c); err != nil {
+					t.Fatal(err)
+				}
+			}
+			m := store.Message{ID: "m", ContainerID: "c3", SenderName: "Sam", SentAt: time.Now(), Body: "hi"}
+			if err := st.UpsertMessage(ctx, m); err != nil {
+				t.Fatal(err)
+			}
+			k := &kit{ctx: ctx, out: io.Discard, prefix: "test_"}
+			if err := k.checkSchema(path); err != nil {
+				t.Fatalf("schema: %v", err)
+			}
+			if err := tc.check(ctx, st.DB()); err != nil {
+				t.Fatalf("before %s: %v", tc.sql, err)
+			}
+			if _, err := st.DB().ExecContext(ctx, tc.sql); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.check(ctx, st.DB()); err == nil {
+				t.Fatalf("passes after %s", tc.sql)
+			}
+		})
+	}
+}

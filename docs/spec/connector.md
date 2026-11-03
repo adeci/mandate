@@ -145,8 +145,8 @@ CREATE TABLE media (
 - `parent_id` chains are acyclic and at most three deep; deeper chats are
   invisible to agents.
 - A name the person chose (a profile or push name) starts with `~`;
-  address-book names don't. The owner's chat with themself gets the
-  service's name for it.
+  address-book names and the owner's own name don't. The owner's chat with
+  themself gets the service's name for it.
 - A DM has `kind = 'dm'`. If its ID is not the other person's, it lists them
   in `participants_json`, so hiding a person hides their DMs.
 - `is_from_me` marks the owner's messages; `reply_to_id` the message answered.
@@ -271,7 +271,7 @@ chat picker, so the owner side never opens the store:
 
 ## Conformance kit
 
-`mandate-conformance CONNECTOR [--config FILE] [--store data.db]` runs the
+`mandate conformance PROGRAM [--config FILE] [--store data.db]` runs the
 connector with a fresh state directory and checks what needs no account:
 
 - the spec, and that every route refuses the wrong caller;
@@ -279,9 +279,9 @@ connector with a fresh state directory and checks what needs no account:
 - health has a valid shape;
 - the empty store's schema and `user_version`;
 - setup steps have a valid shape;
-- `execute` refuses a bad signature, an untrusted or expired key, another
-  connector's record and a changed display, and `PUT /keys` refuses a
-  rewritten log.
+- `execute` refuses a bad signature, an untrusted or removed key, an expired
+  record, another connector's record and a changed display, and `PUT /keys`
+  refuses a rewritten log.
 
 With `--store`, it also checks an existing `data.db` against the store rules.
 Successful writes and replay are each connector's own tests; the Go SDK
