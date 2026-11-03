@@ -87,23 +87,31 @@ let
     "127.0.0.54"
   ];
 
+  # The gateway's group reads a connector's store: the directory, by its
+  # default ACL what the connector creates in it, and a store that is there
+  # already, from an older layout or after systemd's chown dropped its ACLs.
+  # private/ is left alone: its mask must stay empty. -P skips symlinks the
+  # connector might plant. The unit's own view of the directory is idmapped,
+  # where the gateway's group has no ID, so this goes through PID 1's root.
+  storeACL = pkgs.writeShellScript "mandate-store-acl" ''
+    set -eu
+    dir=/proc/1/root/var/lib/private/mandate/connectors/$1
+    ${pkgs.acl}/bin/setfacl -m g:mandate-gateway:r-X,d:g:mandate-gateway:r-X "$dir"
+    for f in "$dir/data.db" "$dir/data.db-journal"; do
+      if [ -f "$f" ]; then
+        ${pkgs.acl}/bin/setfacl -P -m g:mandate-gateway:r "$f"
+      fi
+    done
+  '';
+
   connectorService =
     name: c:
-    let
-      # Where DynamicUser= puts StateDirectory=mandate/connectors/NAME.
-      state = "/var/lib/private/mandate/connectors/${name}";
-    in
     unit "mandate connector ${name}" {
       User = "mandate-${name}";
       StateDirectory = "mandate/connectors/${name}";
       StateDirectoryMode = "0750";
       RuntimeDirectory = "mandate/connectors/${name}";
-      # The gateway reads data.db: its group gets the directory and, by the
-      # default ACL, what the connector creates group-readable in it.
-      # private/ is 0700, so its mask keeps the gateway out. The unit's own
-      # view of the directory is idmapped, where the gateway's group has no
-      # ID, so the ACL goes on through PID 1's root.
-      ExecStartPre = "+${pkgs.acl}/bin/setfacl -m g:mandate-gateway:r-X,d:g:mandate-gateway:r-X /proc/1/root${state}";
+      ExecStartPre = "+${storeACL} ${name}";
       ExecStart = utils.escapeSystemdExecArgs [
         (lib.getExe c.package)
         "--name"

@@ -27,15 +27,22 @@ in
           package = testPrograms;
           config.account = "vm";
         };
+        # Started by the test, on a store left from before.
+        legacy = {
+          package = testPrograms;
+          config.account = "old";
+        };
       }
       // pkgs.lib.genAttrs bundled (_: { });
     };
+    systemd.services.mandate-legacy.wantedBy = pkgs.lib.mkForce [ ];
     networking.firewall.allowedTCPPorts = [ 8443 ];
     environment.systemPackages = [
       testPrograms
       pkgs.acl
       pkgs.curl
       pkgs.jq
+      pkgs.sqlite
     ];
   };
 
@@ -149,7 +156,7 @@ in
         server.wait_until_succeeds("test $(testdevice --state /root/phone.json call GET /owner/v1/keys | jq '.body.trusted | length') = 1")
         assert connector_keys() == 1
         connectors = {c["name"]: c for c in call("GET", "/owner/v1/connectors")["body"]}
-        assert set(connectors) == {"test", *bundled}, connectors
+        assert set(connectors) == {"test", "legacy", *bundled}, connectors
         assert connectors["test"]["health"]["state"] == "ok", connectors
         for name in bundled:
             assert connectors[name]["health"]["state"] == "setup", connectors
@@ -230,6 +237,31 @@ in
         assert agent("test messages sam")[0] != 0
         assert "fresh secret" not in bodies("test search fresh")
 
+    with subtest("a store from before, another uid's and without ACLs, is read through the gateway; private/ is not"):
+        d = "/var/lib/private/mandate/connectors/legacy"
+        now = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+        server.succeed(
+            f"mkdir -p {d}/private && echo session > {d}/private/session"
+            f" && sqlite3 {d}/data.db < ${../store/schema.sql}"
+            f" && sqlite3 {d}/data.db \"INSERT INTO containers (id, kind, name, updated_at) VALUES ('old', 'group', 'Old friends', {now});"
+            f" INSERT INTO messages (id, container_id, sender_id, sent_at, body, ingested_at) VALUES ('old/1', 'old', '+15550009', {now}, 'kept from before', {now})\""
+            f" && chown -R 4242:4242 {d} && chmod 0750 {d} && chmod 0700 {d}/private && chmod 0600 {d}/data.db"
+        )
+        assert "mandate-gateway" not in server.succeed(f"getfacl -p {d}/data.db")
+        server.succeed("systemctl start mandate-legacy")
+        server.wait_until_succeeds("test -S /run/mandate/connectors/legacy/socket")
+        out = sign("/owner/v1/grants/challenge", {"identity": identity, "connector": "legacy", "for": 1800, "horizon": 0})
+        assert out["status"] == 200, out
+        laptop.wait_until_succeeds("mandate legacy chats | grep -q old")
+        assert ids("legacy chats") == ["old"]
+        assert bodies("legacy messages old") == ["kept from before"]
+        # A process in the gateway's group, seeing what the gateway sees.
+        as_gateway = ("systemd-run --wait --pipe --quiet -p DynamicUser=yes -p User=probe -p Group=mandate-gateway"
+                      " -p BindReadOnlyPaths=/var/lib/private/mandate/connectors:/var/lib/mandate/connectors cat")
+        server.succeed(f"{as_gateway} /var/lib/mandate/connectors/legacy/data.db >/dev/null")
+        server.fail(f"{as_gateway} /var/lib/mandate/connectors/legacy/private/session")
+        assert "mandate-gateway" not in server.succeed(f"getfacl -p {d}/private")
+
     with subtest("a write approved with an edit runs exactly once"):
         status, out = agent("test send fam on my way --note 'mum asked' --wait 0")
         assert status == 75, (status, out)
@@ -259,7 +291,7 @@ in
         status, out = agent("request test --chat club --reason 'one more' --wait 0")
         assert status == 75, (status, out)
         out = call("POST", "/owner/v1/stop-all")
-        assert out == {"status": 200, "body": {"grants": 2, "requests": 1}}, out
+        assert out == {"status": 200, "body": {"grants": 3, "requests": 1}}, out
         laptop.wait_until_fails("mandate test chats")
         status, out = agent("test chats")
         assert "mandate request test" in out, out
