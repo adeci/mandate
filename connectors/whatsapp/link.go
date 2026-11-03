@@ -1,0 +1,410 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	wastore "go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+
+	"github.com/adeci/mandate/connector"
+	"github.com/adeci/mandate/store"
+)
+
+const (
+	qrText   = "On your phone: WhatsApp › Settings › Linked devices › Link a device, then scan this code. Or link with your phone number instead."
+	codeText = "On your phone: WhatsApp › Settings › Linked devices › Link a device › Link with phone number instead, then type this code."
+	outdated = "WhatsApp rejected this client version; update mandate"
+
+	firstCodeWait = 30 * time.Second
+	// WhatsApp rotates QR codes every 20 seconds at most.
+	pollSeconds = 2
+)
+
+type waClient interface {
+	IsConnected() bool
+	IsLoggedIn() bool
+	SendMessage(ctx context.Context, to types.JID, msg *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
+	DownloadToFile(ctx context.Context, msg whatsmeow.DownloadableMessage, file whatsmeow.File) error
+	GetQRChannel(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error)
+	PairPhone(ctx context.Context, phone string, showPushNotification bool, clientType whatsmeow.PairClientType, clientDisplayName string) (string, error)
+	ConnectContext(ctx context.Context) error
+	Disconnect()
+	Logout(ctx context.Context) error
+}
+
+type waConnector struct {
+	st  *store.Store
+	log *slog.Logger
+	// ctx outlives requests: the connection and pairing run until shutdown.
+	ctx       context.Context
+	newDevice func() *wastore.Device
+	// newClient wires onEvent, then ingest, into a client for dev.
+	newClient func(dev *wastore.Device, onEvent func(evt any)) waClient
+
+	mu sync.Mutex
+	// Replaced after a logout or unlink: a deleted device cannot pair again.
+	cli waClient
+	dev *wastore.Device
+	// linked is tracked here rather than read from dev.ID, which whatsmeow
+	// writes from its own goroutines.
+	linked    bool
+	loggedOut bool
+	failure   string // why whatsmeow stopped reconnecting
+	pairing   *pairing
+}
+
+func newConnector(ctx context.Context, st *store.Store, log *slog.Logger, dev *wastore.Device,
+	newDevice func() *wastore.Device, newClient func(*wastore.Device, func(any)) waClient,
+) *waConnector {
+	c := &waConnector{st: st, log: log, ctx: ctx, newDevice: newDevice, newClient: newClient}
+	c.use(dev)
+	c.linked = dev.ID != nil
+	return c
+}
+
+// use needs c.mu, except during construction.
+func (c *waConnector) use(dev *wastore.Device) {
+	var cli waClient
+	cli = c.newClient(dev, func(evt any) { c.event(cli, evt) })
+	c.cli, c.dev = cli, dev
+}
+
+func (c *waConnector) current() (waClient, *wastore.Device, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cli, c.dev, c.linked
+}
+
+func (c *waConnector) connect() error {
+	cli, _, linked := c.current()
+	if !linked {
+		c.log.Warn("not linked; waiting for setup")
+		return nil
+	}
+	c.log.Info("connecting")
+	if err := cli.ConnectContext(c.ctx); err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	return nil
+}
+
+func (c *waConnector) disconnect() {
+	cli, _, _ := c.current()
+	cli.Disconnect()
+}
+
+func (c *waConnector) Health(context.Context) connector.Health {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case !c.linked && c.loggedOut:
+		return connector.Health{State: connector.NeedsSetup, Detail: "logged out from the phone"}
+	case !c.linked:
+		return connector.Health{State: connector.NeedsSetup, Detail: "not linked"}
+	case c.failure != "":
+		return connector.Health{State: connector.Broken, Detail: c.failure}
+	case c.cli.IsConnected() && c.cli.IsLoggedIn():
+		return connector.Health{State: connector.Healthy}
+	default:
+		return connector.Health{State: connector.Connecting, Detail: "connecting…"}
+	}
+}
+
+// event handles events from cli after which whatsmeow does not reconnect.
+func (c *waConnector) event(cli waClient, evt any) {
+	if _, ok := evt.(events.PermanentDisconnect); !ok {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cli != c.cli {
+		return
+	}
+	switch e := evt.(type) {
+	case *events.LoggedOut:
+		c.log.Warn("logged out from the phone; waiting for setup", "reason", e.Reason.String())
+		c.linked, c.loggedOut, c.failure, c.pairing = false, true, "", nil
+		c.use(c.newDevice())
+		// Disconnect takes the socket lock, which whatsmeow may hold while
+		// dispatching.
+		go cli.Disconnect()
+	case *events.ClientOutdated:
+		c.log.Error("whatsapp rejected this client version")
+		c.failure = outdated
+	case *events.StreamReplaced:
+		c.log.Error("session taken over by another client using the same session file")
+		c.failure = "session taken over by another client using the same session file; stop it, then restart this connector"
+	case events.PermanentDisconnect:
+		d := e.PermanentDisconnectDescription()
+		c.log.Error("permanent disconnect", "reason", d)
+		c.failure = d + "; restart this connector"
+	}
+}
+
+// Unlink removes the device from the phone and forgets the session.
+func (c *waConnector) Unlink(ctx context.Context) error {
+	cli, dev, linked := c.current()
+	if linked {
+		if err := c.forget(ctx, cli, dev); err != nil {
+			return err
+		}
+	}
+	c.mu.Lock()
+	old := c.cli
+	c.linked, c.loggedOut, c.failure, c.pairing = false, false, "", nil
+	c.use(c.newDevice())
+	c.mu.Unlock()
+	old.Disconnect()
+	c.log.Info("unlinked")
+	return nil
+}
+
+// forget logs dev out, best effort, and deletes its session.
+func (c *waConnector) forget(ctx context.Context, cli waClient, dev *wastore.Device) error {
+	// Offline the phone keeps listing the device until it expires; the
+	// session is forgotten either way.
+	if err := cli.Logout(ctx); err != nil {
+		c.log.Warn("logout from whatsapp failed; forgetting the session anyway", "err", err)
+	}
+	cli.Disconnect()
+	if err := dev.Delete(ctx); err != nil {
+		return fmt.Errorf("delete session: %w", err)
+	}
+	return nil
+}
+
+// pairing is one QR session: WhatsApp rotates its codes until one is
+// scanned or they run out.
+type pairing struct {
+	cli   waClient
+	dev   *wastore.Device
+	ready chan struct{} // closed at the first code or at the end
+
+	// Guarded by waConnector.mu.
+	qr      string
+	done    bool
+	expired bool
+	err     error
+
+	phoneMu   sync.Mutex // one pairing-code request at a time
+	phone     string
+	phoneCode string
+}
+
+// Setup links as WhatsApp Web does: step "qr" shows the rotating QR code
+// and takes a phone number instead, step "code" shows the pairing code for
+// that number. Polls continue the pairing in progress; once its codes run
+// out, the next poll starts another and shows a QR code again.
+func (c *waConnector) Setup(ctx context.Context, step string, values map[string]string) (connector.Step, error) {
+	var phone string
+	switch step {
+	case "", "qr":
+		for k, v := range values {
+			if k != "phone" {
+				return connector.Step{}, connector.Invalid("unknown field %q", k)
+			}
+			d, ok := phoneDigits(v)
+			if !ok {
+				return connector.Step{}, connector.Invalid("type the phone number with its country code, e.g. +15551234567")
+			}
+			phone = "+" + d
+		}
+	case "code":
+		if len(values) > 0 {
+			return connector.Step{}, connector.Invalid("the code step takes no values")
+		}
+	default:
+		return connector.Step{}, connector.Invalid("unknown step %q", step)
+	}
+	for range 2 {
+		p, end, err := c.pairingFor()
+		if p == nil {
+			return end, err
+		}
+		select {
+		case <-p.ready:
+		case <-ctx.Done():
+			return connector.Step{}, ctx.Err()
+		case <-time.After(firstCodeWait):
+			return connector.Step{}, &connector.Error{Status: http.StatusGatewayTimeout, Message: "WhatsApp sent no QR code; try again"}
+		}
+		c.mu.Lock()
+		qr, expired := p.qr, p.expired
+		c.mu.Unlock()
+		if expired {
+			continue
+		}
+		if p, end, err := c.pairingFor(); p == nil {
+			return end, err
+		}
+		if step == "code" {
+			phone = p.requestedPhone()
+		}
+		if phone == "" {
+			return connector.Step{
+				ID: "qr", Title: "Link WhatsApp", Text: qrText, QR: qr, Poll: pollSeconds,
+				Fields: []connector.Field{{Name: "phone", Label: "Phone number, with country code", Kind: connector.TextField}},
+			}, nil
+		}
+		code, err := c.phoneCode(ctx, p, phone)
+		if err != nil {
+			return connector.Step{}, err
+		}
+		return connector.Step{ID: "code", Title: "Link WhatsApp", Text: codeText, Code: code, Poll: pollSeconds}, nil
+	}
+	return connector.Step{}, &connector.Error{Status: http.StatusGatewayTimeout, Message: "the QR codes expired; try again"}
+}
+
+// pairingFor returns the pairing in progress, starting one if needed, or
+// the step or error that ends linking.
+func (c *waConnector) pairingFor() (*pairing, connector.Step, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p := c.pairing
+	switch {
+	case p != nil && p.done:
+		c.pairing = nil
+		return nil, connector.Step{Title: "WhatsApp linked", Done: true}, nil
+	case c.linked:
+		return nil, connector.Step{}, &connector.Error{Status: http.StatusConflict, Message: "already linked"}
+	case p != nil && p.err != nil:
+		c.pairing = nil
+		return nil, connector.Step{}, &connector.Error{Status: http.StatusBadGateway, Message: p.err.Error()}
+	case p != nil && !p.expired:
+		return p, connector.Step{}, nil
+	}
+	p = &pairing{cli: c.cli, dev: c.dev, ready: make(chan struct{})}
+	c.pairing = p
+	go c.pair(p)
+	return p, connector.Step{}, nil
+}
+
+func (c *waConnector) pair(p *pairing) {
+	ch, err := p.cli.GetQRChannel(c.ctx)
+	if err == nil {
+		err = p.cli.ConnectContext(c.ctx)
+	}
+	if err != nil {
+		c.log.Error("start pairing", "err", err)
+		p.cli.Disconnect()
+		c.endPairing(p, fmt.Errorf("connect to whatsapp: %w", err))
+		return
+	}
+	for item := range ch {
+		switch item.Event {
+		case whatsmeow.QRChannelEventCode:
+			c.mu.Lock()
+			first := p.qr == ""
+			p.qr = item.Code
+			c.mu.Unlock()
+			if first {
+				close(p.ready)
+			}
+			continue
+		case whatsmeow.QRChannelSuccess.Event:
+			c.mu.Lock()
+			// Unlink drops the pairing in progress.
+			current := c.pairing == p
+			if current {
+				c.linked, c.loggedOut, c.failure = true, false, ""
+				p.done = true
+			}
+			c.mu.Unlock()
+			if current {
+				c.log.Info("linked")
+				c.endPairing(p, nil)
+				return
+			}
+			if err := c.forget(c.ctx, p.cli, p.dev); err != nil {
+				c.log.Error("forget the device of a dropped pairing", "err", err)
+			}
+		case whatsmeow.QRChannelTimeout.Event:
+			// The codes ran out: expired, and the next Setup starts again.
+		case whatsmeow.QRChannelClientOutdated.Event:
+			err = errors.New(outdated)
+		case whatsmeow.QRChannelEventPasskeyRequest, whatsmeow.QRChannelEventPasskeyResponse:
+			err = errors.New("the phone asked for passkey pairing, which mandate does not support; link with the QR code or a phone number")
+		case whatsmeow.QRChannelEventError:
+			err = fmt.Errorf("pairing failed: %w", item.Error)
+		default:
+			err = fmt.Errorf("pairing failed: %s", item.Event)
+		}
+		break
+	}
+	// whatsmeow disconnects on some of these, but only after closing the
+	// channel; the next pairing needs the socket closed.
+	p.cli.Disconnect()
+	c.endPairing(p, err)
+}
+
+func (c *waConnector) endPairing(p *pairing, err error) {
+	c.mu.Lock()
+	switch {
+	case err != nil:
+		p.err = err
+	case !p.done:
+		p.expired = true
+	}
+	first := p.qr == ""
+	c.mu.Unlock()
+	if first {
+		close(p.ready)
+	}
+}
+
+// phoneCode requests a pairing code for phone once per pairing; each request
+// notifies the phone.
+func (c *waConnector) phoneCode(ctx context.Context, p *pairing, phone string) (string, error) {
+	p.phoneMu.Lock()
+	defer p.phoneMu.Unlock()
+	if p.phone == phone {
+		return p.phoneCode, nil
+	}
+	code, err := p.cli.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	if errors.Is(err, whatsmeow.ErrIQBadRequest) {
+		return "", connector.Invalid("WhatsApp refused %s; check the number and its country code", phone)
+	}
+	if err != nil {
+		return "", &connector.Error{Status: http.StatusBadGateway, Message: "request pairing code: " + err.Error()}
+	}
+	p.phone, p.phoneCode = phone, code
+	return code, nil
+}
+
+// requestedPhone is the number a pairing code was requested for, if any.
+func (p *pairing) requestedPhone() string {
+	p.phoneMu.Lock()
+	defer p.phoneMu.Unlock()
+	return p.phone
+}
+
+// phoneDigits accepts an E.164 number or bare digits including the country
+// code, tolerating spaces, dashes, dots, and parentheses.
+func phoneDigits(s string) (string, bool) {
+	s = strings.TrimPrefix(s, "+")
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == ' ' || r == '-' || r == '.' || r == '(' || r == ')':
+		default:
+			return "", false
+		}
+	}
+	d := b.String()
+	if len(d) < 7 || len(d) > 15 || d[0] == '0' {
+		return "", false
+	}
+	return d, true
+}
