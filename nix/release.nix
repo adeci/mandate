@@ -65,7 +65,7 @@ let
         gzip -9n >$out/mandate-linux-${arch}.tar.gz
     '';
 in
-pkgs.runCommand "mandate-release" { } ''
+pkgs.runCommand "mandate-release" { nativeBuildInputs = [ pkgs.binutils ]; } ''
   mkdir $out
   ${tarball {
     arch = "x86_64";
