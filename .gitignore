@@ -16,3 +16,5 @@ result-*
 /connectors/matrix/matrix
 /connectors/signal/signal
 /connectors/whatsapp/whatsapp
+/nix/testconnector/testconnector
+/nix/testdevice/testdevice
