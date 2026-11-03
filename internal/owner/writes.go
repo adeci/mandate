@@ -46,7 +46,7 @@ func (s *Server) postProposal(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, "no live grant covers the chat")
 		return
 	}
-	now := s.now().UTC().Truncate(time.Second)
+	now := s.now()
 	p := &proposal{
 		ID: record.NewID(), Identity: np.Identity, Connector: np.Connector, Op: np.Op,
 		Prepared: np.Prepared, Note: np.Note, CreatedAt: now, ExpiresAt: now.Add(proposalTTL),

@@ -93,7 +93,7 @@ func newServer(dir string, conns map[string]*connector.Client, gatewaySock strin
 			},
 		}},
 		log:        log,
-		now:        time.Now,
+		now:        func() time.Time { return time.Now().UTC().Truncate(time.Second) },
 		st:         st,
 		keys:       keys,
 		challenges: map[string]*challenge{},

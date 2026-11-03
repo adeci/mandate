@@ -456,7 +456,6 @@ type grantView struct {
 	IdentityName string            `json:"identity_name"`
 	ChatNames    map[string]string `json:"chat_names,omitempty"`
 	ClosedAt     time.Time         `json:"closed_at,omitzero"`
-	Open         bool              `json:"open"`
 }
 
 func (s *Server) grantView(g *grant) grantView {
@@ -464,7 +463,7 @@ func (s *Server) grantView(g *grant) grantView {
 	if i := s.st.Identities[g.Record.Identity]; i != nil {
 		name = i.Name
 	}
-	return grantView{g.Record, name, g.ChatNames, g.ClosedAt, g.open(s.now())}
+	return grantView{g.Record, name, g.ChatNames, g.ClosedAt}
 }
 
 type requestView struct {

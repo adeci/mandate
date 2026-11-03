@@ -109,7 +109,7 @@ func start(t *testing.T, conns map[string]*connector.Client) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := &clock{t: time.Now().UTC()}
+	c := &clock{t: time.Now().UTC().Truncate(time.Second)}
 	s.now = c.now
 	ln, err := peer.Listen(filepath.Join(socks, "owner"))
 	if err != nil {

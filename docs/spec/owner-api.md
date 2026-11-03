@@ -110,10 +110,72 @@ Chat names that start with `~` were chosen by other people. The app shows chat I
 | `POST /owner/v1/connectors/{name}/unlink` | |
 | `GET /owner/v1/connectors/{name}/chats` | `?q=` or `?parent=`: chats for the picker, with ID, name, kind, parent and last activity. |
 | `GET /owner/v1/never-share` | `[{connector, kind, id, name}]`, `kind` being `chat` or `person` |
-| `PUT /owner/v1/never-share/{connector}/{kind}/{id}` | Hides the chat, or the person's messages and DMs, from every read and chat list, whatever the grants say. |
+| `PUT /owner/v1/never-share/{connector}/{kind}/{id}` | `{name?}`. Hides the chat, or the person's messages and DMs, from every read and chat list, whatever the grants say. |
 | `DELETE /owner/v1/never-share/{connector}/{kind}/{id}` | |
 | `GET /owner/v1/keys` | The key log as envelopes, and the trusted keys with their device names. |
 | `POST /owner/v1/keys/{id}/remove/challenge` | The `remove` entry. |
+
+Calls that return nothing above answer `{}`.
+
+### Bodies
+
+Times are RFC 3339 UTC, whole seconds. `…` stands for what the example would repeat.
+
+A grant is its record (`records.md`) plus `identity_name`, `chat_names` where the request named them, and `closed_at` once closed or paused:
+
+```json
+{"id": "7RJ4P2W5ZK3HXQ6N5M2C4YB7DE", "identity": "QX3M7E2KQ4F5PN6ZJ7LDV2Y3AU", "identity_name": "laptop",
+ "connector": "signal", "chats": ["group.6f1b2c"], "chat_names": {"group.6f1b2c": "~Family"},
+ "horizon": 604800, "from": "2026-11-03T09:15:00Z", "until": "2026-11-03T10:15:00Z",
+ "created_at": "2026-11-03T09:15:00Z", "closed_at": "2026-11-03T09:40:00Z"}
+```
+
+A proposal, as `GET /owner/v1/proposals/{id}` and `now` show it; `editable` lists the `param`s of `display`:
+
+```json
+{"id": "Z2K7Q4M3P6X5W2N7D4R3J6YB5C", "identity": "QX3M…", "identity_name": "laptop", "connector": "signal", "op": "send",
+ "display": [{"label": "To", "value": "~Family"}, {"label": "Text", "value": "See you at 8", "param": "text"}],
+ "editable": ["text"], "note": "the owner asked me to reply", "status": "pending",
+ "created_at": "2026-11-03T09:30:00Z", "expires_at": "2026-11-04T09:30:00Z"}
+```
+
+`GET /owner/v1/now`:
+
+```json
+{"requests": [{"id": "B5TQ…", "identity": "QX3M…", "identity_name": "laptop", "connector": "signal", "kind": "once",
+               "terms": [{"term": "fam", "chats": [{"id": "group.6f1b2c", "name": "~Family"}]}, {"term": "climbing", "chats": []}],
+               "for": 1800, "horizon": 604800, "reason": "summarize the weekend plans",
+               "created_at": "2026-11-03T09:14:00Z", "status": "pending"}],
+ "proposals": [<proposal>],
+ "grants": [<grant>], "routines": [<grant>], "stopped": [<grant>],
+ "activity": [{"at": "2026-11-03T09:20:00Z", "identity": "QX3M…", "connector": "signal", "verb": "messages",
+               "chats": [{"id": "group.6f1b2c", "name": "~Family"}], "count": 20}],
+ "more": false}
+```
+
+- A request without `terms` asks for every chat; a term with no chats matched nothing. A routine has `schedule` (`days`, `start`, `length`) instead of `for`; `extend` has only `for`.
+- `verb` is a read (`chats`, `messages`, `search`, `media`) or a write op. Activity is newest first, at most 500; `more` means `before` the last `at` finds more.
+
+`GET /owner/v1/identities`:
+
+```json
+[{"id": "QX3M…", "name": "laptop", "created_at": "2026-11-03T09:10:00Z",
+  "first_seen": "2026-11-03T09:14:00Z", "last_seen": "2026-11-03T09:20:00Z", "grants": [<grant>]}]
+```
+
+`GET /owner/v1/connectors`, with `health` as in `connector.md`:
+
+```json
+[{"name": "signal", "health": {"state": "resting", "detail": "daily budget used", "until": "2026-11-04T06:00:00Z"}, "setup": false}]
+```
+
+`GET /owner/v1/keys`:
+
+```json
+{"log": [<key envelope>, …], "trusted": [{"id": "b903…", "name": "Pixel 9", "public_key": "BN4C…", "type": "p256"}]}
+```
+
+`POST /owner/v1/exchanges/{id}/code` answers `{"payload": {"token_sha256": "…"}}` for an agent, with `key` added for a device. `GET /owner/v1/connectors/{name}/chats` answers as `GET /containers` in `connector.md`.
 
 ## Stream
 
