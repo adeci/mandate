@@ -26,9 +26,11 @@ Pairing gives the app the server's SPKI SHA-256, which it checks on first connec
    ```
 
 3. The app makes its signing key and a device token, then calls `POST /owner/v1/pair` with:
-   - `secret` and `name`;
+   - `secret`;
    - `token_sha256`;
-   - key log entry seq 0, adding its key, signed by that key.
+   - `entry`: key log entry seq 0, adding its key, signed by that key. The key's `name` is the device's name.
+
+   It answers `{"kind": "key", "id": "<key id>"}`.
 4. That spends the secret and the setup password.
 
 The setup page exists only before the first pairing and again after `mandate reset`. Whoever pairs first owns the server: if the app's pairing succeeds, its key is seq 0 and nobody paired before it; if the secret is already spent, run `mandate reset`.
@@ -44,12 +46,12 @@ On an existing device, the owner:
 2. types the code (`POST /owner/v1/exchanges/{id}/code`);
 3. signs the `add` entry from `POST /owner/v1/exchanges/{id}/challenge`.
 
-**`mandate reset`** (root) wipes:
+**`mandate reset`** (root) stops `mandate.target`, then wipes:
 
-- the owner side's key log, identities, grants and device tokens;
-- every connector's key log.
+- the owner side's key log, identities, grants, device tokens, requests and proposals;
+- every connector's key log, and the gateway's copy of the live set.
 
-It keeps every connector's spent approvals, so nothing signed before the reset can run again, and then issues a new setup password.
+It keeps never-share, activity and every connector's spent approvals, so nothing signed before the reset can run again. Then it issues a new setup password and starts `mandate.target` again.
 
 ## Device token
 
@@ -140,3 +142,4 @@ A notification shows the identity, the connector and what kind of thing it is, e
 | 409 | `conflict` | decided, closed, replaced, or the challenge was cancelled |
 | 410 | `expired` | challenge, proposal or exchange past its time |
 | 429 | `rate_limited` | |
+| 502 | `connector` | the connector is down or refused for its own reasons |

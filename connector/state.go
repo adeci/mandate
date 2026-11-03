@@ -15,8 +15,11 @@ import (
 	"github.com/adeci/mandate/record"
 )
 
-// loadKeys reads the key log at path, which `mandate reset` deletes; none is
-// an empty log.
+// keyLogFile, in private/, holds the key log as a JSON array of envelopes.
+// `mandate reset` deletes it.
+const keyLogFile = "keylog.json"
+
+// loadKeys reads the key log at path; none is an empty log.
 func loadKeys(path string) (*record.Log, error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {

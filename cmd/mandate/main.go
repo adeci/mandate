@@ -11,10 +11,16 @@ import (
 
 	"github.com/adeci/mandate/internal/config"
 	"github.com/adeci/mandate/internal/front"
+	"github.com/adeci/mandate/internal/gateway"
+	"github.com/adeci/mandate/internal/owner"
 )
 
 const usage = `usage:
-  mandate serve front`
+  mandate serve front
+  mandate serve gateway
+  mandate serve owner
+  sudo mandate setup
+  sudo mandate reset`
 
 var errUsage = errors.New("bad usage")
 
@@ -33,8 +39,18 @@ func main() {
 }
 
 func run(ctx context.Context, args []string) error {
-	if len(args) == 2 && args[0] == "serve" {
+	switch {
+	case len(args) == 2 && args[0] == "serve":
 		return serve(ctx, args[1])
+	case len(args) == 1 && (args[0] == "setup" || args[0] == "reset"):
+		cfg, err := config.Load(config.File())
+		if err != nil {
+			return err
+		}
+		if args[0] == "setup" {
+			return owner.Setup(ctx, cfg, os.Stdout)
+		}
+		return owner.Reset(ctx, cfg, os.Stdout)
 	}
 	return errUsage
 }
@@ -44,6 +60,10 @@ func serve(ctx context.Context, process string) error {
 	switch process {
 	case "front":
 		start = front.Serve
+	case "gateway":
+		start = gateway.Serve
+	case "owner":
+		start = owner.Serve
 	default:
 		return errUsage
 	}

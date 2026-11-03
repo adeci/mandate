@@ -20,18 +20,19 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
+	"github.com/adeci/mandate/internal/peer"
 	"github.com/adeci/mandate/record"
 	"github.com/adeci/mandate/store"
 )
 
 const maxBody = 1 << 20
 
-// Server serves a Connector to the gateway and owner users.
+// Server serves a Connector to the gateway and owner groups.
 type Server struct {
 	c              Connector
+	name           string
 	dir            string
 	gateway, owner uint32
 	log            *slog.Logger
@@ -44,11 +45,11 @@ type Server struct {
 	fetching  atomic.Int32
 }
 
-// NewServer serves c with its state in dir, where dir/private exists. Only
-// callers whose primary group is gateway or owner may call it, each on its
-// own routes.
-func NewServer(c Connector, dir string, gateway, owner uint32, log *slog.Logger) (*Server, error) {
-	keys, err := loadKeys(filepath.Join(dir, "private", "keys.json"))
+// NewServer serves c under name, with its state in dir, where dir/private
+// exists. Only callers whose primary group is gateway or owner may call it,
+// each on its own routes.
+func NewServer(c Connector, name, dir string, gateway, owner uint32, log *slog.Logger) (*Server, error) {
+	keys, err := loadKeys(filepath.Join(dir, "private", keyLogFile))
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +57,7 @@ func NewServer(c Connector, dir string, gateway, owner uint32, log *slog.Logger)
 	if err != nil {
 		return nil, err
 	}
-	return &Server{c: c, dir: dir, gateway: gateway, owner: owner, log: log, keys: keys, spent: sp}, nil
+	return &Server{c: c, name: name, dir: dir, gateway: gateway, owner: owner, log: log, keys: keys, spent: sp}, nil
 }
 
 // Serve serves on ln until ctx is done, then waits for writes in flight.
@@ -65,14 +66,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
 		Handler:           s.handler(),
 		ReadHeaderTimeout: 5 * time.Second,
-		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			gid, err := peerGID(c)
-			if err != nil {
-				s.log.Warn("peer credentials", "err", err)
-				return ctx
-			}
-			return context.WithValue(ctx, peerKey{}, gid)
-		},
+		ConnContext:       peer.ConnContext,
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
@@ -92,81 +86,30 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	return err
 }
 
-// class is who may call a route.
-type class uint8
-
-const (
-	gateway class = 1 << iota
-	owner
-)
-
 func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
-	route := func(pattern string, who class, h http.HandlerFunc) {
-		mux.HandleFunc(pattern, s.allow(who, h))
+	both := []uint32{s.gateway, s.owner}
+	route := func(pattern string, gids []uint32, h http.HandlerFunc) {
+		mux.Handle(pattern, peer.Allow(s.log, h, gids...))
 	}
-	route("GET /spec", gateway|owner, s.spec)
-	route("GET /health", gateway|owner, s.health)
-	route("GET /keys", gateway|owner, s.getKeys)
-	route("POST /prepare", gateway|owner, s.prepare)
-	route("POST /read", gateway, s.read)
-	route("POST /media", gateway, s.media)
-	route("POST /setup", owner, s.setup)
-	route("POST /unlink", owner, s.unlink)
-	route("POST /execute", owner, s.execute)
-	route("PUT /keys", owner, s.putKeys)
-	route("GET /containers", owner, s.containers)
+	route("GET /spec", both, s.spec)
+	route("GET /health", both, s.health)
+	route("GET /keys", both, s.getKeys)
+	route("POST /prepare", both, s.prepare)
+	route("POST /read", []uint32{s.gateway}, s.read)
+	route("POST /media", []uint32{s.gateway}, s.media)
+	route("POST /setup", []uint32{s.owner}, s.setup)
+	route("POST /unlink", []uint32{s.owner}, s.unlink)
+	route("POST /execute", []uint32{s.owner}, s.execute)
+	route("PUT /keys", []uint32{s.owner}, s.putKeys)
+	route("GET /containers", []uint32{s.owner}, s.containers)
 	return mux
-}
-
-type peerKey struct{}
-
-func (s *Server) allow(who class, h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		gid, ok := r.Context().Value(peerKey{}).(uint32)
-		var c class
-		if ok && gid == s.gateway {
-			c |= gateway
-		}
-		if ok && gid == s.owner {
-			c |= owner
-		}
-		if c&who == 0 {
-			s.log.Warn("caller refused", "gid", gid, "known", ok, "method", r.Method, "path", r.URL.Path)
-			writeError(w, &Error{Status: http.StatusForbidden, Message: "this caller may not use " + r.Method + " " + r.URL.Path})
-			return
-		}
-		h(w, r)
-	}
-}
-
-// peerGID is the primary group of the process at the other end of a Unix
-// socket, as the kernel recorded it at connect.
-func peerGID(c net.Conn) (uint32, error) {
-	uc, ok := c.(*net.UnixConn)
-	if !ok {
-		return 0, fmt.Errorf("%T is not a Unix socket", c)
-	}
-	raw, err := uc.SyscallConn()
-	if err != nil {
-		return 0, err
-	}
-	var cred *syscall.Ucred
-	var credErr error
-	if err := raw.Control(func(fd uintptr) {
-		cred, credErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
-	}); err != nil {
-		return 0, err
-	}
-	if credErr != nil {
-		return 0, credErr
-	}
-	return cred.Gid, nil
 }
 
 func (s *Server) spec(w http.ResponseWriter, _ *http.Request) {
 	spec := s.c.Spec()
 	spec.Protocol = ProtocolVersion
+	spec.Name = s.name
 	_, spec.Media = s.c.(MediaFetcher)
 	_, spec.Unlink = s.c.(Unlinker)
 	writeJSON(w, http.StatusOK, spec)
@@ -245,9 +188,8 @@ func (s *Server) execute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wr := rec.(record.Write)
-	spec := s.c.Spec()
-	if op, ok := spec.Op(wr.Op); wr.Connector != spec.Name || !ok || op.Kind != Write {
-		refuse(http.StatusForbidden, fmt.Sprintf("approval is for %s %s, not a write op of %s", wr.Connector, wr.Op, spec.Name))
+	if op, ok := s.c.Spec().Op(wr.Op); wr.Connector != s.name || !ok || op.Kind != Write {
+		refuse(http.StatusForbidden, fmt.Sprintf("approval is for %s %s, not a write op of %s", wr.Connector, wr.Op, s.name))
 		return
 	}
 	// A record whose display differs from what its args render now showed
@@ -302,7 +244,7 @@ func (s *Server) putKeys(w http.ResponseWriter, r *http.Request) {
 		writeError(w, &Error{Status: http.StatusConflict, Message: "key log refused: " + err.Error()})
 		return
 	}
-	if err := saveKeys(filepath.Join(s.dir, "private", "keys.json"), &next); err != nil {
+	if err := saveKeys(filepath.Join(s.dir, "private", keyLogFile), &next); err != nil {
 		writeError(w, fmt.Errorf("save key log: %w", err))
 		return
 	}
@@ -433,7 +375,7 @@ func (s *Server) listContainers(ctx context.Context, q, parent string, limit int
 	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 		return out, nil
 	}
-	db, err := store.OpenReadOnly(ctx, path)
+	db, err := store.OpenReadOnly(ctx, path, nil)
 	if err != nil {
 		return nil, err
 	}

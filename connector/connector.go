@@ -50,13 +50,14 @@ type Unlinker interface {
 }
 
 type Spec struct {
+	// Protocol, Name, Media and Unlink are set by the server: Name from
+	// --name, Media and Unlink from the optional interfaces.
 	Protocol int    `json:"protocol"`
 	Name     string `json:"name"`
 	Doc      string `json:"doc,omitempty"`
-	// Media and Unlink are set from the optional interfaces.
-	Media  bool `json:"media,omitempty"`
-	Unlink bool `json:"unlink,omitempty"`
-	Ops    []Op `json:"ops"`
+	Media    bool   `json:"media,omitempty"`
+	Unlink   bool   `json:"unlink,omitempty"`
+	Ops      []Op   `json:"ops"`
 }
 
 // Kind separates ops that run inside an agent's grant from proposals.

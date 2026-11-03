@@ -15,7 +15,8 @@ import (
 	"fmt"
 	"time"
 
-	_ "github.com/ncruces/go-sqlite3/driver" // registers "sqlite3"
+	"github.com/ncruces/go-sqlite3"
+	"github.com/ncruces/go-sqlite3/driver"
 )
 
 // Version is the schema version in PRAGMA user_version.
@@ -136,9 +137,10 @@ func migrate(ctx context.Context, db *sql.DB) error {
 }
 
 // OpenReadOnly opens the store at path for reading only and refuses any
-// version but Version.
-func OpenReadOnly(ctx context.Context, path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", "file:"+path+"?mode=ro&_pragma=busy_timeout(10000)")
+// version but Version. init, if not nil, runs on each new connection, such
+// as to register functions.
+func OpenReadOnly(ctx context.Context, path string, init func(*sqlite3.Conn) error) (*sql.DB, error) {
+	db, err := driver.Open("file:"+path+"?mode=ro&_pragma=busy_timeout(10000)", init)
 	if err != nil {
 		return nil, fmt.Errorf("open store %s: %w", path, err)
 	}

@@ -7,6 +7,7 @@ require (
 	github.com/gtank/ristretto255 v0.2.0
 	github.com/ncruces/go-sqlite3 v0.35.6
 	golang.org/x/crypto v0.58.0
+	rsc.io/qr v0.2.0
 )
 
 require (

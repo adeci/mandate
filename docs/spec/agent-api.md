@@ -54,8 +54,10 @@ mistyped code fails and nobody can guess it offline.
    picks it, types the code and unlocks the device. The server, as CPace
    initiator, sends `Ya`.
 4. The new party polls `GET {base}/join/{id}?wait=SECONDS` → `{"msg": "<Ya hex>"}`,
-   runs CPace as responder and posts:
-   `POST {base}/join/{id}` with `{"msg": "<Yb>", "confirm": "<party_confirm>", "sealed": "<sealed>"}`.
+   or `{"status": "pending"}` while the owner has not typed the code, runs
+   CPace as responder and posts:
+   `POST {base}/join/{id}` with `{"msg": "<Yb>", "confirm": "<party_confirm>", "sealed": "<sealed>"}`,
+   all in lowercase hex, as is `server_confirm` below.
 5. The server checks `party_confirm`. If it fails, the answer is `403`, the
    attempt counts as a wrong code, and the new party polls again for the
    owner's next try. If it holds, the server answers
@@ -193,7 +195,8 @@ Reads answer a table:
   `Content-Disposition`.
 - A read op's `container` and `message` params are checked before the
   connector runs; what it stored comes back through the same filter. A grant
-  that closes meanwhile answers `403`.
+  that closes meanwhile answers `403`. `containers` counts the visible chats
+  a sync stored.
 
 ## Access
 

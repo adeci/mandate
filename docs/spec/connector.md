@@ -13,10 +13,12 @@ Each connector runs as its own Unix user, usually a systemd dynamic user,
 started by mandate as:
 
 ```
-NAME --socket PATH --state DIR [--config FILE] --gateway-group GROUP --owner-group GROUP
-NAME --check-config FILE
+PROGRAM --name NAME --socket PATH --state DIR [--config FILE] --gateway-group GROUP --owner-group GROUP
+PROGRAM --check-config FILE
 ```
 
+- `--name` is the name mandate configured it under, so one program can serve
+  two accounts of the same service.
 - `--config` is JSON; unknown keys are refused. `--check-config` exits 0 for
   a valid file, else non-zero with a message on stderr.
 - The socket is mode 0666: who may call what is decided per route, by the
@@ -64,8 +66,7 @@ what it sent; `429` adds `retry_after_seconds`.
      {"name": "seq", "doc": "message to reply to", "message": true}]}]}
 ```
 
-- `name` equals the name mandate configured. mandate refuses another
-  `protocol`.
+- `name` equals `--name`. mandate refuses another `protocol`.
 - `kind`: `read` runs inside an agent's grant; `write` is a proposal.
 - `container`: a chat ID. `message`: a message `seq` in the op's one
   `container` chat. The gateway checks both against the agent's grants before
@@ -91,7 +92,9 @@ content.
 
 The connector alone writes `data.db`; mandate opens it read-only and filters
 every read. The connector sets `PRAGMA user_version = 1`, migrates its own
-store in place on upgrade, and mandate reads only the current version.
+store in place on upgrade, and mandate reads only the current version. A
+connector may add its own tables, named `PROGRAM_…`; mandate ignores them,
+but the gateway can read them, so they hold nothing secret.
 
 ```sql
 CREATE TABLE containers (

@@ -107,7 +107,7 @@ VALUES ('m1', 'c1', '2026-10-01T12:00:00.000Z', 'hi', '2026-10-01T12:00:01.000Z'
 	must(t, err)
 	must(t, old.Close())
 
-	if db, err := OpenReadOnly(ctx, path); err == nil {
+	if db, err := OpenReadOnly(ctx, path, nil); err == nil {
 		db.Close()
 		t.Fatal("OpenReadOnly accepted an unversioned store")
 	}
@@ -121,7 +121,7 @@ VALUES ('m1', 'c1', '2026-10-01T12:00:00.000Z', 'hi', '2026-10-01T12:00:01.000Z'
 	must(t, err)
 	must(t, s.Close())
 
-	db, err := OpenReadOnly(ctx, path)
+	db, err := OpenReadOnly(ctx, path, nil)
 	must(t, err)
 	defer db.Close()
 	var v int

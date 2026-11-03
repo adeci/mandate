@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -82,6 +83,9 @@ func (c *Config) validate() error {
 		if !connectorName.MatchString(name) {
 			return fmt.Errorf("connector %q: name must be a-z, 0-9 and -, start with a letter, at most 24 characters", name)
 		}
+		if slices.Contains([]string{"access", "connectors", "join", "proposals"}, name) {
+			return fmt.Errorf("connector %q: the name is taken by an agent API route", name)
+		}
 		if !filepath.IsAbs(conn.Command) {
 			return fmt.Errorf("connector %s: command must be an absolute path", name)
 		}
@@ -106,6 +110,9 @@ func StateDir(process string) string { return root("/var/lib/mandate/" + process
 
 // Socket is where gateway or owner serves HTTP.
 func Socket(process string) string { return root("/run/mandate/" + process + ".sock") }
+
+// SetupPasswordFile holds the setup password in plain text, for root only.
+func SetupPasswordFile() string { return root("/var/lib/mandate/setup-password") }
 
 // ConnectorDir is the connector's --state directory.
 func ConnectorDir(name string) string { return root("/var/lib/mandate/connectors/" + name) }

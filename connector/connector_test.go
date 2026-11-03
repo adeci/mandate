@@ -24,7 +24,7 @@ import (
 type fake struct{ runs atomic.Int32 }
 
 func (*fake) Spec() Spec {
-	return Spec{Name: "test", Ops: []Op{
+	return Spec{Ops: []Op{
 		{Name: "fetch", Kind: Read},
 		{Name: "send", Kind: Write, Params: []Param{
 			{Name: "chat", Required: true, Container: true},
@@ -63,7 +63,7 @@ func serve(t *testing.T, c Connector, dir string, gateway, owner uint32) (*Clien
 	if err := os.MkdirAll(filepath.Join(dir, "private"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := NewServer(c, dir, gateway, owner, slog.New(slog.DiscardHandler))
+	srv, err := NewServer(c, "test", dir, gateway, owner, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,29 +104,30 @@ func status(err error) int {
 func TestCallerClasses(t *testing.T) {
 	self := uint32(os.Getgid())
 	other := self + 1
+	const gw, ow = 1, 2
 	routes := []struct {
 		method, path string
-		who          class
+		who          int
 	}{
-		{"GET", "/spec", gateway | owner},
-		{"GET", "/health", gateway | owner},
-		{"GET", "/keys", gateway | owner},
-		{"POST", "/prepare", gateway | owner},
-		{"POST", "/read", gateway},
-		{"POST", "/media", gateway},
-		{"POST", "/setup", owner},
-		{"POST", "/unlink", owner},
-		{"POST", "/execute", owner},
-		{"PUT", "/keys", owner},
-		{"GET", "/containers", owner},
+		{"GET", "/spec", gw | ow},
+		{"GET", "/health", gw | ow},
+		{"GET", "/keys", gw | ow},
+		{"POST", "/prepare", gw | ow},
+		{"POST", "/read", gw},
+		{"POST", "/media", gw},
+		{"POST", "/setup", ow},
+		{"POST", "/unlink", ow},
+		{"POST", "/execute", ow},
+		{"PUT", "/keys", ow},
+		{"GET", "/containers", ow},
 	}
 	for _, caller := range []struct {
 		name           string
-		is             class
+		is             int
 		gateway, owner uint32
 	}{
-		{"gateway", gateway, self, other},
-		{"owner", owner, other, self},
+		{"gateway", gw, self, other},
+		{"owner", ow, other, self},
 		{"stranger", 0, other, other},
 	} {
 		t.Run(caller.name, func(t *testing.T) {

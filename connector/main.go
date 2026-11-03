@@ -10,17 +10,18 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"net"
 	"os"
 	"os/signal"
-	"os/user"
 	"path/filepath"
-	"strconv"
 	"syscall"
+
+	"github.com/adeci/mandate/internal/peer"
 )
 
 // Env is what Main gives a connector's start function.
 type Env struct {
+	// Name is the name mandate configured the connector under.
+	Name     string
 	StateDir string
 	Log      *slog.Logger
 
@@ -66,8 +67,8 @@ func (s Secret) Delete() error {
 
 // Main runs a connector program:
 //
-//	NAME --socket PATH --state DIR [--config FILE] --gateway-group GROUP --owner-group GROUP
-//	NAME --check-config FILE
+//	PROGRAM --name NAME --socket PATH --state DIR [--config FILE] --gateway-group GROUP --owner-group GROUP
+//	PROGRAM --check-config FILE
 //
 // It decodes the JSON config strictly into C (no --config decodes "{}") and
 // runs its Validate method if it has one, then calls start and serves until
@@ -85,8 +86,9 @@ func Main[C any](start func(ctx context.Context, env *Env, cfg C) (Connector, er
 	}
 }
 
-func run[C any](ctx context.Context, name string, args []string, start func(context.Context, *Env, C) (Connector, error)) (err error) {
-	flags := flag.NewFlagSet(name, flag.ContinueOnError)
+func run[C any](ctx context.Context, program string, args []string, start func(context.Context, *Env, C) (Connector, error)) (err error) {
+	flags := flag.NewFlagSet(program, flag.ContinueOnError)
+	name := flags.String("name", "", "the name mandate configured this connector under")
 	socket := flags.String("socket", "", "serve on this Unix socket")
 	stateDir := flags.String("state", "", "state directory")
 	configPath := flags.String("config", "", "JSON config")
@@ -103,22 +105,22 @@ func run[C any](ctx context.Context, name string, args []string, start func(cont
 		_, err := loadConfig[C](*checkPath)
 		return err
 	}
-	if *socket == "" || *stateDir == "" || *gatewayGroup == "" || *ownerGroup == "" {
-		return errors.New("--socket, --state, --gateway-group and --owner-group are required")
+	if *name == "" || *socket == "" || *stateDir == "" || *gatewayGroup == "" || *ownerGroup == "" {
+		return errors.New("--name, --socket, --state, --gateway-group and --owner-group are required")
 	}
 	cfg, err := loadConfig[C](*configPath)
 	if err != nil {
 		return err
 	}
-	gatewayGID, err := lookupGID(*gatewayGroup)
+	gatewayGID, err := peer.LookupGID(*gatewayGroup)
 	if err != nil {
 		return fmt.Errorf("--gateway-group: %w", err)
 	}
-	ownerGID, err := lookupGID(*ownerGroup)
+	ownerGID, err := peer.LookupGID(*ownerGroup)
 	if err != nil {
 		return fmt.Errorf("--owner-group: %w", err)
 	}
-	env := &Env{StateDir: *stateDir, Log: slog.Default()}
+	env := &Env{Name: *name, StateDir: *stateDir, Log: slog.Default()}
 	if err := os.MkdirAll(env.PrivateDir(), 0o700); err != nil {
 		return err
 	}
@@ -139,11 +141,11 @@ func run[C any](ctx context.Context, name string, args []string, start func(cont
 	if cl, ok := c.(io.Closer); ok {
 		defer func() { err = errors.Join(err, cl.Close()) }()
 	}
-	srv, err := NewServer(c, *stateDir, gatewayGID, ownerGID, env.Log)
+	srv, err := NewServer(c, *name, *stateDir, gatewayGID, ownerGID, env.Log)
 	if err != nil {
 		return err
 	}
-	ln, err := listen(*socket)
+	ln, err := peer.Listen(*socket)
 	if err != nil {
 		return err
 	}
@@ -158,45 +160,6 @@ func run[C any](ctx context.Context, name string, args []string, start func(cont
 		return cause
 	}
 	return nil
-}
-
-// listen listens on a Unix socket at path, replacing a stale socket. Anyone
-// may connect; the caller's group decides what it may call.
-func listen(path string) (net.Listener, error) {
-	if fi, err := os.Lstat(path); err == nil {
-		if fi.Mode()&fs.ModeSocket == 0 {
-			return nil, fmt.Errorf("%s exists and is not a socket", path)
-		}
-		if err := os.Remove(path); err != nil {
-			return nil, err
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
-	}
-	var lc net.ListenConfig
-	ln, err := lc.Listen(context.Background(), "unix", path)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.Chmod(path, 0o666); err != nil {
-		ln.Close()
-		return nil, err
-	}
-	return ln, nil
-}
-
-// lookupGID resolves a group name, or takes a numeric gid as is: without
-// cgo, os/user reads only /etc/group, which lacks systemd's dynamic groups.
-func lookupGID(group string) (uint32, error) {
-	if gid, err := strconv.ParseUint(group, 10, 32); err == nil {
-		return uint32(gid), nil
-	}
-	g, err := user.LookupGroup(group)
-	if err != nil {
-		return 0, err
-	}
-	gid, err := strconv.ParseUint(g.Gid, 10, 32)
-	return uint32(gid), err
 }
 
 func loadConfig[C any](path string) (C, error) {
