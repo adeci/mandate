@@ -93,8 +93,9 @@ content.
 The connector alone writes `data.db`; mandate opens it read-only and filters
 every read. The connector sets `PRAGMA user_version = 1`, migrates its own
 store in place on upgrade, and mandate reads only the current version. A
-connector may add its own tables, named `PROGRAM_…`; mandate ignores them,
-but the gateway can read them, so they hold nothing secret.
+connector may add its own tables, prefixed with the program's name
+(`whatsapp_identity_changes`); mandate ignores them, but the gateway can
+read them, so they hold nothing secret.
 
 ```sql
 CREATE TABLE containers (
