@@ -3,13 +3,11 @@ self:
   config,
   lib,
   pkgs,
-  utils,
   ...
 }:
 let
   cfg = config.services.mandate;
   inherit (pkgs.stdenv.hostPlatform) system;
-  exe = lib.getExe cfg.package;
   json = pkgs.formats.json { };
   toml = pkgs.formats.toml { };
 
@@ -25,110 +23,12 @@ let
     }
   );
   connectorConfig = name: c: json.generate "mandate-${name}.json" c.config;
-  connectorUnits = map (n: "mandate-${n}.service") (lib.attrNames cfg.connectors);
 
-  # DynamicUser= implies ProtectSystem=strict, ProtectHome=read-only,
-  # PrivateTmp, RemoveIPC, NoNewPrivileges and RestrictSUIDSGID.
-  hardening = {
-    DynamicUser = true;
-    ProtectHome = true;
-    PrivateDevices = true;
-    ProtectKernelTunables = true;
-    ProtectKernelModules = true;
-    ProtectKernelLogs = true;
-    ProtectControlGroups = true;
-    ProtectClock = true;
-    ProtectHostname = true;
-    ProtectProc = "invisible";
-    ProcSubset = "pid";
-    RestrictNamespaces = true;
-    RestrictRealtime = true;
-    LockPersonality = true;
-    MemoryDenyWriteExecute = true;
-    SystemCallArchitectures = "native";
-    SystemCallFilter = [
-      "@system-service"
-      "~@privileged"
-    ];
-    CapabilityBoundingSet = "";
-    UMask = "0027";
-    Restart = "always";
-    RestartSec = "2s";
-  };
-
-  unit = description: serviceConfig: {
-    inherit description;
-    partOf = [ "mandate.target" ];
-    wantedBy = [ "mandate.target" ];
-    restartTriggers = [ configFile ];
-    serviceConfig = hardening // serviceConfig;
-  };
-
-  # gateway and owner talk over Unix sockets only.
-  unixOnly = {
-    PrivateNetwork = true;
-    RestrictAddressFamilies = [ "AF_UNIX" ];
-  };
-
-  # Connectors talk to their service on the internet, not to the LAN or
-  # localhost. A connector for a LAN or self-hosted service takes an
-  # IPAddressAllow in systemd.services.mandate-NAME.serviceConfig.
-  privateNets = [
-    "127.0.0.0/8"
-    "::1/128"
-    "10.0.0.0/8"
-    "172.16.0.0/12"
-    "192.168.0.0/16"
-    "100.64.0.0/10"
-    "169.254.0.0/16"
-    "fc00::/7"
-    "fe80::/10"
-  ];
-  # systemd-resolved's stub listeners.
-  dnsStub = [
-    "127.0.0.53"
-    "127.0.0.54"
-  ];
-
-  connectorService =
-    name: c:
-    unit "mandate connector ${name}" {
-      User = "mandate-${name}";
-      StateDirectory = "mandate/connectors/${name}";
-      StateDirectoryMode = "0750";
-      RuntimeDirectory = "mandate/connectors/${name}";
-      # The gateway's group reads the store, but not private/ (docs/design.md).
-      ExecStartPre = "+${exe} store-acl ${name}";
-      ExecStart = utils.escapeSystemdExecArgs [
-        (lib.getExe c.package)
-        "--name"
-        name
-        "--socket"
-        "/run/mandate/connectors/${name}/socket"
-        "--state"
-        "/var/lib/mandate/connectors/${name}"
-        "--config"
-        (connectorConfig name c)
-        "--gateway-group"
-        "mandate-gateway"
-        "--owner-group"
-        "mandate-owner"
-      ];
-      RestrictAddressFamilies = [
-        "AF_UNIX"
-        "AF_INET"
-        "AF_INET6"
-      ];
-      IPAddressDeny = privateNets;
-      IPAddressAllow = dnsStub;
-      # A connector may buffer whole media files; a cap keeps a runaway one
-      # from taking the host's memory with it.
-      MemoryMax = "1G";
-    }
-    // {
-      after = [ "network-online.target" ];
-      wants = [ "network-online.target" ];
-    };
+  # The units, sandbox and all, come from mandate itself, as on any other
+  # host (internal/owner/systemd.tmpl).
+  units = pkgs.runCommand "mandate-units" { } ''
+    ${lib.getExe cfg.package} units --config ${configFile} --out $out/lib/systemd/system
+  '';
 in
 {
   options.services.mandate = {
@@ -250,7 +150,12 @@ in
       message = "services.mandate.connectors.${name}: names are a-z, 0-9 and -, start with a letter, have at most 24 characters, and are not front, gateway or owner";
     }) (lib.attrNames cfg.connectors);
 
-    environment.etc."mandate/mandate.toml".source = configFile;
+    environment.etc = {
+      "mandate/mandate.toml".source = configFile;
+    }
+    // lib.mapAttrs' (
+      n: c: lib.nameValuePair "mandate/connectors/${n}.json" { source = connectorConfig n c; }
+    ) cfg.connectors;
     # mandate setup and mandate reset, as root.
     environment.systemPackages = [ cfg.package ];
 
@@ -269,71 +174,23 @@ in
       "mandate-owner"
     ] (_: { });
 
-    systemd.targets.mandate = {
-      description = "mandate";
-      wantedBy = [ "multi-user.target" ];
-    };
-
+    # The units' own [Install] sections are ignored on NixOS. Anything set
+    # here becomes a drop-in, such as the IPAddressAllow= of a connector for a
+    # LAN or self-hosted service in systemd.services.mandate-NAME.serviceConfig.
+    systemd.packages = [ units ];
+    systemd.targets.mandate.wantedBy = [ "multi-user.target" ];
     systemd.services =
-      lib.mapAttrs' (n: c: lib.nameValuePair "mandate-${n}" (connectorService n c)) cfg.connectors
-      // {
-        mandate-front =
-          unit "mandate front" {
-            # A dynamic user may not share its name with the static group.
-            User = "mandate_front";
-            Group = "mandate-front";
-            ExecStart = "${exe} serve front";
-            StateDirectory = "mandate/front";
-            StateDirectoryMode = "0700";
-            AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
-            CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
-            RestrictAddressFamilies = [
-              "AF_UNIX"
-              "AF_INET"
-              "AF_INET6"
-            ];
-          }
-          // {
-            after = [ "network-online.target" ];
-            wants = [ "network-online.target" ];
-          };
-
-        mandate-gateway =
-          unit "mandate gateway" (
-            unixOnly
-            // {
-              User = "mandate_gateway";
-              Group = "mandate-gateway";
-              ExecStart = "${exe} serve gateway";
-              StateDirectory = "mandate/gateway";
-              StateDirectoryMode = "0700";
-              RuntimeDirectory = "mandate/gateway";
-              # Connector state lives under /var/lib/private, which only root
-              # may enter; the ACLs then let the gateway read each data.db.
-              BindReadOnlyPaths = lib.optional (
-                cfg.connectors != { }
-              ) "/var/lib/private/mandate/connectors:/var/lib/mandate/connectors";
-            }
-          )
-          // {
-            after = connectorUnits;
-          };
-
-        mandate-owner =
-          unit "mandate owner" (
-            unixOnly
-            // {
-              User = "mandate_owner";
-              Group = "mandate-owner";
-              ExecStart = "${exe} serve owner";
-              StateDirectory = "mandate/owner";
-              StateDirectoryMode = "0700";
-              RuntimeDirectory = "mandate/owner";
-            }
-          )
-          // {
-            after = [ "mandate-gateway.service" ] ++ connectorUnits;
-          };
-      };
+      lib.genAttrs
+        (map (n: "mandate-${n}") (
+          [
+            "front"
+            "gateway"
+            "owner"
+          ]
+          ++ lib.attrNames cfg.connectors
+        ))
+        (_: {
+          wantedBy = [ "mandate.target" ];
+        });
   };
 }

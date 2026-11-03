@@ -1,11 +1,10 @@
 {{/*
-The units mandate setup writes on a host the NixOS module doesn't manage, one
-template per file. They follow nix/module.nix; the differences are on purpose:
-- no X-Restart-Triggers, which only NixOS acts on, nor the Environment= NixOS
-  gives every unit (PATH, LOCALE_ARCHIVE, TZDIR);
-- mandate.target is wanted by multi-user.target through its [Install] section;
-- each connector's --config file is /etc/mandate/connectors/NAME.json, made
-  by mandate setup from mandate.toml, rather than a file in the Nix store.
+mandate's systemd units, one template per file and the only definition of
+their sandbox: `mandate units` renders them for the NixOS module, and
+`mandate setup` elsewhere. X-Restart-Triggers carries mandate.toml's hash,
+so a change to it rewrites every unit, and so restarts it, on NixOS too.
+Each connector's --config is /etc/mandate/connectors/NAME.json, which the
+NixOS module or mandate setup makes from mandate.toml.
 */}}
 
 {{- define "common"}}
@@ -48,6 +47,7 @@ WantedBy=multi-user.target
 [Unit]
 Description=mandate front
 PartOf=mandate.target
+X-Restart-Triggers={{.Trigger}}
 After=network-online.target
 Wants=network-online.target
 
@@ -68,8 +68,9 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 [Unit]
 Description=mandate gateway
 PartOf=mandate.target
+X-Restart-Triggers={{.Trigger}}
 {{- range .Connectors}}
-After=mandate-{{.Name}}.service
+After=mandate-{{.}}.service
 {{- end}}
 
 [Service]
@@ -95,9 +96,10 @@ RestrictAddressFamilies=AF_UNIX
 [Unit]
 Description=mandate owner
 PartOf=mandate.target
+X-Restart-Triggers={{.Trigger}}
 After=mandate-gateway.service
 {{- range .Connectors}}
-After=mandate-{{.Name}}.service
+After=mandate-{{.}}.service
 {{- end}}
 
 [Service]
@@ -117,6 +119,7 @@ RestrictAddressFamilies=AF_UNIX
 [Unit]
 Description=mandate connector {{.Name}}
 PartOf=mandate.target
+X-Restart-Triggers={{.Trigger}}
 After=network-online.target
 Wants=network-online.target
 
@@ -126,7 +129,7 @@ StateDirectory=mandate/connectors/{{.Name}}
 StateDirectoryMode=0750
 RuntimeDirectory=mandate/connectors/{{.Name}}
 ExecStartPre=+{{quote .Exe}} store-acl {{.Name}}
-ExecStart={{quote .Command}} --name {{.Name}} --socket /run/mandate/connectors/{{.Name}}/socket --state /var/lib/mandate/connectors/{{.Name}} --config {{quote .Config}} --gateway-group mandate-gateway --owner-group mandate-owner
+ExecStart={{quote .Command}} --name {{.Name}} --socket /run/mandate/connectors/{{.Name}}/socket --state /var/lib/mandate/connectors/{{.Name}} --config /etc/mandate/connectors/{{.Name}}.json --gateway-group mandate-gateway --owner-group mandate-owner
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 # Connectors talk to their service on the internet, not to the LAN or

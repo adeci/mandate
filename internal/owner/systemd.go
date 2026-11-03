@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,31 +29,94 @@ const (
 	// Where install.sh puts the bundled connectors.
 	bundledDir = "/usr/local/lib/mandate/connectors"
 	unitDir    = "/etc/systemd/system"
+	// The first line of every unit, by which mandate setup tells its own.
+	unitHeader = "# Made by `mandate units` from mandate.toml.\n"
 )
 
 //go:embed systemd.tmpl
 var unitText string
 
-var units = template.Must(template.New("units").Funcs(template.FuncMap{"quote": execQuote}).Parse(unitText))
+var unitTmpl = template.Must(template.New("units").Funcs(template.FuncMap{"quote": execQuote}).Parse(unitText))
 
-type connectorUnit struct {
-	Exe, Name, Command, Config string
+type unitData struct {
+	Exe string
+	// mandate.toml's SHA-256: a change rewrites every unit, which restarts it.
+	Trigger    string
+	Connectors []string
+	// The connector of a connector's unit.
+	Name, Command string
 }
 
-// Install readies a host that the NixOS module doesn't manage for Setup: it
-// makes the three groups, the default config unless there is one, and
-// mandate's systemd units, and starts them. On NixOS, or once mandate.target
-// exists, it does nothing.
+// RenderUnits renders mandate.target and every unit for the config file,
+// by file name. The units run exe.
+func RenderUnits(file, exe string) (map[string][]byte, *config.Config, error) {
+	b, err := os.ReadFile(file)
+	if err != nil {
+		return nil, nil, err
+	}
+	cfg, err := config.Load(file)
+	if err != nil {
+		return nil, nil, err
+	}
+	sum := sha256.Sum256(b)
+	d := unitData{Exe: exe, Trigger: "sha256:" + hex.EncodeToString(sum[:]), Connectors: slices.Sorted(maps.Keys(cfg.Connectors))}
+	units := map[string][]byte{}
+	render := func(file, tmpl string, d unitData) error {
+		buf := bytes.NewBufferString(unitHeader)
+		if err := unitTmpl.ExecuteTemplate(buf, tmpl, d); err != nil {
+			return err
+		}
+		units[file] = buf.Bytes()
+		return nil
+	}
+	for _, name := range []string{"mandate.target", "mandate-front.service", "mandate-gateway.service", "mandate-owner.service"} {
+		if err := render(name, name, d); err != nil {
+			return nil, nil, err
+		}
+	}
+	for _, name := range d.Connectors {
+		c := d
+		c.Name, c.Command = name, cfg.Connectors[name].Command
+		if err := render("mandate-"+name+".service", "connector", c); err != nil {
+			return nil, nil, err
+		}
+	}
+	return units, cfg, nil
+}
+
+// WriteUnits writes the units for the config file into dir, for the NixOS
+// module. They run this executable.
+func WriteUnits(file, dir string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	units, _, err := RenderUnits(file, exe)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	for name, b := range units {
+		if err := os.WriteFile(filepath.Join(dir, name), b, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Install brings a host that the NixOS module doesn't manage in line with
+// mandate.toml, on every mandate setup: the three groups, the default config
+// unless there is one, each connector's config file, and mandate's units.
+// It restarts the units that changed, removes those of connectors no longer
+// configured, and starts mandate.target. On NixOS it does nothing.
 func Install(ctx context.Context) error {
 	if _, err := os.Stat("/etc/NIXOS"); err == nil {
 		return nil
 	}
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		return errors.New("mandate runs under systemd, and there is no systemctl")
-	}
-	out, _ := exec.CommandContext(ctx, "systemctl", "show", "--property=LoadState", "--value", "mandate.target").Output()
-	if strings.TrimSpace(string(out)) == "loaded" {
-		return nil
 	}
 	if os.Geteuid() != 0 {
 		return errors.New("run it as root: sudo mandate setup")
@@ -64,41 +129,59 @@ func Install(ctx context.Context) error {
 	if err := writeDefaultConfig(); err != nil {
 		return fmt.Errorf("write %s: %w", config.File(), err)
 	}
-	cfg, err := config.Load(config.File())
-	if err != nil {
-		return err
-	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	conns, err := connectorConfigs(ctx, exe, cfg)
+	units, cfg, err := RenderUnits(config.File(), exe)
 	if err != nil {
 		return err
 	}
-
-	data := struct {
-		Exe        string
-		Connectors []connectorUnit
-	}{exe, conns}
-	// mandate.target goes last, so that a setup cut short writes them all again.
-	var names []string
-	for _, c := range conns {
-		names = append(names, "mandate-"+c.Name+".service")
-		if err := writeUnit(names[len(names)-1], "connector", c); err != nil {
-			return err
-		}
-	}
-	for _, name := range []string{"mandate-front.service", "mandate-gateway.service", "mandate-owner.service", "mandate.target"} {
-		names = append(names, name)
-		if err := writeUnit(name, name, data); err != nil {
-			return err
-		}
-	}
-	if err := run(ctx, "systemctl", "daemon-reload"); err != nil {
+	if err := writeConnectorConfigs(ctx, cfg); err != nil {
 		return err
 	}
-	return run(ctx, "systemctl", append([]string{"enable", "--quiet", "--now"}, names...)...)
+
+	stale, err := staleUnits(units)
+	if err != nil {
+		return err
+	}
+	if len(stale) > 0 {
+		if err := run(ctx, "systemctl", append([]string{"disable", "--quiet", "--now"}, stale...)...); err != nil {
+			return err
+		}
+		for _, name := range stale {
+			if err := os.Remove(filepath.Join(unitDir, name)); err != nil {
+				return err
+			}
+		}
+	}
+	var changed []string
+	for _, name := range slices.Sorted(maps.Keys(units)) {
+		file := filepath.Join(unitDir, name)
+		if old, err := os.ReadFile(file); err == nil && bytes.Equal(old, units[name]) {
+			continue
+		}
+		if err := writeFile(file, units[name], 0o644); err != nil {
+			return err
+		}
+		if strings.HasSuffix(name, ".service") {
+			changed = append(changed, name)
+		}
+	}
+	if len(changed) > 0 || len(stale) > 0 {
+		if err := run(ctx, "systemctl", "daemon-reload"); err != nil {
+			return err
+		}
+	}
+	if err := run(ctx, "systemctl", append([]string{"enable", "--quiet"}, slices.Sorted(maps.Keys(units))...)...); err != nil {
+		return err
+	}
+	if len(changed) > 0 {
+		if err := run(ctx, "systemctl", append([]string{"restart"}, changed...)...); err != nil {
+			return err
+		}
+	}
+	return run(ctx, "systemctl", "start", "mandate.target")
 }
 
 // writeDefaultConfig writes the owner's default mandate.toml unless one is
@@ -126,38 +209,59 @@ func writeDefaultConfig() error {
 	return writeFile(file, []byte(b.String()), 0o644)
 }
 
-// connectorConfigs writes each connector's config as the JSON file its unit
-// passes to --config, and has the connector check it.
-func connectorConfigs(ctx context.Context, exe string, cfg *config.Config) ([]connectorUnit, error) {
+// writeConnectorConfigs writes each connector's config as the JSON file its
+// unit passes to --config, has the connector check it, and removes the
+// files of connectors no longer configured.
+func writeConnectorConfigs(ctx context.Context, cfg *config.Config) error {
 	dir := filepath.Join(filepath.Dir(config.File()), "connectors")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
+		return err
 	}
-	var conns []connectorUnit
-	for _, name := range slices.Sorted(maps.Keys(cfg.Connectors)) {
-		c := cfg.Connectors[name]
+	for name, c := range cfg.Connectors {
 		b, err := json.Marshal(c.Config)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		file := filepath.Join(dir, name+".json")
 		if err := writeFile(file, append(b, '\n'), 0o644); err != nil {
-			return nil, err
+			return err
 		}
 		if err := run(ctx, c.Command, "--check-config", file); err != nil {
-			return nil, fmt.Errorf("connector %s: %w", name, err)
+			return fmt.Errorf("connector %s: %w", name, err)
 		}
-		conns = append(conns, connectorUnit{Exe: exe, Name: name, Command: c.Command, Config: file})
 	}
-	return conns, nil
-}
-
-func writeUnit(file, tmpl string, data any) error {
-	var b bytes.Buffer
-	if err := units.ExecuteTemplate(&b, tmpl, data); err != nil {
+	files, err := filepath.Glob(filepath.Join(dir, "*.json"))
+	if err != nil {
 		return err
 	}
-	return writeFile(filepath.Join(unitDir, file), b.Bytes(), 0o644)
+	for _, f := range files {
+		if _, ok := cfg.Connectors[strings.TrimSuffix(filepath.Base(f), ".json")]; !ok {
+			if err := os.Remove(f); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// staleUnits names the units mandate setup wrote before that units lacks:
+// those of connectors no longer configured.
+func staleUnits(units map[string][]byte) ([]string, error) {
+	files, err := filepath.Glob(filepath.Join(unitDir, "mandate-*.service"))
+	if err != nil {
+		return nil, err
+	}
+	var stale []string
+	for _, f := range files {
+		name := filepath.Base(f)
+		if _, ok := units[name]; ok {
+			continue
+		}
+		if b, err := os.ReadFile(f); err == nil && bytes.HasPrefix(b, []byte(unitHeader)) {
+			stale = append(stale, name)
+		}
+	}
+	return stale, nil
 }
 
 func run(ctx context.Context, name string, args ...string) error {

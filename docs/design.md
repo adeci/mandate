@@ -8,6 +8,7 @@ The specs in [spec/](spec/) are mandate's public contracts. This is how the serv
 - `mandate serve front|gateway|owner`: the three server processes;
 - `mandate setup`, `mandate reset`: root, on the server;
 - `mandate store-acl NAME`: root, before connector NAME starts (see systemd below);
+- `mandate units --out DIR`: renders the systemd units from mandate.toml;
 - `mandate conformance PROGRAM`: connector.md's kit, also run by the flake check;
 - the agent CLI (`login`, reads, `request`, proposals, …).
 
@@ -35,7 +36,7 @@ Each unit has its own `RuntimeDirectory=` (`mandate/gateway`, `mandate/owner`, `
 | connector | per connector.md | `mandate-gateway`, `mandate-owner` |
 
 - **front** reaches only the gateway and owner sockets. It never touches stores or connectors.
-- **gateway** reads each `data.db`. The service manager (the NixOS module, or the units `mandate setup` writes) puts a default ACL on each connector's state directory, `group:mandate-gateway:r-X`. An ACL names a group without making the connector a member, so connectors can't read each other's stores.
+- **gateway** reads each `data.db`. Each connector's unit puts a default ACL on its state directory, `group:mandate-gateway:r-X`. An ACL names a group without making the connector a member, so connectors can't read each other's stores.
 - **owner** calls connectors as the owner caller. It never opens `data.db`.
 - **gateway ↔ owner:** each serves the other an internal HTTP API on its own socket, under `/internal/`, which front never forwards.
   - gateway → owner: new access requests and proposals, and activity entries.
@@ -103,9 +104,9 @@ JSON over the two sockets, under `/internal/`, and caller-checked by group as in
 
 ## systemd
 
-Every mandate unit (front, gateway, owner, and one per connector) is `PartOf=` and `WantedBy=` `mandate.target`. The NixOS module and the units `mandate setup` writes both define it. `mandate reset` stops the target, wipes, and starts it again.
+Every mandate unit (front, gateway, owner, and one per connector) is `PartOf=` and `WantedBy=` `mandate.target`. `mandate reset` stops the target, wipes, and starts it again.
 
-- **Without the NixOS module:** when mandate.target doesn't exist, `mandate setup` makes the three groups and the default config, writes the units from one template (`internal/owner/systemd.tmpl`, which lists how they differ from the module's), and enables and starts them. Each connector's `--config` is `/etc/mandate/connectors/NAME.json`, made from mandate.toml.
+- **One definition:** the units, sandbox and all, come from one template in the binary (`internal/owner/systemd.tmpl`), rendered from mandate.toml by `mandate units`. The NixOS module installs them as a package and adds only `wantedBy`, so NixOS options on a mandate unit become drop-ins. Elsewhere `mandate setup` reconciles on every run: it makes the three groups and the default config, writes each connector's `--config` file (`/etc/mandate/connectors/NAME.json`, which the module also writes) and the units, removes those of connectors no longer configured, restarts what changed and starts the target. A unit's `X-Restart-Triggers=` is mandate.toml's hash, so a config change restarts every unit on both.
 - **Unit user names:** a dynamic user can't share its name with a static group, so the units run as `User=mandate_front`, `mandate_gateway` and `mandate_owner`, with the fixed `Group=` names. The underscore keeps them from clashing with connector users (`mandate-NAME`).
 - **Connector state ACL:**
   - With dynamic users, systemd keeps state under `/var/lib/private`, owned by `nobody` on disk and mapped into each unit's view. A named-group ACL set inside the unit fails, and systemd's recursive chown removes ACLs.

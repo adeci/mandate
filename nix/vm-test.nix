@@ -37,6 +37,8 @@ in
       // pkgs.lib.genAttrs bundled (_: { });
     };
     systemd.services.mandate-legacy.wantedBy = pkgs.lib.mkForce [ ];
+    # The module's units come from mandate; NixOS options still override them.
+    systemd.services.mandate-test.serviceConfig.IPAddressAllow = [ "192.0.2.1" ];
     networking.firewall.allowedTCPPorts = [
       8443
       8444
@@ -139,6 +141,7 @@ in
         assert re.search(r"group:mandate-gateway:r..\s+#effective:r--", acl), acl
         assert "mask::---" in server.succeed("getfacl -p /var/lib/mandate/connectors/test/private")
         assert server.succeed("systemctl show -p MemoryDenyWriteExecute --value mandate-signal").strip() == "yes"
+        assert "192.0.2.1" in server.succeed("systemctl show -p IPAddressAllow --value mandate-test")
 
     with subtest("mandate setup prints a password, which the setup page trades for a pairing link"):
         out = server.succeed("mandate setup")

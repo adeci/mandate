@@ -4,10 +4,13 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
+	// Units carry no TZDIR, so the time zones come with the binary.
+	_ "time/tzdata"
 
 	"github.com/adeci/mandate/internal/cli"
 	"github.com/adeci/mandate/internal/config"
@@ -23,6 +26,7 @@ const usage = `usage:
   mandate serve owner
   sudo mandate setup
   sudo mandate reset
+  mandate units [--config FILE] --out DIR
   mandate conformance PROGRAM [--config FILE] [--store FILE]`
 
 var errUsage = errors.New("bad usage")
@@ -64,6 +68,14 @@ func run(ctx context.Context, args []string) error {
 		return owner.Reset(ctx, cfg, os.Stdout)
 	case len(args) == 2 && args[0] == "store-acl":
 		return owner.StoreACL(args[1])
+	case len(args) > 0 && args[0] == "units":
+		fs := flag.NewFlagSet("units", flag.ContinueOnError)
+		file := fs.String("config", config.File(), "")
+		out := fs.String("out", "", "")
+		if fs.Parse(args[1:]) != nil || fs.NArg() > 0 || *out == "" {
+			return errUsage
+		}
+		return owner.WriteUnits(*file, *out)
 	case len(args) > 0 && args[0] == "conformance":
 		return conformance.Run(ctx, args[1:], os.Stdout)
 	}
