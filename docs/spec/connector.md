@@ -9,29 +9,35 @@ Protocol version 1, store schema version 1.
 
 ## Process
 
-Each connector runs as its own Unix user, started by mandate as:
+Each connector runs as its own Unix user, usually a systemd dynamic user,
+started by mandate as:
 
 ```
-NAME --socket PATH --state DIR [--config FILE] --gateway-user USER --owner-user USER --socket-group GROUP
+NAME --socket PATH --state DIR [--config FILE] --gateway-group GROUP --owner-group GROUP
 NAME --check-config FILE
 ```
 
 - `--config` is JSON; unknown keys are refused. `--check-config` exits 0 for
   a valid file, else non-zero with a message on stderr.
-- The socket is mode 0660, group `--socket-group`, which both callers are in.
-- `DIR/data.db` is the store, readable by the gateway's group. `DIR/private/`
-  (0700) holds the session, credentials, key log and spent approvals.
+- The socket is mode 0666: who may call what is decided per route, by the
+  caller's group (see [Callers](#callers)).
+- `DIR/data.db` is the store, in SQLite's rollback-journal mode: a reader
+  without write access can't rely on WAL's shared-memory file. mandate gives
+  the gateway's group read access to `DIR` through a default ACL, so the
+  connector creates the store and its `-journal` group-readable.
+  `DIR/private/` (0700) holds the session, credentials, key log and spent
+  approvals.
 - It exits on SIGTERM after finishing in-flight writes. A fault only a
   restart clears ends the process non-zero; anything the owner must fix is
   reported through [health](#health).
 
 ## Callers
 
-Two processes call a connector, each as its own user: the **gateway**,
-which answers agents and enforces grants, and the **owner** side, which
-serves the app and holds approvals. The connector reads the caller's uid
-from the socket (`SO_PEERCRED`) and answers each route only to its class;
-anyone else gets `403`.
+Two processes call a connector: the **gateway**, which answers agents and
+enforces grants, and the **owner** side, which serves the app and holds
+approvals. The connector reads the caller's primary group from the socket
+(`SO_PEERCRED`) and answers each route only to its class; anyone else gets
+`403`.
 
 | Route | gateway | owner |
 |---|---|---|

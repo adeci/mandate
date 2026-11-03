@@ -16,6 +16,8 @@ Writes are proposals the owner approves on a device.
   certificate), normal checks apply from then on; otherwise the client pins
   the key.
 - Bodies are JSON. Times are RFC 3339 in UTC. Durations are integer seconds.
+  IDs of identities, grants, requests and proposals are record IDs: 26
+  base32 characters ([records.md](records.md)).
 - Every route except `join` needs `Authorization: Bearer <token>`.
 
 A refusal is a non-2xx status with `error`, written for the agent:
@@ -199,7 +201,7 @@ Reads answer a table:
 open again:
 
 ```json
-[{"id": "g-…", "connector": "signal",
+[{"id": "7RJ4P2W5ZK3HXQ6N5M2C4YB7DE", "connector": "signal",
   "chats": [{"id": "…", "name": "Family 🏡"}],
   "schedule": {"days": [1, 2, 3, 4, 5], "start": "07:00", "length": 1200, "zone": "Europe/Berlin"},
   "horizon": 86400,
@@ -229,7 +231,7 @@ A one-off grant has `from` and `until` instead of `schedule`.
 - 3 waiting requests and 10 an hour per identity; beyond that, `429` before
   anything is looked up.
 
-The answer is `202 {"id": "r-…"}`. `GET /agent/v1/access/requests/{id}?wait=SECONDS`
+The answer is `202 {"id": "…"}`. `GET /agent/v1/access/requests/{id}?wait=SECONDS`
 (at most 900) answers `{"status", "grant_id", "until"}` with `status`
 `pending`, `granted`, `denied` or `expired` (after an hour). Once it says
 `granted`, the next read works.
@@ -248,7 +250,7 @@ The answer is `202 {"id": "r-…"}`. `GET /agent/v1/access/requests/{id}?wait=SE
   `404`, before the connector is asked.
 - `note` is shown to the owner as the agent's words.
 
-The answer is `202 {"id": "p-…", "status": "pending"}`.
+The answer is `202 {"id": "…", "status": "pending"}`.
 `GET /agent/v1/proposals/{id}?wait=SECONDS` (at most 900) answers
 `{"id", "status", "result"}`:
 

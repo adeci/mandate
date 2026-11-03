@@ -306,8 +306,11 @@ func (s Schedule) check() error {
 }
 
 func (w Write) check() error {
-	if w.ID == "" || w.Connector == "" || w.Op == "" {
-		return errors.New("id, connector and op are required")
+	if !isID(w.ID) {
+		return fmt.Errorf("id %q is not a record ID", w.ID)
+	}
+	if w.Connector == "" || w.Op == "" {
+		return errors.New("connector and op are required")
 	}
 	return nil
 }

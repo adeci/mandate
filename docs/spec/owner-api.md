@@ -49,7 +49,7 @@ On an existing device, the owner:
 - the owner side's key log, identities, grants and device tokens;
 - every connector's key log.
 
-It then issues a new setup password.
+It keeps every connector's spent approvals, so nothing signed before the reset can run again, and then issues a new setup password.
 
 ## Device token
 
