@@ -1,0 +1,9 @@
+[workspace]
+resolver = "3"
+members = ["core", "ui"]
+
+[workspace.package]
+edition = "2024"
+
+[profile.release]
+strip = true

@@ -1,0 +1,600 @@
+//! A client for the owner API (owner-api.md), and the two ways a device gets
+//! one: pairing the first device, or the code exchange for another. Calls
+//! block, so the app makes them off its UI thread.
+
+use crate::envelope::{DeviceKey, Envelope};
+use crate::exchange::{self, Payload, token_sha256};
+use crate::http::{Peer, Response, Server, Trust};
+use crate::log::Log;
+use crate::record::{Key, KeyEntry, Op, Record, Time};
+use crate::{Error, hex, invalid, unhex};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::io::BufRead;
+use std::str::FromStr;
+use std::time::Duration;
+
+/// Ordinary calls, some of which wait on a connector.
+const CALL: Duration = Duration::from_secs(60);
+/// How long a join poll waits on the server, in seconds.
+const POLL: u64 = 60;
+/// The owner's code waits up to 2 minutes for the new party's answer.
+const CODE: Duration = Duration::from_secs(150);
+/// The stream sends a comment every 30 seconds.
+const STREAM: Duration = Duration::from_secs(90);
+
+/// The link the setup page shows as text and as a QR code:
+/// `mandate://pair?url=…&spki=…&secret=…`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairLink {
+    pub url: String,
+    pub spki_sha256: [u8; 32],
+    pub secret: Vec<u8>,
+}
+
+impl FromStr for PairLink {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<PairLink, Error> {
+        let query = s
+            .strip_prefix("mandate://pair?")
+            .ok_or_else(|| invalid("not a mandate://pair link"))?;
+        let (mut url, mut spki_sha256, mut secret) = (None, None, None);
+        for field in query.split('&') {
+            let (k, v) = field.split_once('=').unwrap_or((field, ""));
+            let v = unescape(v).ok_or_else(|| invalid("bad escape in the pairing link"))?;
+            match k {
+                "url" => url = Some(v),
+                "spki" => spki_sha256 = unhex(&v).and_then(|b| b.try_into().ok()),
+                "secret" => secret = URL_SAFE_NO_PAD.decode(v).ok(),
+                _ => {}
+            }
+        }
+        match (url, spki_sha256, secret) {
+            (Some(url), Some(spki_sha256), Some(secret)) => {
+                Ok(PairLink { url, spki_sha256, secret })
+            }
+            _ => Err(invalid("the pairing link lacks url, spki or secret")),
+        }
+    }
+}
+
+/// Undoes query escaping: %XX, and + for a space.
+fn unescape(s: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut b = s.bytes();
+    while let Some(c) = b.next() {
+        out.push(match c {
+            b'%' => {
+                u8::from_str_radix(std::str::from_utf8(&[b.next()?, b.next()?]).ok()?, 16).ok()?
+            }
+            b'+' => b' ',
+            c => c,
+        });
+    }
+    String::from_utf8(out).ok()
+}
+
+fn to_json(v: &impl Serialize) -> Result<Vec<u8>, Error> {
+    serde_json::to_vec(v).map_err(|e| invalid(e.to_string()))
+}
+
+/// A paired device's client.
+#[derive(Clone)]
+pub struct Client {
+    server: Server,
+    token: String,
+}
+
+/// The answer to `signed` and to pairing: the record's kind and ID, the
+/// key's for a key entry.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct Signed {
+    pub kind: String,
+    pub id: String,
+}
+
+impl Client {
+    /// The client of a paired device: the server's URL, how its key is
+    /// checked, and the device token.
+    pub fn new(url: &str, trust: Trust, token: &str) -> Result<Client, Error> {
+        Ok(Client { server: Server::new(url, Some(trust))?, token: token.into() })
+    }
+
+    /// The client once a first connect showed what to trust from then on.
+    fn connected(mut server: Server, peer: Peer, token: String) -> Client {
+        server.trust = Some(peer.trust());
+        Client { server, token }
+    }
+
+    /// Pairs the first device: makes seq 0 of the key log, which adds key
+    /// under the device's name and is signed by it, and registers the
+    /// device token. Keep `trust()` with the URL.
+    pub fn pair(
+        link: &PairLink,
+        key: &dyn DeviceKey,
+        name: &str,
+        token: &str,
+    ) -> Result<Client, Error> {
+        let server = Server::new(&link.url, Some(Trust::Pin(link.spki_sha256)))?;
+        let now = Time::now();
+        let key_entry = Key::p256(&key.public_key(), name);
+        let entry = KeyEntry { seq: 0, op: Op::Add, key: key_entry, prev: String::new(), at: now };
+        let mut env = Envelope::new(&Record::Key(entry), now)?;
+        env.sign(key)?;
+        let body = json!({
+            "secret": URL_SAFE_NO_PAD.encode(&link.secret),
+            "token_sha256": token_sha256(token),
+            "entry": env,
+        });
+        let res = server.send("POST", "/owner/v1/pair", None, Some(&to_json(&body)?), CALL)?;
+        let peer = res.peer;
+        res.json::<Signed>()?;
+        Ok(Client::connected(server, peer, token.into()))
+    }
+
+    /// How this client checks the server's key.
+    pub fn trust(&self) -> Trust {
+        self.server.trust.expect("a paired client has a trust")
+    }
+
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<Response, Error> {
+        let path = format!("/owner/v1/{path}");
+        self.server.send(method, &path, Some(&self.token), body, timeout)
+    }
+
+    /// GETs a route under /owner/v1/, given without that prefix.
+    pub fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
+        self.request("GET", path, None, CALL)?.json()
+    }
+
+    /// POSTs, PUTs, PATCHes or DELETEs a route under /owner/v1/, given
+    /// without that prefix, with a JSON body.
+    pub fn send<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        path: &str,
+        body: &impl Serialize,
+    ) -> Result<T, Error> {
+        self.request(method, path, Some(&to_json(body)?), CALL)?.json()
+    }
+
+    /// What waits, open grants, routines, stopped routines and a day's
+    /// activity; day (YYYY-MM-DD) and before page back. T is the app's view
+    /// of it, or serde_json::Value.
+    pub fn now<T: DeserializeOwned>(
+        &self,
+        day: Option<&str>,
+        before: Option<Time>,
+    ) -> Result<T, Error> {
+        let query: Vec<String> =
+            [day.map(|d| format!("day={d}")), before.map(|b| format!("before={b}"))]
+                .into_iter()
+                .flatten()
+                .collect();
+        if query.is_empty() {
+            self.get("now")
+        } else {
+            self.get(&format!("now?{}", query.join("&")))
+        }
+    }
+
+    /// POSTs a …/challenge route and answers the unsigned envelope. The app
+    /// shows the owner `record()`, then signs it and passes it to `signed`.
+    pub fn challenge(&self, path: &str, body: &impl Serialize) -> Result<Envelope, Error> {
+        self.send("POST", path, body)
+    }
+
+    pub fn signed(&self, envelope: &Envelope) -> Result<Signed, Error> {
+        self.send("POST", "signed", envelope)
+    }
+
+    /// The server's key log, verified here.
+    pub fn keys(&self) -> Result<Log, Error> {
+        #[derive(Deserialize)]
+        struct Keys {
+            log: Vec<Envelope>,
+        }
+        Log::new(self.get::<Keys>("keys")?.log)
+    }
+
+    /// The owner's try at a new party's code. Once the new party confirms,
+    /// its payload, which the record from `exchanges/{id}/challenge` must
+    /// match before the owner signs it. A wrong code is `Error::Api` with
+    /// status 403 and `attempts_left`.
+    pub fn exchange_code(&self, id: &str, code: &str) -> Result<Payload, Error> {
+        #[derive(Deserialize)]
+        struct Confirmed {
+            payload: Payload,
+        }
+        let body = to_json(&json!({ "code": code }))?;
+        let path = format!("exchanges/{id}/code");
+        Ok(self.request("POST", &path, Some(&body), CODE)?.json::<Confirmed>()?.payload)
+    }
+
+    /// The owner's event stream. It ends with the connection; the app
+    /// reconnects, then refetches `now`.
+    pub fn events(&self) -> Result<Events, Error> {
+        let res = self.request("GET", "stream", None, STREAM)?;
+        if res.status != 200 {
+            return Err(res.error());
+        }
+        Ok(Events { body: res.body })
+    }
+}
+
+/// An event of the owner's stream.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(tag = "event", content = "data", rename_all = "lowercase")]
+pub enum Event {
+    /// An access request or a proposal (`kind`) waits for the owner.
+    Waiting { kind: String, id: String, identity: String, connector: String },
+    /// A code exchange waits for the owner to type its code.
+    Exchange { id: String, kind: String, name: String },
+    /// What changed: "now", "identities", "connectors" or "keys".
+    Changed { what: String },
+}
+
+/// The events of the owner's stream, until the connection ends.
+pub struct Events {
+    body: Box<dyn BufRead + Send>,
+}
+
+impl Iterator for Events {
+    type Item = Result<Event, Error>;
+
+    fn next(&mut self) -> Option<Result<Event, Error>> {
+        let (mut name, mut data, mut line) = (String::new(), String::new(), String::new());
+        loop {
+            line.clear();
+            match self.body.read_line(&mut line) {
+                Ok(0) => return None,
+                Ok(_) => {}
+                Err(e) => return Some(Err(e.into())),
+            }
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                // Events this app does not know are left out.
+                if matches!(name.as_str(), "waiting" | "exchange" | "changed") {
+                    let event = serde_json::from_str(&data).and_then(|data: serde_json::Value| {
+                        serde_json::from_value(json!({ "event": name, "data": data }))
+                    });
+                    return Some(event.map_err(|e| invalid(format!("{name} event: {e}"))));
+                }
+                name.clear();
+                data.clear();
+                continue;
+            }
+            let (field, value) = line.split_once(':').unwrap_or((line, ""));
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match field {
+                "event" => name = value.into(),
+                "data" if data.is_empty() => data = value.into(),
+                "data" => {
+                    data.push('\n');
+                    data.push_str(value);
+                }
+                _ => {} // comments
+            }
+        }
+    }
+}
+
+/// A new device joining by code exchange, as the new party
+/// (owner-api.md, Another device).
+pub struct Join {
+    server: Server,
+    id: [u8; 16],
+    code: String,
+    payload: Payload,
+    token: String,
+    /// The connection that proved the server's key, once the code matched.
+    peer: Option<Peer>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinStatus {
+    /// The owner has not typed the code yet.
+    Pending,
+    /// The owner typed another code; the exchange goes on for the next try.
+    WrongCode,
+    /// The code matched and the server proved its TLS key; the owner signs
+    /// next.
+    Confirmed,
+    /// The owner signed: the device's key is trusted and its token works.
+    Approved,
+    /// Three wrong codes, or 10 minutes.
+    Ended,
+}
+
+impl Join {
+    /// Starts joining the server at url as a device with key and name, and
+    /// draws the code to show.
+    pub fn start(url: &str, key: &dyn DeviceKey, name: &str, token: &str) -> Result<Join, Error> {
+        #[derive(Deserialize)]
+        struct Started {
+            id: String,
+        }
+        let server = Server::new(url, None)?;
+        let body = to_json(&json!({ "kind": "device", "name": name }))?;
+        let started: Started =
+            server.send("POST", "/owner/v1/join", None, Some(&body), CALL)?.json()?;
+        let id = unhex(&started.id)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| invalid("the exchange ID is not 16 bytes in hex"))?;
+        let key = Key::p256(&key.public_key(), name);
+        Ok(Join {
+            server,
+            id,
+            code: exchange::new_code(),
+            payload: Payload { key: Some(key), token_sha256: token_sha256(token) },
+            token: token.into(),
+            peer: None,
+        })
+    }
+
+    /// The code to show the owner.
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    /// Waits up to a minute for the exchange to move, and moves it: answers
+    /// the owner's try at the code, and checks the server's confirmation
+    /// against the TLS key the answer came over.
+    pub fn poll(&mut self) -> Result<JoinStatus, Error> {
+        #[derive(Deserialize)]
+        struct Poll {
+            #[serde(default)]
+            status: String,
+            #[serde(default)]
+            msg: String,
+        }
+        let path = format!("/owner/v1/join/{}?wait={POLL}", hex(&self.id));
+        let timeout = Duration::from_secs(POLL) + CALL;
+        let p: Poll = self.server.send("GET", &path, None, None, timeout)?.json()?;
+        Ok(match (p.status.as_str(), self.peer) {
+            ("", _) => return self.answer(&p.msg),
+            ("pending", None) => JoinStatus::Pending,
+            ("pending", Some(_)) => JoinStatus::Confirmed,
+            ("approved", Some(_)) => JoinStatus::Approved,
+            ("ended", _) => JoinStatus::Ended,
+            (status, _) => return Err(invalid(format!("unexpected join status {status:?}"))),
+        })
+    }
+
+    fn answer(&mut self, msg: &str) -> Result<JoinStatus, Error> {
+        #[derive(Deserialize)]
+        struct Confirm {
+            confirm: String,
+        }
+        let ya = unhex(msg).ok_or_else(|| invalid("the server's message is not hex"))?;
+        let reply = exchange::respond(&self.id, &self.code, &ya, &self.payload)?;
+        let body = json!({
+            "msg": hex(&reply.msg),
+            "confirm": hex(&reply.confirm),
+            "sealed": hex(&reply.sealed),
+        });
+        let path = format!("/owner/v1/join/{}", hex(&self.id));
+        let res = self.server.send("POST", &path, None, Some(&to_json(&body)?), CALL)?;
+        match res.status {
+            403 => return Ok(JoinStatus::WrongCode),
+            410 => return Ok(JoinStatus::Ended),
+            _ => {}
+        }
+        let peer = res.peer;
+        let confirm = unhex(&res.json::<Confirm>()?.confirm).ok_or(Error::Confirm)?;
+        reply.check(&confirm, &peer.spki_sha256)?;
+        self.peer = Some(peer);
+        Ok(JoinStatus::Confirmed)
+    }
+
+    /// The joined device's client, once `poll` said Approved. Keep its
+    /// `trust()` with the URL.
+    pub fn into_client(self) -> Result<Client, Error> {
+        let peer = self.peer.ok_or_else(|| invalid("the code was not confirmed"))?;
+        Ok(Client::connected(self.server, peer, self.token))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SoftwareKey;
+    use crate::exchange::tests::Server as Attempt;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivateSec1KeyDer};
+    use rustls::{ServerConfig, ServerConnection, StreamOwned};
+    use std::io::{self, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, mpsc};
+
+    // A self-signed P-256 certificate, its SEC1 key, and the SHA-256 of its
+    // SubjectPublicKeyInfo as openssl computes it.
+    const CERT: &str = "MIIBlTCCATygAwIBAgIUdKCDbAf7nK0qkvqWApDQpMziquUwCgYIKoZIzj0EAwIwFzEVMBMGA1UEAwwMbWFuZGF0ZS10ZXN0MCAXDTI2MTEwMzA3NDY0N1oYDzIxMjYxMDEwMDc0NjQ3WjAXMRUwEwYDVQQDDAxtYW5kYXRlLXRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQpiuK1qGWxbrxKFuE7ixH38nOrKHS2KzZAuLcW3lorOMezkvFPwiFpVr5U2M8QtA6fB3hgilOBFl0ZiyqITMiKo2QwYjAdBgNVHQ4EFgQU4sSz4aA2ghrfsYhJ8mJYtqybAm4wHwYDVR0jBBgwFoAU4sSz4aA2ghrfsYhJ8mJYtqybAm4wDwYDVR0TAQH_BAUwAwEB_zAPBgNVHREECDAGhwR_AAABMAoGCCqGSM49BAMCA0cAMEQCIC1y93GGLcCj4DBPrPMAiGpReP7RGIta2qNUdBFWG_95AiBig6WmuDpB2aWyDTX9cshthb0gWBwdtYrAlPHDCmu1yg";
+    const KEY: &str = "MHcCAQEEIOf-bSPuHajP8AXsEPsITZK_u-3SCLNwa9xgr9jg_RMaoAoGCCqGSM49AwEHoUQDQgAEKYritahlsW68ShbhO4sR9_Jzqyh0tis2QLi3Ft5aKzjHs5LxT8IhaVa-VNjPELQOnwd4YIpTgRZdGYsqiEzIig";
+    const SPKI_SHA256: &str = "120d3a8992a6c76328727bded93323f953c13f3e6abb18aa9263a7f78809e287";
+
+    struct Request {
+        line: String,
+        auth: String,
+        body: Vec<u8>,
+    }
+
+    /// Serves TLS on 127.0.0.1, one request per connection, answering with
+    /// handle's status and body; the stream's chunked, the rest not.
+    fn serve(mut handle: impl FnMut(Request) -> (u16, String) + Send + 'static) -> u16 {
+        let b64 = |s: &str| URL_SAFE_NO_PAD.decode(s).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(b64(CERT))],
+                PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(b64(KEY))),
+            )
+            .unwrap();
+        let config = Arc::new(config);
+        let ln = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = ln.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for tcp in ln.incoming().flatten() {
+                let s = StreamOwned::new(ServerConnection::new(config.clone()).unwrap(), tcp);
+                // A client that refuses the key ends its connection here.
+                let _ = answer(s, &mut handle);
+            }
+        });
+        port
+    }
+
+    fn answer(
+        mut s: StreamOwned<ServerConnection, TcpStream>,
+        handle: &mut impl FnMut(Request) -> (u16, String),
+    ) -> io::Result<()> {
+        let mut r = io::BufReader::new(&mut s);
+        let mut req = Request { line: String::new(), auth: String::new(), body: Vec::new() };
+        r.read_line(&mut req.line)?;
+        loop {
+            let mut h = String::new();
+            r.read_line(&mut h)?;
+            let Some((k, v)) = h.trim_end().split_once(": ") else {
+                break;
+            };
+            match k {
+                "Authorization" => req.auth = v.into(),
+                "Content-Length" => req.body.resize(v.parse().unwrap(), 0),
+                _ => {}
+            }
+        }
+        r.read_exact(&mut req.body)?;
+        let stream = req.line.starts_with("GET /owner/v1/stream ");
+        let (status, body) = handle(req);
+        if stream {
+            write!(s, "HTTP/1.1 {status} X\r\nTransfer-Encoding: chunked\r\n\r\n")?;
+            write!(s, "{:x}\r\n{body}\r\n0\r\n\r\n", body.len())?;
+        } else {
+            write!(s, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{body}", body.len())?;
+        }
+        s.conn.send_close_notify();
+        s.flush()
+    }
+
+    /// Pairs a phone, joins a laptop by code with one wrong try, and reads
+    /// the stream, against a mock owner side.
+    #[test]
+    fn pair_join_stream() {
+        let spki: [u8; 32] = unhex(SPKI_SHA256).unwrap().try_into().unwrap();
+        let (phone, laptop) = (SoftwareKey::generate(), SoftwareKey::generate());
+        let (phone_token, laptop_token) = (crate::new_token(), crate::new_token());
+        let (code_tx, code_rx) = mpsc::channel::<String>();
+        let (payload_tx, payload_rx) = mpsc::channel();
+        let id = [9; 16];
+        let (mut step, mut attempt) = (0, None);
+        let stream_auth = format!("Bearer {laptop_token}");
+        let port = serve(move |req| {
+            step += 1;
+            let line = req.line.trim_end();
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let hex_field = |k: &str| unhex(body[k].as_str().unwrap()).unwrap();
+            let ok = |v: serde_json::Value| (200, v.to_string());
+            match step {
+                1 => {
+                    assert_eq!(line, "POST /owner/v1/pair HTTP/1.1");
+                    let entry: Envelope = serde_json::from_value(body["entry"].clone()).unwrap();
+                    assert_eq!(body["secret"], "c2VjcmV0");
+                    let log = Log::new([entry]).unwrap();
+                    ok(json!({ "kind": "key", "id": log.trusted().next().unwrap().id }))
+                }
+                2 => {
+                    assert_eq!(line, "POST /owner/v1/join HTTP/1.1");
+                    assert_eq!(body, json!({ "kind": "device", "name": "MacBook" }));
+                    (201, json!({ "id": hex(&id) }).to_string())
+                }
+                3 | 5 => {
+                    assert_eq!(line, format!("GET /owner/v1/join/{}?wait=60 HTTP/1.1", hex(&id)));
+                    let code = code_rx.recv().unwrap();
+                    let a = Attempt::start("device", id, &code);
+                    let msg = hex(&a.msg);
+                    attempt = Some(a);
+                    ok(json!({ "msg": msg }))
+                }
+                4 | 6 => {
+                    let a = attempt.take().unwrap();
+                    let (msg, sealed) = (hex_field("msg"), hex_field("sealed"));
+                    match a.finish(&msg, &hex_field("confirm"), &sealed, &spki) {
+                        Ok((payload, confirm)) => {
+                            payload_tx.send(payload).unwrap();
+                            ok(json!({ "confirm": hex(&confirm) }))
+                        }
+                        Err(_) => (403, r#"{"error":"wrong code","code":"forbidden"}"#.into()),
+                    }
+                }
+                7 => ok(json!({ "status": "pending" })),
+                8 => ok(json!({ "status": "approved" })),
+                9 if req.auth == stream_auth => (200, concat!(
+                    ": open\n\n",
+                    "event: changed\ndata: {\"what\":\"keys\"}\n\n",
+                    ": ping\n\n",
+                    "event: later\ndata: {}\n\n",
+                    "event: waiting\ndata: {\"kind\":\"request\",\"id\":\"R\",\"identity\":\"I\",",
+                    "\"connector\":\"signal\"}\n\n",
+                ).into()),
+                _ => (500, format!("unexpected {line}")),
+            }
+        });
+        let url = format!("https://127.0.0.1:{port}");
+
+        let link = format!(
+            "mandate://pair?url=https%3A%2F%2F127.0.0.1%3A{port}&spki={SPKI_SHA256}&secret=c2VjcmV0"
+        );
+        let link: PairLink = link.parse().unwrap();
+        assert_eq!(
+            link,
+            PairLink { url: url.clone(), spki_sha256: spki, secret: b"secret".to_vec() }
+        );
+        let client = Client::pair(&link, &phone, "Pixel 9", &phone_token).unwrap();
+        assert_eq!(client.trust(), Trust::Pin(spki));
+
+        let mut join = Join::start(&url, &laptop, "MacBook", &laptop_token).unwrap();
+        let wrong = format!("{:06}", (join.code().parse::<u32>().unwrap() + 1) % 1_000_000);
+        code_tx.send(wrong).unwrap();
+        assert_eq!(join.poll().unwrap(), JoinStatus::WrongCode);
+        code_tx.send(join.code().into()).unwrap();
+        assert_eq!(join.poll().unwrap(), JoinStatus::Confirmed);
+        let want = Payload {
+            key: Some(Key::p256(&laptop.public_key(), "MacBook")),
+            token_sha256: token_sha256(&laptop_token),
+        };
+        assert_eq!(payload_rx.recv().unwrap(), want);
+        assert_eq!(join.poll().unwrap(), JoinStatus::Confirmed);
+        assert_eq!(join.poll().unwrap(), JoinStatus::Approved);
+        let client = join.into_client().unwrap();
+        assert_eq!(client.trust(), Trust::Pin(spki));
+
+        let events: Vec<Event> = client.events().unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            events,
+            [
+                Event::Changed { what: "keys".into() },
+                Event::Waiting {
+                    kind: "request".into(),
+                    id: "R".into(),
+                    identity: "I".into(),
+                    connector: "signal".into(),
+                },
+            ]
+        );
+
+        // A pinned client refuses another key before it sends anything.
+        let other = Client::new(&url, Trust::Pin([0; 32]), &laptop_token).unwrap();
+        assert!(matches!(other.get::<serde_json::Value>("now"), Err(Error::Io(_))));
+    }
+}

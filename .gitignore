@@ -18,3 +18,5 @@ result-*
 /connectors/whatsapp/whatsapp
 /nix/testconnector/testconnector
 /nix/testdevice/testdevice
+/app/target
+/app/ui/android/build
