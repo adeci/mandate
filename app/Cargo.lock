@@ -3593,10 +3593,14 @@ version = "0.0.0"
 dependencies = [
  "android-activity",
  "android_logger",
+ "futures",
  "gpui-pre",
  "gpui-pre-mobile",
  "gpui-pre-platform",
  "log",
+ "mandate-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
