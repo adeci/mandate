@@ -30,8 +30,9 @@ const (
 	requestUsages = requestUsage + "\n  " + routineUsage + "\n  " + extendUsage
 )
 
-// timeFormat is how access times print; like the rest of the output, in UTC.
-const timeFormat = "2006-01-02 15:04"
+// timeFormat is how access times print: in UTC, like the rest of the output,
+// and marked so, since agents pass these times on to the owner.
+const timeFormat = "2006-01-02 15:04 UTC"
 
 func Access(ctx context.Context, args []string) error {
 	c, err := newClient()

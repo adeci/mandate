@@ -244,10 +244,15 @@ func TestHealthReconnecting(t *testing.T) {
 	wantHealth(t, f.c, connector.Connecting)
 	f.cli().emit(signalmeow.SignalConnectionStatus{Event: signalmeow.SignalConnectionEventConnected})
 	eventually(t, func() bool { return f.c.Health(ctx).State == connector.Healthy })
+	// The sync is queued just after the state turns healthy.
 	cli := f.cli()
-	cli.mu.Lock()
-	defer cli.mu.Unlock()
-	if cli.syncs != 2 {
-		t.Fatalf("storage synced %d times, want once per connect", cli.syncs)
+	syncs := func() int {
+		cli.mu.Lock()
+		defer cli.mu.Unlock()
+		return cli.syncs
+	}
+	eventually(t, func() bool { return syncs() >= 2 })
+	if n := syncs(); n != 2 {
+		t.Fatalf("storage synced %d times, want once per connect", n)
 	}
 }

@@ -44,11 +44,9 @@ type Config struct {
 	// NtfyURL is the ntfy topic notified when something waits for the
 	// owner, NtfyToken its access token; none when empty.
 	NtfyURL, NtfyToken string
-	// GatewayURL is where agents reach the gateway, for their setup sheet.
-	GatewayURL string
-	StateDir   string
-	Log        *slog.Logger
-	Now        func() time.Time
+	StateDir           string
+	Log                *slog.Logger
+	Now                func() time.Time
 }
 
 type Server struct {

@@ -20,7 +20,7 @@ import (
 
 // A full contact sync fills the contact store without per-contact events, so
 // DMs stored before it are named afterwards; only the address book gives an
-// unmarked name.
+// unmarked name. The owner's own chat gets WhatsApp's name for it.
 func TestNameDMs(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -29,11 +29,16 @@ func TestNameDMs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	self := owner.ToNonAD()
+	if err := f.st.UpsertContainer(ctx, store.Container{ID: self.String(), Kind: "dm", Name: "Owner"}); err != nil {
+		t.Fatal(err)
+	}
 	newIngester(whatsmeow.NewClient(dev, nil), f.st, slog.New(slog.NewTextHandler(io.Discard, nil))).nameDMs(ctx)
 	for id, want := range map[string]string{
 		farid.String():    "Farid Haddad", // replaces the push name stored earlier
 		samParkL.String(): "Sam Park",     // listed in the address book under its LID
 		stranger.String(): "~Mom",         // not in the address book
+		self.String():     messageYourself,
 	} {
 		var got string
 		if err := f.st.DB().QueryRowContext(ctx, `SELECT COALESCE(name, '') FROM containers WHERE id = ?`, id).Scan(&got); err != nil {

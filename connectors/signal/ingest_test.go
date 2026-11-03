@@ -120,3 +120,27 @@ func TestContactListNamesDMs(t *testing.T) {
 		t.Fatalf("contact without a chat became a chat: %d, %v", n, err)
 	}
 }
+
+// The owner's own chat is named as Signal names it, also when stored
+// earlier under the owner's profile name, and a contact sync keeps it.
+func TestOwnChatIsNoteToSelf(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t)
+	if err := f.st.UpsertContainer(ctx, store.Container{ID: owner.String(), Kind: "dm", Name: "Owner"}); err != nil {
+		t.Fatal(err)
+	}
+	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, discard)
+	in.nameOwnChat(ctx)
+	in.handle(ctx, &events.ContactList{Contacts: []*types.Recipient{{ACI: owner, Profile: types.Profile{Name: "Owner"}}}})
+	in.handle(ctx, &events.ChatEvent{Info: events.MessageInfo{Sender: owner, ChatID: owner.String()}, Event: &signalpb.DataMessage{
+		Body: new("milk"), Timestamp: new(uint64(1798000000000)),
+	}})
+	var got string
+	if err := f.st.DB().QueryRow(`SELECT COALESCE(name, '') FROM containers WHERE id = ?`, owner.String()).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != noteToSelf {
+		t.Errorf("own chat named %q, want %q", got, noteToSelf)
+	}
+}

@@ -28,15 +28,15 @@ func windowText(g approval.Grant) string {
 	return fmt.Sprintf("%s at %s for %s (%s)", daysText(sc.Days), sc.Start, span(sc.Length), sc.Zone)
 }
 
-// routineText says when a requested routine runs; the zone is the
-// approver's.
-func routineText(sc proposal.RequestSchedule) string {
-	return scheduleWords(sc) + " (your time zone)"
-}
-
-// scheduleWords says a routine's runs: "weekdays 07:00 for 20 min".
+// scheduleWords says a requested routine's runs as a card shows them:
+// "Daily 09:00 · 10 min", "Mon Wed Fri 07:00 · 20 min". The zone is the
+// approving browser's.
 func scheduleWords(sc proposal.RequestSchedule) string {
-	return daysText(sc.Days) + " " + sc.Start + " for " + span(sc.Length)
+	days := daysText(sc.Days)
+	if days == "every day" {
+		days = "daily"
+	}
+	return upperFirst(strings.ReplaceAll(days, ",", "")) + " " + sc.Start + " · " + span(sc.Length)
 }
 
 func daysText(days []time.Weekday) string {

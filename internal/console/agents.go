@@ -4,44 +4,17 @@ import (
 	"context"
 	"maps"
 	"net/http"
-	"regexp"
-	"runtime/debug"
 	"slices"
 	"time"
 
 	"github.com/adeci/mandate/connector"
 )
 
-// release is the tag this build was released as, set with
-// -ldflags "-X github.com/adeci/mandate/internal/console.release=vX.Y.Z".
-// A build of a tagged module by go install carries it in its build info.
-var release string
-
-var releaseTag = regexp.MustCompile(`^v\d+\.\d+\.\d+(-rc\.\d+)?$`)
-
-// sources says where agents get the CLI and the skill: from this build's
-// release when it is one, else the latest release and main.
-func sources() (releaseURL, skillURL string) {
-	const repo = "https://github.com/adeci/mandate"
-	tag := release
-	if info, ok := debug.ReadBuildInfo(); ok && tag == "" {
-		tag = info.Main.Version
-	}
-	if !releaseTag.MatchString(tag) {
-		return repo + "/releases/latest/download", repo + "/blob/main/skills/mandate/SKILL.md"
-	}
-	return repo + "/releases/download/" + tag, repo + "/blob/" + tag + "/skills/mandate/SKILL.md"
-}
-
 // agentsData is the Agents screen; the page renders it and /agents.json
 // serves it.
 type agentsData struct {
-	Agents []agentItem `json:"agents"`
-	// GatewayURL, ReleaseURL and SkillURL fill a new agent's setup sheet.
-	GatewayURL string `json:"gateway_url,omitempty"`
-	ReleaseURL string `json:"release_url"`
-	SkillURL   string `json:"skill_url"`
-	CanSign    bool   `json:"can_sign"`
+	Agents  []agentItem `json:"agents"`
+	CanSign bool        `json:"can_sign"`
 	// The new-grant form's choices.
 	Connectors []connectorChoice `json:"connectors"`
 	For        []option          `json:"for_options"`
@@ -89,13 +62,11 @@ func (s *Server) agentsJSON(w http.ResponseWriter, r *http.Request, _ session) {
 func (s *Server) agentsData(ctx context.Context) (agentsData, error) {
 	now := s.now()
 	d := agentsData{
-		GatewayURL: s.cfg.GatewayURL,
-		CanSign:    len(s.keys.Trusted()) > 0,
-		For:        spanOptions(grantChoices, 0, time.Hour, span),
-		Length:     spanOptions(forChoices, 0, time.Hour, span),
-		Horizon:    spanOptions(horizonChoices, 0, 7*24*time.Hour, horizonText),
+		CanSign: len(s.keys.Trusted()) > 0,
+		For:     spanOptions(grantChoices, 0, time.Hour, span),
+		Length:  spanOptions(forChoices, 0, time.Hour, span),
+		Horizon: spanOptions(horizonChoices, 0, 7*24*time.Hour, horizonText),
 	}
-	d.ReleaseURL, d.SkillURL = sources()
 	fo := s.forwardOnlyAll(ctx)
 	for _, name := range slices.Sorted(maps.Keys(s.conns)) {
 		d.Connectors = append(d.Connectors, connectorChoice{Name: name, ForwardOnly: fo[name]})

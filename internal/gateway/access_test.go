@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,7 +29,8 @@ import (
 // testAccess knows one agent, holding testToken and grants.
 func testAccess(grants ...approval.Grant) *access {
 	sum := sha256.Sum256([]byte(testToken))
-	a := &access{}
+	// Nothing to sync from: refresh finds a sync done.
+	a := &access{synced: time.Now().Add(time.Hour)}
 	a.cur.Store(&[]*agent{{Agent: approval.Agent{ID: "a1", Name: "Test Agent"}, sum: sum[:], grants: grants}})
 	return a
 }
@@ -211,7 +213,9 @@ func TestScheduleOutsideWindowRefuses(t *testing.T) {
 
 // A console that serves the key log and access records.
 type recordConsole struct {
+	fetches    atomic.Int32
 	mu         sync.Mutex
+	status     proposal.AccessStatus
 	down       bool
 	accessDown bool
 	log        []approval.SignedChange
@@ -235,7 +239,13 @@ func (c *recordConsole) handler() http.Handler {
 		}
 		connector.WriteJSON(w, http.StatusOK, c.log)
 	})
+	mux.HandleFunc("GET /access/requests/{id}", func(w http.ResponseWriter, _ *http.Request) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		connector.WriteJSON(w, http.StatusOK, c.status)
+	})
 	mux.HandleFunc("GET /access", func(w http.ResponseWriter, _ *http.Request) {
+		c.fetches.Add(1)
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if c.down || c.accessDown {
@@ -805,5 +815,49 @@ func TestRoutineAndExtendRequests(t *testing.T) {
 		if rec := call(r.h, http.MethodPost, "/v1/access/requests", body); rec.Code != http.StatusBadRequest {
 			t.Errorf("%s: %d %s, want 400", body, rec.Code, rec.Body)
 		}
+	}
+}
+
+// The first read after an agent hears its request was granted is served,
+// though the next periodic sync is up to 15 s away; asking again does not
+// sync faster than refreshGap.
+func TestGrantServedRightAfterItIsReported(t *testing.T) {
+	t.Parallel()
+	const rpID, origin = "console.example", "https://console.example"
+	owner := approvaltest.New(t, rpID, origin)
+	sum := sha256.Sum256([]byte(testToken))
+	now := time.Now()
+	agentRec, err := approval.EncodeAgent(approval.Agent{ID: "a1", Name: "Bot", TokenSHA256: hex.EncodeToString(sum[:]), CreatedAt: now})
+	mustDo(t, err)
+	grantRec, err := approval.EncodeGrant(oneOff("g1", "whatsapp", 0))
+	mustDo(t, err)
+	console := &recordConsole{log: approvaltest.Keys(t, owner).Log()}
+	console.set(owner.SignAccess(approval.KindAgent, agentRec, now))
+	socket := serveUnix(t, "console", console.handler())
+	acc, err := openAccess(t.TempDir(), rpID, origin, proposal.Dial(socket), nil)
+	mustDo(t, err)
+	mustDo(t, acc.sync(t.Context()))
+	h := newHandler(Config{
+		Sources: fixture(t), ExposureFile: filepath.Join(t.TempDir(), "exposure.toml"), Timeout: testTimeout, ConsoleSocket: socket,
+	}, acc)
+	if code, _, _ := getTable(t, h, "/v1/whatsapp/chats"); code != http.StatusForbidden {
+		t.Fatalf("chats before the grant: %d", code)
+	}
+
+	console.set(owner.SignAccess(approval.KindAgent, agentRec, now), owner.SignAccess(approval.KindGrant, grantRec, now))
+	console.mu.Lock()
+	console.status = proposal.AccessStatus{Status: proposal.AccessGranted, AgentID: "a1", GrantID: "g1"}
+	console.mu.Unlock()
+	if rec := call(h, http.MethodGet, "/v1/access/requests/r1", ""); rec.Code != http.StatusOK {
+		t.Fatalf("status: %d %s", rec.Code, rec.Body)
+	}
+	if code, _, body := getTable(t, h, "/v1/whatsapp/chats"); code != http.StatusOK {
+		t.Errorf("chats right after the grant was reported: %d %s", code, body)
+	}
+
+	fetches, start := console.fetches.Load(), time.Now()
+	call(h, http.MethodGet, "/v1/access/requests/r1", "")
+	if d := time.Since(start); d < refreshGap/2 || console.fetches.Load() != fetches+1 {
+		t.Errorf("asking again synced %d times after %v, want once after refreshGap", console.fetches.Load()-fetches, d)
 	}
 }

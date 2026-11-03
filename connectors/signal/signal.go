@@ -70,6 +70,7 @@ func start(ctx context.Context, env *connector.Env, _ struct{}) (connector.Conne
 			return in.handle(ctx, evt)
 		})
 		in = newIngester(cli, dev, st, sess, env.Log)
+		in.nameOwnChat(ctx)
 		return cli
 	}
 	c := newConnector(ctx, st, env.Log, sess, dev, provision, newClient)

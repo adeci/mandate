@@ -118,7 +118,6 @@ pkgs.testers.runNixOSTest {
         url = "http://127.0.0.1:9001/mandate";
         tokenFile = "/etc/mandate-ntfy-token";
       };
-      gatewayUrl = "http://machine:8780";
     };
     environment.etc."mandate-ntfy-token".text = "tk_ntfytest";
     # No ACME server answers, so the console keeps the self-signed placeholder.
@@ -290,9 +289,7 @@ pkgs.testers.runNixOSTest {
         assert code == 200 and "Grok Bot" in page and token not in page, code
         code, _ = console("GET", "/access")
         assert code == 303, code
-        # The setup sheet's URL, and the gateway reporting that the agent connected.
-        code, out = console("GET", "/agents.json")
-        assert code == 200 and out["gateway_url"] == "http://machine:8780", (code, out)
+        # The gateway reports that the agent connected.
         machine.wait_until_succeeds(
             "curl -s -b /tmp/jar --cacert /var/lib/acme/${host}/chain.pem --resolve ${host}:443:127.0.0.1 "
             "https://${host}/agents.json | grep -q first_seen"
@@ -407,11 +404,24 @@ pkgs.testers.runNixOSTest {
         assert code == 200 and out["kind"] == "grant", (code, out)
         code, st = gw("GET", f"/v1/access/requests/{rid}?wait=5")
         assert st["status"] == "granted" and st["grant_id"] == out["id"], (code, st)
-        _, out = gw_until("/v1/whatsapp/chats", lambda code, _: code == 200)
-        assert rows(out) == ["fam@g.us"], out
+        # The gateway syncs before it answers "granted", so the first read works.
+        code, out = gw("GET", "/v1/whatsapp/chats")
+        assert code == 200 and rows(out) == ["fam@g.us"], (code, out)
         # The request's default horizon of 7 days hides the October messages.
         code, out = gw("GET", "/v1/whatsapp/messages?chat=fam@g.us")
         assert bodies(out) == ["fresh family"], (code, out)
+
+    with subtest("when nothing matched, the owner may pick the chats to grant"):
+        code, ref = gw("POST", "/v1/access/requests", {"connector": "whatsapp", "chats": ["Nobody"], "reason": "find the club"})
+        assert code == 202, (code, ref)
+        code, page = console("GET", "/")
+        assert "Nothing matched" in page and "Nobody" in page, code
+        code, out = sign({"kind": "grant", "request": ref["id"], "chats": ["club@g.us"], "for": "10m"})
+        assert code == 200 and out["kind"] == "grant", (code, out)
+        code, st = gw("GET", f"/v1/access/requests/{ref['id']}?wait=5")
+        assert st["status"] == "granted", (code, st)
+        code, out = gw("GET", "/v1/whatsapp/messages?chat=club@g.us")
+        assert code == 200 and bodies(out) == ["fresh club"], (code, out)
 
     with subtest("an agent has at most 3 requests waiting; a denied one grants nothing"):
         waiting = []
@@ -483,7 +493,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("a grant on every chat reads them all, through the hide rules"):
         grant({"connector": "whatsapp", "for": "30m", "horizon": "0"})
-        _, out = gw_until("/v1/whatsapp/chats", lambda code, out: code == 200 and "club@g.us" in rows(out))
+        _, out = gw_until("/v1/whatsapp/chats", lambda code, out: code == 200 and "sub@g.us" in rows(out))
         assert sorted(rows(out)) == ["club@g.us", "fam@g.us", "long@g.us", "sub@g.us"], out
         code, out = gw("GET", "/v1/whatsapp/messages?chat=fam@g.us")
         assert bodies(out) == ["fresh family", "[image/jpeg] look", "[login code hidden]", "dinner at 7?"], out

@@ -17,7 +17,6 @@ services.mandate = {
   hostname = "mandate.example.com";
   useACMEHost = "mandate.example.com"; # or tlsCertFile and tlsKeyFile
   connectors.whatsapp = { };
-  gatewayUrl = "http://box.example.ts.net:8780"; # optional, for agent setup
   notify.ntfy.url = "http://ntfy.example.ts.net/mandate"; # optional
 };
 ```
@@ -27,10 +26,9 @@ After deploying:
 1. Sign in to the console with `sudo cat /var/lib/mandate/admin-password`
    and add a passkey under Keys.
 2. Link your accounts under Connections.
-3. Create an agent under Agents. The setup sheet lists what it needs, each
-   value with a copy button: the gateway URL (from `gatewayUrl`), its token,
-   which is shown only once, the CLI download and the skill. The sheet
-   shows when the agent first connects.
+3. Create an agent under Agents and set it up as below with the token your
+   browser shows, which is shown only once. The page shows when the agent
+   first connects.
 
 The gateway (port 8780) and the console (443) listen on all addresses, and
 the firewall opens them on `tailscale0` only (`openFirewallOn`).
@@ -38,7 +36,11 @@ Set `adminPasswordHashFile` to manage the admin password yourself.
 
 ## Agents
 
+On the agent's machine, put the token in a file only the agent can read and
+point the CLI at the gateway:
+
 ```sh
+install -m 600 /dev/null ~/.config/mandate/token   # then paste the token into it
 export MANDATE_URL=http://box:8780 MANDATE_TOKEN_FILE=~/.config/mandate/token
 mandate --help
 mandate access                                     # what this agent may read now
@@ -49,12 +51,18 @@ mandate whatsapp send 15551234567@s.whatsapp.net "running 10 late" --wait 10m
 mandate whatsapp media 15551234567@s.whatsapp.net 812   # save that message's photo
 ```
 
-On a machine without Nix, download the CLI from the
-[latest release](https://github.com/adeci/mandate/releases/latest)
-(`mandate-linux-amd64` or `mandate-linux-arm64`). `MANDATE_TOKEN` works in
-place of a token file. Give the agent
-[skills/mandate/SKILL.md](skills/mandate/SKILL.md) as a skill or in its
-instructions.
+`MANDATE_URL` is the mandate host's tailnet name with the gateway port
+(8780). `MANDATE_TOKEN` works in place of a token file. On a machine without
+Nix, download the CLI and check it against the release's checksums:
+
+```sh
+base=https://github.com/adeci/mandate/releases/latest/download
+curl -LO $base/mandate-linux-amd64 -LO $base/SHA256SUMS   # or mandate-linux-arm64
+sha256sum --ignore-missing -c SHA256SUMS && install -m 755 mandate-linux-amd64 ~/.local/bin/mandate
+```
+
+Give the agent [skills/mandate/SKILL.md](skills/mandate/SKILL.md) as a skill
+or in its instructions.
 
 ## Access
 

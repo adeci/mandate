@@ -55,9 +55,12 @@ type card struct {
 
 	// Access requests: the chats named and those under them (Every when a
 	// read or routine named none), the terms that matched nothing, and the
-	// window.
+	// window. When the terms matched no chat, NoMatch says so and Pick
+	// lets the owner choose chats instead.
 	Chats       []chatNode                `json:"chats,omitempty"`
 	Unmatched   []string                  `json:"unmatched,omitempty"`
+	NoMatch     string                    `json:"no_match,omitempty"`
+	Pick        bool                      `json:"pick,omitempty"`
 	Every       bool                      `json:"every,omitempty"`
 	ForwardOnly bool                      `json:"forward_only,omitempty"`
 	For         time.Duration             `json:"for,omitempty"`
@@ -204,7 +207,9 @@ func (s *Server) nowData(ctx context.Context, r *http.Request) (nowData, error) 
 		return d, err
 	}
 	for _, pr := range pending {
-		d.Waiting = append(d.Waiting, sendCard(pr))
+		c := sendCard(pr)
+		c.CanApprove = d.CanSign
+		d.Waiting = append(d.Waiting, c)
 	}
 	slices.SortStableFunc(d.Waiting, func(a, b card) int { return b.CreatedAt.Compare(a.CreatedAt) })
 
@@ -376,7 +381,7 @@ func (s *Server) requestCard(ctx context.Context, ar accessRequest, grants map[s
 		CreatedAt: ar.CreatedAt, ExpiresAt: ar.ExpiresAt, Reason: ar.Reason,
 		Unmatched: ar.Unmatched, Every: !ar.names(), ForwardOnly: fo,
 		For: ar.For, Horizon: ar.Horizon, Schedule: ar.Schedule,
-		When: "for " + span(ar.For), HorizonText: horizonText(ar.Horizon), Window: span(ar.For),
+		When: span(ar.For), HorizonText: horizonText(ar.Horizon), Window: span(ar.For),
 		ForOptions:     spanOptions(forChoices, ar.For, ar.For, span),
 		HorizonOptions: spanOptions(horizonChoices, ar.Horizon, ar.Horizon, horizonText),
 	}
@@ -392,8 +397,9 @@ func (s *Server) requestCard(ctx context.Context, ar accessRequest, grants map[s
 		c.CanApprove = canSign && c.Extends != nil && c.Extends.RevokedAt.IsZero()
 		return c
 	case ar.Schedule != nil:
-		c.Kind, c.When, c.ForOptions = "routine", routineText(*ar.Schedule), nil
-		c.Window = scheduleWords(*ar.Schedule)
+		c.Kind, c.ForOptions = "routine", nil
+		c.When = scheduleWords(*ar.Schedule)
+		c.Window = c.When
 	}
 	if fo {
 		c.HorizonText, c.HorizonOptions = "every allowlisted read", nil
@@ -413,9 +419,17 @@ func (s *Server) requestCard(ctx context.Context, ar accessRequest, grants map[s
 			tree[0].Ticked = true
 		}
 		c.Chats = tree
+		if len(ar.Chats) == 0 {
+			terms := make([]string, len(ar.Unmatched))
+			for i, t := range ar.Unmatched {
+				terms[i] = `"` + t + `"`
+			}
+			c.Pick = true
+			c.NoMatch = fmt.Sprintf("Nothing matched %s on %s.", strings.Join(terms, " or "), connectorTitle(ar.Connector))
+		}
 	}
 	c.Approve, c.Ready = approveLabel(c)
-	c.CanApprove = canSign && (c.Every || len(c.Chats) > 0) && (!fo || !ar.names())
+	c.CanApprove = canSign && (c.Every || c.Pick || len(c.Chats) > 0) && (!fo || !ar.names())
 	return c
 }
 

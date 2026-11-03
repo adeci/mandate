@@ -17,6 +17,10 @@ import (
 	"github.com/adeci/mandate/internal/proposal"
 )
 
+// listRefresh is how long after a grant was reported /v1/access makes sure
+// the gateway has synced since.
+const listRefresh = 30 * time.Second
+
 // Limits of an access request; the console enforces them too.
 const (
 	defaultFor     = 30 * time.Minute
@@ -164,7 +168,21 @@ type grantInfo struct {
 // their chats as the agent would see them; a chat since hidden keeps only its
 // ID.
 func (h *handler) grants(w http.ResponseWriter, r *http.Request) {
-	ag, now := agentOf(r.Context()), time.Now()
+	ag := agentOf(r.Context())
+	// A sync after a grant was reported may have failed; listing soon
+	// after tries again.
+	h.grantedMu.Lock()
+	granted := h.granted[ag.ID]
+	h.grantedMu.Unlock()
+	if time.Since(granted) < listRefresh {
+		if err := h.access.refresh(r.Context(), granted); err != nil {
+			logFor(r.Context()).Warn("access sync after grant", "err", err)
+		}
+		if fresh := h.access.byID(ag.ID); fresh != nil {
+			ag = fresh
+		}
+	}
+	now := time.Now()
 	out := []grantInfo{}
 	chats := map[string][]string{}
 	listed := map[string][]rule{}
@@ -436,13 +454,25 @@ func (h *handler) requestStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st, err := h.console.AccessStatus(r.Context(), id, wait)
+	answered := time.Now()
 	if err != nil {
 		relay(w, r, "console", err)
 		return
 	}
-	if st.AgentID != agentOf(r.Context()).ID {
+	ag := agentOf(r.Context())
+	if st.AgentID != ag.ID {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("no access request %q of yours", id))
 		return
+	}
+	// The agent reads right after hearing it was granted, sooner than the
+	// next sync.
+	if st.Status == proposal.AccessGranted {
+		h.grantedMu.Lock()
+		h.granted[ag.ID] = answered
+		h.grantedMu.Unlock()
+		if err := h.access.refresh(r.Context(), answered); err != nil {
+			logFor(r.Context()).Warn("access sync after grant", "err", err)
+		}
 	}
 	connector.WriteJSON(w, http.StatusOK, st)
 }

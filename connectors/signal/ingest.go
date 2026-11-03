@@ -200,7 +200,10 @@ func (in *ingester) ensureContainer(ctx context.Context, chat string, revision u
 			}
 		}
 	} else if sid, err := libsignalgo.ServiceIDFromString(chat); err == nil && sid.Type == libsignalgo.ServiceIDTypeACI {
-		c.Name = in.contactName(ctx, sid.UUID)
+		c.Name = noteToSelf
+		if !in.own(sid.UUID) {
+			c.Name = in.contactName(ctx, sid.UUID)
+		}
 	}
 	if err := in.st.UpsertContainer(ctx, c); err != nil {
 		in.mu.Lock()
@@ -211,10 +214,32 @@ func (in *ingester) ensureContainer(ctx context.Context, chat string, revision u
 	return nil
 }
 
+// noteToSelf is what Signal calls the owner's chat with themself.
+const noteToSelf = "Note to Self"
+
+func (in *ingester) own(aci uuid.UUID) bool {
+	return in.dev != nil && aci != uuid.Nil && aci == in.dev.ACI
+}
+
+// nameOwnChat names a stored chat with the owner's own ACI as Signal does,
+// so one stored under an older name is renamed on connecting.
+func (in *ingester) nameOwnChat(ctx context.Context) {
+	if in.dev == nil || in.dev.ACI == uuid.Nil {
+		return
+	}
+	if _, err := in.st.DB().ExecContext(ctx, `UPDATE containers SET name = ?1 WHERE id = ?2 AND kind = 'dm' AND name IS NOT ?1`,
+		noteToSelf, in.dev.ACI.String()); err != nil {
+		in.log.Error("name own chat", "err", err)
+	}
+}
+
 // renameDMs names the stored DMs of contacts the owner's devices synced.
 func (in *ingester) renameDMs(ctx context.Context, contacts []*types.Recipient) {
 	for _, r := range contacts {
 		name := displayName(r, in.dev.ACI)
+		if in.own(r.ACI) {
+			name = noteToSelf
+		}
 		if r.ACI == uuid.Nil || name == "" {
 			continue
 		}

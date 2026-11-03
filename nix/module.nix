@@ -270,16 +270,6 @@ in
       description = "TLS key for the hostname. Defaults to the one of {option}`services.mandate.useACMEHost`.";
     };
 
-    gatewayUrl = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      example = "http://mandate.example.ts.net:8780";
-      description = ''
-        URL agents reach the gateway at, shown as `MANDATE_URL` when you
-        create an agent. If null, the console leaves that line out.
-      '';
-    };
-
     notify.ntfy = {
       url = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
@@ -473,10 +463,6 @@ in
                   ++ lib.optionals (ntfy.url != null) [
                     "--ntfy-url"
                     ntfy.url
-                  ]
-                  ++ lib.optionals (cfg.gatewayUrl != null) [
-                    "--gateway-url"
-                    cfg.gatewayUrl
                   ]
                   ++ connectorArgs
                 )

@@ -44,6 +44,8 @@ type access struct {
 	path     string
 
 	mu      sync.Mutex // serializes sync
+	synced  time.Time  // when the last successful sync started
+	forced  time.Time  // when refresh last synced
 	seen    map[string]bool
 	revoked map[string]bool
 	dirty   bool // revocations not yet written to path
@@ -143,7 +145,41 @@ func (a *access) run(ctx context.Context) {
 func (a *access) sync(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.syncLocked(ctx)
+}
+
+// refreshGap spaces the syncs refresh forces, so agents can't drive the
+// console with them.
+const refreshGap = 2 * time.Second
+
+// refresh makes sure a sync that started after since has succeeded, so a
+// grant the console reported by then is served. A caller sooner than
+// refreshGap after the last forced sync waits for the gap.
+func (a *access) refresh(ctx context.Context, since time.Time) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.synced.After(since) {
+		return nil
+	}
+	if wait := time.Until(a.forced.Add(refreshGap)); wait > 0 {
+		t := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+	a.forced = time.Now()
+	return a.syncLocked(ctx)
+}
+
+func (a *access) syncLocked(ctx context.Context) error {
+	start := time.Now()
 	err := a.update(ctx)
+	if err == nil {
+		a.synced = start
+	}
 	if a.dirty {
 		if serr := a.save(); serr != nil {
 			return errors.Join(err, fmt.Errorf("save revocations: %w", serr))

@@ -2,6 +2,7 @@ package console
 
 import (
 	"context"
+	"html"
 	"regexp"
 	"strings"
 	"testing"
@@ -27,6 +28,9 @@ func TestNowRendersEveryCard(t *testing.T) {
 		Schedule: &proposal.RequestSchedule{Days: []time.Weekday{1, 2, 3, 4, 5}, Start: "07:00", Length: 20 * time.Minute},
 	})
 	h.requestAccess(t, proposal.AccessRequest{AgentID: other, Connector: "fake", Extend: true, For: 30 * time.Minute, Reason: "more"})
+	h.requestAccess(t, proposal.AccessRequest{
+		AgentID: third, Connector: "fake", Terms: []string{"lawyer"}, Unmatched: []string{"lawyer"}, For: time.Hour, Reason: "nothing",
+	})
 	if _, err := h.api.Submit(ctx, proposal.Request{
 		Connector: "fake", Op: "send", Args: map[string]string{"to": "Farid", "text": "hi"}, AgentID: third, AgentName: "third",
 	}); err != nil {
@@ -58,7 +62,7 @@ func TestNowRendersEveryCard(t *testing.T) {
 		picker := strings.Contains(body, "data-chat-picker")
 		switch kind {
 		case "read", "routine":
-			if !hasChats || picker != (chats == "every") {
+			if !hasChats || picker != (chats == "every" || chats == "pick") {
 				t.Errorf("%s card: data-chats %q, picker %v", kind, chats, picker)
 			}
 			if !strings.Contains(body, "data-adjust") || !regexp.MustCompile(`data-approve-access data-span="[^"]+"`).MatchString(body) {
@@ -69,21 +73,25 @@ func TestNowRendersEveryCard(t *testing.T) {
 				t.Errorf("extend card: data-chats %v, picker %v, or no Approve", hasChats, picker)
 			}
 		case "send":
-			if hasChats || !strings.Contains(body, `href="/r/`) {
-				t.Errorf("send card: data-chats %v, or no Review link", hasChats)
+			if hasChats || !strings.Contains(body, `href="/r/`) || !strings.Contains(body, "data-approve-send=") {
+				t.Errorf("send card: data-chats %v, or no Review link or Approve", hasChats)
 			}
 		default:
 			t.Errorf("card of kind %q", kind)
 		}
 	}
-	for _, want := range []string{"read/named", "read/every", "routine/named", "extend/", "send/"} {
+	for _, want := range []string{"read/named", "read/every", "read/pick", "routine/named", "extend/", "send/"} {
 		if !kinds[want] {
 			t.Errorf("no %s card among %v", want, kinds)
 		}
 	}
-	// Stop all asks first without any script.
-	if !strings.Contains(page, `<details class="stop-all">`) || !strings.Contains(page, `Waiting sends stay.`) {
-		t.Error("Stop all has no confirmation step")
+	if !strings.Contains(html.UnescapeString(page), `Nothing matched "lawyer" on fake.`) {
+		t.Error("a request that matched nothing doesn't say so")
+	}
+	// Stop all asks first without any script, at the bottom.
+	stop := strings.Index(page, `<section class="panel stop-all">`)
+	if stop < strings.Index(page, `id="today"`) || !strings.Contains(page[stop:], `Waiting sends stay.`) {
+		t.Error("Stop all isn't below Today with a confirmation step")
 	}
 }
 

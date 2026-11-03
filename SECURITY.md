@@ -153,8 +153,8 @@ What each part is trusted with:
   not log, not which they were, and loses the count when the gateway
   restarts. It records no search terms or forwarded paths, and a search
   across chats is logged without the chats it touched.
-- **Agent setup**: a token copied from the setup sheet lands in your
-  clipboard history. The install line checks the binary against
+- **Agent setup**: a token you copy from the console lands in your
+  clipboard history. The README's install steps check the binary against
   `SHA256SUMS` from the same release, which catches a broken download, not a
   forged release.
 - **Access requests** carry the agent's own words in the reason. Read the

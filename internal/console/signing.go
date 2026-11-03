@@ -219,8 +219,9 @@ func (s *Server) newGrant(ctx context.Context, req accessChallengeRequest, now t
 
 // requestGrant answers an access request with a grant, narrowed by the
 // owner but never wider than asked: chats named in the request or under
-// them, any chats when it asked for every chat. A routine runs as asked in
-// the owner's zone; an extension lengthens the window it names.
+// them, any chats when it asked for every chat. When its terms matched no
+// chat, the owner picks the chats. A routine runs as asked in the owner's
+// zone; an extension lengthens the window it names.
 func (s *Server) requestGrant(ctx context.Context, req accessChallengeRequest, now time.Time) (signing, error) {
 	ar, err := s.db.accessRequest(ctx, req.Request, now)
 	if err != nil {
@@ -264,6 +265,11 @@ func (s *Server) requestGrant(ctx context.Context, req accessChallengeRequest, n
 			return signing{}, connector.Invalid("%s keeps no chats; deny a request that names some", ar.Connector)
 		}
 	case !ar.names():
+		chats = req.Chats
+	case len(ar.Chats) == 0:
+		if req.Chats == nil {
+			return signing{}, connector.Invalid("pick the chats to grant")
+		}
 		chats = req.Chats
 	default:
 		if req.Chats == nil {

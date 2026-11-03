@@ -521,6 +521,10 @@ func TestReadsAndChatPicker(t *testing.T) {
 		t.Fatalf("tree: %d %s", status, body)
 	}
 	agent := h.agent(t, "bot")
+	// Today starts at midnight; reads an hour back must fall within it.
+	if now := h.clock.now(); now.Sub(startOfDay(now)) < 2*time.Hour {
+		h.clock.advance(2 * time.Hour)
+	}
 	for i, at := range []time.Duration{0, 5 * time.Minute, 30 * time.Minute} {
 		err := h.api.Read(context.Background(), proposal.ReadEvent{
 			AgentID: agent, Connector: "fake", Verb: "messages", Chat: "c1", ChatName: "family", Grants: []string{"g1"},
@@ -637,7 +641,7 @@ func TestRoutinePauseResume(t *testing.T) {
 		Schedule: &proposal.RequestSchedule{Days: []time.Weekday{1, 2, 3, 4, 5}, Start: "07:00", Length: 20 * time.Minute},
 		Reason:   "morning summary",
 	})
-	if w := h.nowJSON(t).Waiting; len(w) != 1 || w[0].Kind != "routine" || w[0].When != "weekdays 07:00 for 20 min (your time zone)" {
+	if w := h.nowJSON(t).Waiting; len(w) != 1 || w[0].Kind != "routine" || w[0].When != "Weekdays 07:00 · 20 min" {
 		t.Fatalf("waiting = %+v", w)
 	}
 	if status, _, _ := h.accessChallenge(t, accessChallengeRequest{Kind: approval.KindGrant, Request: ref.ID, Chats: []string{"c2"}}); status != http.StatusBadRequest {
@@ -849,5 +853,28 @@ func TestTodayShowsNewestSessions(t *testing.T) {
 	}
 	if len(rest.Today) != 7 || rest.Hidden != 0 || rest.Today[6].Text != "bot listed fake chats" {
 		t.Fatalf("earlier sessions: %+v", rest.Today)
+	}
+}
+
+// When a request's terms matched no chat, the owner may pick chats instead,
+// and the passkey summary names them.
+func TestPickWhenNothingMatched(t *testing.T) {
+	h := start(t)
+	agent := h.agent(t, "bot")
+	ref := h.requestAccess(t, proposal.AccessRequest{
+		AgentID: agent, Connector: "fake", Terms: []string{"lawyer"}, Unmatched: []string{"lawyer"}, For: time.Hour, Reason: "r",
+	})
+	if w := h.nowJSON(t).Waiting; len(w) != 1 || !w[0].Pick || !w[0].CanApprove || w[0].Ready {
+		t.Fatalf("waiting = %+v", w)
+	}
+	if status, _, _ := h.accessChallenge(t, accessChallengeRequest{Kind: approval.KindGrant, Request: ref.ID}); status != http.StatusBadRequest {
+		t.Fatalf("approving with no chats picked: %d", status)
+	}
+	_, res := h.sign(t, accessChallengeRequest{Kind: approval.KindGrant, Request: ref.ID, Chats: []string{"d2"}})
+	if !strings.Contains(string(res.Summary), "Dad (d2)") {
+		t.Errorf("summary %q", res.Summary)
+	}
+	if _, grants := h.records(t); len(grants) != 1 || !slices.Equal(grants[0].Chats, []string{"d2"}) {
+		t.Fatalf("grants = %+v", grants)
 	}
 }

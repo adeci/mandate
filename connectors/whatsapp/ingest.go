@@ -211,6 +211,22 @@ func (in *ingester) contactName(ctx context.Context, ids ...types.JID) string {
 	return chosen
 }
 
+// messageYourself is what WhatsApp calls the owner's chat with themself.
+const messageYourself = "Message yourself"
+
+// chatName names the direct chat with the user under ids: the owner's own
+// chat as WhatsApp does, any other as contactName.
+func (in *ingester) chatName(ctx context.Context, ids ...types.JID) string {
+	for _, own := range []types.JID{in.cli.Store.GetJID(), in.cli.Store.GetLID()} {
+		for _, j := range ids {
+			if !own.IsEmpty() && j.User == own.User && j.Server == own.Server {
+				return messageYourself
+			}
+		}
+	}
+	return in.contactName(ctx, ids...)
+}
+
 func (in *ingester) nameFunc(ctx context.Context) func(types.JID) string {
 	return func(j types.JID) string { return in.contactName(ctx, j) }
 }
@@ -264,7 +280,7 @@ func (in *ingester) ensureContainer(ctx context.Context, chat types.JID, base st
 			c.LastMessageAt = base.LastMessageAt
 		}
 	} else if !c.IsGroup {
-		if n := in.contactName(ctx, chat); n != "" {
+		if n := in.chatName(ctx, chat); n != "" {
 			c.Name = n
 		}
 	}
@@ -286,7 +302,7 @@ func (in *ingester) renameDM(ctx context.Context, j types.JID) {
 	if !seen || chat.Server == types.GroupServer {
 		return
 	}
-	name := in.contactName(ctx, chat)
+	name := in.chatName(ctx, chat)
 	if name == "" {
 		return
 	}
@@ -317,7 +333,7 @@ func (in *ingester) nameDMs(ctx context.Context) {
 		if err != nil {
 			continue
 		}
-		name := in.contactName(ctx, in.pn(j), j)
+		name := in.chatName(ctx, in.pn(j), j)
 		if name == "" || name == d.name {
 			continue
 		}

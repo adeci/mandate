@@ -150,8 +150,8 @@ function showWindow() {
     const s = unlocked ? Math.ceil((unlocked.until - Date.now()) / 1000) : 0;
     $("[data-window-left]", box).textContent = `${Math.floor(s / 60)}:${pad(s % 60)}`;
   }
-  const sign = $("[data-sign]");
-  if (sign) sign.textContent = unlocked ? "Approve →" : "Approve with passkey →";
+  for (const b of $$("[data-sign], [data-approve-send]")) b.textContent = approveText();
+  decideLabel();
   const last = $("#steps li:last-child");
   if (last) last.textContent = unlocked ? "approve" : "touch key";
 }
@@ -251,22 +251,63 @@ function closeReview() {
   steps(1);
 }
 
-async function review() {
-  const id = $("#decide").dataset.id;
-  const edits = {};
+function approveText() {
+  return unlocked ? "Approve →" : "Approve with passkey →";
+}
+
+function edits() {
+  const out = {};
   for (const ta of $$("textarea[data-param]")) {
-    if (ta.value !== ta.defaultValue) edits[ta.dataset.param] = ta.value;
+    if (ta.value !== ta.defaultValue) out[ta.dataset.param] = ta.value;
   }
-  const res = await call("POST", `/r/${id}/challenge`, { edits });
+  return out;
+}
+
+// decideLabel says what the proposal page's button does: approve what the
+// page shows, or after edits show the final text first.
+function decideLabel() {
+  const b = $("[data-review]");
+  if (b) b.textContent = Object.keys(edits()).length ? "Review edits →" : approveText();
+}
+
+// prepare asks for the challenge that signs proposal id with edits and
+// shows what it signs in preview, rendered by the server from that record;
+// display values are escaped and hidden characters marked there.
+async function prepare(id, changes, preview) {
+  const res = await call("POST", `/r/${id}/challenge`, { edits: changes });
   pending = { id, nonce: res.nonce, options: res.options };
-  // Server-rendered from the record the passkey signs; display values are
-  // escaped and hidden characters marked there.
-  $("#preview").innerHTML = res.preview;
+  if (preview) {
+    preview.innerHTML = res.preview;
+    preview.hidden = false;
+  }
+}
+
+// decide approves the proposal as the page shows it in one step. Edited,
+// the final text differs from what the agent wrote, so it is shown first.
+async function decide() {
+  const id = $("#decide").dataset.id;
+  const changes = edits();
+  if (!Object.keys(changes).length) {
+    await prepare(id, changes, null);
+    steps(2);
+    return signNow();
+  }
+  await prepare(id, changes, $("#preview"));
   $("[data-review]").closest(".actions").hidden = true;
   $("#review").hidden = false;
   steps(2);
   say("");
   $("#review").scrollIntoView({ block: "start" });
+}
+
+// signNow signs what prepare just set up; a cancelled passkey leaves
+// nothing waiting, so the page refreshes again.
+async function signNow() {
+  try {
+    await sign();
+  } finally {
+    pending = null;
+  }
 }
 
 async function sign() {
@@ -360,44 +401,14 @@ async function newAgent(form) {
   const tokenSHA256 = hex(await crypto.subtle.digest("SHA-256", utf8(token)));
   const res = await signAccess({ kind: "agent", name, token_sha256: tokenSHA256 }, $(".msg", form));
   const sheet = $("#agent-setup");
-  const d = sheet.dataset;
-  const install =
-    `curl -LO ${d.releaseUrl}/mandate-linux-amd64 && curl -LO ${d.releaseUrl}/SHA256SUMS && ` +
-    "sha256sum --ignore-missing -c SHA256SUMS && install -m755 mandate-linux-amd64 ~/bin/mandate";
-  const rows = [];
-  if (d.gatewayUrl) rows.push(["URL", `MANDATE_URL=${d.gatewayUrl}`]);
-  rows.push(["Token", `MANDATE_TOKEN=${token}`], ["Install", install], ["Skill", d.skillUrl]);
-  const all = [];
-  if (d.gatewayUrl) all.push(`MANDATE_URL=${d.gatewayUrl}`);
-  all.push(`MANDATE_TOKEN=${token}`, "# install", install, "# skill", d.skillUrl);
-  const copyButton = (text, label = "Copy") => {
-    const b = document.createElement("button");
-    b.type = "button";
-    b.textContent = label;
-    b.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(text);
-      b.textContent = "Copied";
-      setTimeout(() => (b.textContent = label), 2000);
-      if (text.includes(token)) $("[data-clipboard-warning]", sheet).hidden = false;
-    });
-    return b;
-  };
-  const list = $("[data-setup-values]", sheet);
-  list.replaceChildren(
-    ...rows.map(([name, value]) => {
-      const row = document.createElement("div");
-      row.className = "setup-row";
-      const label = document.createElement("span");
-      label.className = "setup-label";
-      label.textContent = name;
-      const code = document.createElement("code");
-      code.className = "setup-value";
-      code.textContent = value;
-      row.append(label, code, copyButton(value));
-      return row;
-    }),
-  );
-  list.append(copyButton(all.join("\n"), "Copy all"));
+  $("[data-setup-token]", sheet).textContent = token;
+  const copy = $("[data-copy-token]", sheet);
+  copy.addEventListener("click", async () => {
+    await navigator.clipboard.writeText(token);
+    copy.textContent = "Copied";
+    setTimeout(() => (copy.textContent = "Copy"), 2000);
+    $("[data-clipboard-warning]", sheet).hidden = false;
+  });
   for (const el of $$("[data-setup-name]", sheet)) el.textContent = name;
   form.hidden = true;
   sheet.hidden = false;
@@ -407,7 +418,7 @@ async function newAgent(form) {
     const data = await call("GET", "/agents.json").catch(() => null);
     const agent = data && data.agents.find((a) => a.id === res.id);
     if (agent && agent.first_seen) {
-      state.textContent = `${name} connected.`;
+      state.textContent = "Connected";
       return;
     }
     setTimeout(poll, POLL_MS);
@@ -501,6 +512,7 @@ function picker(root, connector, msg) {
 // cardChats is what approving a card signs for chats: undefined keeps the
 // request's choice, a list narrows it.
 function cardChats(card) {
+  if (card.dataset.chats === "pick") return card.picker.chats();
   if (card.dataset.chats === "named") return checked($("[data-tree]", card));
   if (card.picker && $("input[value=pick]", card).checked) return card.picker.chats();
   return undefined;
@@ -522,9 +534,9 @@ async function approveAccess(card) {
   await reload();
 }
 
-// requestCard wires Adjust, the picker for a request for every chat, and
-// keeps the Approve button naming what it signs; with no chat ticked it
-// stays off.
+// requestCard wires Adjust, the picker for a request for every chat or one
+// whose terms matched none, and keeps the Approve button naming what it
+// signs; with no chat ticked it stays off.
 function requestCard(card) {
   const approve = $("[data-approve-access]", card);
   const adjust = $("[data-adjust]", card);
@@ -536,6 +548,10 @@ function requestCard(card) {
     for (const radio of $$("input[type=radio]", card)) {
       radio.addEventListener("change", () => card.picker.show($("input[value=pick]", card).checked));
     }
+  }
+  if (card.dataset.chats === "pick" && pickerRoot && adjust) {
+    card.picker = picker(pickerRoot, () => card.dataset.connector, $(".msg", card));
+    adjust.addEventListener("click", () => card.picker.show(!panel.hidden));
   }
   if (!approve || card.dataset.card === "extend") return;
   const hint = $("[data-tick-hint]", card);
@@ -765,7 +781,7 @@ function busy(el, action) {
 const engaged = () =>
   pending !== null ||
   $(
-    "#review:not([hidden]), .linking:not([hidden]), #agent-setup:not([hidden]), details.stop-all[open], " +
+    "#review:not([hidden]), .linking:not([hidden]), #agent-setup:not([hidden]), .stop-all details[open], " +
       "button:disabled:not([data-approve-access]), input:focus, textarea:focus, select:focus",
   ) ||
   $$("input:not([type=hidden]), textarea").some((el) => el.value !== el.defaultValue);
@@ -848,7 +864,7 @@ function bind() {
   }
 
   const reviewButton = $("[data-review]");
-  if (reviewButton) reviewButton.addEventListener("click", busy(reviewButton, review));
+  if (reviewButton) reviewButton.addEventListener("click", busy(reviewButton, decide));
   const signButton = $("[data-sign]");
   if (signButton) signButton.addEventListener("click", busy(signButton, sign));
   const back = $("[data-back]");
@@ -857,6 +873,7 @@ function bind() {
   for (const ta of $$("textarea[data-param]")) {
     ta.addEventListener("input", () => {
       closeReview();
+      decideLabel();
       const hint = $(`[data-edited-hint="${ta.dataset.param}"]`);
       if (hint) hint.dataset.edited = ta.value !== ta.defaultValue ? "yes" : "";
     });
@@ -901,6 +918,14 @@ function bind() {
   each($$("#new-agent"), (form) => form.addEventListener("submit", busy(form, () => newAgent(form))));
   each($$("[data-setup-done]"), (b) => b.addEventListener("click", () => location.reload()));
   each($$("[data-cancel-stop]"), (b) => b.addEventListener("click", () => (b.closest("details").open = false)));
+  each($$("[data-approve-send]"), (button) => {
+    const preview = $("[data-send-preview]", button.closest("[data-card]"));
+    button.addEventListener("click", busy(button, async () => {
+      // What the passkey signs shows on the card while it asks.
+      await prepare(button.dataset.approveSend, {}, preview);
+      await signNow();
+    }));
+  });
   each($$("[data-card]"), (card) => {
     if (card.dataset.card === "send") return;
     requestCard(card);

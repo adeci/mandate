@@ -176,6 +176,9 @@ type handler struct {
 
 	seenMu sync.Mutex
 	seen   map[string]time.Time // when each agent ID was last reported seen
+
+	grantedMu sync.Mutex
+	granted   map[string]time.Time // when each agent ID last heard a request was granted
 }
 
 func newHandler(cfg Config, acc *access) *handler {
@@ -189,6 +192,7 @@ func newHandler(cfg Config, acc *access) *handler {
 		reads:      make(chan proposal.ReadEvent, readQueue),
 		dropped:    map[string]int{},
 		seen:       map[string]time.Time{},
+		granted:    map[string]time.Time{},
 	}
 	h.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
 	h.mux.HandleFunc("GET /v1/connectors", h.authed(h.list))

@@ -353,24 +353,21 @@ button.content, .button.content { text-transform: none; font-weight: var(--w-med
 /* The proposal's own words, like the cards. */
 dl.fields .message, textarea[data-param] { font-family: var(--content); }
 .page-heading { flex-direction: row; flex-wrap: nowrap; align-items: start; }
-.stop-all > summary { width: auto; color: var(--error); border-color: var(--error); }
-.stop-all > summary::before { content: none; }
-.stop-all[open] > summary { display: none; }
-.stop-all .panel { max-width: 40ch; margin: 0; }
+.stop-all { border-color: var(--error); margin-top: calc(var(--lh) * 2); }
+.stop-all summary { width: auto; color: var(--error); border-color: var(--error); }
+.stop-all summary::before { content: none; }
+.stop-all details[open] > summary { display: none; }
 .flash[data-kind="ok"] { border-color: var(--accent); }
 .actor[data-actor="you"] { color: var(--accent); }
 .timeline li > .meta { display: inline-block; min-width: 13ch; }
 .pager { display: flex; justify-content: space-between; gap: 2ch; }
-.setup-row { display: grid; grid-template-columns: 8ch minmax(0, 1fr) auto; gap: 0 1ch; align-items: stretch; margin-bottom: calc(var(--lh) / 2); }
-.setup-label { align-self: center; color: var(--fg-alt); }
+.setup-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 1ch; align-items: stretch; margin-bottom: calc(var(--lh) / 2); }
 .setup-value { display: block; padding: calc(var(--lh) / 2) 1ch; border: var(--bw) solid var(--line-strong);
   white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; }
 .setup-row > button { height: auto; }
-@media (max-width: 480px) { .setup-row { grid-template-columns: minmax(0, 1fr) auto; } .setup-label { grid-column: 1 / -1; } }
 .reason em { font-style: italic; }
 .adjust { border-top: var(--bw) dashed var(--line); padding-top: var(--lh); margin-bottom: var(--lh); }
 .page-heading form { margin: 0; }
 .timeline { list-style: none; padding: 0; }
 .timeline li { padding: calc(var(--lh) / 4) 0; border-bottom: var(--bw) solid var(--line); overflow-wrap: anywhere; }
 .grantline summary { min-height: 44px; display: flex; align-items: center; flex-wrap: wrap; gap: 0 1ch; }
-.page-heading:has(.stop-all[open]) { flex-wrap: wrap; }

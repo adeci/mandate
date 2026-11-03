@@ -65,8 +65,8 @@ func TestAccessPrintsGrants(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "connector\tnow\tchats\twhen\tsince\tid\tnote\n" +
-		"signal\topen until 2026-11-02 15:00\tFamily (c1)\t2026-11-02 14:00 to 2026-11-02 15:00\tlast 7d\tg1\t\n" +
-		"mail\tclosed, opens 2026-11-06 06:00\tall\tevery Mon,Fri at 07:00 for 1h30m (Europe/Berlin)\tall history\tg2\t\n"
+		"signal\topen until 2026-11-02 15:00 UTC\tFamily (c1)\t2026-11-02 14:00 UTC to 2026-11-02 15:00 UTC\tlast 7d\tg1\t\n" +
+		"mail\tclosed, opens 2026-11-06 06:00 UTC\tall\tevery Mon,Fri at 07:00 for 1h30m (Europe/Berlin)\tall history\tg2\t\n"
 	if out.String() != want {
 		t.Errorf("access:\n%q\nwant\n%q", out, want)
 	}
