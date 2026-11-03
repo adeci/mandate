@@ -1,85 +1,80 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
-  <style>
-    .g0 { fill: #f8fafc; stroke: #cbd5e1 }
-    .g1 { fill: #eef2ff; stroke: #a5b4fc }
-    .g2 { fill: #ecfdf5; stroke: #6ee7b7 }
-    .card { fill: #fff; stroke: #e2e8f0 }
-    .dash { fill: none; stroke: #cbd5e1; stroke-dasharray: 5 4 }
-    .t { fill: #0f172a }
-    .s { fill: #64748b }
-    .m { fill: #94a3b8 }
-    .l0 { fill: #475569 }
-    .l1 { fill: #4f46e5 }
-    .l2 { fill: #047857 }
-    .a0 { stroke: #475569 }
-    .a1 { stroke: #4f46e5 }
-    .a2 { stroke: #059669 }
-    .h1 { fill: #4f46e5 }
-    .h2 { fill: #059669 }
-    @media (prefers-color-scheme: dark) {
-      .g0 { fill: #161b22; stroke: #30363d }
-      .g1 { fill: #1b1d3a; stroke: #4f46e5 }
-      .g2 { fill: #0f2a22; stroke: #059669 }
-      .card { fill: #0d1117; stroke: #30363d }
-      .dash { stroke: #484f58 }
-      .t { fill: #e6edf3 }
-      .s { fill: #8b949e }
-      .m { fill: #6e7681 }
-      .l0 { fill: #9da7b3 }
-      .l1 { fill: #a5b4fc }
-      .l2 { fill: #34d399 }
-      .a0 { stroke: #9da7b3 }
-      .a1 { stroke: #818cf8 }
-      .a2 { stroke: #34d399 }
-    }
-  </style>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="448" viewBox="0 0 900 448" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
   <defs>
-    <marker id="m0" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" class="l0"/></marker>
-    <marker id="m1" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" class="l1"/></marker>
-    <marker id="m2" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" class="l2"/></marker>
+    <linearGradient id="indigo" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#4338ca"/></linearGradient>
+    <linearGradient id="emerald" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#10b981"/><stop offset="1" stop-color="#047857"/></linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="14"/></filter>
+    <marker id="n" markerWidth="8" markerHeight="8" refX="6.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#8b95a7"/></marker>
+    <marker id="i" markerWidth="8" markerHeight="8" refX="6.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#818cf8"/></marker>
+    <marker id="e" markerWidth="8" markerHeight="8" refX="6.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#34d399"/></marker>
   </defs>
 
-  <rect x="20" y="20" width="200" height="250" rx="14" class="g0"/>
-  <text x="38" y="48" font-size="13" font-weight="600" class="l0">Agent machine</text>
-  <rect x="40" y="70" width="160" height="46" rx="10" class="dash"/>
-  <text x="120" y="98" text-anchor="middle" font-size="13" class="m">any agents …</text>
-  <line x1="120" y1="116" x2="120" y2="146" stroke-width="1.5" class="a0" marker-end="url(#m0)"/>
-  <rect x="40" y="150" width="160" height="64" rx="10" class="card"/>
-  <text x="120" y="178" text-anchor="middle" font-size="15" font-weight="600" class="t">agent identity</text>
-  <text x="120" y="198" text-anchor="middle" font-size="11" class="s">mandate CLI</text>
+  <!-- Its own dark canvas, so it reads the same in any theme. -->
+  <rect width="900" height="448" rx="18" fill="#0b1020"/>
+  <rect x="0.5" y="0.5" width="899" height="447" rx="18" fill="none" stroke="#1e2638"/>
 
-  <rect x="260" y="20" width="380" height="380" rx="14" class="g1"/>
-  <text x="278" y="48" font-size="13" font-weight="600" class="l1">Server machine</text>
-  <rect x="290" y="140" width="320" height="84" rx="10" class="h1"/>
-  <text x="450" y="176" text-anchor="middle" font-size="16" font-weight="600" fill="#fff">mandate</text>
-  <text x="450" y="200" text-anchor="middle" font-size="11" fill="#c7d2fe">grants · approvals · one HTTPS port</text>
-  <rect x="290" y="280" width="200" height="60" rx="10" class="card"/>
-  <text x="390" y="306" text-anchor="middle" font-size="15" font-weight="600" class="t">connector</text>
-  <text x="390" y="325" text-anchor="middle" font-size="11" class="s">one account · its login</text>
-  <rect x="290" y="352" width="200" height="36" rx="10" class="dash"/>
-  <text x="390" y="375" text-anchor="middle" font-size="13" class="m">more connectors …</text>
+  <g font-size="11" font-weight="600" letter-spacing="1.2" fill="#6b7a99">
+    <rect x="24" y="36" width="212" height="214" rx="14" fill="none" stroke="#2a3448" stroke-dasharray="4 5"/>
+    <text x="40" y="60">AGENT MACHINE</text>
+    <rect x="290" y="36" width="320" height="388" rx="14" fill="none" stroke="#2a3448" stroke-dasharray="4 5"/>
+    <text x="306" y="60">SERVER MACHINE</text>
+    <rect x="664" y="36" width="212" height="214" rx="14" fill="none" stroke="#2a3448" stroke-dasharray="4 5"/>
+    <text x="680" y="60">YOUR DEVICES</text>
+  </g>
 
-  <rect x="680" y="20" width="200" height="250" rx="14" class="g2"/>
-  <text x="698" y="48" font-size="13" font-weight="600" class="l2">Your devices</text>
-  <rect x="700" y="140" width="160" height="84" rx="10" class="h2"/>
-  <text x="780" y="176" text-anchor="middle" font-size="16" font-weight="600" fill="#fff">mandate app</text>
-  <text x="780" y="200" text-anchor="middle" font-size="11" fill="#a7f3d0">phone · desktop</text>
+  <rect x="342" y="166" width="216" height="68" rx="14" fill="#6366f1" opacity="0.45" filter="url(#glow)"/>
+  <rect x="704" y="166" width="140" height="68" rx="14" fill="#10b981" opacity="0.35" filter="url(#glow)"/>
 
-  <rect x="680" y="280" width="200" height="60" rx="10" class="card"/>
-  <text x="780" y="306" text-anchor="middle" font-size="15" font-weight="600" class="t">your accounts</text>
-  <text x="780" y="325" text-anchor="middle" font-size="11" class="s">WhatsApp · Signal · email · …</text>
+  <rect x="56" y="82" width="148" height="38" rx="19" fill="none" stroke="#2a3448" stroke-dasharray="4 4"/>
+  <text x="130" y="105" text-anchor="middle" font-size="12" fill="#6b7a99">any agents …</text>
+  <rect x="52" y="170" width="156" height="60" rx="12" fill="#111827" stroke="#2a3448"/>
+  <text x="130" y="196" text-anchor="middle" font-size="15" font-weight="600" fill="#e5e7eb">agent identity</text>
+  <text x="130" y="215" text-anchor="middle" font-size="11" fill="#8b95a7">mandate CLI</text>
 
-  <line x1="200" y1="182" x2="286" y2="182" stroke-width="1.5" class="a0" marker-end="url(#m0)"/>
-  <text x="243" y="172" text-anchor="middle" font-size="11" class="l0">asks</text>
+  <rect x="330" y="160" width="240" height="80" rx="14" fill="url(#indigo)"/>
+  <text x="450" y="196" text-anchor="middle" font-size="17" font-weight="700" fill="#fff">mandate</text>
+  <text x="450" y="218" text-anchor="middle" font-size="11" fill="#c7d2fe">grants · approvals · one HTTPS port</text>
+  <rect x="352" y="318" width="196" height="58" rx="12" fill="#111827" stroke="#2a3448"/>
+  <text x="450" y="343" text-anchor="middle" font-size="15" font-weight="600" fill="#e5e7eb">connector</text>
+  <text x="450" y="362" text-anchor="middle" font-size="11" fill="#8b95a7">one account · its login</text>
+  <rect x="352" y="388" width="196" height="26" rx="13" fill="none" stroke="#2a3448" stroke-dasharray="4 4"/>
+  <text x="450" y="405" text-anchor="middle" font-size="11" fill="#6b7a99">more connectors …</text>
 
-  <line x1="610" y1="168" x2="696" y2="168" stroke-width="1.5" class="a1" marker-end="url(#m1)"/>
-  <text x="653" y="158" text-anchor="middle" font-size="11" class="l1">notifies</text>
-  <line x1="700" y1="196" x2="614" y2="196" stroke-width="1.5" class="a2" marker-end="url(#m2)"/>
-  <text x="657" y="214" text-anchor="middle" font-size="11" class="l2">approves</text>
+  <rect x="692" y="160" width="164" height="80" rx="14" fill="url(#emerald)"/>
+  <text x="774" y="196" text-anchor="middle" font-size="17" font-weight="700" fill="#fff">mandate app</text>
+  <text x="774" y="218" text-anchor="middle" font-size="11" fill="#a7f3d0">phone · desktop</text>
+  <rect x="692" y="318" width="164" height="58" rx="12" fill="#111827" stroke="#2a3448"/>
+  <text x="774" y="343" text-anchor="middle" font-size="15" font-weight="600" fill="#e5e7eb">your accounts</text>
+  <text x="774" y="362" text-anchor="middle" font-size="11" fill="#8b95a7">WhatsApp · Signal · email · …</text>
 
-  <line x1="390" y1="224" x2="390" y2="276" stroke-width="1.5" class="a0" marker-end="url(#m0)"/>
-  <text x="400" y="254" font-size="11" class="l0">signed writes</text>
+  <g fill="none" stroke-width="1.6">
+    <path d="M130,120 V166" stroke="#8b95a7" marker-end="url(#n)"/>
+    <path d="M208,200 H326" stroke="#8b95a7" marker-end="url(#n)"/>
+    <path d="M572,186 C612,140 650,140 688,184" stroke="#818cf8" marker-end="url(#i)"/>
+    <path d="M690,214 C650,260 612,260 574,216" stroke="#34d399" marker-end="url(#e)"/>
+    <path d="M450,240 V314" stroke="#8b95a7" marker-end="url(#n)"/>
+    <path d="M548,347 H688" stroke="#8b95a7" marker-end="url(#n)"/>
+  </g>
 
-  <line x1="490" y1="310" x2="676" y2="310" stroke-width="1.5" class="a0" marker-end="url(#m0)"/>
-  <text x="583" y="300" text-anchor="middle" font-size="11" class="l0">its login</text>
+  <!-- Numbered transitions, in the order a write takes them. -->
+  <g font-size="11">
+    <rect x="241" y="190" width="56" height="20" rx="10" fill="#0b1020" stroke="#8b95a7"/>
+    <circle cx="252" cy="200" r="7" fill="#8b95a7"/><text x="252" y="204" text-anchor="middle" font-size="9" font-weight="700" fill="#0b1020">1</text>
+    <text x="263" y="204" fill="#cbd5e1">asks</text>
+
+    <rect x="595" y="142" width="72" height="20" rx="10" fill="#0b1020" stroke="#818cf8"/>
+    <circle cx="606" cy="152" r="7" fill="#818cf8"/><text x="606" y="156" text-anchor="middle" font-size="9" font-weight="700" fill="#0b1020">2</text>
+    <text x="617" y="156" fill="#c7d2fe">notifies</text>
+
+    <rect x="591" y="238" width="80" height="20" rx="10" fill="#0b1020" stroke="#34d399"/>
+    <circle cx="602" cy="248" r="7" fill="#34d399"/><text x="602" y="252" text-anchor="middle" font-size="9" font-weight="700" fill="#0b1020">3</text>
+    <text x="613" y="252" fill="#a7f3d0">approves</text>
+
+    <rect x="402" y="267" width="96" height="20" rx="10" fill="#0b1020" stroke="#8b95a7"/>
+    <circle cx="413" cy="277" r="7" fill="#8b95a7"/><text x="413" y="281" text-anchor="middle" font-size="9" font-weight="700" fill="#0b1020">4</text>
+    <text x="424" y="281" fill="#cbd5e1">signed write</text>
+
+    <rect x="580" y="337" width="76" height="20" rx="10" fill="#0b1020" stroke="#8b95a7"/>
+    <circle cx="591" cy="347" r="7" fill="#8b95a7"/><text x="591" y="351" text-anchor="middle" font-size="9" font-weight="700" fill="#0b1020">5</text>
+    <text x="602" y="351" fill="#cbd5e1">its login</text>
+  </g>
 </svg>
