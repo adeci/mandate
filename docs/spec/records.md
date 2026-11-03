@@ -143,7 +143,7 @@ A grant has either `from` < `until` or `schedule`, not both. What a grant allows
 
 The connector:
 
-- requires `issued_at` within 5 minutes of now, allowing 1 minute of skew, and now before `expires_at`;
+- requires `issued_at` no more than 5 minutes before now or 1 minute after it, and now before `expires_at`;
 - spends the nonce and `id`, so each runs at most once;
 - re-renders `display` from `args` and refuses if it differs.
 
@@ -234,10 +234,10 @@ sig       a5dbc6cae740a94412b5160aac2c850ef8ab02c6ce3f99f38a331ebebebf0ec98bd687
 **grant, routine**
 
 ```
-{"chats":["inbox"],"connector":"fastmail","created_at":"2026-11-03T09:20:00Z","horizon":86400,"id":"M4D2X7KQ9P3ZL6WJ5R2N8YB4TA","identity":"QX3M7E2KQ4F5PN6ZJ7LDV2Y3AU","note":"morning summary","schedule":{"days":[1,2,3,4,5],"length":1200,"start":"07:00","zone":"Europe/Berlin"}}
+{"chats":["inbox"],"connector":"fastmail","created_at":"2026-11-03T09:20:00Z","horizon":86400,"id":"M4D2X7KQ5P3ZL6WJ5R2N4YB4TA","identity":"QX3M7E2KQ4F5PN6ZJ7LDV2Y3AU","note":"morning summary","schedule":{"days":[1,2,3,4,5],"length":1200,"start":"07:00","zone":"Europe/Berlin"}}
 nonce 505152535455565758595a5b5c5d5e5f  issued_at 2026-11-03T09:20:00Z  key laptop
-challenge b0822d359369d44dc31e75a4d6104ea88cba255f55c9066551d816024e52f6ec
-sig       b1a0b260433efe6ee926a1320120c5e94624863dd8d27f3c9bb08068a5029bd068dddfbf99de336674a35003419351cd6e46d776b5908675cd10d0fd325c9cdf
+challenge df66a320e16ab732eeedfff1ab0efbd8e90771775bbd3d9eacfccf39af82acd2
+sig       8ac71b9fb1fb4d882a194878688ccf4727206b35c5d636652ad5f553542d345dca229717cbb1e142e0ad3e23a07f60d527838925e6f5e713a7cf7b390ae1064d
 ```
 
 **write**
@@ -263,5 +263,5 @@ sig       c0bd3f0afc7c0a080b4f85fe6afe1f9737966049ce3a87d4273b9b41e2f185cefec064
 
 **Must fail**
 
-- The one-off grant's envelope with `kind` set to `identity`. The challenge becomes `fa68aefd9d143f4937810198130e07ad1816c529dd278258c0c776bd4f552ef8`, and `sig` fails.
+- The one-off grant's envelope with `kind` set to `identity`. The bytes do not decode as an identity, and the challenge becomes `fa68aefd9d143f4937810198130e07ad1816c529dd278258c0c776bd4f552ef8`, so `sig` fails too.
 - The one-off grant with a space before `"horizon"`. It is not canonical, so it is rejected before the signature is checked.
