@@ -38,7 +38,6 @@ func (e *statusError) Error() string {
 	return fmt.Sprintf("Fastmail answered %d", e.code)
 }
 
-// methodError is a JMAP method that failed as a whole.
 type methodError struct {
 	Type        string `json:"type"`
 	Description string `json:"description"`
@@ -61,7 +60,6 @@ type session struct {
 	} `json:"accounts"`
 }
 
-// client speaks JMAP with one API token.
 type client struct {
 	http  *http.Client
 	token string
@@ -127,7 +125,6 @@ type response struct {
 	id   string
 }
 
-// call runs calls in one request.
 func (c *client) call(ctx context.Context, api string, calls ...invocation) ([]response, error) {
 	b, err := json.Marshal(map[string]any{
 		"using":       []string{capCore, capMail, capSubmission},
@@ -164,7 +161,6 @@ func (c *client) call(ctx context.Context, api string, calls ...invocation) ([]r
 	return resps, nil
 }
 
-// result decodes the response named name to the call with id.
 func result[T any](resps []response, name, id string) (T, error) {
 	var v T
 	for _, r := range resps {
@@ -278,5 +274,4 @@ var emailProperties = []string{
 	"messageId", "inReplyTo", "references", "textBody", "bodyValues", "attachments",
 }
 
-// utcDate formats t as a JMAP UTCDate.
 func utcDate(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05Z") }

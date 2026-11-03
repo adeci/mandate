@@ -35,6 +35,17 @@ func (s *Server) postProposal(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, "unknown identity or connector")
 		return
 	}
+	// The gateway checked the chat against its live set, which may lag a
+	// Close; the proposal becomes durable only under a grant still live.
+	covered := false
+	for _, g := range s.st.Grants {
+		covered = covered || g.Record.Identity == np.Identity && g.Record.Connector == np.Connector && g.live(s.now()) &&
+			(np.Prepared.Container == "" || len(g.Record.Chats) == 0 || slices.Contains(g.Record.Chats, np.Prepared.Container))
+	}
+	if !covered {
+		fail(w, http.StatusNotFound, "no live grant covers the chat")
+		return
+	}
 	now := s.now().UTC().Truncate(time.Second)
 	p := &proposal{
 		ID: record.NewID(), Identity: np.Identity, Connector: np.Connector, Op: np.Op,
@@ -101,24 +112,18 @@ type proposalView struct {
 func (s *Server) proposalView(p *proposal) proposalView {
 	v := proposalView{
 		ID: p.ID, Identity: p.Identity, Connector: p.Connector, Op: p.Op,
-		Display: p.Prepared.Display, Editable: editable(p.Prepared), Note: p.Note,
+		Display: p.Prepared.Display, Editable: []string{}, Note: p.Note,
 		Status: p.Status, CreatedAt: p.CreatedAt, ExpiresAt: p.ExpiresAt,
+	}
+	for _, f := range p.Prepared.Display {
+		if f.Param != "" {
+			v.Editable = append(v.Editable, f.Param)
+		}
 	}
 	if i := s.st.Identities[p.Identity]; i != nil {
 		v.IdentityName = i.Name
 	}
 	return v
-}
-
-// editable lists the params the display marks as the owner's to change.
-func editable(p connector.Prepared) []string {
-	out := []string{}
-	for _, f := range p.Display {
-		if f.Param != "" {
-			out = append(out, f.Param)
-		}
-	}
-	return out
 }
 
 func (s *Server) getProposal(w http.ResponseWriter, r *http.Request) {
@@ -132,7 +137,6 @@ func (s *Server) getProposal(w http.ResponseWriter, r *http.Request) {
 	reply(w, http.StatusOK, s.proposalView(p))
 }
 
-// pendingProposal is the proposal the owner can still decide, or an error.
 // The caller holds s.mu.
 func (s *Server) pendingProposal(id string) (*proposal, error) {
 	p := s.st.Proposals[id]
@@ -167,9 +171,9 @@ func (s *Server) proposalChallenge(w http.ResponseWriter, r *http.Request) {
 
 	if len(body.Edits) > 0 {
 		args := maps.Clone(prepared.Args)
-		ok := editable(prepared)
 		for k, v := range body.Edits {
-			if !slices.Contains(ok, k) {
+			// The display's param marks what the owner may change.
+			if k == "" || !slices.ContainsFunc(prepared.Display, func(f record.Field) bool { return f.Param == k }) {
 				fail(w, http.StatusBadRequest, k+" can't be edited")
 				return
 			}

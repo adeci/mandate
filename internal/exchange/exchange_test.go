@@ -3,11 +3,13 @@ package exchange
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/adeci/mandate/record"
 	"github.com/gtank/ristretto255"
 )
 
@@ -140,13 +142,19 @@ func TestDerivationVector(t *testing.T) {
 	}
 }
 
+// The phone's key from records.md's vectors.
+const phoneKey = `{"id":"b9035233be144c52017fbb52541aab66faa7f6c93eef6e76968ba564c477d31e","name":"Pixel 9","public_key":"BN4CBo-cv2UYsv7S22CmwboOxAVnQh_vAIceeHGJ_wTKxefX7CfLCPv9U9pGtDjRzs6ZPn39ROrW67Fcq2ilkcE","type":"p256"}`
+
 func TestExchange(t *testing.T) {
 	id := unhex(t, "000102030405060708090a0b0c0d0e0f")
 	spki := unhex(t, "f910152c80be10ee2280a04cb011ce9131b993408adb19cf47f1495c331bcdbc")
-	key := `{"id":"b9035233be144c52017fbb52541aab66faa7f6c93eef6e76968ba564c477d31e","name":"Pixel 9","public_key":"BN4CBo-cv2UYsv7S22CmwboOxAVnQh_vAIceeHGJ_wTKxefX7CfLCPv9U9pGtDjRzs6ZPn39ROrW67Fcq2ilkcE","type":"p256"}`
+	var key record.Key
+	if err := json.Unmarshal([]byte(phoneKey), &key); err != nil {
+		t.Fatal(err)
+	}
 	payloads := map[string]Payload{
 		Agent:  {TokenSHA256: TokenSHA256(NewToken())},
-		Device: {Key: []byte(key), TokenSHA256: TokenSHA256(NewToken())},
+		Device: {Key: &key, TokenSHA256: TokenSHA256(NewToken())},
 	}
 	for kind, p := range payloads {
 		t.Run(kind, func(t *testing.T) {
@@ -187,5 +195,23 @@ func TestExchange(t *testing.T) {
 	}
 	if _, _, err := s.Finish(r.Msg, r.Confirm, r.Sealed, spki); !errors.Is(err, ErrConfirm) {
 		t.Errorf("wrong code: %v, want ErrConfirm", err)
+	}
+}
+
+func TestDevicePayloadCanonical(t *testing.T) {
+	hash := TokenSHA256(NewToken())
+	payload := func(key string) []byte { return []byte(`{"key":` + key + `,"token_sha256":"` + hash + `"}`) }
+	if _, err := decodePayload(Device, payload(phoneKey)); err != nil {
+		t.Fatalf("canonical payload refused: %v", err)
+	}
+	for name, key := range map[string]string{
+		"whitespace": strings.Replace(phoneKey, `"name":`, `"name": `, 1),
+		"unknown":    strings.Replace(phoneKey, `"type":"p256"`, `"type":"p256","x":"y"`, 1),
+		"duplicate":  strings.Replace(phoneKey, `"name":"Pixel 9"`, `"name":"Evil","name":"Pixel 9"`, 1),
+		"wrong id":   strings.Replace(phoneKey, `"id":"b9`, `"id":"c9`, 1),
+	} {
+		if _, err := decodePayload(Device, payload(key)); err == nil {
+			t.Errorf("%s key accepted", name)
+		}
 	}
 }

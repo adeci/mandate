@@ -1,58 +1,9 @@
 package main
 
 import (
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
-
-	fhttp "github.com/bogdanfinn/fhttp"
-	tls_client "github.com/bogdanfinn/tls-client"
-	"github.com/bogdanfinn/tls-client/profiles"
 )
-
-func TestChromeProfileSpeaksHTTP2(t *testing.T) {
-	type seen struct {
-		proto  string
-		header http.Header
-	}
-	got := make(chan seen, 1)
-	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got <- seen{r.Proto, r.Header.Clone()}
-		w.Write([]byte("{}"))
-	}))
-	srv.EnableHTTP2 = true
-	srv.StartTLS()
-	defer srv.Close()
-
-	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(),
-		tls_client.WithClientProfile(profiles.Chrome_152),
-		tls_client.WithRandomTLSExtensionOrder(),
-		tls_client.WithInsecureSkipVerify(),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	st := testState()
-	req, err := fhttp.NewRequest(fhttp.MethodGet, srv.URL+"/api/v9/users/@me", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	applyHeaders(req, apiHeaders(st, call{token: "tok", timezone: "UTC", referer: "https://discord.com/channels/@me"}))
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	s := <-got
-	if s.proto != "HTTP/2.0" {
-		t.Errorf("protocol %s, want HTTP/2.0", s.proto)
-	}
-	if s.header.Get("User-Agent") != userAgent || s.header.Get("Sec-Ch-Ua") != secChUA || s.header.Get("Authorization") != "tok" ||
-		s.header.Get("Accept-Encoding") != "gzip, deflate, br, zstd" {
-		t.Errorf("headers %v", s.header)
-	}
-}
 
 func TestCheckToken(t *testing.T) {
 	tests := []struct {

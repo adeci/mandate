@@ -31,6 +31,8 @@ import (
 type fakeConn struct {
 	st       *store.Store
 	prepares atomic.Int32
+	// during runs inside Prepare, as if the owner acted meanwhile.
+	during atomic.Pointer[func()]
 }
 
 func (*fakeConn) Spec() connector.Spec {
@@ -56,6 +58,9 @@ func (*fakeConn) Setup(context.Context, string, map[string]string) (connector.St
 
 func (f *fakeConn) Prepare(ctx context.Context, _ string, args map[string]string) (connector.Prepared, error) {
 	f.prepares.Add(1)
+	if fn := f.during.Load(); fn != nil {
+		(*fn)()
+	}
 	p := connector.Prepared{Args: args, Display: []record.Field{{Label: "Text", Value: args["text"], Param: "text"}}, Container: args["chat"]}
 	if args["seq"] != "" {
 		if err := f.st.DB().QueryRowContext(ctx, `SELECT id FROM messages WHERE seq = ?`, args["seq"]).Scan(&p.Message); err != nil {
@@ -107,8 +112,6 @@ func (o *fakeOwner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		o.requests = append(o.requests, req)
 		writeJSON(w, http.StatusOK, map[string]string{"id": fixedID})
-	case "GET /internal/requests/" + fixedID:
-		writeJSON(w, http.StatusOK, map[string]string{"status": "pending"})
 	case "POST /internal/proposals":
 		b, _ := io.ReadAll(r.Body)
 		o.proposals = append(o.proposals, b)
@@ -518,11 +521,6 @@ func TestRequestAnswerIgnoresMatches(t *testing.T) {
 		len(got[1].Terms[0].Chats) != 0 || len(got[2].Terms[0].Chats) != 0 {
 		t.Errorf("owner side got %+v", got)
 	}
-	// A fourth while three wait is refused before matching.
-	s, _ := e.call(http.MethodPost, "/agent/v1/access/requests", map[string]any{"connector": "chat", "chats": []string{"fam"}, "reason": "x"})
-	if n := len(e.owner.got().requests); s != http.StatusTooManyRequests || n != 3 {
-		t.Errorf("fourth waiting request: %d, owner side got %d", s, n)
-	}
 }
 
 func seqOf(t *testing.T, e *env, id string) string {
@@ -572,6 +570,14 @@ func TestProposalChecks(t *testing.T) {
 	}
 	if n := len(e.owner.got().proposals); n != 1 {
 		t.Errorf("owner side got %d proposals, want 1", n)
+	}
+
+	// A grant closed while the connector prepares lets nothing through.
+	e.push([]record.Envelope{e.grant(e.phone, []string{"fam"}, 0, -time.Hour, time.Hour)})
+	closeAll := func() { e.push(nil) }
+	e.conn.during.Store(&closeAll)
+	if s := send(map[string]string{"chat": "fam", "text": "x"}); s != http.StatusForbidden {
+		t.Errorf("grant closed during prepare: %d", s)
 	}
 }
 

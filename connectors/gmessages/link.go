@@ -30,8 +30,7 @@ const (
 		"Open devtools › Network, pick any request to messages.google.com, copy its Cookie request header (Copy as cURL works too), then close the window. " +
 		"These cookies are a signed-in Google session: mandate can act as that Google account. " +
 		"After unlinking, you can end that session under Google Account › Security › Your devices."
-	emojiText = "On your phone, Google Messages asks which emoji you see; tap this one."
-	// A QR code lasts about 30 seconds.
+	emojiText   = "On your phone, Google Messages asks which emoji you see; tap this one."
 	pollSeconds = 2
 
 	// Starting a Google account pairing waits up to 20 s for the phone.
@@ -80,13 +79,11 @@ type pairClient interface {
 }
 
 type gmConnector struct {
-	st      *store.Store
-	log     *slog.Logger
-	in      *ingester
-	session connector.Secret
-	// ctx outlives requests: the connection and pairing run until shutdown.
-	ctx context.Context
-	// newClient wires onEvent into a client for auth.
+	st        *store.Store
+	log       *slog.Logger
+	in        *ingester
+	session   connector.Secret
+	ctx       context.Context
 	newClient func(auth *libgm.AuthData, onEvent func(any)) gmClient
 	// newPairing returns a client for a new session. For a QR pairing it
 	// calls paired once the phone has scanned a code and filled in auth.
@@ -95,19 +92,16 @@ type gmConnector struct {
 	qrCodes    int
 	settleTime time.Duration
 
-	mu sync.Mutex
-	// cli and auth are nil until paired.
-	cli  gmClient
-	auth *libgm.AuthData
-	// The phone accepted this browser session (BROWSER_ACTIVE).
+	mu     sync.Mutex
+	cli    gmClient
+	auth   *libgm.AuthData
 	active bool
 	// Google Messages for Web was opened elsewhere, which pauses this session.
 	elsewhere bool
 	phoneDown bool
 	listenErr error
-	// unpaired says why the last pairing ended, until the next one.
-	unpaired string
-	pairing  *pairing
+	unpaired  string
+	pairing   *pairing
 }
 
 func newConnector(ctx context.Context, st *store.Store, log *slog.Logger, session connector.Secret,
@@ -119,7 +113,6 @@ func newConnector(ctx context.Context, st *store.Store, log *slog.Logger, sessio
 	}
 }
 
-// resume connects with the stored session, if any.
 func (c *gmConnector) resume() error {
 	data, err := c.session.Load()
 	if err != nil {
@@ -166,14 +159,12 @@ func (c *gmConnector) connect(cli gmClient) {
 	}
 }
 
-// google reports whether cli's session was paired through a Google account.
 func (c *gmConnector) google(cli gmClient) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return cli == c.cli && c.auth.IsGoogleAccount()
 }
 
-// refused forgets cli's session after Google turned it down.
 func (c *gmConnector) refused(cli gmClient) {
 	if c.google(cli) {
 		c.unpair(cli, "Google signed out the browser session the cookies came from; link again with new cookies")
@@ -197,7 +188,6 @@ func (c *gmConnector) disconnect() {
 	}
 }
 
-// state is the current client and the health of its session.
 func (c *gmConnector) state() (gmClient, connector.Health) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -320,7 +310,6 @@ func (c *gmConnector) activate(cli gmClient) {
 	}
 }
 
-// update runs f under c.mu if cli is current.
 func (c *gmConnector) update(cli gmClient, f func()) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -329,7 +318,6 @@ func (c *gmConnector) update(cli gmClient, f func()) {
 	}
 }
 
-// save stores the session after libgm refreshed its token.
 func (c *gmConnector) save(cli gmClient) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -353,7 +341,6 @@ func (c *gmConnector) store(auth *libgm.AuthData) error {
 	return c.session.Store(data)
 }
 
-// unpair forgets cli's session after the phone or Google ended it.
 func (c *gmConnector) unpair(cli gmClient, why string) {
 	c.mu.Lock()
 	if cli != c.cli {
@@ -372,7 +359,6 @@ func (c *gmConnector) unpair(cli gmClient, why string) {
 	c.in.reset()
 }
 
-// Unlink unpairs from the phone and forgets the session.
 func (c *gmConnector) Unlink(ctx context.Context) error {
 	c.mu.Lock()
 	cli, p := c.cli, c.pairing

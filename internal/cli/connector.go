@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,7 +14,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"text/tabwriter"
 
 	"github.com/adeci/mandate/connector"
 )
@@ -200,9 +198,6 @@ func (c *cli) media(ctx context.Context, name string, args []string) error {
 		os.Remove(saved.Path)
 		return fmt.Errorf("save %s: %w", saved.Path, err)
 	}
-	if c.json {
-		return json.NewEncoder(c.out).Encode(saved)
-	}
 	return c.printTable(table{Columns: []string{"path", "type", "size", "name"}, Rows: [][]any{{saved.Path, saved.Type, saved.Size, saved.Name}}})
 }
 
@@ -255,23 +250,20 @@ func extension(typ, name string) string {
 	return ""
 }
 
-func (c *cli) connectors(ctx context.Context) ([]connectorInfo, []byte, error) {
+func (c *cli) connectors(ctx context.Context) ([]connectorInfo, error) {
 	var list []connectorInfo
-	raw, _, err := c.do(ctx, requestTimeout, http.MethodGet, "/agent/v1/connectors", nil, &list)
-	return list, raw, err
+	_, _, err := c.do(ctx, requestTimeout, http.MethodGet, "/agent/v1/connectors", nil, &list)
+	return list, err
 }
 
 // listConnectors prints each connector's state, read access and commands.
 func (c *cli) listConnectors(ctx context.Context, args []string) error {
-	if _, err := c.parse(flag.NewFlagSet("connectors", flag.ContinueOnError), "mandate connectors [--json]", args, 0, 0); err != nil {
+	if _, err := c.parse(flag.NewFlagSet("connectors", flag.ContinueOnError), "mandate connectors", args, 0, 0); err != nil {
 		return err
 	}
-	list, raw, err := c.connectors(ctx)
+	list, err := c.connectors(ctx)
 	if err != nil {
 		return err
-	}
-	if c.json {
-		return c.printJSON(raw)
 	}
 	t := table{Columns: []string{"name", "health", "access", "commands"}}
 	for _, ci := range list {
@@ -296,7 +288,7 @@ func commands(ci connectorInfo) []string {
 }
 
 func (c *cli) connectorHelp(ctx context.Context, name string) error {
-	list, _, err := c.connectors(ctx)
+	list, err := c.connectors(ctx)
 	if err != nil {
 		return err
 	}
@@ -317,19 +309,16 @@ func writeConnectorHelp(w io.Writer, ci connectorInfo) {
 		fmt.Fprintf(w, "\n%s\n", sanitize(doc))
 	}
 	fmt.Fprintln(w)
-	fmt.Fprintf(w, "  "+chatsUsage+"\n      id kind name last_message, most recent first\n", ci.Name)
-	fmt.Fprintf(w, "  "+messagesUsage+"\n      seq sent_at sender_id sender reply_to body, newest first\n", ci.Name)
-	fmt.Fprintf(w, "  "+searchUsage+"\n      seq sent_at chat_id chat sender_id sender reply_to body, newest first\n", ci.Name)
+	fmt.Fprintf(w, "  "+chatsUsage+"\n", ci.Name)
+	fmt.Fprintf(w, "  "+messagesUsage+"\n", ci.Name)
+	fmt.Fprintf(w, "  "+searchUsage+"\n", ci.Name)
 	if ci.Media {
-		fmt.Fprintf(w, "  "+mediaUsage+"\n      save a message's file, by default as %s-SEQ.EXT here; prints path type size name\n", ci.Name, ci.Name)
+		fmt.Fprintf(w, "  "+mediaUsage+"\n", ci.Name)
 	}
-	writes, reads := false, false
 	for _, op := range ci.Ops {
 		kind := "read"
 		if op.Kind == connector.Write {
-			kind, writes = "proposal", true
-		} else {
-			reads = true
+			kind = "proposal"
 		}
 		if op.Name == "send" && chatText(op.Params) {
 			fmt.Fprintf(w, "  "+sendUsage+"\n      %s (%s)\n", ci.Name, op.Summary, kind)
@@ -351,22 +340,6 @@ func writeConnectorHelp(w io.Writer, ci connectorInfo) {
 			fmt.Fprintf(w, "      %s: %s%s\n", p.Name, p.Doc, paramTags(p))
 		}
 	}
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Chats are addressed by id: find one with chats --search, then pass its id.")
-	fmt.Fprintln(w, "sender me is the owner; reply_to is the seq replied to. Bodies may carry [image/jpeg]")
-	fmt.Fprintln(w, "(or another media type), [deleted] or [login code hidden].")
-	if ci.Media {
-		fmt.Fprintln(w, "A message with several files marks them [#0 image/png] [#1 ...]; pass that --index.")
-	}
-	fmt.Fprintln(w, "When more rows exist, stderr gives the --before value for the next page.")
-	fmt.Fprintf(w, "Bodies over %d characters are cut; --full prints them whole, --seq SEQ one message whole.\n", bodyPreview)
-	if reads {
-		fmt.Fprintln(w, "Read ops print messages in search's columns.")
-	}
-	if writes {
-		fmt.Fprintln(w, "--note is shown to the owner with the proposal.")
-	}
-	fmt.Fprintln(w, "Every command takes --json.")
 }
 
 // chatText reports whether a send op takes the CHAT_ID TEXT shorthand.
@@ -408,56 +381,16 @@ func health(h connector.Health) string {
 	return s
 }
 
-// help prints the agent commands, with the connectors when logged in.
-func (c *cli) help(ctx context.Context) error {
-	fmt.Fprint(c.out, `mandate reads the owner's accounts. Reads need access the owner grants;
-anything that writes is a proposal the owner approves first.
-
-usage:
+// help prints the agent commands.
+func (c *cli) help() error {
+	_, err := fmt.Fprint(c.out, `usage:
   `+loginUsage+`
   mandate connectors
+  mandate CONNECTOR --help
   mandate CONNECTOR COMMAND [ARGS]
   mandate access
   `+requestUsages+`
   mandate status ID [--wait 15m]
-
-`)
-	var list []connectorInfo
-	err := c.connect()
-	if err == nil {
-		list, _, err = c.connectors(ctx)
-	}
-	if err != nil {
-		fmt.Fprintf(c.out, "connectors: unavailable (%v)\n", err)
-	} else {
-		fmt.Fprintln(c.out, "connectors:")
-		tw := tabwriter.NewWriter(c.out, 0, 0, 2, ' ', 0)
-		for _, ci := range list {
-			fmt.Fprintf(tw, "  %s\t%s\tread %s\t%s\n", ci.Name, health(ci.Health), ci.Access, strings.Join(commands(ci), " "))
-		}
-		if err := tw.Flush(); err != nil {
-			return err
-		}
-	}
-	fmt.Fprint(c.out, `
-Run mandate CONNECTOR --help for its commands.
-
-Output is TSV with a header line (a table on a terminal), or JSON with --json.
-TSV escapes backslash, tab, newline and CR in values as \\, \t, \n and \r, and
-other control characters as \xHH or \uHHHH. Times are UTC.
-
-Reading a connector needs an open grant: mandate access lists yours. So does
-proposing a write, which may only target or answer chats and messages the
-grant lets you read; writes still work for a day after a window closes. If
-the task needs access, ask once with mandate request: every chat the task
-needs in that one request and no more (--chat matches chat names), the
-shortest --for, a --since that covers only what the task needs, and a
---reason the owner can judge. The owner decides in the mandate app. Extend a
-window with --extend rather than asking again; for recurring work, request a
-routine with --every and --at. Don't request in a loop.
-
-request, a proposal and status wait for the owner's decision, 15m unless
---wait says otherwise (0 returns at once).
 
 exit codes:
   0   done, or access granted
@@ -465,5 +398,5 @@ exit codes:
   1   rejected, denied, expired, failed, or unknown (it may have been sent; don't resend)
   2   usage
 `)
-	return nil
+	return err
 }

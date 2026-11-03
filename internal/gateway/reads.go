@@ -375,7 +375,7 @@ func (g *gateway) op(w http.ResponseWriter, r *http.Request, cl *caller) {
 	}
 	cancel()
 	if op.Kind == connector.Write {
-		g.propose(w, r, cl, c, op, req, scope)
+		g.propose(w, r, cl, c, op, req)
 		return
 	}
 	if !g.healthy(w, r, cl, c) {
@@ -482,9 +482,7 @@ func (g *gateway) readOp(w http.ResponseWriter, r *http.Request, cl *caller, c *
 		relayOp(w, cl, c, op, args, err)
 		return
 	}
-	// A grant closed while the connector worked shows nothing.
-	cl = &caller{identity: cl.identity, live: g.live.Load(), log: cl.log}
-	scope, ok := g.scoped(w, cl, c, readScope)
+	cl, scope, ok := g.rescope(w, cl, c, readScope)
 	if !ok {
 		return
 	}
@@ -515,14 +513,26 @@ func (g *gateway) readOp(w http.ResponseWriter, r *http.Request, cl *caller, c *
 	g.record(cl, c, op.Name, named, len(t.Rows))
 }
 
+// rescope reloads the live set after a connector call, so that a grant
+// closed or a chat never-shared meanwhile counts.
+func (g *gateway) rescope(w http.ResponseWriter, cl *caller, c *conn, pick func([]record.Grant, time.Time) []rule) (*caller, []rule, bool) {
+	cl = &caller{identity: cl.identity, live: g.live.Load(), log: cl.log}
+	scope, ok := g.scoped(w, cl, c, pick)
+	return cl, scope, ok
+}
+
 // propose prepares a write and hands it to the owner side. The chat and
-// message the connector resolved must be ones scope shows, like the args.
-func (g *gateway) propose(w http.ResponseWriter, r *http.Request, cl *caller, c *conn, op connector.Op, req opRequest, scope []rule) {
+// message the connector resolved must be ones the grants show, like the args.
+func (g *gateway) propose(w http.ResponseWriter, r *http.Request, cl *caller, c *conn, op connector.Op, req opRequest) {
 	pctx, pcancel := context.WithTimeout(r.Context(), callTimeout)
 	prepared, err := c.client.Prepare(pctx, op.Name, req.Args)
 	pcancel()
 	if err != nil {
 		relayOp(w, cl, c, op, req.Args, err)
+		return
+	}
+	cl, scope, ok := g.rescope(w, cl, c, writeScope)
+	if !ok {
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), queryTimeout)

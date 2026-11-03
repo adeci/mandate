@@ -33,9 +33,6 @@ func (c *cli) table(raw []byte) error {
 	if c.seq > 0 && (len(t.Rows) == 0 || seqCol < 0 || cell(t.Rows[0][seqCol]) != strconv.FormatInt(c.seq, 10)) {
 		return fmt.Errorf("no message %d in that chat", c.seq)
 	}
-	if c.json {
-		return c.printJSON(raw)
-	}
 	if err := c.printTable(t); err != nil {
 		return err
 	}

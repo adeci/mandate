@@ -53,6 +53,35 @@ func (s *Server) postRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := s.now()
+	// A waiting request expires within the hour, so either limit lifts by
+	// the time the oldest request it counts is an hour old.
+	var waiting, recent []time.Time
+	for _, req := range s.st.Requests {
+		if req.Identity != nr.Identity {
+			continue
+		}
+		if req.Status == "pending" {
+			waiting = append(waiting, req.CreatedAt)
+		}
+		if now.Sub(req.CreatedAt) < time.Hour {
+			recent = append(recent, req.CreatedAt)
+		}
+	}
+	limited := waiting
+	if len(waiting) < requestsWaiting {
+		limited = nil
+		if len(recent) >= requestsPerHour {
+			limited = recent
+		}
+	}
+	if limited != nil {
+		lifts := slices.MinFunc(limited, time.Time.Compare).Add(time.Hour)
+		reply(w, http.StatusTooManyRequests, apiError{
+			Error: "at most 3 waiting requests and 10 an hour; wait for the owner",
+			Code:  codes[http.StatusTooManyRequests], RetryAfter: int(lifts.Sub(now).Seconds()) + 1,
+		})
+		return
+	}
 	req := &request{
 		ID: record.NewID(), Identity: nr.Identity, Connector: nr.Connector, Kind: nr.Kind,
 		Terms: nr.Terms, For: nr.For, Horizon: nr.Horizon, Schedule: nr.Schedule, Reason: nr.Reason,
@@ -68,8 +97,7 @@ func (s *Server) postRequest(w http.ResponseWriter, r *http.Request) {
 	reply(w, http.StatusCreated, map[string]string{"id": req.ID})
 }
 
-// seen notes that the gateway acted for an identity. The caller holds s.mu
-// and commits.
+// The caller holds s.mu and commits.
 func (s *Server) seen(id string, at time.Time) {
 	if i := s.st.Identities[id]; i != nil {
 		if i.FirstSeen.IsZero() {
@@ -111,7 +139,7 @@ func (s *Server) requestStatus(w http.ResponseWriter, r *http.Request) {
 	reply(w, http.StatusOK, view)
 }
 
-// waiting is whether the owner can still answer req. The caller holds s.mu.
+// The caller holds s.mu.
 func (s *Server) waiting(req *request) bool {
 	return s.st.Requests[req.ID] == req && req.Status == "pending" && req.GrantID == "" &&
 		s.now().Before(req.CreatedAt.Add(requestTTL)) && s.st.Identities[req.Identity] != nil
@@ -240,8 +268,7 @@ func (s *Server) grantFor(req *request, n narrowing) (record.Grant, map[string]s
 	return g, kept, old, nil
 }
 
-// extendable is the identity's latest window on the connector that is open
-// or ended in the last day, and not closed. The caller holds s.mu.
+// The caller holds s.mu.
 func (s *Server) extendable(identity, conn string) *grant {
 	var best *grant
 	for _, g := range s.st.Grants {
@@ -361,8 +388,7 @@ func (s *Server) resumeChallenge(w http.ResponseWriter, r *http.Request) {
 	s.replaceGrant(w, old, g, func() bool { return !old.ClosedAt.IsZero() })
 }
 
-// replaceGrant hands out g, which replaces old while holds. The caller
-// holds s.mu.
+// The caller holds s.mu.
 func (s *Server) replaceGrant(w http.ResponseWriter, old *grant, g record.Grant, holds func() bool) {
 	s.issue(w, g, &challenge{
 		identity: g.Identity,
@@ -425,7 +451,6 @@ func (s *Server) stopAll(w http.ResponseWriter, _ *http.Request) {
 	reply(w, http.StatusOK, map[string]int{"grants": grants, "requests": requests})
 }
 
-// grantView is a grant for the app.
 type grantView struct {
 	record.Grant
 	IdentityName string            `json:"identity_name"`

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"slices"
@@ -114,7 +113,7 @@ func (s *Server) joinStart(kind string) http.HandlerFunc {
 	}
 }
 
-// join is the exchange of this kind named in the path. The caller holds s.mu.
+// An empty kind matches either. The caller holds s.mu.
 func (s *Server) join(r *http.Request, kind string) *joining {
 	j := s.joins[r.PathValue("id")]
 	if j == nil || kind != "" && j.kind != kind {
@@ -123,7 +122,6 @@ func (s *Server) join(r *http.Request, kind string) *joining {
 	return j
 }
 
-// joinPoll is the new party's wait for the server's message or the outcome.
 func (s *Server) joinPoll(kind string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		wait, ok := waitParam(r)
@@ -158,7 +156,6 @@ func (s *Server) joinPoll(kind string) http.HandlerFunc {
 	}
 }
 
-// joinAnswer takes the new party's answer to the owner's attempt.
 func (s *Server) joinAnswer(kind string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -290,7 +287,6 @@ func (s *Server) joinCode(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// joinChallenge hands out the record that lets the new party in.
 func (s *Server) joinChallenge(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -324,11 +320,7 @@ func (s *Server) joinChallenge(w http.ResponseWriter, r *http.Request) {
 		}})
 		return
 	}
-	var k record.Key
-	if err := json.Unmarshal(j.payload.Key, &k); err != nil {
-		fail(w, http.StatusBadRequest, "the device's key: "+err.Error())
-		return
-	}
+	k := *j.payload.Key
 	s.keyChallenge(w, "add", k, holds, func() error {
 		s.st.Devices[k.ID] = token
 		j.approved = true
@@ -336,8 +328,7 @@ func (s *Server) joinChallenge(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// tokenTaken is whether a device or identity has the token already. The
-// caller holds s.mu.
+// The caller holds s.mu.
 func (s *Server) tokenTaken(sum string) bool {
 	for _, t := range s.st.Devices {
 		if t == sum {

@@ -584,40 +584,15 @@ func TestFetchUpsertsMessages(t *testing.T) {
 	}
 }
 
-// Earlier versions stored threads under their guild. At startup a thread
-// whose starter message is stored moves under that message's channel, and
-// requests for it name the guild as the web client does.
-func TestStartupMovesThreadsUnderTheirChannel(t *testing.T) {
-	const unstarted = "1100000000000000008"
-	h := newHarness(t, func(s *state) { s.SelfID, s.SelfCheckedAt = selfUser, noon })
-	ctx := context.Background()
-	for _, c := range []store.Container{
-		{ID: guildID, Kind: kindGuild, Name: "Club"},
-		{ID: chanGeneral, Kind: kindChannel, ParentID: guildID, Name: "#general"},
-		{ID: threadID, Kind: kindThread, ParentID: guildID, Name: "rig thread"},
-		{ID: unstarted, Kind: kindThread, ParentID: guildID, Name: "forum post"},
-	} {
-		if err := h.st.UpsertContainer(ctx, c); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := h.st.UpsertMessage(ctx, store.Message{ID: threadID, ContainerID: chanGeneral, SenderID: aliceUser, Body: "rig?", SentAt: noon}); err != nil {
-		t.Fatal(err)
-	}
-	path := api("/channels/" + threadID + "/messages")
-	h.discord.handle(path, func(w http.ResponseWriter, _ *http.Request, _ int) {
-		writeJSON(w, http.StatusOK, []map[string]any{})
-	})
+// The limit counts stored messages, so a skipped system message takes no slot.
+func TestFetchLimitCountsStoredMessages(t *testing.T) {
+	h := newHarness(t, nil)
+	h.discord.reply(api("/channels/"+dmID+"/messages"), 200, []map[string]any{dmMessagesBody[1], dmMessagesBody[0]})
 	h.start()
-	if row := h.queryRow(`SELECT parent_id FROM containers WHERE id = ?`, threadID); row[0] != chanGeneral {
-		t.Errorf("started thread under %v, want its channel", row[0])
-	}
-	if row := h.queryRow(`SELECT parent_id FROM containers WHERE id = ?`, unstarted); row[0] != guildID {
-		t.Errorf("thread without a starter message under %v, want the guild still", row[0])
-	}
-	h.callOK("fetch", map[string]string{"channel_id": threadID}, &connector.ReadResult{})
-	if hits := h.discord.to(path); len(hits) != 1 || hits[0].header.Get("Referer") != "https://discord.com/channels/"+guildID+"/"+threadID {
-		t.Errorf("thread fetch requests %+v, want one with the guild in its referer", hits)
+	var resp connector.ReadResult
+	h.callOK("fetch", map[string]string{"channel_id": dmID, "limit": "1"}, &resp)
+	if strings.Join(resp.MessageIDs, ",") != msg4 {
+		t.Errorf("ids %v, want %s", resp.MessageIDs, msg4)
 	}
 }
 
@@ -1273,6 +1248,11 @@ func TestValidation(t *testing.T) {
 		{"search long content", "guild-search", map[string]string{"guild_id": guildID, "content": strings.Repeat("a", 513)}},
 		{"sync bad guild", "sync", map[string]string{"guild_id": "x"}},
 		{"fetch limit not a number", "fetch", map[string]string{"channel_id": dmID, "limit": "ten"}},
+		{"fetch 14-digit ID", "fetch", map[string]string{"channel_id": "12345678901234"}},
+		{"fetch 22-digit ID", "fetch", map[string]string{"channel_id": "1234567890123456789012"}},
+		{"fetch ID with a letter", "fetch", map[string]string{"channel_id": "17592884729911706a"}},
+		{"fetch ID with a newline", "fetch", map[string]string{"channel_id": "175928847299117063\n"}},
+		{"fetch full-width digits", "fetch", map[string]string{"channel_id": "１７５９２８８４７２９９１１７０６３"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1281,27 +1261,6 @@ func TestValidation(t *testing.T) {
 	}
 	if hits := h.discord.all(); len(hits) != 0 {
 		t.Errorf("invalid calls reached Discord: %v", h.discord.paths())
-	}
-}
-
-func TestIsSnowflake(t *testing.T) {
-	tests := []struct {
-		in   string
-		want bool
-	}{
-		{"175928847299117063", true},
-		{"123456789012345", true},       // 15 digits
-		{"123456789012345678901", true}, // 21 digits
-		{"12345678901234", false},
-		{"1234567890123456789012", false},
-		{"17592884729911706a", false},
-		{"175928847299117063\n", false},
-		{"１７５９２８８４７２９９１１７０６３", false}, // full-width digits
-	}
-	for _, tt := range tests {
-		if got := isSnowflake(tt.in); got != tt.want {
-			t.Errorf("isSnowflake(%q) = %v", tt.in, got)
-		}
 	}
 }
 

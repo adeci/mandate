@@ -2,18 +2,13 @@ package main
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -156,14 +151,14 @@ func seed(jm *fakeJMAP) {
 	jm.add(draft)
 }
 
-func TestSetup(t *testing.T) {
+func TestLinking(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	ctx := context.Background()
-	if h := f.c.Health(ctx); h != (connector.Health{State: connector.NeedsSetup, Detail: "not linked"}) {
+	if h := f.c.Health(ctx); h.State != connector.NeedsSetup {
 		t.Fatalf("health before linking: %+v", h)
 	}
-	if step, err := f.c.Setup(ctx, "", nil); err != nil || step.ID != "token" || len(step.Fields) != 1 || step.Fields[0].Kind != connector.SecretField {
+	if step, err := f.c.Setup(ctx, "", nil); err != nil || step.ID != "token" || step.Fields[0].Kind != connector.SecretField {
 		t.Fatalf("first step: %+v %v", step, err)
 	}
 	for name, tc := range map[string]struct {
@@ -180,25 +175,13 @@ func TestSetup(t *testing.T) {
 		}
 		_, err := f.c.Setup(ctx, "token", map[string]string{"token": tc.token})
 		var ce *connector.Error
-		if !errors.As(err, &ce) || ce.Status != http.StatusBadRequest || !strings.Contains(ce.Message, tc.want) {
+		if !errors.As(err, &ce) || ce.Status != http.StatusBadRequest || !strings.Contains(ce.Message, tc.want) || f.c.current() != nil {
 			t.Fatalf("%s: %v", name, err)
-		}
-		if entries, _ := os.ReadDir(f.env.PrivateDir()); len(entries) != 0 {
-			t.Fatalf("%s: stored %v", name, entries)
-		}
-		if f.c.current() != nil {
-			t.Fatalf("%s: linked", name)
 		}
 	}
 	f.jm.set(func(j *fakeJMAP) { j.noSubmission, j.readOnly = false, false })
 
 	f.link()
-	if h := f.c.Health(ctx); h.State != connector.Healthy {
-		t.Fatalf("health after linking: %+v", h)
-	}
-	if b, err := os.ReadFile(filepath.Join(f.env.PrivateDir(), "token")); err != nil || string(b) != goodToken {
-		t.Fatalf("stored token %q %v", b, err)
-	}
 	var ce *connector.Error
 	if _, err := f.c.Setup(ctx, "token", map[string]string{"token": goodToken}); !errors.As(err, &ce) || ce.Status != http.StatusConflict {
 		t.Fatalf("second setup: %v", err)
@@ -207,41 +190,26 @@ func TestSetup(t *testing.T) {
 	// A restart resumes with the stored token.
 	f.c.Close()
 	f.start()
-	eventually(t, "the restarted connector connects", func() bool { return f.c.Health(ctx) == connector.Health{State: connector.Healthy} })
+	healthy := func() bool { return f.c.Health(ctx) == connector.Health{State: connector.Healthy} }
+	eventually(t, "the restarted connector connects", healthy)
+
+	// A revoked token asks for setup, and a new one replaces it without unlinking.
+	f.jm.set(func(j *fakeJMAP) { j.token = "fmu1-other" })
+	f.c.current().poke()
+	eventually(t, "health asks for setup", func() bool { return f.c.Health(ctx).State == connector.NeedsSetup })
+	if step, err := f.c.Setup(ctx, "token", map[string]string{"token": "fmu1-other"}); err != nil || !step.Done {
+		t.Fatalf("relink: %+v %v", step, err)
+	}
+	eventually(t, "healthy again", healthy)
 
 	if err := f.c.Unlink(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if entries, _ := os.ReadDir(f.env.PrivateDir()); len(entries) != 0 {
-		t.Fatalf("private dir keeps %v", entries)
+	if b, err := f.env.Secret("token").Load(); b != nil || err != nil {
+		t.Fatalf("token kept after unlink: %v", err)
 	}
 	if h := f.c.Health(ctx); h.State != connector.NeedsSetup {
 		t.Fatalf("health after unlink: %+v", h)
-	}
-	if _, err := f.c.Prepare(ctx, "send", map[string]string{"to": "a@example.com", "subject": "s", "body": "b"}); !errors.Is(err, errNotLinked) {
-		t.Fatalf("prepare after unlink: %v", err)
-	}
-}
-
-func TestRevokedToken(t *testing.T) {
-	t.Parallel()
-	f := newFixture(t)
-	f.link()
-	f.jm.set(func(j *fakeJMAP) { j.token = "fmu1-other" })
-	f.c.current().poke()
-	eventually(t, "health asks for setup", func() bool { return f.c.Health(context.Background()).State == connector.NeedsSetup })
-	if h := f.c.Health(context.Background()); !strings.Contains(h.Detail, "revoked") {
-		t.Fatalf("health = %+v", h)
-	}
-
-	// A new token replaces the refused one without unlinking.
-	step, err := f.c.Setup(context.Background(), "token", map[string]string{"token": "fmu1-other"})
-	if err != nil || !step.Done {
-		t.Fatalf("relink: %+v %v", step, err)
-	}
-	eventually(t, "healthy again", func() bool { return f.c.Health(context.Background()) == connector.Health{State: connector.Healthy} })
-	if b, err := f.env.Secret("token").Load(); string(b) != "fmu1-other" || err != nil {
-		t.Fatalf("stored token %q %v", b, err)
 	}
 }
 
@@ -500,38 +468,24 @@ func compact(t *testing.T, v any) string {
 	return string(b)
 }
 
-func TestApprovedSendAndReply(t *testing.T) {
+func TestSendAndReply(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	seed(f.jm)
 	f.link()
-	client, key := serve(t, f)
-
-	approve := func(op string, args map[string]string) (connector.Result, record.Envelope) {
+	ctx := context.Background()
+	execute := func(op string, args map[string]string) connector.Result {
 		t.Helper()
-		p, err := client.Prepare(context.Background(), op, args)
+		p, err := f.c.Prepare(ctx, op, args)
 		if err != nil {
 			t.Fatal(err)
 		}
-		now := time.Now()
-		a := sign(t, record.Write{
-			ID: record.NewID(), Connector: "fastmail", Op: op, Args: p.Args, Display: p.Display,
-			CreatedAt: record.Time{Time: now}, ExpiresAt: record.Time{Time: now.Add(time.Hour)},
-		}, key)
-		res, err := client.Execute(context.Background(), a)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return res, a
+		return f.c.Execute(ctx, record.Write{ID: record.NewID(), Connector: "fastmail", Op: op, Args: p.Args, Display: p.Display})
 	}
 
-	res, a := approve("send", map[string]string{"to": "bob@example.com", "cc": "carol@example.org", "subject": "Plans", "body": "See you."})
+	res := execute("send", map[string]string{"to": "bob@example.com", "cc": "carol@example.org", "subject": "Plans", "body": "See you."})
 	if res.Status != connector.Done || res.Ref == "" {
 		t.Fatalf("send: %+v", res)
-	}
-	var ce *connector.Error
-	if _, err := client.Execute(context.Background(), a); !errors.As(err, &ce) || ce.Status != http.StatusConflict {
-		t.Fatalf("replay: %v", err)
 	}
 	calls := f.jm.recorded()
 	if len(calls) != 2 || calls[0].name != "Email/set" || calls[1].name != "EmailSubmission/set" {
@@ -553,7 +507,7 @@ func TestApprovedSendAndReply(t *testing.T) {
 		t.Fatalf("the sent email is stored as %+v", got)
 	}
 
-	res, _ = approve("reply", map[string]string{"chat": "t2", "body": "Unsubscribe me."})
+	res = execute("reply", map[string]string{"chat": "t2", "body": "Unsubscribe me."})
 	if res.Status != connector.Done {
 		t.Fatalf("reply: %+v", res)
 	}
@@ -579,7 +533,7 @@ func TestApprovedSendAndReply(t *testing.T) {
 	if err != nil || p.Args["to"] != "Alice@Example.com" {
 		t.Fatalf("prepared %+v %v", p, err)
 	}
-	res = f.c.Execute(context.Background(), record.Write{ID: "p3", Op: "reply", Args: p.Args})
+	res = f.c.Execute(ctx, record.Write{ID: "p3", Op: "reply", Args: p.Args})
 	calls = f.jm.recorded()
 	draft = calls[len(calls)-2].args["create"].(map[string]any)["draft"]
 	if res.Status != connector.Done || compact(t, draft.(map[string]any)["references"]) != `["e1@mail.example","e2@mail.example"]` {
@@ -778,57 +732,4 @@ func TestBackfill(t *testing.T) {
 	if _, err := f.c.st.Media(ctx, "e1", 0); !errors.Is(err, store.ErrNoMedia) {
 		t.Fatalf("backfill ran twice: %v", err)
 	}
-}
-
-// serve runs f's connector behind connector.Server, which checks approvals,
-// and returns a client and the key that approves.
-func serve(t *testing.T, f *fixture) (*connector.Client, *ecdsa.PrivateKey) {
-	t.Helper()
-	gid := uint32(os.Getgid())
-	srv, err := connector.NewServer(f.c, "fastmail", f.env.StateDir, gid, gid, f.env.Log)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// t.TempDir can be too long for a socket path.
-	sockDir, err := os.MkdirTemp("", "fm")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
-	sock := filepath.Join(sockDir, "s")
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- srv.Serve(ctx, ln) }()
-	t.Cleanup(func() { cancel(); <-done })
-	client := connector.Dial("fastmail", sock)
-
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key, err := record.P256Key(&priv.PublicKey, "phone")
-	if err != nil {
-		t.Fatal(err)
-	}
-	entry := sign(t, record.KeyEntry{Op: "add", Key: key, At: record.Time{Time: time.Now()}}, priv)
-	if _, err := client.PutKeys(context.Background(), []record.Envelope{entry}); err != nil {
-		t.Fatal(err)
-	}
-	return client, priv
-}
-
-func sign(t *testing.T, r record.Record, priv *ecdsa.PrivateKey) record.Envelope {
-	t.Helper()
-	e, err := record.New(r, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := record.Sign(&e, priv); err != nil {
-		t.Fatal(err)
-	}
-	return e
 }

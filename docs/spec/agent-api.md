@@ -231,8 +231,7 @@ A one-off grant has `from` and `until` instead of `schedule`.
 - `extend` lengthens the current or recently ended window by `for`, keeping
   its chats and horizon; with nothing to extend, `409`.
 - `reason` is required, at most 1000 characters, shown as the agent's words.
-- 3 waiting requests and 10 an hour per identity; beyond that, `429` before
-  anything is looked up.
+- 3 waiting requests and 10 an hour per identity; beyond that, `429`.
 
 The answer is `202 {"id": "…"}`. `GET /agent/v1/access/requests/{id}?wait=SECONDS`
 (at most 900) answers `{"status", "grant_id", "until"}` with `status`

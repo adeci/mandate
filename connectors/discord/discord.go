@@ -216,15 +216,8 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 	if st.CooldownUntil.After(cfg.clock.Now()) {
 		cfg.log.Warn("in rate-limit cooldown", "until", st.CooldownUntil.Format(time.RFC3339))
 	}
-	moved, err := reparentThreads(ctx, cfg.store.DB())
-	if err != nil {
-		return nil, fmt.Errorf("move threads under their channels: %w", err)
-	}
-	if moved > 0 {
-		cfg.log.Info("moved threads under their channels", "count", moved)
-	}
-	if err := markSenderNames(ctx, cfg.store.DB()); err != nil {
-		return nil, fmt.Errorf("mark sender names: %w", err)
+	if _, err := cfg.store.DB().ExecContext(ctx, handlesSchema); err != nil {
+		return nil, fmt.Errorf("create handles table: %w", err)
 	}
 	// When ctx is done the worker stops before the socket shuts down, so a
 	// call still waiting for its slot is answered right away instead of

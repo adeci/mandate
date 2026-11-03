@@ -229,7 +229,7 @@ func TestChannelContainer(t *testing.T) {
 			name: "dm uses the recipient's name and is dated by its last message",
 			in:   &apiChannel{ID: "d", Type: channelDM, Recipients: []apiUser{*alice}, LastMessageID: "175928847299117063"},
 			want: store.Container{
-				ID: "d", Kind: "dm", Name: "~Alice A", Participants: []store.Participant{{ID: "200", Name: "~Alice A", Handle: "alice"}},
+				ID: "d", Kind: "dm", Name: "~Alice A", Participants: []store.Participant{{ID: "200", Name: "~Alice A"}},
 				LastMessageAt: time.Date(2016, 4, 30, 11, 18, 25, 796e6, time.UTC),
 			}, wantOK: true,
 		},
@@ -243,7 +243,7 @@ func TestChannelContainer(t *testing.T) {
 			in:   &apiChannel{ID: "gd", Name: "crew", Type: channelGroupDM, Recipients: []apiUser{*alice, *bob}},
 			want: store.Container{
 				ID: "gd", Kind: "group", Name: "crew", IsGroup: true,
-				Participants: []store.Participant{{ID: "200", Name: "~Alice A", Handle: "alice"}, {ID: "300", Name: "~bob", Handle: "bob#0042"}},
+				Participants: []store.Participant{{ID: "200", Name: "~Alice A"}, {ID: "300", Name: "~bob"}},
 			}, wantOK: true,
 		},
 		{
@@ -251,7 +251,7 @@ func TestChannelContainer(t *testing.T) {
 			in:   &apiChannel{ID: "gd", Type: channelGroupDM, Recipients: []apiUser{*alice, *bob}},
 			want: store.Container{
 				ID: "gd", Kind: "group", Name: "~Alice A, ~bob", IsGroup: true,
-				Participants: []store.Participant{{ID: "200", Name: "~Alice A", Handle: "alice"}, {ID: "300", Name: "~bob", Handle: "bob#0042"}},
+				Participants: []store.Participant{{ID: "200", Name: "~Alice A"}, {ID: "300", Name: "~bob"}},
 			}, wantOK: true,
 		},
 		{name: "category skipped", in: &apiChannel{ID: "cat", GuildID: "g", Type: channelGuildCategory}},

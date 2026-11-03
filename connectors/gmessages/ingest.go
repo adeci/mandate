@@ -28,17 +28,14 @@ type ingester struct {
 	st  *store.Store
 	log *slog.Logger
 
-	mu    sync.Mutex
-	convs map[string]*gmproto.Conversation
-	sims  map[string]*gmproto.SIMPayload // by the owner's participant ID
-	// pending holds messages waiting for their conversation's lookup.
+	mu      sync.Mutex
+	convs   map[string]*gmproto.Conversation
+	sims    map[string]*gmproto.SIMPayload // by the owner's participant ID
 	pending map[string][]*gmproto.Message
-	// syncing is set while a sync runs; again asks it to run once more.
+	// again asks a running sync to run once more.
 	syncing, again bool
-	// phoneSyncing is set while the phone rebuilds its message database.
-	phoneSyncing bool
-	// dmsFilled is set once fillDMs has run.
-	dmsFilled bool
+	phoneSyncing   bool
+	dmsFilled      bool
 }
 
 func newIngester(st *store.Store, log *slog.Logger) *ingester {
@@ -47,7 +44,6 @@ func newIngester(st *store.Store, log *slog.Logger) *ingester {
 	return in
 }
 
-// reset forgets what the previous pairing reported.
 func (in *ingester) reset() {
 	in.mu.Lock()
 	defer in.mu.Unlock()
@@ -76,7 +72,6 @@ func (in *ingester) remember(conv *gmproto.Conversation) {
 	in.convs[conv.GetConversationID()] = conv
 }
 
-// lookup returns conv from the cache, or asks the phone.
 func (in *ingester) lookup(ctx context.Context, cli gmClient, id string) (*gmproto.Conversation, error) {
 	if conv, ok := in.conversation(id); ok {
 		return conv, nil
@@ -103,7 +98,6 @@ func (in *ingester) settings(s *gmproto.Settings) {
 	}
 }
 
-// sim picks the SIM conv sends from.
 func (in *ingester) sim(conv *gmproto.Conversation) *gmproto.SIMPayload {
 	in.mu.Lock()
 	sim := in.sims[conv.GetDefaultOutgoingID()]
@@ -147,7 +141,6 @@ func (in *ingester) message(ctx context.Context, cli gmClient, m *gmproto.Messag
 	}
 }
 
-// resolve looks up conversation id and stores the messages waiting for it.
 func (in *ingester) resolve(ctx context.Context, cli gmClient, id string) {
 	conv, err := in.lookup(ctx, cli, id)
 	in.mu.Lock()
@@ -324,7 +317,6 @@ func (in *ingester) backfill(ctx context.Context, cli gmClient, conv *gmproto.Co
 	return n, nil
 }
 
-// lastActivity is the recorded activity of each stored conversation.
 func (in *ingester) lastActivity(ctx context.Context) (map[string]time.Time, error) {
 	rows, err := in.st.DB().QueryContext(ctx, `SELECT id, last_message_at FROM containers WHERE last_message_at IS NOT NULL`)
 	if err != nil {

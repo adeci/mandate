@@ -24,7 +24,6 @@ import (
 
 const maxBody = 1 << 20
 
-// Serve listens on cfg.Listen until ctx ends.
 func Serve(ctx context.Context, cfg *config.Config) error {
 	tc, err := tlsConfig(cfg, config.StateDir("front"))
 	if err != nil {
@@ -130,9 +129,8 @@ func proxy(sock string) *httputil.ReverseProxy {
 
 type spkiKey struct{}
 
-// listener does the TLS handshake with a per-connection config to learn
-// which certificate this connection was served; the standard library does
-// not expose it.
+// listener records the certificate each connection was served, which
+// tls.ConnectionState does not tell.
 type listener struct {
 	net.Listener
 	config *tls.Config // GetCertificate and NextProtos
@@ -179,8 +177,7 @@ func spkiSHA256(cert *x509.Certificate) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// SPKI returns the hex SHA-256 of the SPKI of the certificate front serves,
-// for `mandate setup` to print. It asks the running front.
+// SPKI asks the running front for the hash of the certificate it serves.
 func SPKI(ctx context.Context, cfg *config.Config) (string, error) {
 	host, port, err := net.SplitHostPort(cfg.Listen)
 	if err != nil {

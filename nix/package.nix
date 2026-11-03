@@ -7,16 +7,15 @@
 }:
 let
   # Connector modules replace github.com/adeci/mandate with ../.., so every
-  # build needs the core sources. go.work is left out: vendoring refuses
-  # workspace mode.
+  # build needs the packages they import from it. go.work is left out:
+  # vendoring refuses workspace mode.
   core = [
     ../go.mod
     ../go.sum
-    ../cmd
-    ../internal
     ../connector
     ../record
     ../store
+    ../internal/peer
   ];
   hashes = lib.importJSON ./vendor-hashes.json;
 
@@ -90,6 +89,8 @@ in
   mandate = module {
     pname = "mandate";
     files = [
+      ../cmd
+      ../internal
       # Test vectors.
       ../docs/spec
       ./testdevice

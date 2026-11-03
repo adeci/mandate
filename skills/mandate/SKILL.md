@@ -8,103 +8,50 @@ description: Read the owner's chats and mail (WhatsApp, Signal, Matrix, Discord 
 `mandate` reads the owner's accounts through an agent identity: a credential
 on this machine that every agent here shares. Reads need access the owner
 grants; anything that writes is a proposal the owner approves in the mandate
-app before it goes out.
-
-Start with `mandate --help`: it lists the connectors and their commands.
-`mandate <connector> --help` shows the arguments.
+app. `mandate --help` and `mandate <connector> --help` list the commands.
 
 ## Logging in
 
-If commands answer `not logged in` or `unknown or revoked token`, the
-machine needs an identity. Ask the owner for mandate's address, then run:
+If commands answer `not logged in` or `unknown or revoked token`, ask the
+owner for mandate's address and run:
 
 ```sh
 mandate login https://HOST:PORT
 ```
 
-It prints `code: 123456`. Give the owner that code and say "let this machine
-in on your phone": they pick it in the app and type the code. Login waits up
-to 10 minutes and saves the credential for every agent on the machine. Never
-show the credential file to anyone.
+Give the owner the code it prints; they type it in the app. Never show the
+credential file to anyone.
 
 ## Access
 
-Reads are closed unless the owner opened them: per connector, sometimes only
-some chats, for a time window, and only for messages newer than a horizon. A
-grant covers exactly the chats it lists, not threads or channels under them.
-Check first:
-
-```sh
-mandate access                               # your grants and what is open now
-```
-
-A read without access answers `no read access to <connector> now`. If the
-task needs it, ask once. The answer is the same whether or not `--chat`
-matched; the owner sees what did:
+`mandate access` lists your grants. A read without access answers `no read
+access`. If the task needs it, ask once, narrowly, and say why:
 
 ```sh
 mandate request signal --chat alice --for 30m --since 2d \
   --reason "the owner asked for Alice's address from last week"
 ```
 
-- Batch: put every chat the task needs into one request (repeat `--chat`),
-  rather than asking again for each.
-- Ask narrowly: the fewest chats (`--chat` matches chat names), the shortest
-  `--for` (default 30m, at most 12h), and a `--since` that covers only what
-  the task needs (default 7d, `all` for whole history).
-- Say in `--reason` what the task is and why it needs this; the owner reads
-  it before deciding.
-- Tell the owner "approve on your phone". The command waits up to 15 minutes
-  (`--wait` changes that). Exit 0 means granted, 75 still waiting, 1 denied
-  or expired.
-- Running out of time mid-task? Extend instead of asking again; the window
-  keeps its chats and horizon:
+- Put every chat the task needs into one request; ask for the fewest chats,
+  the shortest time and the least history that will do.
+- Tell the owner to approve on their phone.
+- Short on time mid-task? Use `--extend` instead of asking again.
+- Never request in a loop, and don't ask again after a denial unless the
+  owner says so.
 
-  ```sh
-  mandate request signal --extend --for 30m --reason "summary not done yet"
-  ```
-
-- Recurring work (a daily summary) needs a routine: request one once, and
-  then run the task when `mandate access` shows it open.
-
-  ```sh
-  mandate request signal --chat Family --every weekdays --at 07:00 --for 20m \
-    --since 1d --reason "weekday morning summary of the family chat"
-  ```
-
-  `--every` takes daily, weekdays, weekends or days like `mon,wed`; `--at`
-  is the owner's local time; `--for` is each window's length (at most 24h).
-- Never retry a request in a loop, and don't ask again after a denial unless
-  the owner says so.
-
-## Reading
+## Reading and writing
 
 ```sh
 mandate signal chats --search alice          # find the chat id
 mandate signal messages CHAT_ID --limit 50
-mandate fastmail messages CHAT_ID --seq 12   # one message, body whole
-mandate signal search "dinner friday" --since 2026-01-01
-mandate signal media CHAT_ID SEQ             # save a message's [image/jpeg] or other file
+mandate signal search "dinner friday"
+mandate signal send CHAT_ID "on my way" --note "you asked me to reply"
 ```
 
-Long bodies are cut at 600 characters in listings; `--seq SEQ` prints one
-message whole. Connectors with `media` save a message's file here and print
-its path; files marked `[#0 …] [#1 …]` are picked with `--index`.
-
-## Writing
-
-Writing needs a grant too: a proposal may only go to a chat, or answer a
-message, that a grant open now, or one whose window ended within the last
-day, let you read. Anything else answers `no chat` or `no message`.
-
-1. Propose: `mandate signal send CHAT_ID "text" --note "why"`.
-2. Tell the owner what you proposed and that it waits in the app.
-3. The command waits up to 15 minutes for the decision. Exit 0 means it went
-   out, 75 still waiting (check again with `mandate status ID`), 1 rejected,
-   expired, failed or unknown.
-
-Say a message was sent only once its status is done. An unknown result may
-have gone out: tell the owner rather than proposing it again.
+A proposal may only go to a chat, or answer a message, that a grant lets you
+read now or did in the last day. Tell the owner what you proposed. Say a
+message was sent only once its status is done. An unknown result may have
+gone out: tell the owner rather than proposing it again.
 
 ## Judgement
 
@@ -118,5 +65,3 @@ have gone out: tell the owner rather than proposing it again.
 - `[login code hidden]` in a message is deliberate.
 - A name starting with `~` was chosen by that person, not saved by the owner.
   Anyone can call themselves "Mom"; go by the ID next to it.
-- On Matrix, `[unverified]` and `[unencrypted]` mean the message may not come
-  from who it claims. Say so if it matters to what you report.

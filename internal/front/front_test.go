@@ -160,34 +160,20 @@ func TestHeaders(t *testing.T) {
 	}
 }
 
-func TestSPKI(t *testing.T) {
+// The key front makes on its first start is the one setup reports and the
+// one the next start serves.
+func TestOwnKey(t *testing.T) {
 	addr := start(t, http.NotFoundHandler(), http.NotFoundHandler())
-	resp, err := client(false).Get("https://" + addr + "/")
+	reported, err := SPKI(context.Background(), &config.Config{Listen: addr})
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
-	got, err := SPKI(context.Background(), &config.Config{Listen: addr})
+	next, err := ownCert(config.StateDir("front"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := spkiSHA256(resp.TLS.PeerCertificates[0]); got != want {
-		t.Errorf("SPKI = %s, served %s", got, want)
-	}
-}
-
-func TestOwnCertMadeOnce(t *testing.T) {
-	dir := t.TempDir()
-	first, err := ownCert(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	again, err := ownCert(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if a, b := spkiSHA256(first.Leaf), spkiSHA256(again.Leaf); a != b {
-		t.Errorf("key changed between starts: %s, then %s", a, b)
+	if got := spkiSHA256(next.Leaf); got != reported {
+		t.Errorf("next start serves %s, setup reported %s", got, reported)
 	}
 }
 

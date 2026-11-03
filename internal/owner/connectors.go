@@ -131,55 +131,32 @@ func (s *Server) listNeverShare(w http.ResponseWriter, _ *http.Request) {
 	reply(w, http.StatusOK, append([]neverShare{}, s.st.NeverShare...))
 }
 
-// neverShareEntry is the entry named in the path, or nil after refusing it.
-func (s *Server) neverShareEntry(w http.ResponseWriter, r *http.Request) *neverShare {
-	n := &neverShare{Connector: r.PathValue("connector"), Kind: r.PathValue("kind"), ID: r.PathValue("id")}
+// PUT adds the entry named in the path, DELETE removes it.
+func (s *Server) editNeverShare(w http.ResponseWriter, r *http.Request) {
+	n := neverShare{Connector: r.PathValue("connector"), Kind: r.PathValue("kind"), ID: r.PathValue("id")}
 	switch {
 	case s.conns[n.Connector] == nil:
 		fail(w, http.StatusNotFound, "no such connector")
-		return nil
+		return
 	case n.Kind != "chat" && n.Kind != "person":
 		fail(w, http.StatusBadRequest, "kind is chat or person")
-		return nil
-	}
-	return n
-}
-
-func (n neverShare) same(o neverShare) bool {
-	return n.Connector == o.Connector && n.Kind == o.Kind && n.ID == o.ID
-}
-
-func (s *Server) putNeverShare(w http.ResponseWriter, r *http.Request) {
-	n := s.neverShareEntry(w, r)
-	if n == nil {
 		return
 	}
 	var body struct {
 		Name string `json:"name"`
 	}
-	if !decode(w, r, &body) {
+	if r.Method == http.MethodPut && !decode(w, r, &body) {
 		return
 	}
 	n.Name = body.Name
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.st.NeverShare = slices.DeleteFunc(s.st.NeverShare, n.same)
-	s.st.NeverShare = append(s.st.NeverShare, *n)
-	if err := s.commit(); err != nil {
-		failErr(w, err)
-		return
+	s.st.NeverShare = slices.DeleteFunc(s.st.NeverShare, func(o neverShare) bool {
+		return o.Connector == n.Connector && o.Kind == n.Kind && o.ID == n.ID
+	})
+	if r.Method == http.MethodPut {
+		s.st.NeverShare = append(s.st.NeverShare, n)
 	}
-	reply(w, http.StatusOK, struct{}{})
-}
-
-func (s *Server) deleteNeverShare(w http.ResponseWriter, r *http.Request) {
-	n := s.neverShareEntry(w, r)
-	if n == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.st.NeverShare = slices.DeleteFunc(s.st.NeverShare, n.same)
 	if err := s.commit(); err != nil {
 		failErr(w, err)
 		return

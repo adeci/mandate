@@ -5,16 +5,7 @@
 { self, pkgs }:
 let
   packages = self.packages.${pkgs.stdenv.hostPlatform.system};
-  testPrograms = packages.mandate.overrideAttrs {
-    name = "mandate-vm-test";
-    subPackages = [
-      "nix/testdevice"
-      "nix/testconnector"
-    ];
-    excludedPackages = [ ];
-    doCheck = false;
-    meta.mainProgram = "testconnector";
-  };
+  testPrograms = import ./test-programs.nix packages.mandate;
   bundled = [
     "whatsapp"
     "discord"
@@ -99,10 +90,11 @@ in
     def agent(cmd):
         return laptop.execute("mandate " + cmd + " 2>&1")
 
+    # Reads print a header row, then tab-separated rows.
     def table(cmd):
-        status, out = agent(cmd + " --json")
+        status, out = laptop.execute("mandate " + cmd)
         assert status == 0, (cmd, status, out)
-        return json.loads(out)["rows"]
+        return [line.split("\t") for line in out.splitlines()[1:]]
 
     def ids(cmd):
         return sorted(r[0] for r in table(cmd))

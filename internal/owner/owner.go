@@ -26,7 +26,6 @@ import (
 
 const maxBody = 1 << 20
 
-// Serve serves the owner socket until ctx ends.
 func Serve(ctx context.Context, cfg *config.Config) error {
 	front, err := peer.LookupGID("mandate-front")
 	if err != nil {
@@ -188,8 +187,8 @@ func (s *Server) handler(front, gateway uint32) http.Handler {
 	authed("POST /owner/v1/connectors/{name}/unlink", s.connectorUnlink)
 	authed("GET /owner/v1/connectors/{name}/chats", s.connectorChats)
 	authed("GET /owner/v1/never-share", s.listNeverShare)
-	authed("PUT /owner/v1/never-share/{connector}/{kind}/{id}", s.putNeverShare)
-	authed("DELETE /owner/v1/never-share/{connector}/{kind}/{id}", s.deleteNeverShare)
+	authed("PUT /owner/v1/never-share/{connector}/{kind}/{id}", s.editNeverShare)
+	authed("DELETE /owner/v1/never-share/{connector}/{kind}/{id}", s.editNeverShare)
 	authed("GET /owner/v1/keys", s.getKeys)
 	authed("POST /owner/v1/keys/{id}/remove/challenge", s.removeKeyChallenge)
 
@@ -210,7 +209,6 @@ func (s *Server) handler(front, gateway uint32) http.Handler {
 	return mux
 }
 
-// device admits a call with the bearer token of a trusted device.
 func (s *Server) device(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token, ok := bytes.CutPrefix([]byte(r.Header.Get("Authorization")), []byte("Bearer "))
@@ -234,8 +232,7 @@ func (s *Server) device(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// commit saves the state after a change and tells whoever waits on it. The
-// caller holds s.mu.
+// The caller holds s.mu.
 func (s *Server) commit(what ...string) error {
 	if err := saveState(s.dir, &s.st); err != nil {
 		s.log.Error("save state", "err", err)
@@ -259,8 +256,7 @@ func (s *Server) changed(what ...string) {
 	}
 }
 
-// await returns once cond holds, wait elapses or ctx ends. cond runs with
-// s.mu held.
+// cond runs with s.mu held.
 func (s *Server) await(ctx context.Context, wait time.Duration, cond func() bool) {
 	t := time.NewTimer(wait)
 	defer t.Stop()
@@ -281,7 +277,6 @@ func (s *Server) await(ctx context.Context, wait time.Duration, cond func() bool
 	}
 }
 
-// waitParam is ?wait= in seconds, at most 900.
 func waitParam(r *http.Request) (time.Duration, bool) {
 	v := r.URL.Query().Get("wait")
 	if v == "" {
@@ -309,13 +304,13 @@ type apiError struct {
 	Error        string `json:"error"`
 	Code         string `json:"code"`
 	AttemptsLeft *int   `json:"attempts_left,omitempty"`
+	RetryAfter   int    `json:"retry_after_seconds,omitempty"`
 }
 
 func fail(w http.ResponseWriter, status int, msg string) {
 	reply(w, status, apiError{Error: msg, Code: codes[status]})
 }
 
-// failErr answers err, which is an *httpError or else an internal error.
 func failErr(w http.ResponseWriter, err error) {
 	if e, ok := errors.AsType[*httpError](err); ok {
 		fail(w, e.status, e.msg)

@@ -148,6 +148,15 @@ func Encode(r Record) ([]byte, error) {
 	return b, nil
 }
 
+// EncodeKey returns k as it appears inside key records, for carrying a key
+// outside one.
+func EncodeKey(k Key) ([]byte, error) {
+	if _, err := k.parse(); err != nil {
+		return nil, err
+	}
+	return canonical(k)
+}
+
 var errNotCanonical = errors.New("record bytes are not canonical or lack a field")
 
 func decode(kind string, b []byte) (Record, error) {

@@ -88,7 +88,6 @@ type cli struct {
 	url, token string
 	http       *http.Client
 
-	json bool
 	full bool   // print bodies whole
 	seq  int64  // the one message asked for, if any
 	name string // the connector
@@ -104,7 +103,7 @@ func Run(ctx context.Context, args []string) error {
 
 func (c *cli) run(ctx context.Context, args []string) error {
 	if len(args) == 0 || isHelp(args[0]) {
-		return c.help(ctx)
+		return c.help()
 	}
 	cmd, args := args[0], args[1:]
 	if cmd == "login" {
@@ -160,10 +159,9 @@ func isHelp(s string) bool { return s == "-h" || s == "--help" || s == "help" }
 
 var errNegativeWait = errors.New("--wait must not be negative")
 
-// parse takes flags anywhere among args, adds --json, and wants between lo
-// and hi positional arguments (hi < 0: no limit).
+// parse takes flags anywhere among args and wants between lo and hi
+// positional arguments (hi < 0: no limit).
 func (c *cli) parse(fs *flag.FlagSet, help string, args []string, lo, hi int) ([]string, error) {
-	fs.BoolVar(&c.json, "json", false, "")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return nil, usage(help, err)
@@ -293,10 +291,4 @@ func (c *cli) send(ctx context.Context, method, path string, body any) (*http.Re
 		msg += fmt.Sprintf("; retry in %s", time.Duration(e.RetryAfterSeconds)*time.Second)
 	}
 	return nil, &apiError{status: resp.StatusCode, msg: msg}
-}
-
-// printJSON writes an answer as it came, on one line.
-func (c *cli) printJSON(raw []byte) error {
-	_, err := c.out.Write(append(bytes.TrimRight(raw, "\n"), '\n'))
-	return err
 }

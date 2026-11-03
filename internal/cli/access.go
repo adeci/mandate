@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	accessUsage  = "mandate access [--json]"
+	accessUsage  = "mandate access"
 	requestUsage = "mandate request CONNECTOR [--chat TEXT]... [--for 30m] [--since 7d] --reason WHY [--wait 15m]"
 	routineUsage = "mandate request CONNECTOR [--chat TEXT]... --every daily|weekdays|weekends|mon,wed,... --at HH:MM [--for 30m] [--since 7d] --reason WHY [--wait 15m]"
 	extendUsage  = "mandate request CONNECTOR --extend [--for 30m] --reason WHY [--wait 15m]"
@@ -74,12 +74,8 @@ func (c *cli) access(ctx context.Context, args []string) error {
 		return err
 	}
 	var grants []grantInfo
-	raw, _, err := c.do(ctx, requestTimeout, http.MethodGet, "/agent/v1/access", nil, &grants)
-	if err != nil {
+	if _, _, err := c.do(ctx, requestTimeout, http.MethodGet, "/agent/v1/access", nil, &grants); err != nil {
 		return err
-	}
-	if c.json {
-		return c.printJSON(raw)
 	}
 	t := table{Columns: []string{"connector", "now", "chats", "when", "since", "id"}}
 	for _, g := range grants {
@@ -275,24 +271,17 @@ func (c *cli) request(ctx context.Context, args []string) error {
 	var ref struct {
 		ID string `json:"id"`
 	}
-	raw, _, err := c.do(ctx, requestTimeout, http.MethodPost, "/agent/v1/access/requests", req, &ref)
-	if err != nil {
+	if _, _, err := c.do(ctx, requestTimeout, http.MethodPost, "/agent/v1/access/requests", req, &ref); err != nil {
 		return err
 	}
-	if c.json {
-		if err := c.printJSON(raw); err != nil {
-			return err
-		}
-	} else {
-		what := "read access to " + req.Connector
-		switch {
-		case req.Schedule != nil:
-			what = fmt.Sprintf("a routine on %s, every %s at %s for %s", req.Connector, days(req.Schedule.Days), req.Schedule.Start, human(seconds(req.Schedule.Length)))
-		case req.Extend:
-			what = "more time on " + req.Connector
-		}
-		fmt.Fprintf(c.out, "%s pending: %s\n", ref.ID, what)
+	what := "read access to " + req.Connector
+	switch {
+	case req.Schedule != nil:
+		what = fmt.Sprintf("a routine on %s, every %s at %s for %s", req.Connector, days(req.Schedule.Days), req.Schedule.Start, human(seconds(req.Schedule.Length)))
+	case req.Extend:
+		what = "more time on " + req.Connector
 	}
+	fmt.Fprintf(c.out, "%s pending: %s\n", ref.ID, what)
 	if *wait > 0 {
 		fmt.Fprintf(c.errOut, "waiting up to %s for the owner to decide in the mandate app\n", *wait)
 	}
@@ -325,7 +314,6 @@ func (c *cli) awaitAccess(ctx context.Context, id, connector string, wait time.D
 			return &exitError{msg: msg, code: errTryLater}
 		case "granted":
 			switch {
-			case c.json:
 			case st.Until.IsZero():
 				fmt.Fprintf(c.out, "%s granted: a routine on %s; mandate access shows when it runs\n", id, connector)
 			default:

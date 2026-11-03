@@ -91,7 +91,6 @@ type gateway struct {
 	conns    map[string]*conn
 	toOwner  *ownerClient
 	activity *activity
-	requests *requestLimits
 
 	liveMu sync.Mutex // serializes pushes
 	live   atomic.Pointer[live]
@@ -108,7 +107,6 @@ func newGateway(o options) (*gateway, error) {
 		conns:    map[string]*conn{},
 		toOwner:  toOwner,
 		activity: &activity{owner: toOwner, log: o.log},
-		requests: &requestLimits{sent: map[string][]*sentRequest{}},
 	}
 	g.live.Store(l)
 	for name, p := range o.connectors {

@@ -169,7 +169,7 @@ func TestLogin(t *testing.T) {
 			// The token works afterwards, over the pin or the roots.
 			after := &bytes.Buffer{}
 			c = &cli{out: after, errOut: &bytes.Buffer{}, getenv: func(k string) string { return env[k] }, roots: roots}
-			if err := c.run(t.Context(), []string{"connectors", "--json"}); err != nil || after.String() != "[]\n" {
+			if err := c.run(t.Context(), []string{"connectors"}); err != nil || after.String() != "name\thealth\taccess\tcommands\n" {
 				t.Errorf("connectors after login: %v %q", err, after)
 			}
 		})

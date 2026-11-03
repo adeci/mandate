@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/adeci/mandate/record"
 	"github.com/gtank/ristretto255"
 )
 
@@ -58,13 +59,11 @@ func TokenSHA256(token string) string {
 
 // Payload is what the new party seals.
 type Payload struct {
-	// Key is the device's key object (records.md), devices only. It is
-	// carried as given; records decoding checks it.
-	Key         json.RawMessage `json:"key,omitempty"`
-	TokenSHA256 string          `json:"token_sha256"`
+	Key         *record.Key `json:"key,omitempty"` // devices only
+	TokenSHA256 string      `json:"token_sha256"`
 }
 
-// encode writes p in JCS form, given that Key already is.
+// encode writes p in JCS form.
 func (p Payload) encode(kind string) ([]byte, error) {
 	if h, err := hex.DecodeString(p.TokenSHA256); err != nil || len(h) != sha256.Size ||
 		hex.EncodeToString(h) != p.TokenSHA256 {
@@ -73,13 +72,17 @@ func (p Payload) encode(kind string) ([]byte, error) {
 	switch {
 	case kind == Agent && p.Key != nil:
 		return nil, errors.New("exchange: agent payload has a key")
-	case kind == Device && (len(p.Key) == 0 || p.Key[0] != '{'):
-		return nil, errors.New("exchange: device payload lacks a key object")
+	case kind == Device && p.Key == nil:
+		return nil, errors.New("exchange: device payload lacks a key")
 	}
 	b := []byte("{")
 	if p.Key != nil {
+		k, err := record.EncodeKey(*p.Key)
+		if err != nil {
+			return nil, fmt.Errorf("exchange: device key: %w", err)
+		}
 		b = append(b, `"key":`...)
-		b = append(b, p.Key...)
+		b = append(b, k...)
 		b = append(b, ',')
 	}
 	return append(b, `"token_sha256":"`+p.TokenSHA256+`"}`...), nil
@@ -90,7 +93,8 @@ func decodePayload(kind string, b []byte) (Payload, error) {
 	if err := json.Unmarshal(b, &p); err != nil {
 		return Payload{}, fmt.Errorf("exchange: payload: %w", err)
 	}
-	// Re-encoding also catches unknown and duplicate fields.
+	// Re-encoding catches unknown, duplicate and missing fields, inside the
+	// key too.
 	enc, err := p.encode(kind)
 	if err != nil {
 		return Payload{}, err

@@ -19,7 +19,6 @@ import (
 	"github.com/adeci/mandate/store"
 )
 
-// pollEvery is how often Email/changes asks what is new.
 const pollEvery = 30 * time.Second
 
 func main() {
@@ -55,7 +54,6 @@ type fmConnector struct {
 	acct *account // nil until linked
 }
 
-// account is a linked token and its sync loop.
 type account struct {
 	client
 	cancel context.CancelFunc
@@ -68,7 +66,6 @@ type account struct {
 	err     error // of the last sync
 }
 
-// conn is what the account's session and settings say.
 type conn struct {
 	api, download, accountID, username string
 	roles                              map[string]string // mailbox role → ID
@@ -92,7 +89,6 @@ func newConnector(ctx context.Context, st *store.Store, token connector.Secret, 
 	return c, nil
 }
 
-// link makes a the linked account and starts syncing it.
 func (c *fmConnector) link(a *account) {
 	ctx, cancel := context.WithCancel(c.ctx)
 	a.cancel, a.done, a.kick = cancel, make(chan struct{}), make(chan struct{}, 1)
@@ -248,7 +244,6 @@ func (c *fmConnector) connect(ctx context.Context, a *account) (*conn, error) {
 	return c.refresh(ctx, a, &conn{api: s.APIURL, download: s.DownloadURL, accountID: mail, username: s.Username})
 }
 
-// refresh reads cn's mailboxes and identities anew.
 func (c *fmConnector) refresh(ctx context.Context, a *account, cn *conn) (*conn, error) {
 	resps, err := a.call(ctx, cn.api,
 		invocation{"Mailbox/get", map[string]any{"accountId": cn.accountID, "properties": []string{"id", "role"}}, "mb"},
@@ -305,7 +300,6 @@ func (cn *conn) identity(addr string) (identity, bool) {
 	return wild, found
 }
 
-// defaultIdentity is the one for the login address, or else the first.
 func (cn *conn) defaultIdentity() (identity, bool) {
 	if id, ok := cn.identity(cn.username); ok && !strings.HasPrefix(id.Email, "*@") {
 		return id, true

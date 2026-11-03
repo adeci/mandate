@@ -29,7 +29,6 @@ func kindFor(conv *gmproto.Conversation) string {
 	return "dm"
 }
 
-// others are the visible participants other than the owner.
 func others(conv *gmproto.Conversation) []*gmproto.Participant {
 	var out []*gmproto.Participant
 	for _, p := range conv.GetParticipants() {
@@ -208,7 +207,6 @@ func convert(m *gmproto.Message, conv *gmproto.Conversation) (op, bool) {
 	return op{kind: opUpsert, msg: msg}, true
 }
 
-// content is the subject and text parts, and the files.
 func content(m *gmproto.Message) (body string, files []store.Media) {
 	var parts []string
 	if s := m.GetSubject(); s != "" {

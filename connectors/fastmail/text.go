@@ -83,7 +83,6 @@ func plainText(e email, limit int) (string, bool) {
 
 var blankLines = regexp.MustCompile(`\n{3,}`)
 
-// tidy trims trailing space from lines and keeps at most one blank line.
 func tidy(s string) string {
 	lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
 	for i, l := range lines {
@@ -160,7 +159,6 @@ func htmlText(s string) string {
 	}
 }
 
-// collapse turns HTML whitespace runs into single spaces.
 func collapse(s string) string {
 	var b strings.Builder
 	space := false
@@ -181,7 +179,6 @@ func collapse(s string) string {
 	return b.String()
 }
 
-// threadName is subject without reply and forward prefixes.
 func threadName(subject string) string {
 	s := oneLine(subject)
 	for {

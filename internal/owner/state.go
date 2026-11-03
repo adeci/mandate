@@ -108,6 +108,9 @@ const (
 	afterEnd = 24 * time.Hour
 	// Decided requests and proposals are kept this long for the agent's poll.
 	keepDecided = 24 * time.Hour
+	// Per identity, counted from the requests kept here.
+	requestsWaiting = 3
+	requestsPerHour = 10
 )
 
 func newState() state {
@@ -173,8 +176,6 @@ func writeFile(path string, b []byte, mode fs.FileMode) error {
 	return nil
 }
 
-// end is when a grant stops being open for good: never for a running
-// routine.
 func (g *grant) end() time.Time {
 	if !g.ClosedAt.IsZero() && (g.Record.Schedule != nil || g.ClosedAt.Before(g.Record.Until.Time)) {
 		return g.ClosedAt
@@ -191,7 +192,6 @@ func (g *grant) live(now time.Time) bool {
 	return g.Record.Schedule != nil || now.Before(g.Record.Until.Add(afterEnd))
 }
 
-// open is whether a one-off window is open now.
 func (g *grant) open(now time.Time) bool {
 	return g.Record.Schedule == nil && g.ClosedAt.IsZero() &&
 		!now.Before(g.Record.From.Time) && now.Before(g.Record.Until.Time)
@@ -240,7 +240,6 @@ func (st *state) expire(now time.Time) bool {
 	return changed
 }
 
-// deleteIdentity ends the identity's grants and refuses what it waits for.
 func (st *state) deleteIdentity(id string, now time.Time) {
 	delete(st.Identities, id)
 	for gid, g := range st.Grants {
@@ -260,7 +259,6 @@ func (st *state) deleteIdentity(id string, now time.Time) {
 	}
 }
 
-// live is the set the gateway serves, as PUT /internal/live takes it.
 type live struct {
 	Keys       []record.Envelope `json:"keys"`
 	Identities []record.Envelope `json:"identities"`

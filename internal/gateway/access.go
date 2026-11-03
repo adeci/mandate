@@ -4,11 +4,9 @@ import (
 	"cmp"
 	"context"
 	"fmt"
-	"math"
 	"net/http"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -130,8 +128,6 @@ const (
 	maxTerm        = 200
 	matchesPerTerm = 5
 	maxReason      = 1000
-	maxWaiting     = 3
-	maxPerHour     = 10
 )
 
 type requestSchedule struct {
@@ -273,29 +269,16 @@ func (g *gateway) requestAccess(w http.ResponseWriter, r *http.Request, cl *call
 		writeError(w, http.StatusConflict, fmt.Sprintf("no window on %s is open or ended in the last day, so there is nothing to extend", c.name))
 		return
 	}
-	sent, retry := g.requests.reserve(r.Context(), g, cl.identity)
-	if sent == nil {
-		writeJSON(w, http.StatusTooManyRequests, connector.Error{
-			Message:    fmt.Sprintf("at most %d waiting requests and %d an hour; wait for the owner", maxWaiting, maxPerHour),
-			RetryAfter: retry,
-		})
-		return
-	}
 	if !g.matchTerms(r.Context(), w, cl, c, o.Terms) {
-		g.requests.release(cl.identity, sent)
 		return
 	}
 	var created struct {
 		ID string `json:"id"`
 	}
 	if err := g.toOwner.do(r.Context(), http.MethodPost, "/internal/requests", o, &created); err != nil {
-		g.requests.release(cl.identity, sent)
 		relay(w, cl, "submit request", err)
 		return
 	}
-	g.requests.mu.Lock()
-	sent.id = created.ID
-	g.requests.mu.Unlock()
 	cl.log.Info("access requested", "connector", c.name, "id", created.ID, "kind", o.Kind)
 	writeJSON(w, http.StatusAccepted, map[string]string{"id": created.ID})
 }
@@ -348,89 +331,10 @@ func (g *gateway) requestStatus(w http.ResponseWriter, r *http.Request, cl *call
 		writeError(w, http.StatusNotFound, fmt.Sprintf("no request %q of yours", id))
 		return
 	}
-	st, err := g.ownerRequestStatus(r.Context(), cl.identity, id, wait)
-	if err != nil {
+	var st requestStatus
+	if err := g.toOwner.do(r.Context(), http.MethodGet, "/internal/requests/"+id+query(cl.identity, wait), nil, &st); err != nil {
 		relay(w, cl, "request status", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, st)
-}
-
-func (g *gateway) ownerRequestStatus(ctx context.Context, identity, id string, wait int) (requestStatus, error) {
-	var st requestStatus
-	err := g.toOwner.do(ctx, http.MethodGet, "/internal/requests/"+id+query(identity, wait), nil, &st)
-	if err == nil && st.Status != "pending" {
-		g.requests.decided(identity, id)
-	}
-	return st, err
-}
-
-// requestLimits counts each identity's requests of the last hour, and which
-// of them still wait for the owner, so a request over the limits is refused
-// before its terms are matched. Requests expire after an hour, so older
-// ones no longer wait.
-type requestLimits struct {
-	mu   sync.Mutex
-	sent map[string][]*sentRequest
-}
-
-type sentRequest struct {
-	id      string // "" while being submitted
-	at      time.Time
-	decided bool
-}
-
-// reserve takes a slot for a new request of identity, or answers nil and
-// the seconds until one frees up.
-func (l *requestLimits) reserve(ctx context.Context, g *gateway, identity string) (*sentRequest, int) {
-	now := time.Now()
-	l.mu.Lock()
-	recent := slices.DeleteFunc(l.sent[identity], func(s *sentRequest) bool { return now.Sub(s.at) >= time.Hour })
-	l.sent[identity] = recent
-	if len(recent) >= maxPerHour {
-		retry := int(math.Ceil(recent[0].at.Add(time.Hour).Sub(now).Seconds()))
-		l.mu.Unlock()
-		return nil, max(retry, 1)
-	}
-	var check []string
-	for _, s := range recent {
-		if !s.decided && s.id != "" {
-			check = append(check, s.id)
-		}
-	}
-	l.mu.Unlock()
-	// The owner may have decided meanwhile; a failed check counts as waiting.
-	for _, id := range check {
-		_, _ = g.ownerRequestStatus(ctx, identity, id, 0)
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	waiting := 0
-	for _, s := range l.sent[identity] {
-		if !s.decided {
-			waiting++
-		}
-	}
-	if waiting >= maxWaiting {
-		return nil, 60
-	}
-	s := &sentRequest{at: now}
-	l.sent[identity] = append(l.sent[identity], s)
-	return s, 0
-}
-
-func (l *requestLimits) release(identity string, s *sentRequest) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.sent[identity] = slices.DeleteFunc(l.sent[identity], func(x *sentRequest) bool { return x == s })
-}
-
-func (l *requestLimits) decided(identity, id string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for _, s := range l.sent[identity] {
-		if s.id == id {
-			s.decided = true
-		}
-	}
 }

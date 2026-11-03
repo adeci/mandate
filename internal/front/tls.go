@@ -56,9 +56,7 @@ func tlsConfig(cfg *config.Config, state string) (*tls.Config, error) {
 	return nil, fmt.Errorf("unknown TLS mode %q", cfg.TLS.Mode)
 }
 
-// ownCert loads the key and self-signed certificate front made on its
-// first start, making them if this is it. Clients pin the key, so it never
-// changes.
+// ownCert makes the key on the first start only, since clients pin it.
 func ownCert(state string) (*tls.Certificate, error) {
 	file := filepath.Join(state, "own.pem")
 	b, err := os.ReadFile(file)
@@ -130,8 +128,6 @@ func makeOwnCert(file string) ([]byte, error) {
 	return b, nil
 }
 
-// certFiles serves the owner's certificate and loads it again once the
-// files change.
 type certFiles struct {
 	cert, key string
 
@@ -162,8 +158,8 @@ func (f *certFiles) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	if f.current != nil && now == f.stamp {
 		return f.current, nil
 	}
-	// Remember the stamp even when loading fails: an update may have
-	// replaced one file but not yet the other, and the next change retries.
+	// A renewal may have replaced one file but not yet the other; the next
+	// change retries.
 	f.stamp = now
 	cert, err := tls.LoadX509KeyPair(f.cert, f.key)
 	if err != nil {

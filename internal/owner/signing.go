@@ -24,7 +24,7 @@ type challenge struct {
 	apply func(env record.Envelope, r record.Record) error
 }
 
-// issue hands out c and answers its envelope. The caller holds s.mu.
+// The caller holds s.mu.
 func (s *Server) issue(w http.ResponseWriter, r record.Record, c *challenge) {
 	env, err := record.New(r, s.now())
 	if err != nil {
@@ -41,7 +41,7 @@ func (s *Server) issue(w http.ResponseWriter, r record.Record, c *challenge) {
 	reply(w, http.StatusOK, env)
 }
 
-// cancel cancels the challenges match selects. The caller holds s.mu.
+// The caller holds s.mu.
 func (s *Server) cancel(match func(c *challenge) bool) {
 	for _, c := range s.challenges {
 		if match(c) {

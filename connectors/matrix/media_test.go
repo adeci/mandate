@@ -157,10 +157,9 @@ func TestMediaOverTheLimitIsRefused(t *testing.T) {
 	}, []map[string]any{huge})}))
 	f.hs.waitSynced(n)
 
-	client, _ := serve(t, f)
-	resp, err := client.Media(ctx, "$huge", 0, 1<<10)
+	file, err := f.c.Media(ctx, "$huge", 0, 1<<10)
 	if err == nil {
-		resp.Body.Close()
+		file.Body.Close()
 	}
 	var ce *connector.Error
 	if !errors.As(err, &ce) || ce.Status != http.StatusRequestEntityTooLarge {

@@ -86,7 +86,6 @@ func newConnector(ctx context.Context, st *store.Store, env *connector.Env, zl z
 
 func (c *mxConnector) cryptoPath() string { return filepath.Join(c.dir, "crypto.db") }
 
-// resume opens the stored session, if any, and starts syncing.
 func (c *mxConnector) resume() error {
 	sess, err := loadSession(c.session)
 	if err != nil || sess == nil {
@@ -104,7 +103,6 @@ func (c *mxConnector) resume() error {
 	return nil
 }
 
-// run syncs a until it is stopped or the homeserver logs it out.
 func (c *mxConnector) run(a *account) {
 	ctx, cancel := context.WithCancel(c.ctx)
 	a.cancel = cancel
@@ -118,7 +116,6 @@ func (c *mxConnector) run(a *account) {
 	}()
 }
 
-// drop forgets a after the homeserver logged it out.
 func (c *mxConnector) drop(a *account) {
 	c.setup.Lock()
 	defer c.setup.Unlock()
@@ -137,7 +134,7 @@ func (c *mxConnector) drop(a *account) {
 	}
 }
 
-// use returns the linked account, or nil. Until release, unlinking waits.
+// Unlinking waits until release.
 func (c *mxConnector) use() *account {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -176,7 +173,6 @@ func (c *mxConnector) Health(context.Context) connector.Health {
 const noBackupDetail = "linked without the key backup, so encrypted messages from before linking stay unreadable; " +
 	"relink with the recovery key to read them"
 
-// Close stops syncing once serving has stopped, then closes the databases.
 func (c *mxConnector) Close() error {
 	c.endVerifying(verifyFailure{msg: "the connector stopped", cancel: event.VerificationCancelCodeUser})
 	c.mu.Lock()

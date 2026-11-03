@@ -69,8 +69,6 @@ type verifying struct {
 	result  error // why it ended without linking
 }
 
-// verifyFailure ends a verification. cancel, if set, is sent to the other
-// device.
 type verifyFailure struct {
 	msg    string
 	cancel event.VerificationCancelCode
@@ -83,8 +81,6 @@ func (v *verifying) fail(f verifyFailure) {
 	}
 }
 
-// startVerifying prepares to verify a from another of the owner's devices,
-// then follows the verification in the background.
 func (c *mxConnector) startVerifying(ctx context.Context, a *account) (connector.Step, error) {
 	user := a.sess.UserID
 	devices, err := a.mach.FetchKeys(ctx, []id.UserID{user}, true)
@@ -122,8 +118,6 @@ func (c *mxConnector) startVerifying(ctx context.Context, a *account) (connector
 	return step, nil
 }
 
-// request sends a verification request to the owner's other devices,
-// replacing mandate's earlier one, until the owner acts on one.
 func (c *mxConnector) request(v *verifying) {
 	c.mu.Lock()
 	old, adopted := v.txn, v.adopted
@@ -163,9 +157,7 @@ func (v *verifying) cancel(ctx context.Context, txn id.VerificationTransactionID
 	}
 }
 
-// adopt makes txn the verification followed once the owner acted on it, and
-// returns mandate's request it replaces. It reports false if another one is
-// followed already.
+// adopt reports false if another verification is followed already.
 func (v *verifying) adopt(txn id.VerificationTransactionID) (id.VerificationTransactionID, bool) {
 	v.c.mu.Lock()
 	defer v.c.mu.Unlock()
@@ -180,15 +172,12 @@ func (v *verifying) adopt(txn id.VerificationTransactionID) (id.VerificationTran
 	return old, true
 }
 
-// current reports whether txn is the verification followed.
 func (v *verifying) current(txn id.VerificationTransactionID) bool {
 	v.c.mu.Lock()
 	defer v.c.mu.Unlock()
 	return txn != "" && txn == v.txn
 }
 
-// follow waits for the verification to end, then links a, or logs it out
-// and forgets it.
 func (c *mxConnector) follow(v *verifying, stopSync func()) {
 	defer close(v.finished)
 	err := c.awaitVerified(v)
@@ -248,8 +237,6 @@ wait:
 	return errors.New(f.msg)
 }
 
-// verifySync receives the to-device messages verification and secret
-// sharing need, until ctx is done.
 func (c *mxConnector) verifySync(ctx context.Context, v *verifying) {
 	var since string
 	var wait time.Duration
@@ -290,7 +277,7 @@ func (c *mxConnector) setVerifyState(v *verifying, s verifyState) {
 	c.mu.Unlock()
 }
 
-// step is what the owner's app shows; c.mu must be held.
+// c.mu must be held.
 func (v *verifying) step() connector.Step {
 	s := connector.Step{ID: "verify", Title: setupTitle, Poll: pollSeconds}
 	switch v.state {
@@ -314,7 +301,6 @@ func (v *verifying) step() connector.Step {
 	return s
 }
 
-// verifyingStep reports the verification in progress, or how it ended.
 func (c *mxConnector) verifyingStep() (connector.Step, error, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -332,7 +318,6 @@ func (c *mxConnector) verifyingStep() (connector.Step, error, bool) {
 	return linkedStep(v.a.sess), nil, true
 }
 
-// answer takes the owner's answer to whether the emoji match.
 func (c *mxConnector) answer(ctx context.Context, answer string) (connector.Step, error) {
 	c.mu.Lock()
 	v := c.verifying
@@ -363,8 +348,6 @@ func (c *mxConnector) answer(ctx context.Context, answer string) (connector.Step
 	return connector.Step{}, connector.Invalid("confirm is yes or no")
 }
 
-// endVerifying stops a verification in progress and waits until it is
-// cleaned up.
 func (c *mxConnector) endVerifying(f verifyFailure) {
 	c.mu.Lock()
 	v := c.verifying
@@ -376,8 +359,7 @@ func (c *mxConnector) endVerifying(f verifyFailure) {
 	}
 }
 
-// restoreBackup asks the owner's verified devices for the key backup key and
-// imports the backup with it. It reports whether it did; nobody sharing the
+// restoreBackup reports whether it imported the key backup; nobody sharing the
 // key within wait is not an error.
 func (a *account) restoreBackup(ctx context.Context, wait time.Duration) (bool, error) {
 	version, err := a.cli.GetKeyBackupLatestVersion(ctx)
@@ -411,8 +393,6 @@ func (a *account) restoreBackup(ctx context.Context, wait time.Duration) (bool, 
 	return false, err
 }
 
-// backupKey decodes a shared key backup key, or returns nil if it is not the
-// key to the backup with public key pub.
 func backupKey(secret string, pub id.Ed25519) *backup.MegolmBackupKey {
 	raw, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(secret, "="))
 	if err != nil {
@@ -427,8 +407,6 @@ func backupKey(secret string, pub id.Ed25519) *backup.MegolmBackupKey {
 
 // The verificationhelper callbacks run on the verification sync goroutine.
 
-// VerificationRequested accepts a request from another of the owner's
-// devices, unless the owner already acted on another one.
 func (v *verifying) VerificationRequested(ctx context.Context, txn id.VerificationTransactionID, from id.UserID, dev id.DeviceID) {
 	if from != v.a.sess.UserID {
 		v.cancel(ctx, txn, event.VerificationCancelCodeUser, "mandate verifies only its owner's devices")
@@ -448,8 +426,6 @@ func (v *verifying) VerificationRequested(ctx context.Context, txn id.Verificati
 	}
 }
 
-// VerificationReady is called when the owner accepted mandate's request, or
-// mandate accepted theirs.
 func (v *verifying) VerificationReady(ctx context.Context, txn id.VerificationTransactionID, _ id.DeviceID, sas, _ bool, _ *verificationhelper.QRCode) {
 	// The helper holds its lock during this callback, and saves the
 	// transaction as ready after it returns; the requests below wait for it.

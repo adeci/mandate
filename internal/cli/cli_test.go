@@ -67,7 +67,7 @@ func TestRead(t *testing.T) {
 	// A multi-line body, and an OSC title change and a C1 CSI from a
 	// third party.
 	const rows = `{"columns":["seq","sender","body"],"rows":[[7,"~Mom\u001b]0;pwned\u0007","see you\nat 5\t\\o/"],[8,"me","a\u009b2Jb"]],"more":true,"next_before":7}`
-	c, g := newGateway(t, map[string][]string{"GET /agent/v1/signal/messages": {"200 " + rows, "200 " + rows}})
+	c, g := newGateway(t, map[string][]string{"GET /agent/v1/signal/messages": {"200 " + rows}})
 	if err := c.run(t.Context(), []string{"signal", "messages", "Fam+1=", "--limit", "2"}); err != nil {
 		t.Fatal(err)
 	}
@@ -78,13 +78,6 @@ func TestRead(t *testing.T) {
 	}
 	if g.got[0] != "GET /agent/v1/signal/messages?chat=Fam%2B1%3D&limit=2" {
 		t.Errorf("request %q", g.got[0])
-	}
-	c.out = &bytes.Buffer{}
-	if err := c.run(t.Context(), []string{"signal", "messages", "Fam+1=", "--json"}); err != nil {
-		t.Fatal(err)
-	}
-	if out, _ := output(c); out != rows+"\n" {
-		t.Errorf("json %q", out)
 	}
 }
 
@@ -130,35 +123,5 @@ func TestProposal(t *testing.T) {
 	c, _ = newGateway(t, map[string][]string{"POST /agent/v1/signal/send": {`202 {"id":"P1","status":"pending"}`}})
 	if err := c.run(t.Context(), []string{"signal", "send", "Fam+1=", "hi", "--wait", "0"}); ExitCode(err) != exitTryLater {
 		t.Errorf("send --wait 0: exit %d (%v)", ExitCode(err), err)
-	}
-}
-
-func TestRequest(t *testing.T) {
-	t.Parallel()
-	for name, tc := range map[string]struct {
-		args []string
-		body string
-	}{
-		"once": {
-			[]string{"--chat", "Family", "--for", "1h", "--since", "2d"},
-			`{"connector":"signal","chats":["Family"],"for":3600,"horizon":172800,"reason":"summary"}`,
-		},
-		"routine": {
-			[]string{"--chat", "Family", "--every", "weekdays", "--at", "07:00", "--for", "20m", "--since", "all"},
-			`{"connector":"signal","chats":["Family"],"horizon":0,"schedule":{"days":[1,2,3,4,5],"start":"07:00","length":1200},"reason":"summary"}`,
-		},
-		"extend": {[]string{"--extend"}, `{"connector":"signal","extend":true,"reason":"summary"}`},
-	} {
-		c, g := newGateway(t, map[string][]string{
-			"POST /agent/v1/access/requests":   {`202 {"id":"R1"}`},
-			"GET /agent/v1/access/requests/R1": {`200 {"status":"granted","until":"2026-11-03T08:00:00Z"}`},
-		})
-		args := append([]string{"request", "signal", "--reason", "summary", "--wait", "0"}, tc.args...)
-		if err := c.run(t.Context(), args); err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		if want := "POST /agent/v1/access/requests " + tc.body; g.got[0] != want {
-			t.Errorf("%s:\n%s\nwant\n%s", name, g.got[0], want)
-		}
 	}
 }

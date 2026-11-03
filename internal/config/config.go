@@ -22,16 +22,15 @@ type Config struct {
 }
 
 type TLS struct {
-	Mode   string `toml:"mode"`   // own, acme or cert
-	Domain string `toml:"domain"` // acme
-	Cert   string `toml:"cert"`   // cert
-	Key    string `toml:"key"`    // cert
+	Mode   string `toml:"mode"`
+	Domain string `toml:"domain"`
+	Cert   string `toml:"cert"`
+	Key    string `toml:"key"`
 }
 
 type Connector struct {
-	Command string `toml:"command"`
-	// Config is passed to the connector as JSON through --config.
-	Config map[string]any `toml:"config"`
+	Command string         `toml:"command"`
+	Config  map[string]any `toml:"config"`
 }
 
 // The name becomes the user mandate-NAME, which useradd caps at 32
@@ -103,21 +102,16 @@ func root(path string) string {
 	return filepath.Join(os.Getenv("MANDATE_ROOT"), path)
 }
 
-// File is the config file every process reads.
 func File() string { return root("/etc/mandate/mandate.toml") }
 
-// StateDir is the state directory of front, gateway or owner.
 func StateDir(process string) string { return root("/var/lib/mandate/" + process) }
 
-// Socket is where gateway or owner serves HTTP. Each process has a runtime
-// directory of its own, since a dynamic user can't share one with others.
+// Each process has a runtime directory of its own, since a dynamic user
+// can't share one with others.
 func Socket(process string) string { return root("/run/mandate/" + process + "/socket") }
 
-// SetupPasswordFile holds the setup password in plain text, for root only.
 func SetupPasswordFile() string { return root("/var/lib/mandate/setup-password") }
 
-// ConnectorDir is the connector's --state directory.
 func ConnectorDir(name string) string { return root("/var/lib/mandate/connectors/" + name) }
 
-// ConnectorSocket is the connector's --socket.
 func ConnectorSocket(name string) string { return root("/run/mandate/connectors/" + name + "/socket") }

@@ -7,40 +7,25 @@ import (
 	"fmt"
 )
 
-// filter prefixes every query. chats leaves out never-shared chats, DMs with
-// never-shared people and everything under either, and gives each chat its
-// ancestors' names as a prefix; msgs leaves out never-shared people and
-// marks login-code and deleted bodies. ?1 and ?2 are the never-shared chat
-// and person IDs as JSON arrays.
+// filter prefixes every query with the chats and msgs an agent may see. ?1
+// and ?2 are the never-shared chat and person IDs, ?3 the scope (see rule),
+// all JSON arrays.
 //
-// ?3 is the scope, a JSON array of rules (see rule). A chat is covered by a
-// rule that names its ID or names no chats; a grant on a guild or channel
-// covers nothing under it, as the owner signs exactly the chats they picked.
-// A chat's cutoff is the earliest of its covering rules', and chats leaves
-// out a chat no rule covers. msgs leaves out messages sent before their
-// chat's cutoff, which makes the grants a union. A rule with an until, a
-// grant whose window has ended, shows only messages sent from its cutoff up
-// to until; bounded marks the chats such a rule covers, so reads, which never
-// carry one, skip the per-rule check. An ancestor's name prefixes a chat's
-// only when the scope covers the ancestor too, so a grant on a thread does
-// not name its channel.
+// A rule naming chats covers exactly those, nothing under them: the owner
+// signs the chats they picked. A rule with an until, an ended grant, shows
+// only what it showed before its end; bounded spares reads, which carry
+// none, the per-rule check.
 //
-// A DM's ID is not its other participant's ID everywhere (Discord channels,
-// Matrix rooms), so a DM is also matched by its stored participants and by
-// who wrote in it. The unary + stops SQLite from looking these up by kind or
-// container, so the hidden people drive both lookups.
+// A DM's ID is not always its other person's (Discord channels, Matrix
+// rooms), so hiding a person also matches DMs by participants and by who
+// wrote in them. The unary + keeps SQLite driving both lookups from the
+// hidden people.
 //
-// A chat is followed up to three ancestors; a deeper chain is left out, so
-// every ancestor is checked. Joins by primary key cost far less than a
-// recursive walk on every query.
+// Three ancestors are joined by primary key, far cheaper than a recursive
+// walk per query; a deeper chain is left out, so every ancestor is checked.
 //
-// msgs.text is the body as agents see it: login codes replaced, deletions
-// and media marked in brackets. Search matches body, not the markers. A
-// message's files are marked by type and name, and numbered when there are
-// several; a message without stored files keeps its media_type. The
-// login-code check reads the file names too, as senders name a file after
-// the code it holds. A deleted message keeps only its marker: connectors keep
-// deleted bodies (a mail trash) for restore.
+// The login-code check reads file names too, as senders name a file after
+// the code; deleted bodies stay in the store for restore and never show.
 const filter = `WITH
 hidden_person(id) AS (SELECT value FROM json_each(?2)),
 hidden(id) AS (

@@ -89,8 +89,15 @@ FROM containers WHERE id = ?1`, chat).Scan(&kind, &name, &parent, &parts)
 			return record.Field{}, fmt.Errorf("chat %s participants: %w", chat, err)
 		}
 		id := chat
-		if len(ps) == 1 && ps[0].Handle != "" {
-			id = "@" + ps[0].Handle
+		if len(ps) == 1 {
+			var h string
+			err := db.QueryRowContext(ctx, `SELECT handle FROM discord_handles WHERE user_id = ?1`, ps[0].ID).Scan(&h)
+			switch {
+			case err == nil:
+				id = "@" + h
+			case !errors.Is(err, sql.ErrNoRows):
+				return record.Field{}, fmt.Errorf("look up handle: %w", err)
+			}
 		}
 		return record.Field{Label: "To", Value: withID(name, id)}, nil
 	case kindGroup:

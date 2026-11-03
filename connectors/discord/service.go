@@ -278,6 +278,11 @@ func (s *service) loadDMs(ctx context.Context, dl time.Time) ([]apiChannel, erro
 	if err := s.up.get(ctx, dl, r, &cs); err != nil {
 		return nil, err
 	}
+	for i := range cs {
+		if err := saveHandles(ctx, s.st.DB(), cs[i].Recipients); err != nil {
+			return nil, err
+		}
+	}
 	s.dms = cachedList[apiChannel]{at: s.clock.Now(), v: cs}
 	return cs, nil
 }
@@ -629,26 +634,25 @@ func adopt(ctx context.Context, db *sql.DB, id, guildID string) error {
 	return err
 }
 
-// reparentThreads moves threads stored under their guild by earlier versions
-// under their channel, where the thread's starter message says which one it
-// is: a thread started from a message shares the message's ID. The others
-// move when Discord next describes them.
-func reparentThreads(ctx context.Context, db *sql.DB) (int64, error) {
-	res, err := db.ExecContext(ctx, `UPDATE containers AS t SET parent_id = ch.id
-FROM messages AS m JOIN containers AS ch ON ch.id = m.container_id
-WHERE t.kind = 'thread' AND m.id = t.id AND ch.kind = 'channel' AND ch.parent_id = t.parent_id`)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
+// discord_handles keeps each DM partner's @handle, which approvals show
+// beside the display name anyone may copy.
+const handlesSchema = `CREATE TABLE IF NOT EXISTS discord_handles (
+    user_id TEXT PRIMARY KEY,
+    handle  TEXT NOT NULL
+)`
 
-// markSenderNames marks ~ the sender names stored by earlier versions,
-// which left them unmarked. Participants are rewritten on the next sync.
-func markSenderNames(ctx context.Context, db *sql.DB) error {
-	_, err := db.ExecContext(ctx, `UPDATE messages SET sender_name = '~' || sender_name
-WHERE sender_name <> '' AND sender_name NOT LIKE '~%'`)
-	return err
+func saveHandles(ctx context.Context, db *sql.DB, users []apiUser) error {
+	for i := range users {
+		h := handle(&users[i])
+		if users[i].ID == "" || h == "" {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO discord_handles (user_id, handle) VALUES (?1, ?2)
+ON CONFLICT (user_id) DO UPDATE SET handle = excluded.handle`, users[i].ID, h); err != nil {
+			return fmt.Errorf("store handle: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *service) fetch(ctx context.Context, dl time.Time, req fetchRequest) (connector.ReadResult, error) {
@@ -738,7 +742,7 @@ func (s *service) fetch(ctx context.Context, dl time.Time, req fetchRequest) (co
 		if err := s.st.UpsertMessage(ctx, msg); err != nil {
 			return connector.ReadResult{}, err
 		}
-		if i < limit {
+		if len(ids) < limit {
 			ids = append(ids, msg.ID)
 		}
 	}

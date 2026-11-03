@@ -243,7 +243,7 @@ func participants(c *apiChannel) []store.Participant {
 	var ps []store.Participant
 	for i := range c.Recipients {
 		if u := &c.Recipients[i]; u.ID != "" {
-			ps = append(ps, store.Participant{ID: u.ID, Name: displayName(u), Handle: handle(u)})
+			ps = append(ps, store.Participant{ID: u.ID, Name: displayName(u)})
 		}
 	}
 	return ps

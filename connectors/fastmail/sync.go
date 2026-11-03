@@ -229,7 +229,6 @@ func (c *fmConnector) apply(ctx context.Context, a *account, cn *conn, created, 
 	return c.store(ctx, a, cn, need)
 }
 
-// store reads ids in full and stores them.
 func (c *fmConnector) store(ctx context.Context, a *account, cn *conn, ids []string) error {
 	for batch := range slices.Chunk(ids, getBatch) {
 		list, err := c.getEmails(ctx, a, cn, batch, emailProperties, 4*maxText)
@@ -344,7 +343,6 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
 	return c.st.UpsertMessage(ctx, msg)
 }
 
-// addresses joins the bare addresses of as.
 func addresses(as []address) string {
 	s := make([]string, len(as))
 	for i, a := range as {

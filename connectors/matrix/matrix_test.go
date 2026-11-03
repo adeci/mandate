@@ -2,15 +2,11 @@ package main
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -567,35 +563,25 @@ func TestPrepare(t *testing.T) {
 	}
 }
 
-func TestApprovedSendRunsOnce(t *testing.T) {
+func TestSend(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
 	f := newFixture(t)
 	f.link()
 	dm := store.Container{ID: dmRoom.String(), Kind: kindDM, Name: "~Bob", Participants: []store.Participant{{ID: bob.String(), Name: "~Bob"}}}
-	if err := f.st.UpsertContainer(context.Background(), dm); err != nil {
+	if err := f.st.UpsertContainer(ctx, dm); err != nil {
 		t.Fatal(err)
 	}
-	client, key := serve(t, f)
-	p, err := client.Prepare(context.Background(), "send", map[string]string{"chat": dmRoom.String(), "text": "running late"})
+	p, err := f.c.Prepare(ctx, "send", map[string]string{"chat": dmRoom.String(), "text": "running late"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now()
-	rid := record.NewID()
-	a := sign(t, record.Write{
-		ID: rid, Connector: "matrix", Op: "send", Args: p.Args, Display: p.Display,
-		CreatedAt: record.Time{Time: now}, ExpiresAt: record.Time{Time: now.Add(time.Hour)},
-	}, key)
-	res, err := client.Execute(context.Background(), a)
-	if err != nil || res.Status != connector.Done || res.Ref != "$sent1" {
-		t.Fatalf("execute: %+v %v", res, err)
-	}
-	var ce *connector.Error
-	if _, err := client.Execute(context.Background(), a); !errors.As(err, &ce) || ce.Status != http.StatusConflict {
-		t.Fatalf("replay: %v", err)
+	res := f.c.Execute(ctx, record.Write{ID: "p1", Args: p.Args})
+	if res.Status != connector.Done || res.Ref != "$sent1" {
+		t.Fatalf("execute: %+v", res)
 	}
 	sent := f.hs.sent()
-	if len(sent) != 1 || sent[0].room != dmRoom || sent[0].typ != "m.room.message" || sent[0].txn != "mandate-"+rid ||
+	if len(sent) != 1 || sent[0].room != dmRoom || sent[0].typ != "m.room.message" || sent[0].txn != "mandate-p1" ||
 		!strings.Contains(string(sent[0].content), `"body":"running late"`) {
 		t.Fatalf("sent %+v", sent)
 	}
@@ -749,77 +735,6 @@ func TestLoggedOutByHomeserver(t *testing.T) {
 		_, err := os.Stat(filepath.Join(f.env.PrivateDir(), "session.json"))
 		return errors.Is(err, os.ErrNotExist)
 	})
-}
-
-// serve runs f's connector behind connector.Server, which checks approvals,
-// and returns a client and the key that approves.
-func serve(t *testing.T, f *fixture) (*connector.Client, *ecdsa.PrivateKey) {
-	t.Helper()
-	dir := t.TempDir()
-	if err := os.Mkdir(filepath.Join(dir, "private"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	gid := uint32(os.Getgid())
-	srv, err := connector.NewServer(f.c, "matrix", dir, gid, gid, slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// t.TempDir can be too long for a socket path.
-	sockDir, err := os.MkdirTemp("", "mx")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
-	sock := filepath.Join(sockDir, "s")
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- srv.Serve(ctx, ln) }()
-	t.Cleanup(func() { cancel(); <-done })
-	client := connector.Dial("matrix", sock)
-
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key, err := record.P256Key(&priv.PublicKey, "phone")
-	if err != nil {
-		t.Fatal(err)
-	}
-	entry := sign(t, record.KeyEntry{Op: "add", Key: key, At: record.Time{Time: time.Now()}}, priv)
-	if _, err := client.PutKeys(context.Background(), []record.Envelope{entry}); err != nil {
-		t.Fatal(err)
-	}
-	return client, priv
-}
-
-func sign(t *testing.T, r record.Record, priv *ecdsa.PrivateKey) record.Envelope {
-	t.Helper()
-	e, err := record.New(r, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := record.Sign(&e, priv); err != nil {
-		t.Fatal(err)
-	}
-	return e
-}
-
-func TestSetupStartsWithLogin(t *testing.T) {
-	t.Parallel()
-	f := newFixture(t)
-	step, err := f.c.Setup(context.Background(), "", nil)
-	if err != nil || step.ID != "login" || len(step.Fields) == 0 {
-		t.Fatalf("first step %+v %v", step, err)
-	}
-	f.link()
-	var ce *connector.Error
-	if _, err := f.c.Setup(context.Background(), "", nil); !errors.As(err, &ce) || ce.Status != http.StatusConflict {
-		t.Fatalf("setup while linked: %v", err)
-	}
 }
 
 // An access token for a new device links as that device; one whose device

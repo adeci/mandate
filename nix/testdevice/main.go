@@ -278,19 +278,7 @@ func join(ctx context.Context, state, u, spki, name string) error {
 	}
 	token := d.Token
 	d.Token = ""
-	// The payload is JCS: re-encoding through a map sorts the keys.
-	var m map[string]any
-	b, err := json.Marshal(k)
-	if err == nil {
-		err = json.Unmarshal(b, &m)
-	}
-	if err == nil {
-		b, err = json.Marshal(m)
-	}
-	if err != nil {
-		return err
-	}
-	payload := exchange.Payload{Key: b, TokenSHA256: exchange.TokenSHA256(token)}
+	payload := exchange.Payload{Key: &k, TokenSHA256: exchange.TokenSHA256(token)}
 
 	var started struct{ ID string }
 	if err := d.callJSON(ctx, http.MethodPost, "/owner/v1/join", map[string]string{"kind": exchange.Device, "name": name}, &started); err != nil {

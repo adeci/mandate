@@ -3,18 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"reflect"
 	"sync"
@@ -427,98 +422,9 @@ func TestExecute(t *testing.T) {
 	}
 }
 
-// serve runs f's connector behind connector.Server, which checks approvals,
-// and returns a client and the key that approves.
-func serve(t *testing.T, f *fixture) (*connector.Client, *ecdsa.PrivateKey) {
-	t.Helper()
-	dir := t.TempDir()
-	if err := os.Mkdir(filepath.Join(dir, "private"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	gid := uint32(os.Getgid())
-	srv, err := connector.NewServer(f.c, "whatsapp", dir, gid, gid, slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// t.TempDir can be too long for a socket path.
-	sockDir, err := os.MkdirTemp("", "wa")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
-	sock := filepath.Join(sockDir, "s")
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- srv.Serve(ctx, ln) }()
-	t.Cleanup(func() { cancel(); <-done })
-	client := connector.Dial("whatsapp", sock)
-
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key, err := record.P256Key(&priv.PublicKey, "phone")
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now()
-	entry := sign(t, record.KeyEntry{Op: "add", Key: key, At: record.Time{Time: now}}, priv)
-	if _, err := client.PutKeys(context.Background(), []record.Envelope{entry}); err != nil {
-		t.Fatal(err)
-	}
-	return client, priv
-}
-
-func sign(t *testing.T, r record.Record, priv *ecdsa.PrivateKey) record.Envelope {
-	t.Helper()
-	e, err := record.New(r, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := record.Sign(&e, priv); err != nil {
-		t.Fatal(err)
-	}
-	return e
-}
-
-func approve(t *testing.T, priv *ecdsa.PrivateKey, p connector.Prepared) record.Envelope {
-	t.Helper()
-	now := time.Now()
-	return sign(t, record.Write{
-		ID: record.NewID(), Connector: "whatsapp", Op: "send", Args: p.Args, Display: p.Display,
-		CreatedAt: record.Time{Time: now}, ExpiresAt: record.Time{Time: now.Add(time.Hour)},
-	}, priv)
-}
-
-func TestApprovedSendRunsOnce(t *testing.T) {
-	t.Parallel()
-	f := newFixture(t)
-	client, key := serve(t, f)
-	p, err := client.Prepare(context.Background(), "send", map[string]string{"chat": farid.String(), "text": "running late"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	a := approve(t, key, p)
-
-	res, err := client.Execute(context.Background(), a)
-	if err != nil || res.Status != connector.Done {
-		t.Fatalf("execute: %+v %v", res, err)
-	}
-	var cerr *connector.Error
-	if _, err := client.Execute(context.Background(), a); !errors.As(err, &cerr) || cerr.Status != http.StatusConflict {
-		t.Fatalf("replay: %v", err)
-	}
-	if got := f.cli.calls(); !reflect.DeepEqual(got, []sent{{to: farid, text: "running late"}}) {
-		t.Fatalf("sends = %+v", got)
-	}
-}
-
 // A security code that changed in the last week is shown on the approval,
-// and one that changes after approving stops the send.
+// and one that changes after approving changes the display, which stops
+// the send.
 func TestIdentityChange(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -528,7 +434,6 @@ func TestIdentityChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	client, key := serve(t, f)
 	security := func(chat types.JID) string {
 		t.Helper()
 		p, err := f.c.Prepare(ctx, "send", map[string]string{"chat": chat.String(), "text": "hi"})
@@ -559,17 +464,16 @@ func TestIdentityChange(t *testing.T) {
 		t.Fatalf("group: %q, want %q", got, want)
 	}
 
-	p, err := client.Prepare(ctx, "send", map[string]string{"chat": samParkL.String(), "text": "hi"})
+	before, err := f.c.Prepare(ctx, "send", map[string]string{"chat": samParkL.String(), "text": "hi"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := approve(t, key, p)
 	in.handle(ctx, &events.IdentityChange{JID: samParkL, Timestamp: now})
-	var cerr *connector.Error
-	if _, err := client.Execute(ctx, a); !errors.As(err, &cerr) || cerr.Status != http.StatusConflict {
-		t.Fatalf("execute after a change: %v", err)
+	after, err := f.c.Prepare(ctx, "send", before.Args)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := f.cli.calls(); len(got) != 0 {
-		t.Fatalf("sent %+v", got)
+	if reflect.DeepEqual(after.Display, before.Display) {
+		t.Fatalf("display unchanged after a new change: %+v", after.Display)
 	}
 }

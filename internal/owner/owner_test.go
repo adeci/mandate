@@ -333,14 +333,17 @@ func (h *harness) agent(owner device) string {
 	return ident
 }
 
-func (h *harness) request(identity string) string {
-	h.t.Helper()
-	body := map[string]any{
+func requestBody(identity string) map[string]any {
+	return map[string]any{
 		"identity": identity, "connector": "test", "kind": "once", "for": 1800, "horizon": 86400, "reason": "summary",
 		"terms": []term{{Term: "fam", Chats: []chat{{"c1", "Family"}, {"c2", "~Fam"}}}},
 	}
+}
+
+func (h *harness) request(identity string) string {
+	h.t.Helper()
 	var out struct{ ID string }
-	if st := h.do("POST", "/internal/requests", "", body, &out); st != http.StatusCreated {
+	if st := h.do("POST", "/internal/requests", "", requestBody(identity), &out); st != http.StatusCreated {
 		h.t.Fatalf("request = %d", st)
 	}
 	return out.ID
@@ -463,14 +466,22 @@ func TestChallengeRules(t *testing.T) {
 	if st, _ := h.sign(owner, extend); st != http.StatusConflict {
 		t.Errorf("challenge after Close = %d", st)
 	}
+
+	h.request(agent)
+	h.request(agent) // three wait now
+	var limited struct {
+		RetryAfter int `json:"retry_after_seconds"`
+	}
+	if st := h.do("POST", "/internal/requests", "", requestBody(agent), &limited); st != http.StatusTooManyRequests || limited.RetryAfter < 1 {
+		t.Errorf("fourth waiting request = %d, retry after %d", st, limited.RetryAfter)
+	}
 }
 
 func TestDeviceJoinAndRevocation(t *testing.T) {
 	h := start(t, nil)
 	phone := h.pair()
 	laptop := newDevice(t, "MacBook")
-	key, _ := json.Marshal(laptop.key)
-	p := exchange.Payload{Key: key, TokenSHA256: exchange.TokenSHA256(laptop.token)}
+	p := exchange.Payload{Key: &laptop.key, TokenSHA256: exchange.TokenSHA256(laptop.token)}
 
 	id, st, out := h.join("/owner/v1", exchange.Device, "MacBook", "654321", "111111", p, phone)
 	if st != http.StatusForbidden || out["attempts_left"] != 2.0 {
@@ -611,6 +622,10 @@ func TestWriteExecutedOnce(t *testing.T) {
 	prepared, _ := f.Prepare(t.Context(), "send", map[string]string{"chat": "c1", "text": "on my way"})
 	var created struct{ ID string }
 	body := map[string]any{"identity": agent, "connector": "test", "op": "send", "prepared": prepared, "note": "asked to reply"}
+	if st := h.do("POST", "/internal/proposals", "", body, nil); st != http.StatusNotFound {
+		t.Errorf("proposal without a grant = %d", st)
+	}
+	h.grant(owner, agent)
 	if st := h.do("POST", "/internal/proposals", "", body, &created); st != http.StatusCreated {
 		t.Fatalf("proposal = %d", st)
 	}

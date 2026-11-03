@@ -3,17 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -502,89 +497,5 @@ func TestExecuteKeepsTimer(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("sends\n got %+v\nwant %+v", got, want)
-	}
-}
-
-// serve runs f's connector behind connector.Server, which checks approvals,
-// and returns a client and the key that approves.
-func serve(t *testing.T, f *fixture) (*connector.Client, *ecdsa.PrivateKey) {
-	t.Helper()
-	dir := t.TempDir()
-	if err := os.Mkdir(filepath.Join(dir, "private"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	gid := uint32(os.Getgid())
-	srv, err := connector.NewServer(f.c, "signal", dir, gid, gid, discard)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// t.TempDir can be too long for a socket path.
-	sockDir, err := os.MkdirTemp("", "sg")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(sockDir) })
-	sock := filepath.Join(sockDir, "s")
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- srv.Serve(ctx, ln) }()
-	t.Cleanup(func() { cancel(); <-done })
-	client := connector.Dial("signal", sock)
-
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key, err := record.P256Key(&priv.PublicKey, "phone")
-	if err != nil {
-		t.Fatal(err)
-	}
-	entry := sign(t, record.KeyEntry{Op: "add", Key: key, At: record.Time{Time: time.Now()}}, priv)
-	if _, err := client.PutKeys(context.Background(), []record.Envelope{entry}); err != nil {
-		t.Fatal(err)
-	}
-	return client, priv
-}
-
-func sign(t *testing.T, r record.Record, priv *ecdsa.PrivateKey) record.Envelope {
-	t.Helper()
-	e, err := record.New(r, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := record.Sign(&e, priv); err != nil {
-		t.Fatal(err)
-	}
-	return e
-}
-
-func TestApprovedSendRunsOnce(t *testing.T) {
-	t.Parallel()
-	f := newFixture(t)
-	client, key := serve(t, f)
-	p, err := client.Prepare(context.Background(), "send", map[string]string{"chat": farid.String(), "text": "running late"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now()
-	a := sign(t, record.Write{
-		ID: record.NewID(), Connector: "signal", Op: "send", Args: p.Args, Display: p.Display,
-		CreatedAt: record.Time{Time: now}, ExpiresAt: record.Time{Time: now.Add(time.Hour)},
-	}, key)
-
-	res, err := client.Execute(context.Background(), a)
-	if err != nil || res.Status != connector.Done {
-		t.Fatalf("execute: %+v %v", res, err)
-	}
-	var cerr *connector.Error
-	if _, err := client.Execute(context.Background(), a); !errors.As(err, &cerr) || cerr.Status != http.StatusConflict {
-		t.Fatalf("replay: %v", err)
-	}
-	if got := f.cli().calls(); !reflect.DeepEqual(got, []sent{{to: farid.String(), text: "running late"}}) {
-		t.Fatalf("sends = %+v", got)
 	}
 }

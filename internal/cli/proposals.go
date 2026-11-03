@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 )
 
@@ -42,12 +41,10 @@ func (c *cli) submit(ctx context.Context, path string, args map[string]string, n
 		return err
 	}
 	if wait == 0 {
-		c.show(raw, p)
+		c.show(p)
 		return outcome(p, 0)
 	}
-	if !c.json {
-		fmt.Fprintf(c.out, "%s pending\n", p.ID)
-	}
+	fmt.Fprintf(c.out, "%s pending\n", p.ID)
 	fmt.Fprintf(c.errOut, "waiting up to %s for the owner to decide in the mandate app\n", human(wait))
 	return c.await(ctx, p.ID, wait)
 }
@@ -72,25 +69,20 @@ func (c *cli) await(ctx context.Context, id string, wait time.Duration) error {
 	for {
 		q, timeout := waitQuery(deadline)
 		var p proposal
-		raw, _, err := c.do(ctx, timeout, http.MethodGet, "/agent/v1/proposals/"+url.PathEscape(id)+q, nil, &p)
-		if err != nil {
+		if _, _, err := c.do(ctx, timeout, http.MethodGet, "/agent/v1/proposals/"+url.PathEscape(id)+q, nil, &p); err != nil {
 			return err
 		}
 		if pending(p.Status) && time.Now().Before(deadline) {
 			continue
 		}
-		c.show(raw, p)
+		c.show(p)
 		return outcome(p, wait)
 	}
 }
 
 func pending(s string) bool { return s == "pending" || s == "executing" }
 
-func (c *cli) show(raw []byte, p proposal) {
-	if c.json {
-		fmt.Fprintln(c.out, strings.TrimSpace(string(raw)))
-		return
-	}
+func (c *cli) show(p proposal) {
 	line := p.ID + " " + p.Status
 	if r := p.Result; r != nil && r.Ref != "" {
 		line += " ref=" + sanitize(r.Ref)
