@@ -1,71 +1,71 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="440" viewBox="0 0 900 440" font-family="'IBM Plex Mono', 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" fill="#1f2328">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="470" viewBox="0 0 900 470" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
   <defs>
-    <marker id="a" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#1f2328"/></marker>
+    <marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1,1 L7,4 L1,7" fill="none" stroke="#fff" stroke-width="1.2"/></marker>
   </defs>
 
-  <!-- A white card of its own, so it reads the same in any theme. -->
-  <rect x="0.5" y="0.5" width="899" height="439" rx="8" fill="#fff" stroke="#d0d7de"/>
+  <rect width="900" height="470" fill="#000"/>
+  <text x="20" y="34" font-size="16" fill="#fff">How a send reaches your accounts</text>
 
-  <g fill="none" stroke="#d0d7de" stroke-width="1.5" stroke-dasharray="5 5">
-    <rect x="24" y="36" width="212" height="214" rx="6"/>
-    <rect x="300" y="36" width="300" height="384" rx="6"/>
-    <rect x="664" y="36" width="212" height="214" rx="6"/>
-  </g>
-  <g font-size="12" fill="#6e7781">
-    <text x="38" y="58">agent machine</text>
-    <text x="314" y="58">server machine</text>
-    <text x="678" y="58">your devices</text>
+  <g fill="none" stroke="#fff" stroke-width="1">
+    <rect x="20" y="62" width="210" height="196"/>
+    <rect x="280" y="62" width="330" height="388"/>
+    <rect x="670" y="62" width="210" height="196"/>
   </g>
 
-  <g fill="#d8dee4">
-    <rect x="53" y="179" width="160" height="52" rx="6"/>
-    <rect x="353" y="179" width="200" height="52" rx="6"/>
-    <rect x="703" y="179" width="160" height="52" rx="6"/>
-    <rect x="353" y="321" width="200" height="44" rx="6"/>
-    <rect x="703" y="321" width="160" height="44" rx="6"/>
-  </g>
-  <g fill="#fff" stroke="#1f2328" stroke-width="2">
-    <rect x="50" y="176" width="160" height="52" rx="6"/>
-    <rect x="350" y="176" width="200" height="52" rx="6"/>
-    <rect x="700" y="176" width="160" height="52" rx="6"/>
-    <rect x="350" y="318" width="200" height="44" rx="6"/>
-    <rect x="700" y="318" width="160" height="44" rx="6"/>
-  </g>
-  <g fill="none" stroke="#8c959f" stroke-width="1.5" stroke-dasharray="4 4">
-    <rect x="60" y="84" width="140" height="36" rx="6"/>
-    <rect x="350" y="376" width="200" height="32" rx="6"/>
+  <g font-family="'IBM Plex Mono', 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" letter-spacing="0.6" fill="#fff">
+    <text x="34" y="86">AGENT MACHINE</text>
+    <text x="294" y="86">SERVER MACHINE</text>
+    <text x="684" y="86">YOUR DEVICES</text>
+
+    <rect x="50" y="104" width="150" height="34" fill="none" stroke="#fff" stroke-dasharray="3 3"/>
+    <text x="125" y="125" text-anchor="middle" fill="#a3a3a3">ANY AGENTS …</text>
+    <rect x="50" y="174" width="150" height="40" fill="none" stroke="#fff"/>
+    <text x="125" y="198" text-anchor="middle">AGENT IDENTITY</text>
+
+    <rect x="330" y="170" width="230" height="48" fill="#3b2a7a" stroke="#6e5bd6"/>
+    <text x="445" y="198" text-anchor="middle" font-size="12">MANDATE</text>
+    <rect x="350" y="330" width="190" height="40" fill="none" stroke="#fff"/>
+    <text x="445" y="354" text-anchor="middle">CONNECTOR</text>
+    <rect x="350" y="394" width="190" height="34" fill="none" stroke="#fff" stroke-dasharray="3 3"/>
+    <text x="445" y="415" text-anchor="middle" fill="#a3a3a3">MORE CONNECTORS …</text>
+
+    <rect x="700" y="170" width="150" height="48" fill="#8b5cf6"/>
+    <text x="775" y="198" text-anchor="middle" font-size="12">MANDATE APP</text>
+    <rect x="700" y="330" width="150" height="40" fill="none" stroke="#fff"/>
+    <text x="775" y="354" text-anchor="middle">YOUR ACCOUNTS</text>
   </g>
 
-  <g text-anchor="middle">
-    <text x="130" y="107" font-size="13" fill="#6e7781">any agents …</text>
-    <text x="130" y="207">agent identity</text>
-    <text x="450" y="207" font-weight="700">mandate</text>
-    <text x="780" y="207">mandate app</text>
-    <text x="450" y="345">connector</text>
-    <text x="450" y="397" font-size="13" fill="#6e7781">more connectors …</text>
-    <text x="780" y="345">your accounts</text>
+  <g fill="none" stroke="#fff" stroke-width="1" marker-end="url(#a)">
+    <path d="M125,138 V172"/>
+    <path d="M200,194 H328"/>
+    <path d="M560,182 H698"/>
+    <path d="M700,206 H562"/>
+    <path d="M445,218 V328"/>
+    <path d="M540,350 H698"/>
   </g>
 
-  <g fill="none" stroke="#1f2328" stroke-width="2" marker-end="url(#a)">
-    <path d="M130,120 V170"/>
-    <path d="M210,202 H344"/>
-    <path d="M550,190 H694"/>
-    <path d="M700,214 H556"/>
-    <path d="M450,228 V312"/>
-    <path d="M550,340 H694"/>
-  </g>
-
-  <!-- Numbered transitions, in the order a write takes them. -->
-  <g font-size="12">
-    <rect x="252" y="194" width="52" height="16" fill="#d0d7de"/>
-    <text x="278" y="206" text-anchor="middle">1 asks</text>
-    <rect x="583" y="182" width="80" height="16" fill="#d0d7de"/>
-    <text x="623" y="194" text-anchor="middle">2 notifies</text>
-    <rect x="583" y="206" width="80" height="16" fill="#d0d7de"/>
-    <text x="623" y="218" text-anchor="middle">3 approves</text>
-    <rect x="396" y="262" width="108" height="16" fill="#d0d7de"/>
-    <text x="450" y="274" text-anchor="middle">4 signed write</text>
-    <rect x="579" y="332" width="88" height="16" fill="#d0d7de"/>
-    <text x="623" y="344" text-anchor="middle">5 its login</text>
+  <!-- Numbered steps, in the order a send takes them. -->
+  <g font-size="11">
+    <g fill="#000" stroke="#fff" stroke-width="1">
+      <circle cx="264" cy="194" r="11"/>
+      <circle cx="610" cy="182" r="11"/>
+      <circle cx="640" cy="206" r="11"/>
+      <circle cx="445" cy="272" r="11"/>
+      <circle cx="655" cy="350" r="11"/>
+    </g>
+    <g font-family="'IBM Plex Mono', ui-monospace, Menlo, monospace" fill="#fff" text-anchor="middle">
+      <text x="264" y="198">1</text>
+      <text x="610" y="186">2</text>
+      <text x="640" y="210">3</text>
+      <text x="445" y="276">4</text>
+      <text x="655" y="354">5</text>
+    </g>
+    <g fill="#a3a3a3">
+      <text x="264" y="226" text-anchor="middle">asks</text>
+      <text x="610" y="160" text-anchor="middle">notifies</text>
+      <text x="640" y="238" text-anchor="middle">approves</text>
+      <text x="464" y="276">signed write</text>
+      <text x="655" y="382" text-anchor="middle">its login</text>
+    </g>
   </g>
 </svg>
