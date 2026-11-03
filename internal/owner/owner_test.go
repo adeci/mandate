@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -29,6 +30,7 @@ import (
 	"github.com/adeci/mandate/internal/exchange"
 	"github.com/adeci/mandate/internal/peer"
 	"github.com/adeci/mandate/record"
+	"github.com/adeci/mandate/store"
 )
 
 const (
@@ -598,9 +600,9 @@ func (f *fakeConnector) Execute(_ context.Context, w record.Write) connector.Res
 	return connector.Result{Status: connector.Done, Ref: "sent"}
 }
 
-func TestWriteExecutedOnce(t *testing.T) {
-	f := &fakeConnector{}
-	dir := t.TempDir()
+// serveConnector serves f with state in dir and dials it as "test".
+func serveConnector(t *testing.T, f *fakeConnector, dir string) map[string]*connector.Client {
+	t.Helper()
 	if err := os.MkdirAll(filepath.Join(dir, "private"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -618,8 +620,68 @@ func TestWriteExecutedOnce(t *testing.T) {
 	done := make(chan error)
 	go func() { done <- srv.Serve(ctx, ln) }()
 	t.Cleanup(func() { cancel(); <-done })
+	return map[string]*connector.Client{"test": connector.Dial("test", sock)}
+}
 
-	h := start(t, map[string]*connector.Client{"test": connector.Dial("test", sock)})
+// storeChats writes a data.db in dir with a group and a DM.
+func storeChats(t *testing.T, dir string) {
+	t.Helper()
+	st, err := store.Open(t.Context(), filepath.Join(dir, "data.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.UpsertContainers(t.Context(), []store.Container{
+		{ID: "c3", Kind: "group", Name: "Book club", IsGroup: true, Participants: []store.Participant{{ID: "u1", Name: "Ana"}, {ID: "u2", Name: "Bo"}}},
+		{ID: "d1", Kind: "dm", Name: "Ana", Participants: []store.Participant{{ID: "u1", Name: "Ana"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPickedChatNamed(t *testing.T) {
+	dir := t.TempDir()
+	storeChats(t, dir)
+	h := start(t, serveConnector(t, &fakeConnector{}, dir))
+	owner := h.pair()
+	agent := h.agent(owner)
+	req := h.request(agent)
+	if st, _ := h.sign(owner, h.challenge(owner, "/owner/v1/requests/"+req+"/challenge", map[string]any{"chats": []string{"c1", "c3", "c9"}})); st != http.StatusOK {
+		t.Fatalf("sign = %d", st)
+	}
+	var now struct {
+		Grants []struct {
+			ChatNames map[string]string `json:"chat_names"`
+		}
+	}
+	h.do("GET", "/owner/v1/now", owner.token, nil, &now)
+	want := map[string]string{"c1": "Family", "c3": "Book club"}
+	if len(now.Grants) != 1 || !maps.Equal(now.Grants[0].ChatNames, want) {
+		t.Errorf("grants = %+v, want names %v", now.Grants, want)
+	}
+}
+
+func TestChatsListDMParticipants(t *testing.T) {
+	dir := t.TempDir()
+	storeChats(t, dir)
+	h := start(t, serveConnector(t, &fakeConnector{}, dir))
+	owner := h.pair()
+	var chats []connector.Container
+	if st := h.do("GET", "/owner/v1/connectors/test/chats", owner.token, nil, &chats); st != http.StatusOK {
+		t.Fatalf("chats = %d", st)
+	}
+	got := map[string][]store.Participant{}
+	for _, c := range chats {
+		got[c.ID] = c.Participants
+	}
+	if len(chats) != 2 || got["c3"] != nil || !slices.Equal(got["d1"], []store.Participant{{ID: "u1", Name: "Ana"}}) {
+		t.Errorf("chats = %+v", chats)
+	}
+}
+
+func TestWriteExecutedOnce(t *testing.T) {
+	f := &fakeConnector{}
+	h := start(t, serveConnector(t, f, t.TempDir()))
 	owner := h.pair()
 	agent := h.agent(owner)
 	prepared, _ := f.Prepare(t.Context(), "send", map[string]string{"chat": "c1", "text": "on my way"})

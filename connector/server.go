@@ -344,6 +344,8 @@ type Container struct {
 	Kind         string    `json:"kind"`
 	ParentID     string    `json:"parent_id"`
 	LastActivity time.Time `json:"last_activity,omitzero"`
+	// Participants is set for DMs only.
+	Participants []store.Participant `json:"participants,omitempty"`
 }
 
 const maxContainers = 500
@@ -381,7 +383,7 @@ func (s *Server) listContainers(ctx context.Context, q, parent string, limit int
 	}
 	defer db.Close()
 	rs, err := db.QueryContext(ctx, `
-SELECT id, kind, COALESCE(parent_id, ''), COALESCE(name, ''),
+SELECT id, kind, COALESCE(parent_id, ''), COALESCE(name, ''), participants_json,
        max(COALESCE(last_message_at, ''), COALESCE((SELECT max(sent_at) FROM messages WHERE container_id = c.id), '')) AS active
 FROM containers AS c
 WHERE (?1 = '' OR id = ?1 OR instr(lower(COALESCE(name, '')), lower(?1)))
@@ -395,10 +397,16 @@ LIMIT ?3`, q, parent, limit)
 	for rs.Next() {
 		var (
 			c      Container
+			parts  string
 			active sql.NullString
 		)
-		if err := rs.Scan(&c.ID, &c.Kind, &c.ParentID, &c.Name, &active); err != nil {
+		if err := rs.Scan(&c.ID, &c.Kind, &c.ParentID, &c.Name, &parts, &active); err != nil {
 			return nil, err
+		}
+		if c.Kind == "dm" {
+			if err := json.Unmarshal([]byte(parts), &c.Participants); err != nil {
+				return nil, fmt.Errorf("participants of chat %s: %w", c.ID, err)
+			}
 		}
 		if active.String != "" {
 			if c.LastActivity, err = time.Parse(time.RFC3339Nano, active.String); err != nil {

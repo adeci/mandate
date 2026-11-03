@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"maps"
 	"net/http"
 	"os"
 	"slices"
@@ -465,7 +466,7 @@ func (s *Server) grantView(g *grant) grantView {
 	if i := s.st.Identities[g.Record.Identity]; i != nil {
 		name = i.Name
 	}
-	return grantView{g.Record, name, g.ChatNames, g.ClosedAt}
+	return grantView{g.Record, name, maps.Clone(g.ChatNames), g.ClosedAt}
 }
 
 type requestView struct {
@@ -498,7 +499,6 @@ func (s *Server) getNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	now := s.now()
 	out := struct {
 		Requests  []requestView  `json:"requests"`
@@ -533,6 +533,8 @@ func (s *Server) getNow(w http.ResponseWriter, r *http.Request) {
 			out.Stopped = append(out.Stopped, s.grantView(g))
 		}
 	}
+	s.mu.Unlock()
+	s.nameChats(r.Context(), out.Grants, out.Routines, out.Stopped)
 	reply(w, http.StatusOK, out)
 }
 
@@ -595,7 +597,7 @@ func (s *Server) postActivity(w http.ResponseWriter, r *http.Request) {
 	reply(w, http.StatusOK, struct{}{})
 }
 
-func (s *Server) listIdentities(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) listIdentities(w http.ResponseWriter, r *http.Request) {
 	type identityView struct {
 		ID        string      `json:"id"`
 		Name      string      `json:"name"`
@@ -605,7 +607,6 @@ func (s *Server) listIdentities(w http.ResponseWriter, _ *http.Request) {
 		Grants    []grantView `json:"grants"`
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	out := []identityView{}
 	for _, i := range s.st.Identities {
 		v := identityView{i.Record.ID, i.Name, i.Record.CreatedAt, i.FirstSeen, i.LastSeen, []grantView{}}
@@ -615,6 +616,10 @@ func (s *Server) listIdentities(w http.ResponseWriter, _ *http.Request) {
 			}
 		}
 		out = append(out, v)
+	}
+	s.mu.Unlock()
+	for _, v := range out {
+		s.nameChats(r.Context(), v.Grants)
 	}
 	slices.SortFunc(out, func(a, b identityView) int { return strings.Compare(a.Name, b.Name) })
 	reply(w, http.StatusOK, out)

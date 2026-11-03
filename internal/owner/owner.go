@@ -72,6 +72,8 @@ type Server struct {
 
 	push      chan struct{}
 	executing sync.WaitGroup
+
+	names chatNames
 }
 
 func newServer(dir string, conns map[string]*connector.Client, gatewaySock string, log *slog.Logger) (*Server, error) {

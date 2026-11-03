@@ -263,8 +263,11 @@ session and credentials, keeps stored messages, and health becomes `setup`.
 chat picker, so the owner side never opens the store:
 
 ```json
-[{"id": "…", "name": "Family 🏡", "kind": "group", "parent_id": "", "last_activity": "2026-11-02T08:10:00Z"}]
+[{"id": "…", "name": "Family 🏡", "kind": "group", "parent_id": "", "last_activity": "2026-11-02T08:10:00Z"},
+ {"id": "…", "name": "Ana", "kind": "dm", "parent_id": "", "participants": [{"id": "…", "name": "Ana"}]}]
 ```
+
+`participants` is set for `dm` chats only, from `participants_json`.
 
 `q` matches name or ID, `parent` lists a chat's children, `limit` is at most
 500.
