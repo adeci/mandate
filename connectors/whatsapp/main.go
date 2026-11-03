@@ -51,7 +51,9 @@ func start(ctx context.Context, env *connector.Env, _ struct{}) (connector.Conne
 		// buffer lets a redelivered (unacked) message be decrypted again.
 		cli.SynchronousAck = true
 		cli.EnableDecryptedEventBuffer = true
-		cli.InitialAutoReconnect = true
+		// Unlinked, pairing needs the connection's error rather than a
+		// reconnect in the background, which ends the QR codes as expired.
+		cli.InitialAutoReconnect = dev.ID != nil
 		in := newIngester(cli, st, env.Log)
 		cli.AddEventHandlerWithSuccessStatus(func(evt any) bool {
 			onEvent(evt)

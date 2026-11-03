@@ -58,6 +58,7 @@ type fakeClient struct {
 	disconnects int
 	logouts     int
 	logoutErr   error
+	connectErr  error
 	phoneErr    error
 	blobs       map[string][]byte // direct path -> encrypted file
 	served      int64             // bytes DownloadToFile streamed
@@ -153,6 +154,9 @@ func (f *fakeClient) PairPhone(_ context.Context, phone string, _ bool, _ whatsm
 func (f *fakeClient) ConnectContext(context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.connectErr != nil {
+		return f.connectErr
+	}
 	f.connected = true
 	return nil
 }

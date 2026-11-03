@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"testing"
 	"time"
@@ -176,6 +178,18 @@ func TestSetupRefusesBadValues(t *testing.T) {
 	f.cli.phoneErr = whatsmeow.ErrIQBadRequest
 	_, err := f.c.Setup(ctx, "qr", map[string]string{"phone": "+15551234567"})
 	wantStatus(t, err, http.StatusBadRequest)
+}
+
+func TestSetupUnreachable(t *testing.T) {
+	t.Parallel()
+	f := newUnlinkedFixture(t)
+	f.cli.connectErr = fmt.Errorf("failed to dial whatsapp web websocket: %w",
+		&net.DNSError{Err: "no such host", Name: "web.whatsapp.com", IsNotFound: true})
+	_, err := f.c.Setup(context.Background(), "", nil)
+	var e *connector.Error
+	if !errors.As(err, &e) || e.Status != http.StatusBadGateway || e.Message != "can't reach WhatsApp: lookup web.whatsapp.com: no such host" {
+		t.Fatalf("err = %v, want 502 naming the lookup", err)
+	}
 }
 
 func TestLoggedOutFromPhone(t *testing.T) {

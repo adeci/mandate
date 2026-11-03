@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -291,13 +292,23 @@ func (c *waConnector) pairingFor() (*pairing, connector.Step, error) {
 
 func (c *waConnector) pair(p *pairing) {
 	ch, err := p.cli.GetQRChannel(c.ctx)
-	if err == nil {
-		err = p.cli.ConnectContext(c.ctx)
-	}
 	if err != nil {
+		c.endPairing(p, fmt.Errorf("start pairing: %w", err))
+		return
+	}
+	if err := p.cli.ConnectContext(c.ctx); err != nil {
 		c.log.Error("start pairing", "err", err)
 		p.cli.Disconnect()
-		c.endPairing(p, fmt.Errorf("connect to whatsapp: %w", err))
+		// whatsmeow wraps the network's error in several layers.
+		var dns *net.DNSError
+		var op *net.OpError
+		switch {
+		case errors.As(err, &dns):
+			err = dns
+		case errors.As(err, &op):
+			err = op
+		}
+		c.endPairing(p, fmt.Errorf("can't reach WhatsApp: %w", err))
 		return
 	}
 	for item := range ch {
