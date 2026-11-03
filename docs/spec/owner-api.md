@@ -53,7 +53,7 @@ It then issues a new setup password.
 
 ## Device token
 
-- The app makes 32 random bytes and keeps them in the platform keystore. Only their SHA-256 reaches the server.
+- The app makes 32 random bytes, in lowercase hex as an agent's token is, and keeps them in the platform keystore. Only the `token_sha256` of that text reaches the server ([agent-api.md, Derivations](agent-api.md#derivations)).
 - It is the bearer token (`Authorization: Bearer …`) for every call below. Signing still needs the device key.
 - Removing the device's key revokes its token.
 

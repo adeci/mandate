@@ -70,13 +70,13 @@ may start 5 an hour; beyond that, `429`.
 
 ### Derivations
 
-CPace is [draft-irtf-cfrg-cpace](https://datatracker.ietf.org/doc/draft-irtf-cfrg-cpace/),
+CPace is [draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/draft-irtf-cfrg-cpace/21/),
 CPACE-RISTR255-SHA512, with its own test vectors there. Inputs:
 
 | | |
 |---|---|
 | PRS | the 6 ASCII digits |
-| CI | `mandate join` ‖ kind (`agent` or `device`), ASCII |
+| CI | `mandate join ` ‖ kind, ASCII: `mandate join agent` or `mandate join device` |
 | sid | the 16 bytes of `id` |
 | ADa, ADb | empty |
 
@@ -86,17 +86,35 @@ From its output key `ISK` (64 bytes):
 party_confirm  = HMAC-SHA-256(ISK, "mandate exchange party")
 server_confirm = HMAC-SHA-256(ISK, "mandate exchange server" ‖ spki_sha256)
 seal_key       = HMAC-SHA-256(ISK, "mandate exchange seal")
-sealed         = AES-256-GCM(seal_key, nonce = 12 zero bytes, aad = id, payload)
+sealed         = AES-256-GCM(seal_key, nonce = 12 zero bytes, aad = the 16 bytes of id, payload)
 ```
 
 `spki_sha256` is the SHA-256 of the server's DER SubjectPublicKeyInfo. Each
-key seals one message, so the fixed nonce is safe. The payload is JCS JSON:
+key seals one message, so the fixed nonce is safe. A token, an agent's or a
+device's, is 32 random bytes in lowercase hex, and `token_sha256` is
+hex(SHA-256) of that 64-character string. The payload is JCS JSON:
 
-- agent: `{"token_sha256": hex(SHA-256(token))}`, where the token is 32 random
-  bytes in lowercase hex and is hashed as that 64-character string;
-- device: `{"key": <key object, records.md>, "token_sha256": hex(SHA-256(device token))}`.
+- agent: `{"token_sha256": …}`;
+- device: `{"key": <key object, records.md>, "token_sha256": …}`.
 
-Vector (all hex unless quoted):
+Vectors (all hex unless quoted). CPace, with the scalars of the draft's
+ristretto255 vector:
+
+```
+code           "123456"
+kind           "agent"
+id             000102030405060708090a0b0c0d0e0f
+ya             da3d23700a9e5699258aef94dc060dfda5ebb61f02a5ea77fad53f4ff0976d08
+yb             d2316b454718c35362d83d69df6320f38578ed5984651435e2949762d900b80d
+g              fa7c52e5f362bd1c187338e289b2ef30b82498a7ac8a1cda8db96fdb9a7c4d33
+Ya             267e392ad5b4d7b690c144d778385d2a9c1f7b1dea9377303d070f4585009d4a
+Yb             9cd3fd382b5faeb37f068e1e814344b25ef28a5a1e9eabdfc0b27599755dd475
+K              a2ba6d19aa4bb696a266bb772c894b825ac87a5082b06c7c4e97b808abbc9601
+ISK            9de94546d597ea438dfb0589a520bc03223a1bb92856b89bb1a0f9c948ddad59
+               480f1132191e282e00f70b992ff27541ed1440cc826d857517e5b4b438840596
+```
+
+The derivations, from a given ISK:
 
 ```
 ISK            000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
