@@ -10,6 +10,7 @@ name = "mandate_app"
 [dependencies]
 futures = "0.3"
 gpui = { package = "gpui-pre", version = "=0.3.7", default-features = false }
+libc = "0.2"
 mandate-core = { path = "../core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,4 +24,5 @@ gpui-platform = { package = "gpui-pre-platform", version = "=0.3.7", features = 
 android-activity = { version = "0.6", features = ["native-activity"] }
 android_logger = "0.15"
 gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/longbridge/gpui-mobile", rev = "9075e3aa3eea812127f2c60ed66f0cd5798ff245", default-features = false }
+jni = "0.22"
 log = "0.4"

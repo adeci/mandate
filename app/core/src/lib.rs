@@ -11,7 +11,7 @@ mod log;
 mod record;
 
 pub use client::{Client, Event, Events, Join, JoinStatus, PairLink, Signed};
-pub use envelope::{DeviceKey, Envelope, SoftwareKey};
+pub use envelope::{DeviceKey, Envelope, SoftwareKey, der_signature};
 pub use exchange::{Payload, new_token};
 pub use http::Trust;
 pub use log::Log;

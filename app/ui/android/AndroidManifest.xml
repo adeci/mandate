@@ -1,17 +1,47 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="dev.mandate.app">
-    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="35" />
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="35" />
     <uses-permission android:name="android.permission.INTERNET" />
-    <application android:label="mandate" android:hasCode="false">
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <application android:label="mandate">
+        <!-- singleTask: a second instance would be a second android_main in this process.
+             stateNotNeeded: android_main leaves the process when the activity ends, also
+             on a recreation, and this lets Android start it again in a new process. -->
         <activity
-            android:name="android.app.NativeActivity"
+            android:name=".Main"
             android:exported="true"
+            android:launchMode="singleTask"
+            android:stateNotNeeded="true"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|density">
             <meta-data android:name="android.app.lib_name" android:value="mandate_app" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="mandate" android:host="pair" />
+            </intent-filter>
         </activity>
+        <service
+            android:name=".Stream"
+            android:process=":stream"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Holds the connection to the owner's own mandate server, which notifies of approvals waiting." />
+        </service>
+        <receiver android:name=".Boot" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

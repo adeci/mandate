@@ -3597,6 +3597,8 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-mobile",
  "gpui-pre-platform",
+ "jni",
+ "libc",
  "log",
  "mandate-core",
  "serde",

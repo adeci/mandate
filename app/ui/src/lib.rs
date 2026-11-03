@@ -1,54 +1,185 @@
+#[cfg(target_os = "android")]
+mod android;
+mod api;
 mod device;
+mod now;
 mod screens;
+mod tabs;
+mod theme;
+mod words;
 
-use device::{Device, Exchange, Now, Proposal, Request};
+use api::{Connector, Exchange, Hidden, Identity, Keys, Now, Proposal, Request};
+use device::Device;
 use futures::StreamExt;
-use gpui::{App, AppContext, Context, FocusHandle, KeyDownEvent, Window, WindowOptions};
-use mandate_core::{Envelope, Error, PairLink};
+use gpui::{App, AppContext, Context, Entity, FocusHandle, KeyDownEvent, Window, WindowOptions};
+use mandate_core::{DeviceKey, Envelope, Error, Key, PairLink, Record};
+use serde::Deserialize;
 use serde_json::{Value, json};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Now,
+    Agents,
+    Connections,
+    Activity,
+}
+
 enum Screen {
     Pair { text: String },
-    Now,
+    Tab(Tab),
+    Settings,
     Code { exchange: Exchange, code: String },
     Admit { exchange: Exchange, envelope: Envelope },
-    Request { request: Request, envelope: Envelope },
-    Proposal { proposal: Proposal, envelope: Envelope },
+    Review { proposal: Proposal, envelope: Envelope },
+}
+
+/// How the owner narrowed a request before approving it.
+#[derive(Clone)]
+struct Adjust {
+    open: bool,
+    chats: BTreeSet<String>,
+    for_: u64,
+    horizon: u64,
+}
+
+impl Adjust {
+    fn of(r: &Request) -> Adjust {
+        let chats = r.chats().iter().map(|c| c.id.clone()).collect();
+        Adjust { open: false, chats, for_: r.for_, horizon: r.horizon }
+    }
 }
 
 pub struct Shell {
     dir: PathBuf,
     device: Option<Device>,
+    /// The device key's ID, to mark it among the trusted keys.
+    key_id: String,
     screen: Screen,
     now: Now,
     exchanges: Vec<Exchange>,
+    identities: Vec<Identity>,
+    connectors: Vec<Connector>,
+    keys: Keys,
+    /// Chats and people hidden from every read (never-share).
+    hidden: Vec<Hidden>,
+    /// The server's URL, for Settings.
+    server: String,
+    /// The search field's text, while it is open.
+    search: Option<String>,
+    adjust: HashMap<String, Adjust>,
+    /// Stop all's confirmation is open.
+    stopping: bool,
+    /// The agent whose Delete waits for a second tap.
+    deleting: Option<String>,
+    notice: Option<String>,
     error: Option<String>,
+    /// A waiting item to open once a refresh shows it, from a notification.
+    pending: Option<String>,
     focus: FocusHandle,
 }
 
 impl Shell {
-    fn new(dir: PathBuf, cx: &mut Context<Self>) -> Self {
+    fn new(dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let device = Device::load(&dir);
-        let screen =
-            if device.is_some() { Screen::Now } else { Screen::Pair { text: String::new() } };
+        let screen = match device {
+            Some(_) => Screen::Tab(Tab::Now),
+            None => Screen::Pair { text: String::new() },
+        };
+        cx.observe_window_appearance(window, |_, _, cx| cx.notify()).detach();
+        // Keeps the countdowns of open grants current.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(30)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         let mut shell = Shell {
             dir,
-            device,
+            key_id: String::new(),
+            device: None,
             screen,
             now: Now::default(),
             exchanges: Vec::new(),
+            identities: Vec::new(),
+            connectors: Vec::new(),
+            keys: Keys::default(),
+            hidden: Vec::new(),
+            server: String::new(),
+            search: None,
+            adjust: HashMap::new(),
+            stopping: false,
+            deleting: None,
+            notice: None,
             error: None,
+            pending: None,
             focus: cx.focus_handle(),
         };
-        shell.listen(cx);
+        if let Some(device) = device {
+            shell.paired(device, cx);
+        }
         shell
+    }
+
+    fn paired(&mut self, device: Device, cx: &mut Context<Self>) {
+        self.key_id = Key::p256(&device.key.public_key(), "").id;
+        let saved: Option<Value> = std::fs::read(self.dir.join(device::FILE))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        self.server = saved.and_then(|v| Some(v["url"].as_str()?.to_string())).unwrap_or_default();
+        self.device = Some(device);
+        self.listen(cx);
+    }
+
+    /// A pairing link opened from outside the app: shown on the pairing
+    /// screen for the owner to check, ignored once paired.
+    pub fn take_link(&mut self, link: String, cx: &mut Context<Self>) {
+        if let Screen::Pair { text } = &mut self.screen {
+            *text = link;
+            cx.notify();
+        }
+    }
+
+    /// Opens the waiting request, proposal or exchange with this ID once a
+    /// refresh shows it; if the refresh does not, it was decided meanwhile.
+    pub fn take_item(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.device.is_some() {
+            self.pending = Some(id);
+            self.refresh(cx);
+        }
+    }
+
+    fn open_pending(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.pending.take() else { return };
+        if let Some(ex) = self.exchanges.iter().find(|e| e.id == id) {
+            self.screen = Screen::Code { exchange: ex.clone(), code: String::new() };
+        } else if let Some(p) = self.now.proposals.iter().find(|p| p.id == id) {
+            self.review(p.clone(), cx);
+        } else if self.now.requests.iter().any(|r| r.id == id) {
+            // Requests are decided on their card in Now.
+            self.screen = Screen::Tab(Tab::Now);
+        }
     }
 
     /// The paired device; only the pairing screen runs without one.
     fn device(&self) -> Device {
         self.device.clone().expect("paired")
+    }
+
+    fn go(&mut self, screen: Screen, cx: &mut Context<Self>) {
+        self.error = None;
+        self.notice = None;
+        self.stopping = false;
+        self.search = None;
+        self.deleting = None;
+        self.screen = screen;
+        cx.notify();
     }
 
     /// Runs a blocking call off the UI thread, then done with what it
@@ -75,7 +206,7 @@ impl Shell {
     /// Holds the event stream open on its own thread, refetching on
     /// connecting and on every event.
     fn listen(&mut self, cx: &mut Context<Self>) {
-        let Some(device) = self.device.clone() else { return };
+        let device = self.device();
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         std::thread::spawn(move || {
             while !tx.is_closed() {
@@ -116,10 +247,21 @@ impl Shell {
         let client = self.device().client;
         self.call(
             cx,
-            move || Ok((client.now(None, None)?, client.get("exchanges")?)),
-            |this, (now, exchanges), _| {
-                this.now = now;
-                this.exchanges = exchanges;
+            move || {
+                let now: Now = client.now(None, None)?;
+                let exchanges: Vec<Exchange> = client.get("exchanges")?;
+                let identities: Vec<Identity> = client.get("identities")?;
+                let connectors: Vec<Connector> = client.get("connectors")?;
+                let keys: Keys = client.get("keys")?;
+                let hidden: Vec<Hidden> = client.get("never-share")?;
+                Ok((now, exchanges, identities, connectors, keys, hidden))
+            },
+            |this, (now, exchanges, identities, connectors, keys, hidden), cx| {
+                this.adjust.retain(|id, _| now.requests.iter().any(|r| &r.id == id));
+                (this.now, this.exchanges, this.identities, this.connectors) =
+                    (now, exchanges, identities, connectors);
+                (this.keys, this.hidden) = (keys, hidden);
+                this.open_pending(cx);
             },
         );
     }
@@ -131,50 +273,44 @@ impl Shell {
             cx,
             move || Device::pair(&dir, &link),
             |this, device, cx| {
-                this.device = Some(device);
-                this.screen = Screen::Now;
-                this.listen(cx);
+                this.paired(device, cx);
+                this.screen = Screen::Tab(Tab::Now);
             },
         );
     }
 
-    fn back(&mut self) {
-        self.error = None;
-        self.screen = Screen::Now;
-    }
-
-    /// Shows what a challenge route answers, for the owner to sign or not.
-    fn challenge(
+    /// Fetches a challenge, checks that its record says what the owner was
+    /// shown, then signs and posts it.
+    fn sign(
         &mut self,
         path: String,
         body: Value,
+        check: impl FnOnce(&Record) -> bool + Send + 'static,
         cx: &mut Context<Self>,
-        screen: impl FnOnce(Envelope) -> Screen + 'static,
     ) {
-        let client = self.device().client;
+        let device = self.device();
         self.error = None;
         self.call(
             cx,
-            move || client.challenge(&path, &body),
-            |this, envelope, _| {
-                this.screen = screen(envelope);
+            move || {
+                let mut envelope = device.client.challenge(&path, &body)?;
+                if !check(&envelope.record()?) {
+                    return Err(Error::Invalid(
+                        "What the server asked to sign isn't what you were shown, so nothing was signed."
+                            .into(),
+                    ));
+                }
+                envelope.sign(&*device.key)?;
+                device.client.signed(&envelope)
+            },
+            |this, _, cx| {
+                this.screen = Screen::Tab(Tab::Now);
+                this.refresh(cx);
             },
         );
     }
 
-    fn open_request(&mut self, request: Request, cx: &mut Context<Self>) {
-        let path = format!("requests/{}/challenge", request.id);
-        self.challenge(path, json!({}), cx, |envelope| Screen::Request { request, envelope });
-    }
-
-    fn open_proposal(&mut self, proposal: Proposal, cx: &mut Context<Self>) {
-        let path = format!("proposals/{}/challenge", proposal.id);
-        self.challenge(path, json!({"edits": {}}), cx, |envelope| Screen::Proposal {
-            proposal,
-            envelope,
-        });
-    }
-
+    /// Signs a record already shown in full: an admit or a reviewed send.
     fn approve(&mut self, mut envelope: Envelope, cx: &mut Context<Self>) {
         let device = self.device();
         self.error = None;
@@ -185,24 +321,101 @@ impl Shell {
                 device.client.signed(&envelope)
             },
             |this, _, cx| {
-                this.screen = Screen::Now;
+                this.screen = Screen::Tab(Tab::Now);
                 this.refresh(cx);
             },
         );
     }
 
-    /// POSTs a route that answers {}, such as a deny, then goes back to Now.
-    fn post(&mut self, path: String, cx: &mut Context<Self>) {
+    fn approve_request(&mut self, r: &Request, cx: &mut Context<Self>) {
+        let a = self.adjust.get(&r.id).cloned().unwrap_or_else(|| Adjust::of(r));
+        let named = r.terms.is_some();
+        let mut body = json!({ "horizon": a.horizon });
+        if named {
+            body["chats"] = json!(a.chats);
+        }
+        match r.kind.as_str() {
+            "routine" => body["zone"] = words::zone().into(),
+            "once" => body["for"] = a.for_.into(),
+            _ => body = json!({}),
+        }
+        let (connector, kind) = (r.connector.clone(), r.kind.clone());
+        let check = move |record: &Record| {
+            let Record::Grant(g) = record else { return false };
+            let window = match kind.as_str() {
+                "once" => {
+                    g.until.zip(g.from).is_some_and(|(u, f)| (u.unix() - f.unix()) as u64 == a.for_)
+                }
+                "routine" => g.schedule.is_some(),
+                _ => return g.connector == connector,
+            };
+            let chats = if named {
+                g.chats.iter().cloned().collect::<BTreeSet<_>>() == a.chats
+            } else {
+                g.chats.is_empty()
+            };
+            g.connector == connector && chats && g.horizon == a.horizon && window
+        };
+        self.sign(format!("requests/{}/challenge", r.id), body, check, cx);
+    }
+
+    fn approve_send(&mut self, p: &Proposal, cx: &mut Context<Self>) {
+        let (connector, display) = (p.connector.clone(), p.display.clone());
+        let check = move |record: &Record| matches!(record, Record::Write(w) if w.connector == connector && w.display == display);
+        self.sign(format!("proposals/{}/challenge", p.id), json!({"edits": {}}), check, cx);
+    }
+
+    fn review(&mut self, proposal: Proposal, cx: &mut Context<Self>) {
+        let client = self.device().client;
+        let path = format!("proposals/{}/challenge", proposal.id);
+        self.error = None;
+        self.call(
+            cx,
+            move || client.challenge(&path, &json!({"edits": {}})),
+            |this, envelope, _| this.screen = Screen::Review { proposal, envelope },
+        );
+    }
+
+    /// Sends a route that answers JSON, then refreshes, with notice saying
+    /// what happened.
+    fn post(
+        &mut self,
+        method: &'static str,
+        path: String,
+        cx: &mut Context<Self>,
+        notice: impl FnOnce(Value) -> Option<String> + 'static,
+    ) {
         let client = self.device().client;
         self.error = None;
         self.call(
             cx,
-            move || client.send::<Value>("POST", &path, &json!({})),
-            |this, _, cx| {
-                this.screen = Screen::Now;
+            move || client.send::<Value>(method, &path, &json!({})),
+            |this, answer, cx| {
+                this.screen = Screen::Tab(match this.screen {
+                    Screen::Tab(tab) => tab,
+                    _ => Tab::Now,
+                });
+                (this.stopping, this.deleting, this.notice) = (false, None, notice(answer));
                 this.refresh(cx);
             },
         );
+    }
+
+    fn stop_all(&mut self, cx: &mut Context<Self>) {
+        #[derive(Deserialize)]
+        struct Stopped {
+            grants: u64,
+            requests: u64,
+        }
+        self.post("POST", "stop-all".into(), cx, |v| {
+            let s: Stopped = serde_json::from_value(v).ok()?;
+            let n = |n: u64, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+            Some(format!(
+                "Stopped: {} closed, {} denied.",
+                n(s.grants, "grant"),
+                n(s.requests, "request")
+            ))
+        });
     }
 
     fn digit(&mut self, d: char, cx: &mut Context<Self>) {
@@ -225,7 +438,7 @@ impl Shell {
                     client.challenge(&format!("exchanges/{id}/challenge"), &json!({}))?;
                 if !payload.matches(&envelope.record()?) {
                     return Err(Error::Invalid(format!(
-                        "the record to sign does not let {name} in"
+                        "What the server asked to sign doesn't let {name} in, so nothing was signed."
                     )));
                 }
                 Ok(envelope)
@@ -240,20 +453,25 @@ impl Shell {
 
     fn key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
-        match &mut self.screen {
-            Screen::Pair { text } if k.modifiers.secondary() && k.key == "v" => {
+        let typed = k.key_char.as_deref().unwrap_or_default();
+        match (&mut self.screen, &mut self.search) {
+            (Screen::Tab(_), Some(q)) if k.key == "backspace" => {
+                q.pop();
+            }
+            (Screen::Tab(_), Some(q)) => q.push_str(typed),
+            (Screen::Pair { text }, _) if k.modifiers.secondary() && k.key == "v" => {
                 let pasted = cx.read_from_clipboard().and_then(|c| c.text());
                 text.push_str(pasted.unwrap_or_default().trim());
             }
-            Screen::Pair { text } if k.key == "backspace" => {
+            (Screen::Pair { text }, _) if k.key == "backspace" => {
                 text.pop();
             }
-            Screen::Pair { text } => text.push_str(k.key_char.as_deref().unwrap_or_default()),
-            Screen::Code { code, .. } if k.key == "backspace" => {
+            (Screen::Pair { text }, _) => text.push_str(typed),
+            (Screen::Code { code, .. }, _) if k.key == "backspace" => {
                 code.pop();
             }
-            Screen::Code { .. } => {
-                if let Some(d) = k.key_char.as_deref().and_then(|c| c.chars().next())
+            (Screen::Code { .. }, _) => {
+                if let Some(d) = typed.chars().next()
                     && d.is_ascii_digit()
                 {
                     self.digit(d, cx);
@@ -263,32 +481,50 @@ impl Shell {
         }
         cx.notify();
     }
+
+    /// Whether text belongs on the current page while searching.
+    fn shown(&self, text: &str) -> bool {
+        self.search.as_deref().is_none_or(|q| text.to_lowercase().contains(&q.to_lowercase()))
+    }
+}
+
+/// The bundled Lucide icons (ISC), drawn in the text color.
+pub struct Assets;
+
+impl gpui::AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        let svg: &'static [u8] = match path {
+            "icons/activity.svg" => include_bytes!("../assets/icons/activity.svg"),
+            "icons/arrow-left.svg" => include_bytes!("../assets/icons/arrow-left.svg"),
+            "icons/bell.svg" => include_bytes!("../assets/icons/bell.svg"),
+            "icons/bot.svg" => include_bytes!("../assets/icons/bot.svg"),
+            "icons/plug.svg" => include_bytes!("../assets/icons/plug.svg"),
+            "icons/search.svg" => include_bytes!("../assets/icons/search.svg"),
+            "icons/settings.svg" => include_bytes!("../assets/icons/settings.svg"),
+            "icons/x.svg" => include_bytes!("../assets/icons/x.svg"),
+            _ => return Ok(None),
+        };
+        Ok(Some(Cow::Borrowed(svg)))
+    }
+
+    fn list(&self, _: &str) -> gpui::Result<Vec<gpui::SharedString>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Opens the app's one window; dir keeps the paired device.
-pub fn open(cx: &mut App, options: WindowOptions, dir: PathBuf) {
+pub fn open(cx: &mut App, options: WindowOptions, dir: PathBuf) -> Entity<Shell> {
+    cx.text_system()
+        .add_fonts(theme::FONTS.iter().map(|f| Cow::Borrowed(*f)).collect())
+        .expect("the bundled fonts load");
+    let mut opened = None;
     cx.open_window(options, |window, cx| {
-        let shell = cx.new(|cx| Shell::new(dir, cx));
+        let shell = cx.new(|cx| Shell::new(dir, window, cx));
         let focus = shell.read(cx).focus.clone();
         window.focus(&focus, cx);
+        opened = Some(shell.clone());
         shell
     })
     .expect("open window");
-}
-
-#[cfg(target_os = "android")]
-#[unsafe(no_mangle)]
-fn android_main(app: android_activity::AndroidApp) {
-    use gpui_mobile::android::jni;
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Info)
-            .with_tag("mandate"),
-    );
-    jni::install_panic_hook();
-    let dir = app.internal_data_path().expect("an app data dir");
-    jni::init_platform(&app);
-    let platform = jni::shared_platform().expect("platform initialised");
-    gpui::Application::with_platform(platform.into_rc())
-        .run(move |cx| open(cx, WindowOptions::default(), dir));
+    opened.expect("the window's view")
 }

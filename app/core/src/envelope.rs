@@ -31,12 +31,19 @@ pub trait DeviceKey {
     /// The 65-byte uncompressed point.
     fn public_key(&self) -> [u8; 65];
     /// ECDSA-P256 with SHA-256 over msg, as r||s. Keystores that answer in DER
-    /// convert.
+    /// convert with `der_signature`.
     fn sign(&self, msg: &[u8]) -> Result<[u8; 64], Error>;
 }
 
-/// A device key held in memory, for tests and until the platform keystores
-/// are in.
+/// r||s from an ASN.1 DER ECDSA-P256 signature, as keystores answer.
+pub fn der_signature(der: &[u8]) -> Result<[u8; 64], Error> {
+    let sig =
+        Signature::from_der(der).map_err(|_| Error::Key("not a DER P-256 signature".into()))?;
+    Ok(sig.to_bytes().into())
+}
+
+/// A device key held in memory, for tests and for the desktop until it has
+/// a keystore.
 pub struct SoftwareKey(SigningKey);
 
 impl SoftwareKey {
@@ -141,5 +148,19 @@ impl Envelope {
             KeyType::Fido2 => vk.verify(&[ad.as_slice(), &challenge].concat(), &sig),
         };
         verified.map_err(|_| Error::BadSignature)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn der_signature_is_r_s() {
+        let key = SoftwareKey::generate();
+        let raw = key.sign(b"msg").unwrap();
+        let der = Signature::from_slice(&raw).unwrap().to_der();
+        assert_eq!(der_signature(der.as_bytes()).unwrap(), raw);
+        assert!(der_signature(&raw).is_err());
     }
 }

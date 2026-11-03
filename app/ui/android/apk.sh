@@ -10,16 +10,21 @@ arm64-v8a) triple=aarch64-linux-android ;;
 esac
 cd "$(dirname "$0")"
 tools=$ANDROID_HOME/build-tools/35.0.0
+android=$ANDROID_HOME/platforms/android-35/android.jar
 out=build/$abi
-rm -rf "$out" && mkdir -p "$out/lib/$abi"
+rm -rf "$out" && mkdir -p "$out/lib/$abi" "$out/classes" "$out/gen"
 
 # The crate stays an rlib on desktop; only Android needs the cdylib.
-cargo ndk -t "$abi" -P 29 rustc -p mandate-app --lib --release --crate-type cdylib
+cargo ndk -t "$abi" -P 30 rustc -p mandate-app --lib --release --crate-type cdylib
 cp "../../target/$triple/release/libmandate_app.so" "$out/lib/$abi/"
 
-"$tools/aapt2" link -o "$out/unaligned.apk" --manifest AndroidManifest.xml \
-	-I "$ANDROID_HOME/platforms/android-35/android.jar"
-(cd "$out" && zip -qr unaligned.apk lib)
+# Linking the resources also writes R.java, which the Java side uses.
+"$tools/aapt2" compile --dir res -o "$out/res.zip"
+"$tools/aapt2" link -o "$out/unaligned.apk" --manifest AndroidManifest.xml -I "$android" \
+	--java "$out/gen" "$out/res.zip"
+javac --release 11 -classpath "$android" -d "$out/classes" $(find java "$out/gen" -name '*.java')
+"$tools/d8" --release --min-api 30 --lib "$android" --output "$out" $(find "$out/classes" -name '*.class')
+(cd "$out" && zip -qr unaligned.apk lib classes.dex)
 "$tools/zipalign" -f -P 16 4 "$out/unaligned.apk" "$out/mandate.apk"
 [ -f build/debug.keystore ] || keytool -genkeypair -keystore build/debug.keystore \
 	-storepass android -alias debug -keyalg RSA -validity 10000 -dname CN=debug

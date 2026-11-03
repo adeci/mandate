@@ -1,337 +1,471 @@
-//! What each screen shows. Records are shown from their bytes, as decoded
-//! from the envelope the owner signs.
+//! The frame every screen shares, the screens outside the tabs, and the
+//! few widgets they are built from.
 
-use crate::device::{Request, hex};
-use crate::{Screen, Shell};
+use crate::api::Exchange;
+use crate::device::hex;
+use crate::theme::{BOLD, FONT, MEDIUM, NORMAL, SIZE, Theme, bold, chars, lines};
+use crate::{Screen, Shell, Tab, words};
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, ElementId, Hsla, SharedString, Window, div, prelude::*,
-    px, rgb,
+    AnyElement, ClickEvent, Context, Div, ElementId, Hsla, SharedString, Stateful, Svg, Window,
+    div, prelude::*, px, svg,
 };
-use mandate_core::{Grant, PairLink, Record};
-
-const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+use mandate_core::{Envelope, PairLink, Record};
 
 impl Render for Shell {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = Theme::of(window);
+        let pad = if window.viewport_size().width < px(480.) { 1. } else { 2. };
+        let tab = match self.screen {
+            Screen::Tab(tab) => Some(tab),
+            _ => None,
+        };
+        let title = match &self.screen {
+            Screen::Pair { .. } => "Pair",
+            Screen::Tab(Tab::Now) => "Now",
+            Screen::Tab(Tab::Agents) => "Agents",
+            Screen::Tab(Tab::Connections) => "Connections",
+            Screen::Tab(Tab::Activity) => "Activity",
+            Screen::Settings => "Settings",
+            Screen::Code { .. } => "Code",
+            Screen::Admit { .. } => "Let in",
+            Screen::Review { .. } => "Review",
+        };
         let screen = match &self.screen {
-            Screen::Pair { text } => pair(text, cx),
-            Screen::Now => self.waiting(cx),
+            Screen::Pair { text } => pair(t, text, cx),
+            Screen::Tab(Tab::Now) => self.now_tab(t, cx),
+            Screen::Tab(Tab::Agents) => self.agents_tab(t, cx),
+            Screen::Tab(Tab::Connections) => self.connections_tab(t),
+            Screen::Tab(Tab::Activity) => self.activity_tab(t),
+            Screen::Settings => self.settings(t, cx),
             Screen::Code { exchange, code } => {
-                let checking = code.len() == 6 && self.error.is_none();
-                with_back(cx)
-                    .child(title(format!("Code from {}", exchange.name)))
-                    .child(muted(format!("Type the 6 digits {} shows.", exchange.name)))
-                    .child(digits(code))
-                    .child(if checking {
-                        muted("Checking…").into_any_element()
-                    } else {
-                        keypad(cx)
-                    })
+                code_entry(t, exchange, code, self.error.is_none(), cx)
             }
-            Screen::Admit { exchange, envelope } => {
-                let what = if exchange.kind == "device" { "as a device" } else { "as an agent" };
-                let envelope = envelope.clone();
-                with_back(cx)
-                    .child(title(format!("Let {} in?", exchange.name)))
-                    .child(muted(what))
-                    .child(button("admit", "Let in", cx, move |this, cx| {
-                        this.approve(envelope.clone(), cx)
-                    }))
-            }
-            Screen::Request { request, envelope } => {
-                let body = match envelope.record() {
-                    Ok(Record::Grant(g)) => grant(&g, request),
-                    _ => muted("This is not a grant record.").into_any_element(),
-                };
-                let (envelope, deny) = (envelope.clone(), format!("requests/{}/deny", request.id));
-                with_back(cx)
-                    .child(title(format!(
-                        "{} wants to read {}",
-                        request.identity_name, request.connector
-                    )))
-                    .when(!request.reason.is_empty(), |d| d.child(muted(request.reason.clone())))
-                    .child(body)
-                    .child(decide(envelope, deny, cx))
-            }
-            Screen::Proposal { proposal, envelope } => {
-                let body = match envelope.record() {
-                    Ok(Record::Write(w)) => div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .children(w.display.into_iter().map(|f| field(f.label, f.value)))
-                        .when(!w.note.is_empty(), |d| d.child(muted(w.note)))
-                        .into_any_element(),
-                    _ => muted("This is not a write record.").into_any_element(),
+            Screen::Admit { exchange, envelope } => admit(t, exchange, envelope, cx),
+            Screen::Review { proposal, envelope } => {
+                let fields: Vec<(String, AnyElement)> = match envelope.record() {
+                    Ok(Record::Write(w)) => w
+                        .display
+                        .into_iter()
+                        .map(|f| (f.label, div().child(f.value).into_any_element()))
+                        .collect(),
+                    _ => vec![(
+                        "Error".into(),
+                        div().child("This is not a write record.").into_any_element(),
+                    )],
                 };
                 let (envelope, deny) =
                     (envelope.clone(), format!("proposals/{}/deny", proposal.id));
-                with_back(cx)
-                    .child(title(format!(
-                        "{} wants to {} on {}",
-                        proposal.identity_name, proposal.op, proposal.connector
-                    )))
-                    .child(body)
-                    .child(decide(envelope, deny, cx))
+                column()
+                    .child(column().child(who(&proposal.identity_name, "wants to send")).child(
+                        div().font_weight(MEDIUM).child(words::connector(&proposal.connector)),
+                    ))
+                    .child(table(t, fields))
+                    .children(reason(t, &proposal.note))
+                    .child(approve(
+                        t,
+                        "approve",
+                        "Approve and send".into(),
+                        true,
+                        cx,
+                        move |this, cx| this.approve(envelope.clone(), cx),
+                    ))
+                    .child(button(t, "deny", "Deny", cx, move |this, cx| {
+                        this.post("POST", deny.clone(), cx, |_| Some("You denied the send.".into()))
+                    }))
             }
         };
+        #[cfg(target_os = "android")]
+        let (top, bottom) = crate::android::insets();
+        #[cfg(not(target_os = "android"))]
+        let (top, bottom) = (0., 0.);
         div()
-            .id("shell")
             .size_full()
-            .overflow_y_scroll()
+            .flex()
+            .flex_col()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key))
-            .p_6()
-            .bg(rgb(0xffffff))
-            .text_color(rgb(0x1f1f1f))
-            .child(screen.gap_3())
-            .when_some(self.error.clone(), |d, e| {
-                d.child(div().pt_4().text_color(rgb(0xa83232)).child(e))
-            })
+            .font_family(FONT)
+            .font_weight(NORMAL)
+            .text_size(px(SIZE))
+            .line_height(lines(1.))
+            .bg(t.bg)
+            .text_color(t.text)
+            .pt(px(top))
+            .pb(px(bottom))
+            .child(self.top_bar(t, title, tab.is_some(), pad, cx))
+            .child(
+                div().id("page").flex_1().min_h_0().overflow_y_scroll().child(
+                    page(pad)
+                        .pt(lines(1.))
+                        .pb(lines(2.))
+                        .gap(lines(1.))
+                        .when_some(self.error.clone(), |d, e| d.child(flash(t, e)))
+                        .when_some(self.notice.clone(), |d, n| d.child(flash(t, n)))
+                        .child(screen.gap(lines(1.))),
+                ),
+            )
+            .when_some(tab, |d, tab| d.child(self.tab_bar(t, tab, cx)))
     }
+}
+
+/// The page's column: the screen's width on phones, a readable measure,
+/// centered, on wider windows.
+fn page(pad: f32) -> Div {
+    column().w_full().max_w(chars(80.)).mx_auto().px(chars(pad))
+}
+
+pub fn icon(name: &str, color: Hsla) -> Svg {
+    svg().path(format!("icons/{name}.svg")).size(px(20.)).flex_none().text_color(color)
+}
+
+fn icon_button(
+    t: Theme,
+    id: &'static str,
+    name: &str,
+    cx: &mut Context<Shell>,
+    f: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
+) -> Stateful<Div> {
+    clickable(id, cx, f)
+        .size(lines(2.5))
+        .flex()
+        .items_center()
+        .justify_center()
+        .active(|s| s.bg(t.bg_alt))
+        .child(icon(name, t.text))
 }
 
 impl Shell {
-    fn waiting(&self, cx: &mut Context<Self>) -> Div {
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for (i, ex) in self.exchanges.iter().enumerate() {
-            let what = if ex.kind == "device" { "join as a device" } else { "log in" };
-            let ex = ex.clone();
-            rows.push(row(
-                ("exchange", i),
-                format!("{} wants to {what}", ex.name),
-                cx,
-                move |this, cx| {
-                    this.error = None;
-                    this.screen = Screen::Code { exchange: ex.clone(), code: String::new() };
+    /// The page's name, a way back off the tabs, and search and settings on
+    /// them.
+    fn top_bar(&self, t: Theme, title: &str, tabs: bool, pad: f32, cx: &mut Context<Self>) -> Div {
+        let paired = self.device.is_some();
+        let row = page(pad)
+            .flex_row()
+            .items_center()
+            .h(lines(3.))
+            .gap(chars(1.))
+            .when(!tabs && paired, |d| {
+                d.child(icon_button(t, "back", "arrow-left", cx, |this, cx| {
+                    this.go(Screen::Tab(Tab::Now), cx)
+                }))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .font_weight(BOLD)
+                    .text_size(px(SIZE * 1.25))
+                    .child(title.to_uppercase()),
+            )
+            .when(tabs, |d| {
+                d.child(icon_button(t, "search", "search", cx, |this, cx| {
+                    this.search = if this.search.is_some() { None } else { Some(String::new()) };
                     cx.notify();
-                },
-            ));
-        }
-        for (i, r) in self.now.requests.iter().enumerate() {
-            let r = r.clone();
-            let text = format!("{} wants to read {}", r.identity_name, r.connector);
-            rows.push(row(("request", i), text, cx, move |this, cx| {
-                this.open_request(r.clone(), cx)
-            }));
-        }
-        for (i, p) in self.now.proposals.iter().enumerate() {
-            let p = p.clone();
-            let text = format!("{} wants to {} on {}", p.identity_name, p.op, p.connector);
-            rows.push(row(("proposal", i), text, cx, move |this, cx| {
-                this.open_proposal(p.clone(), cx)
-            }));
-        }
-        let open = self.now.grants.iter().map(|g| {
-            let until =
-                g.until.as_deref().and_then(|u| u.get(11..16)).map(|t| format!(", until {t} UTC"));
-            div().child(format!(
-                "{} reads {}{}",
-                g.identity_name,
-                g.connector,
-                until.unwrap_or_default()
-            ))
+                }))
+                .child(icon_button(t, "settings", "settings", cx, |this, cx| {
+                    this.go(Screen::Settings, cx)
+                }))
+            });
+        let search = self.search.as_ref().filter(|_| tabs).map(|q| {
+            page(pad)
+                .flex_row()
+                .items_center()
+                .gap(chars(1.))
+                .h(lines(2.5))
+                .child(icon("search", t.alt))
+                .child(if q.is_empty() {
+                    t.alt("Search this page").flex_1()
+                } else {
+                    div().flex_1().child(q.clone())
+                })
+                .child(icon_button(t, "clear", "x", cx, |this, cx| {
+                    this.search = None;
+                    cx.notify();
+                }))
         });
         column()
-            .child(title("Now"))
-            .when(rows.is_empty(), |d| d.child(muted("Nothing waits.")))
-            .children(rows)
-            .when(!self.now.grants.is_empty(), |d| {
-                d.child(div().pt_4().child(muted("Open"))).children(open)
-            })
-            .child(div().pt_6().child(link("stop", "Stop all access", cx, |this, cx| {
-                this.post("stop-all".into(), cx)
-            })))
+            .border_b_2()
+            .border_color(t.text)
+            .child(row)
+            .children(search.map(|s| div().border_t_2().border_color(t.alt).child(s)))
+    }
+
+    /// Thumb-reach tabs: icon over label, the current one in full weight.
+    fn tab_bar(&self, t: Theme, current: Tab, cx: &mut Context<Self>) -> Div {
+        let waiting = self.now.requests.len() + self.now.proposals.len() + self.exchanges.len();
+        let attention = self.connectors.iter().filter(|c| c.health.state != "ok").count();
+        let items = [
+            (Tab::Now, "bell", "Now", waiting),
+            (Tab::Agents, "bot", "Agents", 0),
+            (Tab::Connections, "plug", "Connections", attention),
+            (Tab::Activity, "activity", "Activity", 0),
+        ];
+        let cells = items.into_iter().enumerate().map(|(i, (tab, name, label, count))| {
+            let on = tab == current;
+            let color = if on { t.text } else { t.alt };
+            clickable(("tab", i), cx, move |this, cx| this.go(Screen::Tab(tab), cx))
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .py(lines(0.5))
+                .text_color(color)
+                .when(on, |d| d.font_weight(BOLD))
+                .child(div().flex().items_center().gap(chars(0.5)).child(icon(name, color)).when(
+                    count > 0,
+                    |d| {
+                        d.child(
+                            div()
+                                .px(chars(0.5))
+                                .bg(t.info)
+                                .text_color(t.bg)
+                                .child(count.to_string()),
+                        )
+                    },
+                ))
+                .child(div().text_size(px(SIZE * 0.85)).child(label))
+        });
+        div().flex().border_t_2().border_color(t.text).children(cells)
     }
 }
 
-fn pair(text: &str, cx: &mut Context<Shell>) -> Div {
+fn pair(t: Theme, text: &str, cx: &mut Context<Shell>) -> Div {
     let link: Option<PairLink> = text.parse().ok();
-    let shown = if text.is_empty() {
-        muted("mandate://pair?…").into_any_element()
-    } else {
-        text.to_string().into_any_element()
-    };
+    let have = link.is_some();
+    let shown = if text.is_empty() { "mandate://pair?…" } else { text };
     column()
-        .child(title("Pair"))
-        .child(muted("Paste the pairing link from the setup page."))
-        .child(
-            div().p_2().border_1().border_color(line()).rounded_md().overflow_hidden().child(shown),
-        )
+        .child("Scan the QR code on the setup page with your phone's camera.")
         .when_some(link, |d, link| {
             let key = hex(&link.spki_sha256);
             let groups: Vec<&str> = (0..key.len()).step_by(4).map(|i| &key[i..i + 4]).collect();
-            d.child(muted("Server key"))
-                .child(groups.join(" "))
-                .child(muted("Pair only if this matches what mandate setup printed."))
-                .child(button("pair", "Pair", cx, move |this, cx| this.pair(link.clone(), cx)))
+            d.child(table(
+                t,
+                vec![
+                    ("Server".into(), div().child(link.url.clone()).into_any_element()),
+                    ("Key".into(), div().child(groups.join(" ")).into_any_element()),
+                ],
+            ))
+            .child("Pair only if this key matches what mandate setup printed.")
+            .child(button(t, "pair", "Pair", cx, move |this, cx| this.pair(link.clone(), cx)))
+        })
+        .when(!have, |d| {
+            d.child(t.alt("Or paste the link here:").mt(lines(1.))).child(
+                div()
+                    .border_2()
+                    .border_color(t.text)
+                    .px(chars(1.))
+                    .py(lines(0.5))
+                    .when(text.is_empty(), |d| d.text_color(t.alt))
+                    .child(shown.to_string()),
+            )
         })
 }
 
-fn grant(g: &Grant, request: &Request) -> AnyElement {
-    let chats = if g.chats.is_empty() {
-        "every chat".to_string()
-    } else {
-        let named = g.chats.iter().map(|id| match request.chat_name(id) {
-            Some(name) => format!("{name} ({id})"),
-            None => id.clone(),
-        });
-        named.collect::<Vec<_>>().join(", ")
-    };
-    let window = match (&g.schedule, g.from, g.until) {
-        (Some(s), _, _) => {
-            let days = if s.days.is_empty() {
-                "every day".to_string()
-            } else {
-                s.days.iter().map(|&d| DAYS[usize::from(d) % 7]).collect::<Vec<_>>().join(" ")
-            };
-            format!("{days}, {} for {} ({})", s.start, span(u64::from(s.length)), s.zone)
-        }
-        (None, Some(from), Some(until)) => {
-            let span = span(until.unix().saturating_sub(from.unix()).max(0) as u64);
-            format!("{span}, until {} UTC", &until.to_string()[11..16])
-        }
-        _ => "none".into(),
-    };
-    let horizon =
-        if g.horizon == 0 { "all history".into() } else { format!("{} back", span(g.horizon)) };
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(field("Connector", g.connector.clone()))
-        .child(field("Chats", chats))
-        .child(field("Window", window))
-        .child(field("History", horizon))
-        .into_any_element()
-}
-
-fn span(secs: u64) -> String {
-    match secs {
-        s if s >= 86400 && s % 86400 == 0 => format!("{} days", s / 86400),
-        s if s >= 3600 && s % 3600 == 0 => format!("{} h", s / 3600),
-        s => format!("{} min", s.div_ceil(60)),
-    }
-}
-
-fn decide(envelope: mandate_core::Envelope, deny: String, cx: &mut Context<Shell>) -> Div {
-    div()
-        .flex()
-        .gap_2()
-        .pt_2()
-        .child(button("approve", "Approve", cx, move |this, cx| this.approve(envelope.clone(), cx)))
-        .child(button("deny", "Deny", cx, move |this, cx| this.post(deny.clone(), cx)))
-}
-
-fn digits(code: &str) -> Div {
-    let cell = |c: Option<char>| {
+fn code_entry(t: Theme, ex: &Exchange, code: &str, quiet: bool, cx: &mut Context<Shell>) -> Div {
+    let mut typed = code.chars();
+    let cells = (0..6).map(|_| {
         div()
-            .w(px(36.))
-            .h(px(44.))
+            .w(chars(4.))
+            .h(lines(3.))
             .flex()
             .items_center()
             .justify_center()
-            .border_b_1()
-            .border_color(line())
-            .text_xl()
-            .child(c.map(String::from).unwrap_or_default())
-    };
-    let mut chars = code.chars();
-    div().flex().gap_2().children((0..6).map(|_| cell(chars.next())))
-}
-
-fn keypad(cx: &mut Context<Shell>) -> AnyElement {
-    let rows = [["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"], ["", "0", "Del"]];
-    let key = |label: &'static str, cx: &mut Context<Shell>| -> AnyElement {
-        if label.is_empty() {
-            return div().w(px(72.)).into_any_element();
-        }
-        button(label, label, cx, move |this, cx| match label {
-            "Del" => {
-                if let Screen::Code { code, .. } = &mut this.screen {
-                    code.pop();
-                }
-                cx.notify();
+            .border_2()
+            .border_color(t.text)
+            .text_size(px(SIZE * 1.5))
+            .font_weight(BOLD)
+            .child(typed.next().map(String::from).unwrap_or_default())
+    });
+    let keys = [["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"], ["", "0", "Del"]];
+    let rows = keys.map(|row| {
+        div().flex().gap(chars(1.)).children(row.map(|label| {
+            if label.is_empty() {
+                return div()
+                    .flex_1()
+                    .h(lines(2.))
+                    .px(chars(1.))
+                    .border_2()
+                    .border_color(t.bg)
+                    .into_any_element();
             }
-            d => this.digit(d.chars().next().unwrap_or('0'), cx),
+            button(t, label, label, cx, move |this, cx| match label {
+                "Del" => {
+                    if let Screen::Code { code, .. } = &mut this.screen {
+                        code.pop();
+                    }
+                    cx.notify();
+                }
+                d => this.digit(d.chars().next().unwrap_or('0'), cx),
+            })
+            .flex_1()
+            .into_any_element()
+        }))
+    });
+    let what = if ex.kind == "device" { "wants to join as a device" } else { "wants to log in" };
+    column()
+        .child(who(&ex.name, what))
+        .child(format!("Type the 6 digits {} shows.", ex.name))
+        .child(div().flex().gap(chars(1.)).children(cells))
+        .child(if code.len() == 6 && quiet {
+            t.alt("Checking the code…").into_any_element()
+        } else {
+            column().gap(lines(0.5)).children(rows).into_any_element()
         })
-        .w(px(72.))
-        .into_any_element()
-    };
-    let rows: Vec<Div> =
-        rows.iter().map(|r| div().flex().gap_2().children(r.map(|l| key(l, cx)))).collect();
-    div().flex().flex_col().gap_2().pt_2().children(rows).into_any_element()
 }
 
-fn column() -> Div {
+fn admit(t: Theme, ex: &Exchange, envelope: &Envelope, cx: &mut Context<Shell>) -> Div {
+    let (kind, after) = if ex.kind == "device" {
+        ("device", format!("Once in, {} can approve like this phone.", ex.name))
+    } else {
+        (
+            "agent",
+            format!(
+                "Once in, {} can ask to read your chats. It reads nothing until you approve.",
+                ex.name
+            ),
+        )
+    };
+    let envelope = envelope.clone();
+    let mut rows = vec![("Kind".to_string(), div().child(kind).into_any_element())];
+    if !ex.address.is_empty() {
+        rows.push(("From".into(), div().child(ex.address.clone()).into_any_element()));
+    }
+    column()
+        .child(bold(format!("Let {} in?", ex.name)))
+        .child(format!("The code matches. {after}"))
+        .child(table(t, rows))
+        .child(approve(
+            t,
+            "admit",
+            format!("Let {} in", ex.name).into(),
+            true,
+            cx,
+            move |this, cx| this.approve(envelope.clone(), cx),
+        ))
+        .child(button(t, "later", "Not now", cx, |this, cx| this.go(Screen::Tab(Tab::Now), cx)))
+}
+
+pub fn column() -> Div {
     div().flex().flex_col()
 }
 
-fn with_back(cx: &mut Context<Shell>) -> Div {
-    column().child(link("back", "Back", cx, |this, cx| {
-        this.back();
-        cx.notify();
-    }))
+/// "laptop wants to read": the name stands out.
+pub fn who(name: &str, rest: &str) -> Div {
+    div().flex().flex_wrap().gap_x(chars(1.)).child(bold(name.to_string())).child(rest.to_string())
 }
 
-fn title(text: impl Into<SharedString>) -> Div {
-    div().text_xl().pb_2().child(text.into())
+/// The agent's own words, set apart.
+pub fn reason(t: Theme, text: &str) -> Option<Div> {
+    (!text.is_empty()).then(|| {
+        column()
+            .border_l_2()
+            .border_color(t.alt)
+            .pl(chars(1.))
+            .child(t.alt("agent's reason"))
+            .child(text.to_string())
+    })
 }
 
-fn muted(text: impl Into<SharedString>) -> Div {
-    div().text_color(rgb(0x707070)).child(text.into())
+pub fn flash(t: Theme, text: String) -> Div {
+    div().border_2().border_color(t.info).px(chars(1.)).py(lines(0.5)).child(text)
 }
 
-fn field(label: impl Into<SharedString>, value: impl Into<SharedString>) -> Div {
-    div().flex().flex_col().child(muted(label).text_sm()).child(value.into())
+/// A panel like the site's details box.
+pub fn panel(t: Theme) -> Div {
+    column().gap(lines(1.)).border_2().border_color(t.text).px(chars(1.)).py(lines(1.))
 }
 
-fn line() -> Hsla {
-    rgb(0xd8d8d8).into()
+/// A fully ruled two-column table, like the site's.
+pub fn table(t: Theme, rows: Vec<(String, AnyElement)>) -> Div {
+    // The longest label, its padding and the rule, so no label wraps.
+    let width = rows.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) as f32 + 2.;
+    column().border_2().border_color(t.text).children(rows.into_iter().enumerate().map(
+        |(i, (label, value))| {
+            div()
+                .flex()
+                .when(i > 0, |d| d.border_t_2().border_color(t.text))
+                .child(
+                    div()
+                        .w(chars(width) + px(4.))
+                        .flex_none()
+                        .px(chars(1.))
+                        .py(lines(0.5))
+                        .border_r_2()
+                        .border_color(t.text)
+                        .font_weight(MEDIUM)
+                        .child(label.to_uppercase()),
+                )
+                .child(div().flex_1().min_w_0().px(chars(1.)).py(lines(0.5)).child(value))
+        },
+    ))
 }
 
-fn clickable(
+pub fn clickable(
     id: impl Into<ElementId>,
     cx: &mut Context<Shell>,
     f: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
-) -> gpui::Stateful<Div> {
+) -> Stateful<Div> {
     div()
         .id(id.into())
         .cursor_pointer()
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| f(this, cx)))
 }
 
-fn button(
+/// A 2px block that inverts while pressed.
+pub fn button(
+    t: Theme,
     id: impl Into<ElementId>,
-    label: &'static str,
+    label: &str,
     cx: &mut Context<Shell>,
     f: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
-) -> gpui::Stateful<Div> {
+) -> Stateful<Div> {
     clickable(id, cx, f)
+        .h(lines(2.))
+        .px(chars(1.))
         .flex()
+        .items_center()
         .justify_center()
-        .px_3()
-        .py_2()
-        .border_1()
-        .border_color(line())
-        .rounded_md()
+        .border_2()
+        .border_color(t.text)
+        .font_weight(MEDIUM)
+        .active(|s| s.bg(t.text).text_color(t.bg))
+        .hover(|s| s.bg(t.bg_alt))
+        .child(label.to_uppercase())
+}
+
+/// The emerald action that grants access, saying what it grants.
+pub fn approve(
+    t: Theme,
+    id: impl Into<ElementId>,
+    label: SharedString,
+    enabled: bool,
+    cx: &mut Context<Shell>,
+    f: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
+) -> Stateful<Div> {
+    let block = |d: Stateful<Div>| {
+        d.min_h(lines(2.)).px(chars(1.)).py(lines(0.5)).text_center().border_2().font_weight(MEDIUM)
+    };
+    if !enabled {
+        return block(div().id(id.into())).border_color(t.alt).text_color(t.alt).child(label);
+    }
+    block(clickable(id, cx, f))
+        .border_color(t.grant)
+        .bg(t.grant)
+        .text_color(t.on_grant)
+        .active(|s| s.bg(t.grant_hi).border_color(t.grant_hi))
         .child(label)
 }
 
-fn link(
-    id: &'static str,
-    label: &'static str,
+pub fn link(
+    t: Theme,
+    id: impl Into<ElementId>,
+    label: &str,
     cx: &mut Context<Shell>,
     f: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
-) -> gpui::Stateful<Div> {
-    clickable(id, cx, f).text_color(rgb(0x707070)).underline().child(label)
+) -> Stateful<Div> {
+    clickable(id, cx, f).text_color(t.alt).underline().child(label.to_string())
 }
 
-fn row(
-    id: (&'static str, usize),
-    text: String,
-    cx: &mut Context<Shell>,
-    f: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
-) -> AnyElement {
-    clickable(id, cx, f).py_3().border_b_1().border_color(line()).child(text).into_any_element()
+/// An element ID for one of several alike actions, by the item's ID.
+pub fn id_for(action: &str, item: &str) -> ElementId {
+    ElementId::Name(format!("{action}-{item}").into())
 }
