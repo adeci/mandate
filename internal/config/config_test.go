@@ -27,6 +27,8 @@ config = { phone = "+4912345", retries = 3 }
 		{"own with cert", "[tls]\ncert = \"/c.pem\"\nkey = \"/k.pem\"", false},
 		{"unknown mode", "[tls]\nmode = \"self\"", false},
 		{"listen without port", `listen = "box.example"`, false},
+		{"agent port", `agent_listen = ":8444"`, true},
+		{"agent port same as listen", "listen = \":8443\"\nagent_listen = \":8443\"", false},
 		{"connector name as path", "[connectors.\"../x\"]\ncommand = \"/bin/x\"", false},
 		{"relative command", "[connectors.signal]\ncommand = \"signal\"", false},
 	} {

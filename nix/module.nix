@@ -13,14 +13,17 @@ let
   json = pkgs.formats.json { };
   toml = pkgs.formats.toml { };
 
-  configFile = toml.generate "mandate.toml" {
-    inherit (cfg) listen;
-    tls = lib.filterAttrs (_: v: v != null) cfg.tls;
-    connectors = lib.mapAttrs (_: c: {
-      command = lib.getExe c.package;
-      inherit (c) config;
-    }) cfg.connectors;
-  };
+  configFile = toml.generate "mandate.toml" (
+    lib.filterAttrs (_: v: v != null) {
+      inherit (cfg) listen;
+      agent_listen = cfg.agentListen;
+      tls = lib.filterAttrs (_: v: v != null) cfg.tls;
+      connectors = lib.mapAttrs (_: c: {
+        command = lib.getExe c.package;
+        inherit (c) config;
+      }) cfg.connectors;
+    }
+  );
   connectorConfig = name: c: json.generate "mandate-${name}.json" c.config;
   connectorUnits = map (n: "mandate-${n}.service") (lib.attrNames cfg.connectors);
 
@@ -87,23 +90,6 @@ let
     "127.0.0.54"
   ];
 
-  # The gateway's group reads a connector's store: the directory, by its
-  # default ACL what the connector creates in it, and a store that is there
-  # already, from an older layout or after systemd's chown dropped its ACLs.
-  # private/ is left alone: its mask must stay empty. -P skips symlinks the
-  # connector might plant. The unit's own view of the directory is idmapped,
-  # where the gateway's group has no ID, so this goes through PID 1's root.
-  storeACL = pkgs.writeShellScript "mandate-store-acl" ''
-    set -eu
-    dir=/proc/1/root/var/lib/private/mandate/connectors/$1
-    ${pkgs.acl}/bin/setfacl -m g:mandate-gateway:r-X,d:g:mandate-gateway:r-X "$dir"
-    for f in "$dir/data.db" "$dir/data.db-journal"; do
-      if [ -f "$f" ]; then
-        ${pkgs.acl}/bin/setfacl -P -m g:mandate-gateway:r "$f"
-      fi
-    done
-  '';
-
   connectorService =
     name: c:
     unit "mandate connector ${name}" {
@@ -111,7 +97,8 @@ let
       StateDirectory = "mandate/connectors/${name}";
       StateDirectoryMode = "0750";
       RuntimeDirectory = "mandate/connectors/${name}";
-      ExecStartPre = "+${storeACL} ${name}";
+      # The gateway's group reads the store, but not private/ (docs/design.md).
+      ExecStartPre = "+${exe} store-acl ${name}";
       ExecStart = utils.escapeSystemdExecArgs [
         (lib.getExe c.package)
         "--name"
@@ -158,6 +145,16 @@ in
       type = lib.types.str;
       default = ":8443";
       description = "Address of mandate's one HTTPS port, for agents and the app.";
+    };
+
+    agentListen = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = ":8444";
+      description = ''
+        Address of an extra HTTPS port that serves only the agent API, so a
+        network rule can keep agent machines away from the owner side.
+      '';
     };
 
     tls = {

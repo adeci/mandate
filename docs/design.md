@@ -7,6 +7,7 @@ The specs in [spec/](spec/) are mandate's public contracts. This is how the serv
 `cmd/mandate` holds:
 - `mandate serve front|gateway|owner`: the three server processes;
 - `mandate setup`, `mandate reset`: root, on the server;
+- `mandate store-acl NAME`: root, before connector NAME starts (see systemd below);
 - `mandate conformance PROGRAM`: connector.md's kit, also run by the flake check;
 - the agent CLI (`login`, reads, `request`, proposals, …).
 
@@ -44,6 +45,7 @@ Each unit has its own `RuntimeDirectory=` (`mandate/gateway`, `mandate/owner`, `
 
 - **TLS modes:** `own` (P-256 key and self-signed certificate, made once, in front's state), `acme` (autocert with TLS-ALPN-01, cache in front's state) and `cert` (files, reloaded when they change).
 - **Routing:** `/agent/` goes to the gateway socket, `/owner/` and `/setup` to the owner socket, and everything else is `404`.
+- **Agent-only port:** with `agent_listen` set, front also listens there with the same TLS and forwards only `/agent/`, so a network rule that filters by port (a Tailscale grant) can keep agent machines away from the owner side.
 - **Headers:** front sets these, overwriting anything the client sent:
   - `X-Forwarded-For`: the client's IP;
   - `Mandate-Spki-Sha256`: the hex SHA-256 of the SPKI of the certificate served on this connection, needed for `server_confirm`.
@@ -51,10 +53,11 @@ Each unit has its own `RuntimeDirectory=` (`mandate/gateway`, `mandate/owner`, `
 
 ## Config: `/etc/mandate/mandate.toml`
 
-Every process reads it. The NixOS module writes the same file.
+Every process reads it. The NixOS module writes the same file; elsewhere `mandate setup` writes a default unless there is one: the values below, and every connector `install.sh` put in `/usr/local/lib/mandate/connectors`.
 
 ```toml
 listen = ":8443"
+agent_listen = ""       # optional: a second port serving only /agent/
 
 [tls]
 mode = "own"            # own | acme | cert
@@ -63,7 +66,7 @@ cert = ""               # cert
 key = ""                # cert
 
 [connectors.whatsapp]
-command = "/usr/lib/mandate/connectors/whatsapp"   # NixOS: the package path
+command = "/usr/local/lib/mandate/connectors/whatsapp"   # NixOS: the package path
 config = {}             # written as JSON for the connector's --config
 ```
 
@@ -102,9 +105,10 @@ JSON over the two sockets, under `/internal/`, and caller-checked by group as in
 
 Every mandate unit (front, gateway, owner, and one per connector) is `PartOf=` and `WantedBy=` `mandate.target`. The NixOS module and the units `mandate setup` writes both define it. `mandate reset` stops the target, wipes, and starts it again.
 
+- **Without the NixOS module:** when mandate.target doesn't exist, `mandate setup` makes the three groups and the default config, writes the units from one template (`internal/owner/systemd.tmpl`, which lists how they differ from the module's), and enables and starts them. Each connector's `--config` is `/etc/mandate/connectors/NAME.json`, made from mandate.toml.
 - **Unit user names:** a dynamic user can't share its name with a static group, so the units run as `User=mandate_front`, `mandate_gateway` and `mandate_owner`, with the fixed `Group=` names. The underscore keeps them from clashing with connector users (`mandate-NAME`).
 - **Connector state ACL:**
   - With dynamic users, systemd keeps state under `/var/lib/private`, owned by `nobody` on disk and mapped into each unit's view. A named-group ACL set inside the unit fails, and systemd's recursive chown removes ACLs.
-  - So `ExecStartPre=+` sets the ACL through `/proc/1/root/var/lib/private/mandate/connectors/NAME` on every start.
+  - So `ExecStartPre=+mandate store-acl NAME` sets the ACL through `/proc/1/root/var/lib/private/mandate/connectors/NAME` on every start, writing the ACL xattrs itself, since not every host has `setfacl`.
   - The gateway reads the stores through `BindReadOnlyPaths=/var/lib/private/mandate/connectors:/var/lib/mandate/connectors`.
   - The VM test checks all of this first.

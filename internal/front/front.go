@@ -1,5 +1,5 @@
-// Package front terminates TLS on mandate's one port and forwards requests
-// to the gateway and owner sockets.
+// Package front terminates TLS on mandate's port and forwards requests to
+// the gateway and owner sockets.
 package front
 
 import (
@@ -34,38 +34,59 @@ func Serve(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	return serve(ctx, ln, tc)
+	var agentLn net.Listener
+	if cfg.AgentListen != "" {
+		if agentLn, err = lc.Listen(ctx, "tcp", cfg.AgentListen); err != nil {
+			ln.Close()
+			return fmt.Errorf("agent listen: %w", err)
+		}
+	}
+	return serve(ctx, tc, ln, agentLn)
 }
 
-func serve(ctx context.Context, ln net.Listener, tc *tls.Config) error {
-	l := &listener{Listener: ln, config: tc}
-	srv := &http.Server{
-		Handler:     handler(config.Socket("gateway"), config.Socket("owner")),
-		ConnContext: l.connContext,
-		// No read or write timeout: server-sent events stay open and long
-		// polls last up to 900 seconds. A request body is capped instead.
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-		MaxHeaderBytes:    64 << 10,
+// serve answers everything on ln and only the agent API on agentLn, if any.
+func serve(ctx context.Context, tc *tls.Config, ln, agentLn net.Listener) error {
+	gateway, owner := proxy(config.Socket("gateway")), proxy(config.Socket("owner"))
+	lns := []net.Listener{ln}
+	handlers := []http.Handler{handler(gateway, owner)}
+	if agentLn != nil {
+		lns = append(lns, agentLn)
+		handlers = append(handlers, handler(gateway, nil))
 	}
-	errc := make(chan error, 1)
-	go func() { errc <- srv.Serve(l) }()
+	srvs := make([]*http.Server, len(lns))
+	errc := make(chan error, len(lns))
+	for i, ln := range lns {
+		l := &listener{Listener: ln, config: tc}
+		srvs[i] = &http.Server{
+			Handler:     handlers[i],
+			ConnContext: l.connContext,
+			// No read or write timeout: server-sent events stay open and long
+			// polls last up to 900 seconds. A request body is capped instead.
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       2 * time.Minute,
+			MaxHeaderBytes:    64 << 10,
+		}
+		go func() { errc <- srvs[i].Serve(l) }()
+	}
+	var err error
 	select {
 	case <-ctx.Done():
-		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
+	case err = <-errc:
+		err = fmt.Errorf("serve: %w", err)
+	}
+	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, srv := range srvs {
 		// Streams and long polls never go idle; close what is left.
-		if err := srv.Shutdown(shutdown); err != nil {
+		if srv.Shutdown(shutdown) != nil {
 			srv.Close()
 		}
-		return nil
-	case err := <-errc:
-		return fmt.Errorf("serve: %w", err)
 	}
+	return err
 }
 
-func handler(gatewaySock, ownerSock string) http.Handler {
-	gateway, owner := proxy(gatewaySock), proxy(ownerSock)
+// handler routes to owner too unless it is nil.
+func handler(gateway, owner http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		var h http.Handler

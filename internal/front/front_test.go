@@ -18,8 +18,8 @@ import (
 )
 
 // start runs front in own mode with gateway and owner behind their sockets
-// and returns its address.
-func start(t *testing.T, gateway, owner http.Handler) string {
+// and returns its address and its agent-only address.
+func start(t *testing.T, gateway, owner http.Handler) (addr, agentAddr string) {
 	t.Helper()
 	t.Setenv("MANDATE_ROOT", t.TempDir())
 	for _, b := range []struct {
@@ -42,20 +42,22 @@ func start(t *testing.T, gateway, owner http.Handler) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	var lns [2]net.Listener
+	for i := range lns {
+		if lns[i], err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
-	go func() { done <- serve(ctx, ln, tc) }()
+	go func() { done <- serve(ctx, tc, lns[0], lns[1]) }()
 	t.Cleanup(func() {
 		cancel()
 		if err := <-done; err != nil {
 			t.Error(err)
 		}
 	})
-	return ln.Addr().String()
+	return lns[0].Addr().String(), lns[1].Addr().String()
 }
 
 func client(h2 bool) *http.Client {
@@ -89,36 +91,45 @@ func TestRouting(t *testing.T) {
 			fmt.Fprintf(w, "%s %s", name, r.URL.Path)
 		})
 	}
-	addr := start(t, backend("gateway"), backend("owner"))
+	addr, agentAddr := start(t, backend("gateway"), backend("owner"))
 
 	for _, tt := range []struct {
+		agentPort      bool
 		method, target string
 		want           string // the backend's answer; "" if none may answer
 	}{
-		{"GET", "/agent/v1/connectors", "gateway /agent/v1/connectors"},
-		{"POST", "/owner/v1/pair", "owner /owner/v1/pair"},
-		{"GET", "/setup", "owner /setup"},
-		{"GET", "/", ""},
-		{"GET", "/setup/x", ""},
-		{"GET", "/internal/live", ""},
-		{"GET", "/agent/../internal/live", ""},
-		{"GET", "/owner/v1/%2e%2e/%2e%2e/internal/live", ""},
-		{"GET", "//internal/live", ""},
-		{"CONNECT", "/agent/../internal/live", ""},
+		{false, "GET", "/agent/v1/connectors", "gateway /agent/v1/connectors"},
+		{false, "POST", "/owner/v1/pair", "owner /owner/v1/pair"},
+		{false, "GET", "/setup", "owner /setup"},
+		{false, "GET", "/", ""},
+		{false, "GET", "/setup/x", ""},
+		{false, "GET", "/internal/live", ""},
+		{false, "GET", "/agent/../internal/live", ""},
+		{false, "GET", "/owner/v1/%2e%2e/%2e%2e/internal/live", ""},
+		{false, "GET", "//internal/live", ""},
+		{false, "CONNECT", "/agent/../internal/live", ""},
+		{true, "GET", "/agent/v1/connectors", "gateway /agent/v1/connectors"},
+		{true, "POST", "/owner/v1/pair", ""},
+		{true, "GET", "/setup", ""},
+		{true, "GET", "/agent/../owner/v1/now", ""},
 	} {
-		resp := raw(t, addr, tt.method+" "+tt.target+" HTTP/1.1\r\nHost: box\r\nContent-Length: 0\r\n\r\n")
+		to := addr
+		if tt.agentPort {
+			to = agentAddr
+		}
+		resp := raw(t, to, tt.method+" "+tt.target+" HTTP/1.1\r\nHost: box\r\nContent-Length: 0\r\n\r\n")
 		body := make([]byte, 512)
 		n, _ := resp.Body.Read(body)
 		got := string(body[:n])
 		resp.Body.Close()
 		if tt.want != "" {
 			if resp.StatusCode != http.StatusOK || got != tt.want {
-				t.Errorf("%s %s = %d %q, want %q", tt.method, tt.target, resp.StatusCode, got, tt.want)
+				t.Errorf("%s %s (agent port %v) = %d %q, want %q", tt.method, tt.target, tt.agentPort, resp.StatusCode, got, tt.want)
 			}
 			continue
 		}
 		if resp.StatusCode == http.StatusOK || strings.HasPrefix(got, "gateway") || strings.HasPrefix(got, "owner") {
-			t.Errorf("%s %s reached a backend: %d %q", tt.method, tt.target, resp.StatusCode, got)
+			t.Errorf("%s %s (agent port %v) reached a backend: %d %q", tt.method, tt.target, tt.agentPort, resp.StatusCode, got)
 		}
 	}
 }
@@ -127,7 +138,7 @@ func TestHeaders(t *testing.T) {
 	echo := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(r.Header)
 	})
-	addr := start(t, echo, echo)
+	addr, _ := start(t, echo, echo)
 
 	for _, h2 := range []bool{false, true} {
 		req, err := http.NewRequest(http.MethodGet, "https://"+addr+"/agent/v1/connectors", nil)
@@ -163,7 +174,7 @@ func TestHeaders(t *testing.T) {
 // The key front makes on its first start is the one setup reports and the
 // one the next start serves.
 func TestOwnKey(t *testing.T) {
-	addr := start(t, http.NotFoundHandler(), http.NotFoundHandler())
+	addr, _ := start(t, http.NotFoundHandler(), http.NotFoundHandler())
 	reported, err := SPKI(context.Background(), &config.Config{Listen: addr})
 	if err != nil {
 		t.Fatal(err)
@@ -219,7 +230,7 @@ func TestEventStreamUnbuffered(t *testing.T) {
 		case <-r.Context().Done():
 		}
 	})
-	addr := start(t, http.NotFoundHandler(), owner)
+	addr, _ := start(t, http.NotFoundHandler(), owner)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

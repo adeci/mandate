@@ -49,6 +49,11 @@ func run(ctx context.Context, args []string) error {
 		}
 		return serve(ctx, args[1])
 	case len(args) == 1 && (args[0] == "setup" || args[0] == "reset"):
+		if args[0] == "setup" {
+			if err := owner.Install(ctx); err != nil {
+				return err
+			}
+		}
 		cfg, err := config.Load(config.File())
 		if err != nil {
 			return err
@@ -57,6 +62,8 @@ func run(ctx context.Context, args []string) error {
 			return owner.Setup(ctx, cfg, os.Stdout)
 		}
 		return owner.Reset(ctx, cfg, os.Stdout)
+	case len(args) == 2 && args[0] == "store-acl":
+		return owner.StoreACL(args[1])
 	case len(args) > 0 && args[0] == "conformance":
 		return conformance.Run(ctx, args[1:], os.Stdout)
 	}

@@ -22,6 +22,7 @@ in
     imports = [ self.nixosModules.default ];
     services.mandate = {
       enable = true;
+      agentListen = ":8444";
       connectors = {
         test = {
           package = testPrograms;
@@ -36,7 +37,10 @@ in
       // pkgs.lib.genAttrs bundled (_: { });
     };
     systemd.services.mandate-legacy.wantedBy = pkgs.lib.mkForce [ ];
-    networking.firewall.allowedTCPPorts = [ 8443 ];
+    networking.firewall.allowedTCPPorts = [
+      8443
+      8444
+    ];
     environment.systemPackages = [
       testPrograms
       pkgs.acl
@@ -302,6 +306,9 @@ in
         for path in ["/internal/live", "/internal/requests", "/"]:
             code = server.succeed(f"curl -sk -o /dev/null -w '%{{http_code}}' https://localhost:8443{path}")
             assert code == "404", (path, code)
+        for path, want in [("/owner/v1/now", "404"), ("/setup", "404"), ("/agent/v1/connectors", "401")]:
+            code = server.succeed(f"curl -sk -o /dev/null -w '%{{http_code}}' https://localhost:8444{path}")
+            assert code == want, ("agent port", path, code)
         for sock, path in [("gateway", "/internal/live"), ("owner", "/internal/requests")]:
             code, _ = as_group("mandate-front", f"/run/mandate/{sock}/socket", "GET", path)
             assert code == 403, (sock, path, code)

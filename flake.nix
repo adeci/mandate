@@ -28,7 +28,11 @@
         let
           all = pkgs.callPackages ./nix/package.nix { };
         in
-        all // { default = all.mandate; }
+        all
+        // {
+          default = all.mandate;
+          release = import ./nix/release.nix { inherit pkgs; };
+        }
       );
 
       nixosModules.default = import ./nix/module.nix self;
@@ -44,7 +48,10 @@
       checks = forAllSystems (
         pkgs:
         let
-          packages = removeAttrs self.packages.${pkgs.stdenv.hostPlatform.system} [ "default" ];
+          packages = removeAttrs self.packages.${pkgs.stdenv.hostPlatform.system} [
+            "default"
+            "release"
+          ];
           lint = pkgs.callPackage ./nix/lint.nix { };
           prefix = p: lib.mapAttrs' (n: lib.nameValuePair "${p}-${n}");
         in

@@ -11,6 +11,8 @@ Writes are proposals the owner approves on a device.
 ## Basics
 
 - Routes are under `/agent/v1/`. Protocol version 1.
+- A server may also serve these routes alone on an agent-only port; the owner
+  says which URL to log in with.
 - The client checks the server's TLS key during the code exchange. If the
   certificate chains to a root the machine trusts (ACME, the owner's own
   certificate), normal checks apply from then on; otherwise the client pins

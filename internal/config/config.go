@@ -16,9 +16,10 @@ import (
 )
 
 type Config struct {
-	Listen     string               `toml:"listen"`
-	TLS        TLS                  `toml:"tls"`
-	Connectors map[string]Connector `toml:"connectors"`
+	Listen      string               `toml:"listen"`
+	AgentListen string               `toml:"agent_listen"`
+	TLS         TLS                  `toml:"tls"`
+	Connectors  map[string]Connector `toml:"connectors"`
 }
 
 type TLS struct {
@@ -61,6 +62,14 @@ func (c *Config) validate() error {
 	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
+	if c.AgentListen != "" {
+		if _, _, err := net.SplitHostPort(c.AgentListen); err != nil {
+			return fmt.Errorf("agent_listen: %w", err)
+		}
+		if c.AgentListen == c.Listen {
+			return errors.New("agent_listen: same as listen")
+		}
+	}
 	t := c.TLS
 	switch t.Mode {
 	case "own":
@@ -83,7 +92,7 @@ func (c *Config) validate() error {
 			return fmt.Errorf("connector %q: name must be a-z, 0-9 and -, start with a letter, at most 24 characters", name)
 		}
 		// Agent API routes and CLI commands share the namespace with connectors.
-		if slices.Contains([]string{"access", "connectors", "help", "join", "login", "proposals", "request", "reset", "serve", "setup", "status"}, name) {
+		if slices.Contains([]string{"access", "connectors", "help", "join", "login", "proposals", "request", "reset", "serve", "setup", "status", "store-acl"}, name) {
 			return fmt.Errorf("connector %q: the name is taken by mandate itself", name)
 		}
 		if !filepath.IsAbs(conn.Command) {

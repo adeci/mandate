@@ -1,7 +1,7 @@
 {
   lib,
   buildGoModule,
-  go_1_27,
+  buildPackages,
   libsignal-ffi,
   zlib,
 }:
@@ -30,7 +30,9 @@ let
       buildInputs ? [ ],
       description,
     }:
-    (buildGoModule.override { go = go_1_27; }) {
+    # The Go that runs on the build machine, which differs when cross
+    # compiling or building static (nix/release.nix).
+    (buildGoModule.override { go = buildPackages.go_1_27; }) {
       inherit
         pname
         modRoot
