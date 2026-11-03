@@ -781,7 +781,7 @@ function busy(el, action) {
 const engaged = () =>
   pending !== null ||
   $(
-    "#review:not([hidden]), .linking:not([hidden]), #agent-setup:not([hidden]), .stop-all details[open], " +
+    "#review:not([hidden]), .linking:not([hidden]), #agent-setup:not([hidden]), details.stop-all[open], " +
       "button:disabled:not([data-approve-access]), input:focus, textarea:focus, select:focus",
   ) ||
   $$("input:not([type=hidden]), textarea").some((el) => el.value !== el.defaultValue);

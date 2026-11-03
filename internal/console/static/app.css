@@ -353,10 +353,12 @@ button.content, .button.content { text-transform: none; font-weight: var(--w-med
 /* The proposal's own words, like the cards. */
 dl.fields .message, textarea[data-param] { font-family: var(--content); }
 .page-heading { flex-direction: row; flex-wrap: nowrap; align-items: start; }
-.stop-all { border-color: var(--error); margin-top: calc(var(--lh) * 2); }
-.stop-all summary { width: auto; color: var(--error); border-color: var(--error); }
-.stop-all summary::before { content: none; }
-.stop-all details[open] > summary { display: none; }
+/* A break-glass control: out of the way until it's needed. */
+.stop-all { margin-top: calc(var(--lh) * 3); }
+.stop-all > summary { display: inline; cursor: pointer; font-size: 0.85em; color: var(--fg-alt); text-decoration: underline dotted; }
+.stop-all > summary::before, .stop-all > summary::marker { content: none; }
+.stop-all[open] > summary { display: none; }
+.stop-all > .panel { border-color: var(--error); }
 .flash[data-kind="ok"] { border-color: var(--accent); }
 .actor[data-actor="you"] { color: var(--accent); }
 .timeline li > .meta { display: inline-block; min-width: 13ch; }

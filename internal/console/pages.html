@@ -457,16 +457,16 @@
 <nav class="pager">{{with .Newer}}<a href="{{.}}">← newer</a>{{end}}<a href="{{or .More .Older}}" class="older">Show more →</a></nav>
 </section>
 
-<section class="panel stop-all">
-  <details>
-    <summary class="button danger">Stop all</summary>
+<details class="stop-all">
+  <summary>stop all access…</summary>
+  <div class="panel danger">
     <p>Close every grant and pause every routine? Waiting sends stay.</p>
     <div class="actions">
       <form method="post" action="/access/stop-all"><button type="submit" class="danger">Stop all</button></form>
       <button type="button" data-cancel-stop>Cancel</button>
     </div>
-  </details>
-</section>
+  </div>
+</details>
 {{end}}
 <p id="msg" class="msg" role="status"></p>
 {{template "bottom" .}}{{end}}

@@ -89,7 +89,7 @@ func TestNowRendersEveryCard(t *testing.T) {
 		t.Error("a request that matched nothing doesn't say so")
 	}
 	// Stop all asks first without any script, at the bottom.
-	stop := strings.Index(page, `<section class="panel stop-all">`)
+	stop := strings.Index(page, `<details class="stop-all">`)
 	if stop < strings.Index(page, `id="today"`) || !strings.Contains(page[stop:], `Waiting sends stay.`) {
 		t.Error("Stop all isn't below Today with a confirmation step")
 	}
