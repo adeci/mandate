@@ -1,4 +1,4 @@
-// Command mandate runs mandate's server processes.
+// Command mandate runs mandate's server processes and is the agent CLI.
 package main
 
 import (
@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/adeci/mandate/internal/cli"
 	"github.com/adeci/mandate/internal/config"
 	"github.com/adeci/mandate/internal/front"
 	"github.com/adeci/mandate/internal/gateway"
@@ -34,13 +35,16 @@ func main() {
 		os.Exit(2)
 	case err != nil:
 		fmt.Fprintf(os.Stderr, "mandate: %v\n", err)
-		os.Exit(1)
+		os.Exit(cli.ExitCode(err))
 	}
 }
 
 func run(ctx context.Context, args []string) error {
 	switch {
-	case len(args) == 2 && args[0] == "serve":
+	case len(args) > 0 && args[0] == "serve":
+		if len(args) != 2 {
+			return errUsage
+		}
 		return serve(ctx, args[1])
 	case len(args) == 1 && (args[0] == "setup" || args[0] == "reset"):
 		cfg, err := config.Load(config.File())
@@ -52,7 +56,7 @@ func run(ctx context.Context, args []string) error {
 		}
 		return owner.Reset(ctx, cfg, os.Stdout)
 	}
-	return errUsage
+	return cli.Run(ctx, args)
 }
 
 func serve(ctx context.Context, process string) error {
