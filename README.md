@@ -1,150 +1,54 @@
 # mandate
 
-mandate lets AI agents read your accounts and propose writes. Reads need a
-grant you sign with your passkey, and a write waits until you approve it.
+mandate is a self-hosted gateway to your personal accounts for AI agents. It
+is my compromise with the
+[lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/):
 
-It runs on a NixOS machine you own. Agents reach a gateway over your tailnet,
-you approve in a web console, and each account lives in its own connector,
-which checks your passkey's signature before it acts.
+- Agents should never see your logins. Instead we use connectors on your own machine.
+- Agents can read only what you grant, specifically for as long as you grant it.
+- Anything an agent wants to send is stuck until you review and approve it on your device.
+
+Every connector is an unofficial community plugin: the bundled ones aren't special, and you can write your own.
+
+![Architecture](docs/architecture.svg)
+
+mandate answers agents and filters every read against your grants.
+Connectors each hold one account and act only with your signature. The app
+is where you approve, unlocked with your fingerprint.
 
 ## Setup
+
+On NixOS:
 
 ```nix
 imports = [ inputs.mandate.nixosModules.default ];
 
 services.mandate = {
   enable = true;
-  hostname = "mandate.example.com";
-  useACMEHost = "mandate.example.com"; # or tlsCertFile and tlsKeyFile
   connectors.whatsapp = { };
-  notify.ntfy.url = "http://ntfy.example.ts.net/mandate"; # optional
 };
 ```
 
-After deploying:
-
-1. Sign in to the console with `sudo cat /var/lib/mandate/admin-password`
-   and add a passkey under Keys.
-2. Link your accounts under Connections.
-3. Create an agent under Agents and set it up as below with the token your
-   browser shows, which is shown only once. The page shows when the agent
-   first connects.
-
-The gateway (port 8780) and the console (443) listen on all addresses, and
-the firewall opens them on `tailscale0` only (`openFirewallOn`).
-Set `adminPasswordHashFile` to manage the admin password yourself.
-
-## Agents
-
-On the agent's machine, put the token in a file only the agent can read and
-point the CLI at the gateway:
+On any other Linux with systemd:
 
 ```sh
-install -m 600 /dev/null ~/.config/mandate/token   # then paste the token into it
-export MANDATE_URL=http://box:8780 MANDATE_TOKEN_FILE=~/.config/mandate/token
-mandate --help
-mandate access                                     # what this agent may read now
-mandate request whatsapp --chat Family --for 30m --since 7d --reason "find the dinner plan"
-mandate request signal --chat Family --every weekdays --at 07:00 --for 20m --reason "morning summary"
-mandate request whatsapp --extend --for 30m --reason "still reading"
-mandate whatsapp send 15551234567@s.whatsapp.net "running 10 late" --wait 10m
-mandate whatsapp media 15551234567@s.whatsapp.net 812   # save that message's photo
+curl -fsSL https://github.com/adeci/mandate/releases/latest/download/install.sh | sh
+sudo mandate setup
 ```
 
-`MANDATE_URL` is the mandate host's tailnet name with the gateway port
-(8780). `MANDATE_TOKEN` works in place of a token file. On a machine without
-Nix, download the CLI and check it against the release's checksums:
+mandate listens on one HTTPS port; how you reach it is up to you. Open the
+setup page and scan its code with the mandate app.
+
+## Agent identities
 
 ```sh
-base=https://github.com/adeci/mandate/releases/latest/download
-curl -LO $base/mandate-linux-amd64 -LO $base/SHA256SUMS   # or mandate-linux-arm64
-sha256sum --ignore-missing -c SHA256SUMS && install -m 755 mandate-linux-amd64 ~/.local/bin/mandate
+mandate login https://your-server
 ```
 
-Give the agent [skills/mandate/SKILL.md](skills/mandate/SKILL.md) as a skill
-or in its instructions.
-
-## Access
-
-Each agent has its own token, and reads or writes nothing until you grant it.
-A grant, signed with your passkey, covers one agent and one connector, every
-chat or the ones you check, during a window:
-
-- **once**, from now for a duration, or
-- **a routine**, such as weekdays at 07:00 for 20 minutes, in your
-  browser's time zone,
-
-and a horizon: messages older than 24 hours, 7 days or 30 days stay hidden,
-or none with all history. Checked chats are exact: a thread or channel
-created later is not included. A grant also lets the agent propose writes
-to the chats it covers, while it is open and for 24 hours after its window
-ends unless you close it; a reply then may only answer a message from
-before the end. Grants on `http` cover every allowlisted read, with no
-chats or horizon.
-
-The console's home, Now, shows:
-
-- **Waiting for you**: agents' requests to read, to run a routine or to
-  extend an open grant, and their proposed writes, each naming the agent,
-  the chats, the time and the agent's reason. Adjust a request's chats,
-  time or horizon before you approve it with your passkey, or deny it.
-  Chats start unticked unless the request matched a single contact whose
-  name that person didn't choose.
-- **Open now**: grants that are open, with the time left, `+30m`
-  (passkey) and `Close`.
-- **Routines**, with `Pause`; `Resume` signs the same routine again.
-- **Today**: who read what and when, and what was proposed, approved or
-  closed.
-
-Closing, pausing, denying and `Stop all`, which closes every grant, denies
-every waiting request and cancels approvals you started, need no passkey
-and take effect within 15 seconds; writes already waiting stay for you to
-review. Agents lists each agent with when it was last seen and its grants;
-grants you make yourself start there.
-
-An agent without a grant gets a 403 that tells it to run `mandate request`.
-Undecided requests expire after an hour, and an agent may have 3 waiting at
-a time. With `notify.ntfy.url` (and `notify.ntfy.tokenFile` for a protected
-topic) set, the console posts to that ntfy topic whenever a write or a
-request waits for you, titled with the agent's name; requests to read come
-with high priority.
-
-## Approving
-
-Writes wait on Now; `Review` opens one. Approving with a passkey unlocks the
-tab for 10 minutes, so further approvals need no touch; lock or close the
-tab to end it sooner. Agents and grants always take a touch. To add a passkey,
-register it under Keys and approve the addition with a trusted one; removing
-one needs a trusted one too. Once a passkey is trusted, the admin password no
-longer signs in. Lost them all? `sudo mandate-reset-keys` lets the admin
-password sign in and add a first key again; agents and grants signed by the
-old keys stop working, so create them again.
-
-To hide a chat from agents, whatever they are granted, list it in
-`/var/lib/mandate-gateway/exposure.toml`:
-
-```toml
-[whatsapp]
-hide_containers = ["15551234567@s.whatsapp.net"]
-```
-
-Hiding a chat also hides the chats under it, such as a Discord server's
-channels and their threads; `hide_senders` hides a person's messages and
-DMs. The gateway logs a warning for each listed ID that matches nothing it
-has stored.
+This creates an agent identity for the machine: every agent on it reaches
+mandate through it. Type the code it shows into the app to let it in.
 
 ## Connectors
 
-`whatsapp`, `signal`, `matrix`, `discord`, `gmessages` (Google Messages, for
-SMS and RCS), `fastmail` and `http` (any token API behind an allowlist) are
-included. Each runs as its own user with only its own login. To write one,
-see [docs/connectors.md](docs/connectors.md); for what each part is trusted
-with, see [SECURITY.md](SECURITY.md).
-
-## License
-
-[AGPL-3.0](LICENSE). The WhatsApp, Signal, Discord and Google Messages
-connectors are unofficial clients: using them may break those services' terms
-and get an account limited or banned. mandate comes with no warranty, and its
-authors are not liable for what happens to your accounts (sections 15 and 16
-of the license).
+The bundled connectors are listed in [docs/connectors.md](docs/connectors.md).
+To write your own, see the [connector protocol](docs/spec/connector.md).
