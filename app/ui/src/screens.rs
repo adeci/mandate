@@ -315,9 +315,13 @@ fn code_entry(t: Theme, ex: &Exchange, code: &str, quiet: bool, cx: &mut Context
             .into_any_element()
         }))
     });
-    let what = if ex.kind == "device" { "wants to join as a device" } else { "wants to log in" };
+    let title = if ex.kind == "device" {
+        bold(DEVICE_JOIN.to_string())
+    } else {
+        who(&ex.name, "wants to log in")
+    };
     column()
-        .child(who(&ex.name, what))
+        .child(title)
         .child(format!("Type the 6 digits {} shows.", ex.name))
         .child(div().flex().gap(chars(1.)).children(cells))
         .child(if code.len() == 6 && quiet {
@@ -328,25 +332,30 @@ fn code_entry(t: Theme, ex: &Exchange, code: &str, quiet: bool, cx: &mut Context
 }
 
 fn admit(t: Theme, ex: &Exchange, envelope: &Envelope, cx: &mut Context<Shell>) -> Div {
-    let (kind, after) = if ex.kind == "device" {
-        ("device", format!("Once in, {} can approve like this phone.", ex.name))
-    } else {
-        (
-            "agent",
-            format!(
-                "Once in, {} can ask to read your chats. It reads nothing until you approve.",
-                ex.name
-            ),
-        )
-    };
     let envelope = envelope.clone();
-    let mut rows = vec![("Kind".to_string(), div().child(kind).into_any_element())];
+    let later = button(t, "later", "Not now", cx, |this, cx| this.go(Screen::Tab(Tab::Now), cx));
+    if ex.kind == "device" {
+        // A device can approve anything, so the warning sits on the button.
+        let admit = approve(t, "admit", "Let this device in".into(), true, cx, move |this, cx| {
+            this.approve(envelope.clone(), cx)
+        });
+        return column()
+            .child(bold(DEVICE_JOIN.to_string()))
+            .child("The code matches.")
+            .child(table(t, device_rows(ex)))
+            .child(column().child(device_warning(t)).child(admit))
+            .child(later);
+    }
+    let mut rows = vec![("Kind".to_string(), div().child("agent").into_any_element())];
     if !ex.address.is_empty() {
         rows.push(("From".into(), div().child(ex.address.clone()).into_any_element()));
     }
     column()
         .child(bold(format!("Let {} in?", ex.name)))
-        .child(format!("The code matches. {after}"))
+        .child(format!(
+            "The code matches. Once in, {} can ask to read your chats. It reads nothing until you approve.",
+            ex.name
+        ))
         .child(table(t, rows))
         .child(approve(
             t,
@@ -356,7 +365,27 @@ fn admit(t: Theme, ex: &Exchange, envelope: &Envelope, cx: &mut Context<Shell>) 
             cx,
             move |this, cx| this.approve(envelope.clone(), cx),
         ))
-        .child(button(t, "later", "Not now", cx, |this, cx| this.go(Screen::Tab(Tab::Now), cx)))
+        .child(later)
+}
+
+/// The title of every device join, never the name the device gave itself.
+pub const DEVICE_JOIN: &str = "A new device wants to join";
+
+/// What a joining device calls itself and where it asks from.
+pub fn device_rows(ex: &Exchange) -> Vec<(String, AnyElement)> {
+    let from = if ex.address.is_empty() { "unknown" } else { ex.address.as_str() };
+    vec![
+        ("Name".to_string(), div().child(ex.name.clone()).into_any_element()),
+        ("From".to_string(), div().child(from.to_string()).into_any_element()),
+    ]
+}
+
+/// The warning shown before letting a device in: an agent can start a join
+/// from its own machine and ask the owner to type the code.
+pub fn device_warning(t: Theme) -> Div {
+    div().border_2().border_color(t.text).px(chars(1.)).py(lines(0.5)).font_weight(MEDIUM).child(
+        "A device can approve anything: reads, sends, and other devices. Only let it in if you just started this on your own phone or computer.",
+    )
 }
 
 pub fn column() -> Div {

@@ -3,7 +3,10 @@
 
 use crate::api::{Activity, Exchange, Grant, Proposal, Request};
 use crate::pick::Pick;
-use crate::screens::{approve, button, clickable, column, id_for, link, panel, reason, table, who};
+use crate::screens::{
+    DEVICE_JOIN, approve, button, clickable, column, device_rows, device_warning, id_for, link,
+    panel, reason, table, who,
+};
 use crate::theme::{MEDIUM, Theme, bold, chars, lines};
 use crate::words::{self, connector, horizon, span};
 use crate::{Adjust, Screen, Shell};
@@ -347,20 +350,26 @@ fn adjust_panel(
 }
 
 fn login_card(t: Theme, ex: &Exchange, cx: &mut Context<Shell>) -> Div {
-    let what = if ex.kind == "device" { "wants to join as a device" } else { "wants to log in" };
+    let ex2 = ex.clone();
+    let code = button(t, id_for("code", &ex.id), "Type the code", cx, move |this, cx| {
+        this.go(Screen::Code { exchange: ex2.clone(), code: String::new() }, cx)
+    });
+    let since = ("Since".to_string(), div().child(words::clock(&ex.started_at)).into_any_element());
+    if ex.kind == "device" {
+        let mut rows = device_rows(ex);
+        rows.push(since);
+        return panel(t)
+            .child(bold(DEVICE_JOIN.to_string()))
+            .child(table(t, rows))
+            .child(device_warning(t))
+            .child(code);
+    }
     let mut rows = Vec::new();
     if !ex.address.is_empty() {
         rows.push(("From".to_string(), div().child(ex.address.clone()).into_any_element()));
     }
-    rows.push(("Since".into(), div().child(words::clock(&ex.started_at)).into_any_element()));
-    let ex2 = ex.clone();
-    panel(t).child(who(&ex.name, what)).child(table(t, rows)).child(button(
-        t,
-        id_for("code", &ex.id),
-        "Type the code",
-        cx,
-        move |this, cx| this.go(Screen::Code { exchange: ex2.clone(), code: String::new() }, cx),
-    ))
+    rows.push(since);
+    panel(t).child(who(&ex.name, "wants to log in")).child(table(t, rows)).child(code)
 }
 
 fn send_card(t: Theme, p: &Proposal, cx: &mut Context<Shell>) -> Div {

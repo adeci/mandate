@@ -328,8 +328,12 @@ fn notify(service: &Global<JObject<'static>>, client: &Client, shown: &mut HashS
         let now: Now = client.now(None, None)?;
         let exchanges: Vec<Exchange> = client.get("exchanges")?;
         let exchanges = exchanges.into_iter().map(|e| {
-            let what = if e.kind == "device" { "join as a device" } else { "log in" };
-            (e.id, format!("{} wants to {what}", e.name))
+            let text = if e.kind == "device" {
+                crate::screens::DEVICE_JOIN.to_string()
+            } else {
+                format!("{} wants to log in", e.name)
+            };
+            (e.id, text)
         });
         let requests = now
             .requests
