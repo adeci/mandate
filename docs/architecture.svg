@@ -1,75 +1,71 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="448" viewBox="0 0 900 448" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="440" viewBox="0 0 900 440" font-family="'IBM Plex Mono', 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" fill="#1f2328">
   <defs>
-    <marker id="n" markerWidth="8" markerHeight="8" refX="6.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#7d8590"/></marker>
-    <marker id="g" markerWidth="8" markerHeight="8" refX="6.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#3fb950"/></marker>
+    <marker id="a" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#1f2328"/></marker>
   </defs>
 
-  <!-- Its own dark canvas, so it reads the same in any theme. -->
-  <rect width="900" height="448" rx="12" fill="#0d1117"/>
-  <rect x="0.5" y="0.5" width="899" height="447" rx="12" fill="none" stroke="#21262d"/>
+  <!-- A white card of its own, so it reads the same in any theme. -->
+  <rect x="0.5" y="0.5" width="899" height="439" rx="8" fill="#fff" stroke="#d0d7de"/>
 
-  <g font-size="11" letter-spacing="1" fill="#7d8590" stroke="#30363d" stroke-dasharray="3 4">
-    <rect x="24" y="36" width="212" height="214" rx="8" fill="none"/>
-    <rect x="290" y="36" width="320" height="388" rx="8" fill="none"/>
-    <rect x="664" y="36" width="212" height="214" rx="8" fill="none"/>
+  <g fill="none" stroke="#d0d7de" stroke-width="1.5" stroke-dasharray="5 5">
+    <rect x="24" y="36" width="212" height="214" rx="6"/>
+    <rect x="300" y="36" width="300" height="384" rx="6"/>
+    <rect x="664" y="36" width="212" height="214" rx="6"/>
   </g>
-  <g font-size="11" letter-spacing="1" fill="#7d8590">
-    <text x="40" y="60">AGENT MACHINE</text>
-    <text x="306" y="60">SERVER MACHINE</text>
-    <text x="680" y="60">YOUR DEVICES</text>
+  <g font-size="12" fill="#6e7781">
+    <text x="38" y="58">agent machine</text>
+    <text x="314" y="58">server machine</text>
+    <text x="678" y="58">your devices</text>
   </g>
 
-  <rect x="56" y="82" width="148" height="38" rx="6" fill="none" stroke="#30363d" stroke-dasharray="3 4"/>
-  <text x="130" y="105" text-anchor="middle" font-size="12" fill="#7d8590">any agents …</text>
-  <rect x="52" y="170" width="156" height="60" rx="8" fill="#161b22" stroke="#30363d"/>
-  <text x="130" y="196" text-anchor="middle" font-size="15" font-weight="600" fill="#e6edf3">agent identity</text>
-  <text x="130" y="215" text-anchor="middle" font-size="11" fill="#7d8590">mandate CLI</text>
+  <g fill="#d8dee4">
+    <rect x="53" y="179" width="160" height="52" rx="6"/>
+    <rect x="353" y="179" width="200" height="52" rx="6"/>
+    <rect x="703" y="179" width="160" height="52" rx="6"/>
+    <rect x="353" y="321" width="200" height="44" rx="6"/>
+    <rect x="703" y="321" width="160" height="44" rx="6"/>
+  </g>
+  <g fill="#fff" stroke="#1f2328" stroke-width="2">
+    <rect x="50" y="176" width="160" height="52" rx="6"/>
+    <rect x="350" y="176" width="200" height="52" rx="6"/>
+    <rect x="700" y="176" width="160" height="52" rx="6"/>
+    <rect x="350" y="318" width="200" height="44" rx="6"/>
+    <rect x="700" y="318" width="160" height="44" rx="6"/>
+  </g>
+  <g fill="none" stroke="#8c959f" stroke-width="1.5" stroke-dasharray="4 4">
+    <rect x="60" y="84" width="140" height="36" rx="6"/>
+    <rect x="350" y="376" width="200" height="32" rx="6"/>
+  </g>
 
-  <rect x="330" y="160" width="240" height="80" rx="8" fill="#e6edf3"/>
-  <text x="450" y="196" text-anchor="middle" font-size="17" font-weight="700" fill="#0d1117">mandate</text>
-  <text x="450" y="218" text-anchor="middle" font-size="11" fill="#57606a">grants · approvals · one HTTPS port</text>
-  <rect x="352" y="318" width="196" height="58" rx="8" fill="#161b22" stroke="#30363d"/>
-  <text x="450" y="343" text-anchor="middle" font-size="15" font-weight="600" fill="#e6edf3">connector</text>
-  <text x="450" y="362" text-anchor="middle" font-size="11" fill="#7d8590">one account · its login</text>
-  <rect x="352" y="388" width="196" height="26" rx="6" fill="none" stroke="#30363d" stroke-dasharray="3 4"/>
-  <text x="450" y="405" text-anchor="middle" font-size="11" fill="#7d8590">more connectors …</text>
+  <g text-anchor="middle">
+    <text x="130" y="107" font-size="13" fill="#6e7781">any agents …</text>
+    <text x="130" y="207">agent identity</text>
+    <text x="450" y="207" font-weight="700">mandate</text>
+    <text x="780" y="207">mandate app</text>
+    <text x="450" y="345">connector</text>
+    <text x="450" y="397" font-size="13" fill="#6e7781">more connectors …</text>
+    <text x="780" y="345">your accounts</text>
+  </g>
 
-  <rect x="692" y="160" width="164" height="80" rx="8" fill="#e6edf3"/>
-  <text x="774" y="196" text-anchor="middle" font-size="17" font-weight="700" fill="#0d1117">mandate app</text>
-  <text x="774" y="218" text-anchor="middle" font-size="11" fill="#57606a">phone · desktop</text>
-  <rect x="692" y="318" width="164" height="58" rx="8" fill="#161b22" stroke="#30363d"/>
-  <text x="774" y="343" text-anchor="middle" font-size="15" font-weight="600" fill="#e6edf3">your accounts</text>
-  <text x="774" y="362" text-anchor="middle" font-size="11" fill="#7d8590">WhatsApp · Signal · email · …</text>
-
-  <g fill="none" stroke-width="1.5">
-    <path d="M130,120 V166" stroke="#7d8590" marker-end="url(#n)"/>
-    <path d="M208,200 H326" stroke="#7d8590" marker-end="url(#n)"/>
-    <path d="M572,186 C612,140 650,140 688,184" stroke="#7d8590" marker-end="url(#n)"/>
-    <path d="M690,214 C650,260 612,260 574,216" stroke="#3fb950" marker-end="url(#g)"/>
-    <path d="M450,240 V314" stroke="#7d8590" marker-end="url(#n)"/>
-    <path d="M548,347 H688" stroke="#7d8590" marker-end="url(#n)"/>
+  <g fill="none" stroke="#1f2328" stroke-width="2" marker-end="url(#a)">
+    <path d="M130,120 V170"/>
+    <path d="M210,202 H344"/>
+    <path d="M550,190 H694"/>
+    <path d="M700,214 H556"/>
+    <path d="M450,228 V312"/>
+    <path d="M550,340 H694"/>
   </g>
 
   <!-- Numbered transitions, in the order a write takes them. -->
-  <g font-size="11">
-    <rect x="241" y="190" width="56" height="20" rx="4" fill="#0d1117" stroke="#30363d"/>
-    <text x="252" y="204" text-anchor="middle" font-weight="700" fill="#7d8590">1</text>
-    <text x="263" y="204" fill="#c9d1d9">asks</text>
-
-    <rect x="595" y="142" width="72" height="20" rx="4" fill="#0d1117" stroke="#30363d"/>
-    <text x="606" y="156" text-anchor="middle" font-weight="700" fill="#7d8590">2</text>
-    <text x="617" y="156" fill="#c9d1d9">notifies</text>
-
-    <rect x="591" y="238" width="80" height="20" rx="4" fill="#0d1117" stroke="#3fb950"/>
-    <text x="602" y="252" text-anchor="middle" font-weight="700" fill="#3fb950">3</text>
-    <text x="613" y="252" fill="#c9d1d9">approves</text>
-
-    <rect x="402" y="267" width="96" height="20" rx="4" fill="#0d1117" stroke="#30363d"/>
-    <text x="413" y="281" text-anchor="middle" font-weight="700" fill="#7d8590">4</text>
-    <text x="424" y="281" fill="#c9d1d9">signed write</text>
-
-    <rect x="580" y="337" width="76" height="20" rx="4" fill="#0d1117" stroke="#30363d"/>
-    <text x="591" y="351" text-anchor="middle" font-weight="700" fill="#7d8590">5</text>
-    <text x="602" y="351" fill="#c9d1d9">its login</text>
+  <g font-size="12">
+    <rect x="252" y="194" width="52" height="16" fill="#d0d7de"/>
+    <text x="278" y="206" text-anchor="middle">1 asks</text>
+    <rect x="583" y="182" width="80" height="16" fill="#d0d7de"/>
+    <text x="623" y="194" text-anchor="middle">2 notifies</text>
+    <rect x="583" y="206" width="80" height="16" fill="#d0d7de"/>
+    <text x="623" y="218" text-anchor="middle">3 approves</text>
+    <rect x="396" y="262" width="108" height="16" fill="#d0d7de"/>
+    <text x="450" y="274" text-anchor="middle">4 signed write</text>
+    <rect x="579" y="332" width="88" height="16" fill="#d0d7de"/>
+    <text x="623" y="344" text-anchor="middle">5 its login</text>
   </g>
 </svg>
