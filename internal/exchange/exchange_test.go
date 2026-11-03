@@ -13,7 +13,7 @@ import (
 	"github.com/gtank/ristretto255"
 )
 
-func unhex(t *testing.T, s string) []byte {
+func unhex(t testing.TB, s string) []byte {
 	t.Helper()
 	b, err := hex.DecodeString(strings.Join(strings.Fields(s), ""))
 	if err != nil {

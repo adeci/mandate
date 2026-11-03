@@ -38,7 +38,7 @@ type spec struct {
 
 // readSpec takes the vectors from records.md itself, so the spec and the
 // package cannot drift apart.
-func readSpec(t *testing.T) spec {
+func readSpec(t testing.TB) spec {
 	t.Helper()
 	b, err := os.ReadFile("../docs/spec/records.md")
 	if err != nil {
@@ -142,7 +142,7 @@ func (s spec) envelope(v vector) Envelope {
 }
 
 // log returns the spec's key log: phone, laptop and YubiKey.
-func (s spec) log(t *testing.T) *Log {
+func (s spec) log(t testing.TB) *Log {
 	t.Helper()
 	var entries []Envelope
 	for _, v := range s.vectors {
