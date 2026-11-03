@@ -13,8 +13,9 @@ Every connector is an unofficial community plugin: the bundled ones aren't speci
 ![Architecture](docs/architecture.svg)
 
 mandate answers agents and filters every read against your grants.
-Connectors each hold one account and act only with your signature. The app
-is where you approve, unlocked with your fingerprint.
+Connectors each hold one account and act only with your signature. You
+approve in the mandate app on your phone or desktop, authenticating on that
+device.
 
 ## Setup
 
@@ -37,7 +38,7 @@ sudo mandate setup
 ```
 
 mandate listens on one HTTPS port; how you reach it is up to you. Open the
-setup page and scan its code with the mandate app.
+setup page and pair the mandate app on your phone or desktop.
 
 ## Agent identities
 
