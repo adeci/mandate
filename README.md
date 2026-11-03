@@ -10,7 +10,10 @@ is my compromise with the
 
 Every connector is an unofficial community plugin: the bundled ones aren't special, and you can write your own.
 
-![Architecture](docs/architecture.svg)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
+  <img alt="How a send reaches your accounts" src="docs/architecture-light.svg">
+</picture>
 
 mandate answers agents and filters every read against your grants.
 Connectors each hold one account and act only with your signature. You
