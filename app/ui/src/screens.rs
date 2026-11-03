@@ -29,13 +29,19 @@ impl Render for Shell {
             Screen::Code { .. } => "Code",
             Screen::Admit { .. } => "Let in",
             Screen::Review { .. } => "Review",
+            Screen::Link { .. } => "Link",
+            Screen::Hide { .. } => "Never share",
+            Screen::Grant(_) => "New grant",
         };
         let screen = match &self.screen {
             Screen::Pair { text } => pair(t, text, cx),
             Screen::Tab(Tab::Now) => self.now_tab(t, cx),
             Screen::Tab(Tab::Agents) => self.agents_tab(t, cx),
-            Screen::Tab(Tab::Connections) => self.connections_tab(t),
-            Screen::Tab(Tab::Activity) => self.activity_tab(t),
+            Screen::Tab(Tab::Connections) => self.connections_tab(t, cx),
+            Screen::Tab(Tab::Activity) => self.activity_tab(t, cx),
+            Screen::Link { .. } => self.link_screen(t, cx),
+            Screen::Hide { .. } => self.hide_screen(t, cx),
+            Screen::Grant(_) => self.grant_screen(t, cx),
             Screen::Settings => self.settings(t, cx),
             Screen::Code { exchange, code } => {
                 code_entry(t, exchange, code, self.error.is_none(), cx)
@@ -146,7 +152,13 @@ impl Shell {
             .gap(chars(1.))
             .when(!tabs && paired, |d| {
                 d.child(icon_button(t, "back", "arrow-left", cx, |this, cx| {
-                    this.go(Screen::Tab(Tab::Now), cx)
+                    let back = match this.screen {
+                        Screen::Link { .. } => Screen::Tab(Tab::Connections),
+                        Screen::Hide { .. } => Screen::Settings,
+                        Screen::Grant(_) => Screen::Tab(Tab::Agents),
+                        _ => Screen::Tab(Tab::Now),
+                    };
+                    this.go(back, cx)
                 }))
             })
             .child(
@@ -159,6 +171,7 @@ impl Shell {
             .when(tabs, |d| {
                 d.child(icon_button(t, "search", "search", cx, |this, cx| {
                     this.search = if this.search.is_some() { None } else { Some(String::new()) };
+                    crate::keyboard(this.search.is_some());
                     cx.notify();
                 }))
                 .child(icon_button(t, "settings", "settings", cx, |this, cx| {
@@ -179,6 +192,7 @@ impl Shell {
                 })
                 .child(icon_button(t, "clear", "x", cx, |this, cx| {
                     this.search = None;
+                    crate::keyboard(false);
                     cx.notify();
                 }))
         });

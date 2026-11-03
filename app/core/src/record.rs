@@ -197,7 +197,7 @@ impl Record {
 
 /// strict refuses unknown fields; re-encoding refuses the rest, since an
 /// optional field written empty is then dropped.
-fn strict<T: Serialize + DeserializeOwned>(b: &[u8]) -> Result<T, Error> {
+pub(crate) fn strict<T: Serialize + DeserializeOwned>(b: &[u8]) -> Result<T, Error> {
     let r: T = serde_json::from_slice(b).map_err(|e| invalid(format!("record: {e}")))?;
     if jcs::canonical(&r)? != b {
         return Err(invalid("record bytes are not canonical"));

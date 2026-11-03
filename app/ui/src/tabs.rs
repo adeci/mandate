@@ -1,13 +1,14 @@
 //! Agents, Connections, Activity and Settings, as the console laid them out.
 
-use crate::Shell;
-use crate::api::Grant;
+use crate::api::{Activity, Grant, Now};
 use crate::device::hex;
-use crate::screens::{column, id_for, link, panel, table};
+use crate::pick::NewGrant;
+use crate::screens::{button, column, id_for, link, panel, table};
 use crate::theme::{MEDIUM, Theme, bold, chars, lines};
 use crate::words::{self, connector, horizon};
+use crate::{Screen, Shell, segment};
 use gpui::{AnyElement, Context, Div, div, prelude::*};
-use mandate_core::{Op, Record, Trust};
+use mandate_core::{Op, Record, Time, Trust};
 use serde_json::json;
 
 impl Shell {
@@ -16,8 +17,8 @@ impl Shell {
             let seen = a.last_seen.as_deref().map_or("not connected yet".into(), |s| {
                 format!("last seen {} {}", words::date(s), words::clock(s))
             });
-            let confirm = self.deleting.as_deref() == Some(a.id.as_str());
-            let (id, name) = (a.id.clone(), a.name.clone());
+            let confirm = self.confirming.as_deref() == Some(a.id.as_str());
+            let (id, name, grantee) = (a.id.clone(), a.name.clone(), a.id.clone());
             let open: Vec<&Grant> = a.grants.iter().filter(|g| g.closed_at.is_none()).collect();
             panel(t)
                 .child(
@@ -27,6 +28,20 @@ impl Shell {
                 )
                 .when(open.is_empty(), |d| d.child(t.alt("No grants: this agent reads nothing.")))
                 .children(open.into_iter().map(|g| grant_line(t, g)))
+                .child(div().flex().child(button(
+                    t,
+                    id_for("grant", &a.id),
+                    "New grant",
+                    cx,
+                    move |this, cx| {
+                        let mut g = NewGrant::new(grantee.clone());
+                        let linked: Vec<_> = this.connectors.iter().filter(|c| !c.setup).collect();
+                        if let [c] = linked[..] {
+                            g.connector = c.name.clone();
+                        }
+                        this.go(Screen::Grant(g), cx)
+                    },
+                )))
                 .child(
                     link(
                         t,
@@ -34,13 +49,13 @@ impl Shell {
                         if confirm { "Confirm delete" } else { "Delete agent" },
                         cx,
                         move |this, cx| {
-                            if this.deleting.as_deref() == Some(id.as_str()) {
+                            if this.confirming.as_deref() == Some(id.as_str()) {
                                 let notice = format!("You deleted {name}.");
                                 this.post("DELETE", format!("identities/{id}"), cx, move |_| {
                                     Some(notice)
                                 });
                             } else {
-                                this.deleting = Some(id.clone());
+                                this.confirming = Some(id.clone());
                                 cx.notify();
                             }
                         },
@@ -56,7 +71,7 @@ impl Shell {
             .children(agents)
     }
 
-    pub(crate) fn connections_tab(&self, t: Theme) -> Div {
+    pub(crate) fn connections_tab(&self, t: Theme, cx: &mut Context<Self>) -> Div {
         let panels = self.connectors.iter().filter(|c| self.shown(&c.name)).map(|c| {
             let state = if c.setup { "setup" } else { c.health.state.as_str() };
             let mut rows: Vec<(&str, String)> = Vec::new();
@@ -84,6 +99,7 @@ impl Shell {
                         .child(t.alt(k).w(chars(8.)).flex_none())
                         .child(div().flex_1().child(v))
                 }))
+                .child(self.link_control(t, &c.name, c.setup, cx))
         });
         column()
             .gap(lines(1.))
@@ -91,20 +107,113 @@ impl Shell {
             .children(panels)
     }
 
-    pub(crate) fn activity_tab(&self, t: Theme) -> Div {
-        let rows: Vec<(String, AnyElement)> = self
-            .now
-            .activity
-            .iter()
-            .map(|a| (words::clock(&a.at), self.activity(a)))
-            .filter(|(_, text)| self.shown(text))
-            .map(|(at, text)| (at, div().child(text).into_any_element()))
-            .collect();
-        column().gap(lines(1.)).child(t.heading("Today")).child(if rows.is_empty() {
-            t.alt("Nothing happened yet today.").into_any_element()
-        } else {
-            table(t, rows).into_any_element()
-        })
+    /// Link for a connector waiting to be linked; Unlink, asked twice, for
+    /// one that is.
+    fn link_control(&self, t: Theme, name: &str, setup: bool, cx: &mut Context<Self>) -> Div {
+        let name = name.to_string();
+        if setup {
+            return div().flex().child(button(
+                t,
+                id_for("link", &name),
+                "Link",
+                cx,
+                move |this, cx| this.open_link(name.clone(), cx),
+            ));
+        }
+        let key = format!("unlink {name}");
+        let confirm = self.confirming.as_deref() == Some(key.as_str());
+        let warning = format!(
+            "Unlink {}? It forgets the session; agents read only what is stored until you link it again.",
+            connector(&name)
+        );
+        column().gap(lines(0.5)).when(confirm, |d| d.child(warning)).child(
+            link(
+                t,
+                id_for("unlink", &name),
+                if confirm { "Confirm unlink" } else { "Unlink" },
+                cx,
+                move |this, cx| {
+                    if this.confirming.as_deref() == Some(key.as_str()) {
+                        this.unlink(name.clone(), cx);
+                    } else {
+                        this.confirming = Some(key.clone());
+                        cx.notify();
+                    }
+                },
+            )
+            .font_weight(MEDIUM),
+        )
+    }
+
+    /// What agents did, newest first, under the local day it happened;
+    /// Show more pages back through the server's days.
+    pub(crate) fn activity_tab(&self, t: Theme, cx: &mut Context<Self>) -> Div {
+        let today = words::day(Time::now().unix());
+        let mut days: Vec<(String, Vec<&Activity>)> = vec![(today.clone(), Vec::new())];
+        let all = self.now.activity.iter().chain(self.older.iter().flat_map(|(_, a)| a));
+        for a in all.filter(|a| self.shown(&self.activity(a))) {
+            let day = words::date(&a.at);
+            match days.last_mut() {
+                Some((d, list)) if *d == day => list.push(a),
+                _ => days.push((day, vec![a])),
+            }
+        }
+        let sections = days.into_iter().filter(|(d, acts)| *d == today || !acts.is_empty()).map(
+            |(day, acts)| {
+                let rows: Vec<(String, AnyElement)> = acts
+                    .into_iter()
+                    .map(|a| {
+                        (words::clock(&a.at), div().child(self.activity(a)).into_any_element())
+                    })
+                    .collect();
+                let title = if day == today { "Today".to_string() } else { day };
+                column().gap(lines(1.)).child(t.heading(&title)).child(if rows.is_empty() {
+                    t.alt("Nothing happened yet today.").into_any_element()
+                } else {
+                    table(t, rows).into_any_element()
+                })
+            },
+        );
+        // The server keeps activity by UTC day; say how far back it looked.
+        let back = self.older.last().map(|(day, _)| {
+            t.alt(format!("Looked back to {}.", words::date(&format!("{day}T12:00:00Z"))))
+        });
+        column().gap(lines(1.)).children(sections).children(back).child(div().flex().child(button(
+            t,
+            "more",
+            "Show more",
+            cx,
+            |this, cx| this.more_activity(cx),
+        )))
+    }
+
+    /// Loads more activity: the rest of the last shown day while it has
+    /// more, else the day before it.
+    fn more_activity(&mut self, cx: &mut Context<Self>) {
+        let today = words::utc_day(Time::now().unix());
+        let (day, last, more) = match self.older.last() {
+            Some((day, acts)) => (day.clone(), acts.last(), self.older_more),
+            None => (today, self.now.activity.last(), self.now.more),
+        };
+        let (day, before) = match (more, last) {
+            (true, Some(a)) => (day, a.at.parse::<Time>().ok()),
+            _ => {
+                let noon = format!("{day}T12:00:00Z").parse::<Time>().map_or(0, Time::unix);
+                (words::utc_day(noon - 86400), None)
+            }
+        };
+        let client = self.device().client;
+        self.call(
+            cx,
+            move || {
+                let page: Now = client.now(Some(&day), before)?;
+                Ok((day, page))
+            },
+            |this, (day, page), _| {
+                this.older_more = page.more;
+                this.older.push((day, page.activity));
+            },
+        );
     }
 
     /// This device and the others, what is never shared, and the server.
@@ -129,7 +238,8 @@ impl Shell {
         });
         let devices: Vec<Div> = devices.collect();
         let hidden = self.hidden.iter().enumerate().map(|(i, h)| {
-            let path = format!("never-share/{}/{}/{}", h.connector, h.kind, h.id);
+            let path =
+                format!("never-share/{}/{}/{}", segment(&h.connector), h.kind, segment(&h.id));
             let name = if h.name.is_empty() { h.id.clone() } else { h.name.clone() };
             row(t, i)
                 .child(column().flex_1().child(name.clone()).child(t.alt(format!(
@@ -161,6 +271,17 @@ impl Shell {
             } else {
                 column().border_2().border_color(t.text).children(hidden).into_any_element()
             })
+            .child(div().flex().child(button(t, "hide", "Add a chat or person", cx, |this, cx| {
+                // With one connector there is nothing to choose.
+                let only = match &this.connectors[..] {
+                    [c] => Some(c.name.clone()),
+                    _ => None,
+                };
+                this.go(Screen::Hide { connector: only.clone() }, cx);
+                if let Some(c) = only {
+                    this.open_picker(crate::pick::Pick::Hide, c, cx);
+                }
+            })))
             .child(t.heading("Server"))
             .child(table(
                 t,

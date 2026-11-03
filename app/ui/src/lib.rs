@@ -2,13 +2,15 @@
 mod android;
 mod api;
 mod device;
+mod link;
 mod now;
+mod pick;
 mod screens;
 mod tabs;
 mod theme;
 mod words;
 
-use api::{Connector, Exchange, Hidden, Identity, Keys, Now, Proposal, Request};
+use api::{Activity, Connector, Exchange, Hidden, Identity, Keys, Now, Proposal, Request, Step};
 use device::Device;
 use futures::StreamExt;
 use gpui::{App, AppContext, Context, Entity, FocusHandle, KeyDownEvent, Window, WindowOptions};
@@ -16,7 +18,7 @@ use mandate_core::{DeviceKey, Envelope, Error, Key, PairLink, Record};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -29,12 +31,36 @@ enum Tab {
 }
 
 enum Screen {
-    Pair { text: String },
+    Pair {
+        text: String,
+    },
     Tab(Tab),
     Settings,
-    Code { exchange: Exchange, code: String },
-    Admit { exchange: Exchange, envelope: Envelope },
-    Review { proposal: Proposal, envelope: Envelope },
+    Code {
+        exchange: Exchange,
+        code: String,
+    },
+    Admit {
+        exchange: Exchange,
+        envelope: Envelope,
+    },
+    Review {
+        proposal: Proposal,
+        envelope: Envelope,
+    },
+    /// Linking a connector: the step it asked last, None while it loads.
+    Link {
+        name: String,
+        step: Option<Step>,
+        values: BTreeMap<String, String>,
+        focus: Option<String>,
+    },
+    /// Adding to never-share, from a connector's chat list.
+    Hide {
+        connector: Option<String>,
+    },
+    /// The owner's own grant for an agent.
+    Grant(pick::NewGrant),
 }
 
 /// How the owner narrowed a request before approving it.
@@ -42,14 +68,19 @@ enum Screen {
 struct Adjust {
     open: bool,
     chats: BTreeSet<String>,
+    /// The names of the chats to tick: those the terms matched, then those
+    /// the owner picked.
+    names: BTreeMap<String, String>,
     for_: u64,
     horizon: u64,
 }
 
 impl Adjust {
     fn of(r: &Request) -> Adjust {
-        let chats = r.chats().iter().map(|c| c.id.clone()).collect();
-        Adjust { open: false, chats, for_: r.for_, horizon: r.horizon }
+        let names: BTreeMap<String, String> =
+            r.chats().iter().map(|c| (c.id.clone(), c.name.clone())).collect();
+        let chats = names.keys().cloned().collect();
+        Adjust { open: false, chats, names, for_: r.for_, horizon: r.horizon }
     }
 }
 
@@ -71,10 +102,16 @@ pub struct Shell {
     /// The search field's text, while it is open.
     search: Option<String>,
     adjust: HashMap<String, Adjust>,
+    /// The chat picker, while one is open.
+    picker: Option<pick::Picker>,
+    /// Earlier days of activity, loaded by Show more, newest first.
+    older: Vec<(String, Vec<Activity>)>,
+    /// The last loaded day has more before its last activity.
+    older_more: bool,
     /// Stop all's confirmation is open.
     stopping: bool,
-    /// The agent whose Delete waits for a second tap.
-    deleting: Option<String>,
+    /// The agent or connector whose Delete or Unlink waits for a second tap.
+    confirming: Option<String>,
     notice: Option<String>,
     error: Option<String>,
     /// A waiting item to open once a refresh shows it, from a notification.
@@ -114,8 +151,11 @@ impl Shell {
             server: String::new(),
             search: None,
             adjust: HashMap::new(),
+            picker: None,
+            older: Vec::new(),
+            older_more: false,
             stopping: false,
-            deleting: None,
+            confirming: None,
             notice: None,
             error: None,
             pending: None,
@@ -177,8 +217,10 @@ impl Shell {
         self.notice = None;
         self.stopping = false;
         self.search = None;
-        self.deleting = None;
+        self.picker = None;
+        self.confirming = None;
         self.screen = screen;
+        keyboard(false);
         cx.notify();
     }
 
@@ -329,7 +371,7 @@ impl Shell {
 
     fn approve_request(&mut self, r: &Request, cx: &mut Context<Self>) {
         let a = self.adjust.get(&r.id).cloned().unwrap_or_else(|| Adjust::of(r));
-        let named = r.terms.is_some();
+        let named = r.terms.is_some() || !a.chats.is_empty();
         let mut body = json!({ "horizon": a.horizon });
         if named {
             body["chats"] = json!(a.chats);
@@ -395,7 +437,7 @@ impl Shell {
                     Screen::Tab(tab) => tab,
                     _ => Tab::Now,
                 });
-                (this.stopping, this.deleting, this.notice) = (false, None, notice(answer));
+                (this.stopping, this.confirming, this.notice) = (false, None, notice(answer));
                 this.refresh(cx);
             },
         );
@@ -454,7 +496,26 @@ impl Shell {
     fn key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
         let typed = k.key_char.as_deref().unwrap_or_default();
+        if let Some(p) = &mut self.picker {
+            if k.key == "backspace" {
+                p.q.pop();
+            } else {
+                p.q.push_str(typed);
+            }
+            self.find_chats(cx);
+            return cx.notify();
+        }
         match (&mut self.screen, &mut self.search) {
+            (Screen::Link { focus: Some(_), .. }, _) if k.key == "enter" => self.submit_step(cx),
+            (Screen::Link { values, focus: Some(f), step: Some(step), .. }, _) => {
+                let number = step.fields.iter().any(|x| &x.name == f && x.kind == "number");
+                let value = values.entry(f.clone()).or_default();
+                if k.key == "backspace" {
+                    value.pop();
+                } else if !number || typed.chars().all(|c| c.is_ascii_digit()) {
+                    value.push_str(typed);
+                }
+            }
             (Screen::Tab(_), Some(q)) if k.key == "backspace" => {
                 q.pop();
             }
@@ -486,6 +547,28 @@ impl Shell {
     fn shown(&self, text: &str) -> bool {
         self.search.as_deref().is_none_or(|q| text.to_lowercase().contains(&q.to_lowercase()))
     }
+}
+
+/// Shows or hides the phone's keyboard as a text field opens or closes.
+fn keyboard(show: bool) {
+    #[cfg(target_os = "android")]
+    android::keyboard(show);
+    #[cfg(not(target_os = "android"))]
+    let _ = show;
+}
+
+/// One path segment, percent-encoded.
+fn segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            b => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// The bundled Lucide icons (ISC), drawn in the text color.

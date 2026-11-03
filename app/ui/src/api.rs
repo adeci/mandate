@@ -14,6 +14,8 @@ pub struct Now {
     pub routines: Vec<Grant>,
     pub stopped: Vec<Grant>,
     pub activity: Vec<Activity>,
+    /// Asking again before the last activity's time finds more that day.
+    pub more: bool,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -167,4 +169,49 @@ pub struct Hidden {
     pub kind: String,
     pub id: String,
     pub name: String,
+}
+
+/// A chat from a connector's chat list, for the picker.
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Container {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub parent_id: String,
+    pub last_activity: Option<String>,
+}
+
+/// One step of linking a connector, as the connector describes it
+/// (connector.md, Setup).
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Step {
+    pub step: String,
+    pub title: String,
+    pub text: String,
+    pub fields: Vec<SetupField>,
+    pub qr: String,
+    pub code: String,
+    pub confirm: String,
+    pub poll: u64,
+    pub done: bool,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct SetupField {
+    pub name: String,
+    pub label: String,
+    /// text, secret, number or choice.
+    pub kind: String,
+    pub required: bool,
+    pub options: Vec<Choice>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Choice {
+    pub value: String,
+    pub label: String,
 }

@@ -58,6 +58,7 @@ fn run(app: android_activity::AndroidApp) {
                 shell.update(cx, |shell, cx| match o {
                     Opened::Link(link) => shell.take_link(link, cx),
                     Opened::Item(id) => shell.take_item(id, cx),
+                    Opened::Insets => cx.notify(),
                 });
             }
         })
@@ -65,10 +66,11 @@ fn run(app: android_activity::AndroidApp) {
     });
 }
 
-/// What an intent opened the app with.
+/// What an intent opened the app with, or new insets to lay out for.
 enum Opened {
     Link(String),
     Item(String),
+    Insets,
 }
 
 /// Intents can arrive before android_main takes the receiver.
@@ -117,6 +119,15 @@ extern "system" fn Java_dev_mandate_app_Main_insets(
 ) {
     INSETS[0].store(top.to_bits(), Relaxed);
     INSETS[1].store(bottom.to_bits(), Relaxed);
+    let _ = OPENED.0.unbounded_send(Opened::Insets);
+}
+
+/// Shows or hides the soft keyboard. NativeActivity hands its keys to gpui
+/// as KeyDownEvents, as with a hardware keyboard.
+pub fn keyboard(show: bool) {
+    if let Some(app) = gpui_jni::android_app() {
+        if show { app.show_soft_input(true) } else { app.hide_soft_input(false) }
+    }
 }
 
 /// The Java classes native code calls. They are found while the library

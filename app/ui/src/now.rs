@@ -2,16 +2,17 @@
 //! routines, and Stop all at the bottom.
 
 use crate::api::{Activity, Exchange, Grant, Proposal, Request};
+use crate::pick::Pick;
 use crate::screens::{approve, button, clickable, column, id_for, link, panel, reason, table, who};
 use crate::theme::{MEDIUM, Theme, bold, chars, lines};
 use crate::words::{self, connector, horizon, span};
 use crate::{Adjust, Screen, Shell};
-use gpui::{AnyElement, Context, Div, Stateful, div, prelude::*};
+use gpui::{AnyElement, Context, Div, ElementId, Stateful, div, prelude::*};
 use mandate_core::Record;
 use serde_json::json;
 
-const FOR: [u64; 7] = [900, 1800, 3600, 7200, 14400, 28800, 43200];
-const HORIZON: [u64; 4] = [86400, 604800, 2592000, 0];
+pub(crate) const FOR: [u64; 7] = [900, 1800, 3600, 7200, 14400, 28800, 43200];
+pub(crate) const HORIZON: [u64; 4] = [86400, 604800, 2592000, 0];
 
 impl Shell {
     pub(crate) fn now_tab(&self, t: Theme, cx: &mut Context<Self>) -> Div {
@@ -89,9 +90,9 @@ impl Shell {
 
     fn request_card(&self, t: Theme, r: &Request, cx: &mut Context<Self>) -> Div {
         let a = self.adjust.get(&r.id).cloned().unwrap_or_else(|| Adjust::of(r));
-        let chats = r.chats();
         let named = r.terms.is_some();
-        let nothing = named && chats.is_empty();
+        // The terms matched nothing, and the owner has picked nothing yet.
+        let nothing = named && a.names.is_empty();
         let (verb, window) = match (r.kind.as_str(), &r.schedule) {
             ("extend", _) => {
                 (format!("asks for {} more", span(r.for_)), format!("{} more", span(r.for_)))
@@ -108,13 +109,13 @@ impl Shell {
             let unmatched =
                 r.terms.iter().flatten().filter(|t| t.chats.as_ref().is_none_or(Vec::is_empty));
             column()
-                .children(chats.iter().map(|c| {
+                .children(a.names.iter().map(|(id, name)| {
                     div()
                         .flex()
                         .flex_wrap()
                         .gap_x(chars(1.))
-                        .child(c.name.clone())
-                        .child(t.alt(words::short_id(&c.id)))
+                        .child(name.clone())
+                        .child(t.alt(words::short_id(id)))
                 }))
                 .children(unmatched.map(|u| t.alt(format!("no chat matched \"{}\"", u.term))))
                 .into_any_element()
@@ -128,7 +129,7 @@ impl Shell {
         let chosen = match a.chats.len() {
             _ if !named => Some("every chat".to_string()),
             0 => None,
-            1 => chats.iter().find(|c| a.chats.contains(&c.id)).map(|c| c.name.clone()),
+            1 => a.chats.first().and_then(|id| a.names.get(id)).cloned(),
             n => Some(format!("{n} chats")),
         };
         let label = match (&chosen, r.kind.as_str()) {
@@ -136,7 +137,7 @@ impl Shell {
             (Some(c), _) => format!("Approve · {window} · {c} · {}", horizon(a.horizon)),
             (None, _) => "Approve".into(),
         };
-        let ready = !nothing && (chosen.is_some() || r.kind == "extend");
+        let ready = chosen.is_some() || r.kind == "extend";
         let (id, terms) =
             (r.id.clone(), r.terms.iter().flatten().map(|t| format!("\"{}\"", t.term)));
         let deny = format!("requests/{id}/deny");
@@ -157,7 +158,12 @@ impl Shell {
                 ))
             })
             .children(reason(t, &r.reason))
-            .when(a.open, |d| d.child(adjust_panel(t, r, &a, cx)))
+            .when(a.open, |d| {
+                let picking =
+                    self.picker.as_ref().is_some_and(|p| p.pick == Pick::Request(r.id.clone()));
+                let picker = picking.then(|| self.request_picker(t, &r.id, &a, cx));
+                d.child(adjust_panel(t, r, &a, picker, cx))
+            })
             .when(!nothing, |d| {
                 d.child(approve(
                     t,
@@ -171,18 +177,30 @@ impl Shell {
             .when(named && !nothing && a.chats.is_empty(), |d| {
                 d.child(t.alt("tick the chats to grant"))
             })
+            .when(nothing && !a.open, |d| d.child(t.alt("pick the chats to grant")))
             .child(
                 div()
                     .flex()
                     .gap(chars(1.))
-                    .when(r.kind != "extend" && !nothing, |d| {
+                    .when(r.kind != "extend", |d| {
+                        let label = if nothing { "Pick chats" } else { "Adjust" };
                         d.child(
-                            button(t, id_for("adjust", &id), "Adjust", cx, move |this, cx| {
+                            button(t, id_for("adjust", &id), label, cx, move |this, cx| {
                                 let a = this
                                     .adjust
                                     .entry(rb.id.clone())
                                     .or_insert_with(|| Adjust::of(&rb));
                                 a.open = !a.open;
+                                let (open, empty) = (a.open, a.names.is_empty());
+                                if open && empty && rb.terms.is_some() {
+                                    this.open_picker(
+                                        Pick::Request(rb.id.clone()),
+                                        rb.connector.clone(),
+                                        cx,
+                                    );
+                                } else if !open {
+                                    this.close_picker(cx);
+                                }
                                 cx.notify();
                             })
                             .flex_1(),
@@ -252,11 +270,19 @@ impl Shell {
     }
 }
 
-fn adjust_panel(t: Theme, r: &Request, a: &Adjust, cx: &mut Context<Shell>) -> Div {
+/// The narrowing controls; picker, when open, lists the connector's chats
+/// under the ticked ones.
+fn adjust_panel(
+    t: Theme,
+    r: &Request,
+    a: &Adjust,
+    picker: Option<Div>,
+    cx: &mut Context<Shell>,
+) -> Div {
     let named = r.terms.is_some();
-    let ticks = r.chats().into_iter().map(|c| {
-        let (r, id, on) = (r.clone(), c.id.clone(), a.chats.contains(&c.id));
-        clickable(id_for("tick", &c.id), cx, move |this, cx| {
+    let ticks = a.names.iter().map(|(cid, name)| {
+        let (r, id, on) = (r.clone(), cid.clone(), a.chats.contains(cid));
+        clickable(id_for("tick", cid), cx, move |this, cx| {
             let a = this.adjust.entry(r.id.clone()).or_insert_with(|| Adjust::of(&r));
             if !a.chats.remove(&id) {
                 a.chats.insert(id.clone());
@@ -266,8 +292,15 @@ fn adjust_panel(t: Theme, r: &Request, a: &Adjust, cx: &mut Context<Shell>) -> D
         .flex()
         .gap(chars(1.))
         .child(checkbox(t, on))
-        .child(c.name.clone())
+        .child(name.clone())
     });
+    let ticks: Vec<_> = ticks.collect();
+    let other = {
+        let r = r.clone();
+        link(t, id_for("other", &r.id), "Pick other chats", cx, move |this, cx| {
+            this.open_picker(Pick::Request(r.id.clone()), r.connector.clone(), cx)
+        })
+    };
     let fors: Vec<u64> = FOR.into_iter().filter(|&f| f < r.for_).chain([r.for_]).collect();
     let horizons: Vec<u64> = HORIZON
         .into_iter()
@@ -298,7 +331,12 @@ fn adjust_panel(t: Theme, r: &Request, a: &Adjust, cx: &mut Context<Shell>) -> D
         .border_color(t.alt)
         .pt(lines(1.))
         .when(named, |d| {
-            d.child(div().font_weight(MEDIUM).child("CHATS")).child(column().children(ticks))
+            d.child(div().font_weight(MEDIUM).child("CHATS"))
+                .when(!ticks.is_empty(), |d| d.child(column().children(ticks)))
+                .child(match picker {
+                    Some(p) => p.into_any_element(),
+                    None => other.into_any_element(),
+                })
         })
         .when(r.kind == "once", |d| {
             d.child(div().font_weight(MEDIUM).child("FOR"))
@@ -451,7 +489,7 @@ fn routine(t: Theme, g: &Grant, stopped: bool, cx: &mut Context<Shell>) -> Div {
         .child(div().flex().child(action))
 }
 
-fn checkbox(t: Theme, on: bool) -> Div {
+pub(crate) fn checkbox(t: Theme, on: bool) -> Div {
     div()
         .w(chars(2.))
         .h(lines(1.))
@@ -464,9 +502,9 @@ fn checkbox(t: Theme, on: bool) -> Div {
         .when(on, |d| d.child(div().w(chars(1.)).h(lines(0.5)).bg(t.text)))
 }
 
-fn chip(
+pub(crate) fn chip(
     t: Theme,
-    id: (&'static str, usize),
+    id: impl Into<ElementId>,
     label: &str,
     on: bool,
     cx: &mut Context<Shell>,

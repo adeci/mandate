@@ -114,9 +114,14 @@ impl Log {
 mod tests {
     use super::*;
     use crate::envelope::h;
+    use crate::jcs::tests::respell;
     use crate::record::Time;
     use crate::{DeviceKey, SoftwareKey, unhex};
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use proptest::sample::Index;
     use std::collections::HashMap;
+    use std::sync::LazyLock;
 
     #[derive(Default)]
     struct Vector {
@@ -357,6 +362,42 @@ mod tests {
             e.sig = yubikey.sign(&msg).unwrap().to_vec();
             let err = l.verify(&e).expect_err(name);
             assert!(!matches!(err, Error::BadSignature), "{name}: {err}");
+        }
+    }
+
+    static SPEC: LazyLock<Spec> = LazyLock::new(read_spec);
+
+    proptest! {
+        /// A vector's record spelled any other way is refused.
+        #[test]
+        fn records_spelled_otherwise(i in 0..8usize, choices in vec(any::<u8>(), 1..32)) {
+            let v = &SPEC.vectors[i];
+            let s = respell(&serde_json::from_str(&v.record).unwrap(), &choices);
+            prop_assert_eq!(Record::decode(&v.kind, s.as_bytes()).is_ok(), s == v.record, "{}", s);
+        }
+
+        /// A vector's record with bytes changed decodes, if at all, to a
+        /// record that encodes to those bytes.
+        #[test]
+        fn records_changed(
+            i in 0..8usize,
+            edits in vec((any::<Index>(), prop_oneof![b' '..=b'~', any::<u8>()], 0..3u8), 1..4),
+        ) {
+            let v = &SPEC.vectors[i];
+            let mut b = v.record.clone().into_bytes();
+            for (at, byte, op) in edits {
+                let at = at.index(b.len());
+                match op {
+                    0 => b.insert(at, byte),
+                    1 => b[at] = byte,
+                    _ => {
+                        b.remove(at);
+                    }
+                }
+            }
+            if let Ok(r) = Record::decode(&v.kind, &b) {
+                prop_assert_eq!(r.encode().unwrap(), b);
+            }
         }
     }
 }

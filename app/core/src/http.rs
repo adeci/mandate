@@ -160,51 +160,57 @@ impl Server {
         let peer =
             verifier.peer.lock().unwrap().ok_or_else(|| invalid("TLS without a certificate"))?;
 
-        let mut r = BufReader::new(conn);
-        let (mut head, mut line) = (String::new(), String::new());
-        while line != "\r\n" {
-            if !read_line(&mut r, MAX_LINE, &mut line)? {
-                return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
-            }
-            head.push_str(&line);
-            if head.len() > MAX_HEAD {
-                return Err(invalid("response head over 64 KiB"));
-            }
-        }
-        let mut headers = [httparse::EMPTY_HEADER; 64];
-        let mut res = httparse::Response::new(&mut headers);
-        let complete =
-            matches!(res.parse(head.as_bytes()), Ok(Status::Complete(n)) if n == head.len());
-        let (Some(1), Some(status), true) = (res.version, res.code, complete) else {
-            return Err(invalid("malformed HTTP/1.1 response head"));
-        };
-        let (mut length, mut chunked) = (None, false);
-        for h in res.headers.iter() {
-            if h.name.eq_ignore_ascii_case("content-length") {
-                let n = std::str::from_utf8(h.value)
-                    .ok()
-                    .filter(|v| v.bytes().all(|c| c.is_ascii_digit()))
-                    .and_then(|v| v.parse().ok())
-                    .filter(|&n| n <= MAX_BODY);
-                if length.is_some() || n.is_none() {
-                    return Err(invalid("bad, repeated or oversized Content-Length"));
-                }
-                length = n;
-            } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
-                if chunked || !h.value.eq_ignore_ascii_case(b"chunked") {
-                    return Err(invalid("Transfer-Encoding other than chunked"));
-                }
-                chunked = true;
-            }
-        }
-        let body: Box<dyn BufRead + Send> = match (chunked, length) {
-            (true, None) => Box::new(BufReader::new(Chunked { r, left: 0, done: false })),
-            (true, Some(_)) => return Err(invalid("both Content-Length and chunked")),
-            (false, Some(n)) => Box::new(r.take(n)),
-            (false, None) => Box::new(r),
-        };
+        let (status, body) = read_head(BufReader::new(conn))?;
         Ok(Response { status, peer, body })
     }
+}
+
+/// Reads a response head and returns its status and the body it frames.
+fn read_head<R: BufRead + Send + 'static>(
+    mut r: R,
+) -> Result<(u16, Box<dyn BufRead + Send>), Error> {
+    let (mut head, mut line) = (String::new(), String::new());
+    while line != "\r\n" {
+        if !read_line(&mut r, MAX_LINE, &mut line)? {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+        }
+        head.push_str(&line);
+        if head.len() > MAX_HEAD {
+            return Err(invalid("response head over 64 KiB"));
+        }
+    }
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut res = httparse::Response::new(&mut headers);
+    let complete = matches!(res.parse(head.as_bytes()), Ok(Status::Complete(n)) if n == head.len());
+    let (Some(1), Some(status), true) = (res.version, res.code, complete) else {
+        return Err(invalid("malformed HTTP/1.1 response head"));
+    };
+    let (mut length, mut chunked) = (None, false);
+    for h in res.headers.iter() {
+        if h.name.eq_ignore_ascii_case("content-length") {
+            let n = std::str::from_utf8(h.value)
+                .ok()
+                .filter(|v| v.bytes().all(|c| c.is_ascii_digit()))
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n <= MAX_BODY);
+            if length.is_some() || n.is_none() {
+                return Err(invalid("bad, repeated or oversized Content-Length"));
+            }
+            length = n;
+        } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            if chunked || !h.value.eq_ignore_ascii_case(b"chunked") {
+                return Err(invalid("Transfer-Encoding other than chunked"));
+            }
+            chunked = true;
+        }
+    }
+    let body: Box<dyn BufRead + Send> = match (chunked, length) {
+        (true, None) => Box::new(BufReader::new(Chunked { r, left: 0, done: false })),
+        (true, Some(_)) => return Err(invalid("both Content-Length and chunked")),
+        (false, Some(n)) => Box::new(r.take(n)),
+        (false, None) => Box::new(r),
+    };
+    Ok((status, body))
 }
 
 impl Response {
@@ -396,5 +402,152 @@ impl<R: BufRead> Read for Chunked<R> {
             }
         }
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    /// A peer that sends prefix, then unit forever.
+    pub(crate) struct Endless {
+        prefix: Vec<u8>,
+        unit: Vec<u8>,
+        given: Arc<AtomicUsize>,
+    }
+
+    /// The endless peer, buffered, and the count of the bytes read from it.
+    pub(crate) fn endless(prefix: &[u8], unit: &[u8]) -> (BufReader<Endless>, Arc<AtomicUsize>) {
+        let given = Arc::new(AtomicUsize::new(0));
+        let e = Endless { prefix: prefix.into(), unit: unit.into(), given: given.clone() };
+        (BufReader::new(e), given)
+    }
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let at = self.given.fetch_add(buf.len(), Relaxed);
+            for (k, b) in (at..).zip(buf.iter_mut()) {
+                *b = match k.checked_sub(self.prefix.len()) {
+                    None => self.prefix[k],
+                    Some(k) => self.unit[k % self.unit.len()],
+                };
+            }
+            Ok(buf.len())
+        }
+    }
+
+    /// The status and the body read to its end, or past the client's limit.
+    fn parse(r: impl BufRead + Send + 'static) -> Result<(u16, Vec<u8>), Error> {
+        let (status, body) = read_head(r)?;
+        let mut out = Vec::new();
+        body.take(MAX_BODY + 1).read_to_end(&mut out)?;
+        Ok((status, out))
+    }
+
+    const CHUNKED: &[u8] = b"HTTP/1.1 200 X\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+    #[test]
+    fn endless_answers_are_bounded() {
+        let slack = 2 * MAX_LINE as usize + (8 << 10);
+        // A head that never ends, and a line that never does.
+        let heads: [(&[u8], &[u8]); 2] =
+            [(b"HTTP/1.1 200 X\r\n", b"X-A: b\r\n"), (b"HTTP/1.1 2", b"0")];
+        for (prefix, unit) in heads {
+            let (r, given) = endless(prefix, unit);
+            assert!(read_head(r).is_err());
+            assert!(given.load(Relaxed) <= MAX_HEAD + slack, "{}", given.load(Relaxed));
+        }
+        // A chunk size line or extension that never ends.
+        for (prefix, unit) in [(CHUNKED.to_vec(), b"f"), ([CHUNKED, b"1;"].concat(), b"a")] {
+            let (r, given) = endless(&prefix, unit);
+            assert!(
+                matches!(parse(r), Err(Error::Io(e)) if e.kind() == io::ErrorKind::InvalidData)
+            );
+            assert!(given.load(Relaxed) <= slack + (1 << 10), "{}", given.load(Relaxed));
+        }
+        // Chunks without end are read only up to the client's limit.
+        let unit = [&b"400\r\n"[..], &[b'a'; 0x400], b"\r\n"].concat();
+        let (r, given) = endless(CHUNKED, &unit);
+        let (_, body) = parse(r).unwrap();
+        assert_eq!(body.len() as u64, MAX_BODY + 1);
+        assert!(given.load(Relaxed) as u64 <= 2 * MAX_BODY, "{}", given.load(Relaxed));
+    }
+
+    prop_compose! {
+        /// A well-formed response: its status, its body, and the bytes on
+        /// the wire, with whatever follows the body.
+        fn response()(
+            status in 100u16..1000,
+            reason in "[A-Za-z][A-Za-z ]{0,11}",
+            headers in vec(("[A-Za-z][A-Za-z0-9-]{0,12}", "[!-~]([ -~]{0,20}[!-~])?"), 0..8),
+            body in vec(any::<u8>(), 0..3000),
+            chunks in prop::option::of(vec(1usize..600, 1..8)),
+            ext in any::<bool>(),
+            tail in vec(any::<u8>(), 0..16),
+        ) -> (u16, Vec<u8>, Vec<u8>) {
+            let mut w = format!("HTTP/1.1 {status} {reason}\r\n").into_bytes();
+            let framing = |k: &str| {
+                k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("transfer-encoding")
+            };
+            for (k, v) in headers.iter().filter(|(k, _)| !framing(k)) {
+                w.extend(format!("{k}: {v}\r\n").bytes());
+            }
+            match &chunks {
+                None => w.extend(format!("Content-Length: {}\r\n\r\n", body.len()).bytes()),
+                Some(_) => w.extend(b"Transfer-Encoding: chunked\r\n\r\n"),
+            }
+            match &chunks {
+                None => w.extend(&body),
+                Some(sizes) => {
+                    let mut rest = &body[..];
+                    for &n in sizes.iter().cycle() {
+                        if rest.is_empty() {
+                            break;
+                        }
+                        let (c, r) = rest.split_at(n.min(rest.len()));
+                        let size = if ext { format!("{:X};a=b", c.len()) } else { format!("{:x}", c.len()) };
+                        w.extend(format!("{size}\r\n").bytes());
+                        w.extend(c);
+                        w.extend(b"\r\n");
+                        rest = r;
+                    }
+                    w.extend(b"0\r\nX-Trailer: y\r\n\r\n");
+                }
+            }
+            w.extend(&tail);
+            (status, body, w)
+        }
+    }
+
+    /// Bytes made mostly of the pieces of responses.
+    fn pieces() -> impl Strategy<Value = Vec<u8>> {
+        let piece = prop_oneof![
+            Just(b"HTTP/1.1 200 OK\r\n".to_vec()),
+            Just(b"Content-Length: 4\r\n".to_vec()),
+            Just(b"Transfer-Encoding: chunked\r\n".to_vec()),
+            Just(b"\r\n".to_vec()),
+            "[0-9a-fA-F]{1,20}(;[ -~]{0,4})?\r?\n?".prop_map(String::into_bytes),
+            vec(any::<u8>(), 0..8),
+        ];
+        vec(piece, 0..24).prop_map(|p| p.concat())
+    }
+
+    proptest! {
+        #[test]
+        fn responses_round_trip((status, body, wire) in response()) {
+            let got = parse(io::Cursor::new(wire)).unwrap();
+            prop_assert_eq!(got, (status, body));
+        }
+
+        /// Anything else is read without a panic, and never past its framing.
+        #[test]
+        fn any_response(b in pieces()) {
+            if let Ok((_, body)) = parse(io::Cursor::new(b.clone())) {
+                prop_assert!(body.len() <= b.len());
+            }
+        }
     }
 }

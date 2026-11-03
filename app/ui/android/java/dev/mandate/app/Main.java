@@ -30,8 +30,9 @@ public final class Main extends NativeActivity {
                 .getDecorView()
                 .setOnApplyWindowInsetsListener(
                         (view, all) -> {
-                            int types = WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout();
-                            Insets i = all.getInsets(types);
+                            // The soft keyboard, while it shows, covers the bottom too.
+                            int bars = WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout();
+                            Insets i = Insets.max(all.getInsets(bars), all.getInsets(WindowInsets.Type.ime()));
                             float density = getResources().getDisplayMetrics().density;
                             insets(i.top / density, i.bottom / density);
                             return view.onApplyWindowInsets(all);

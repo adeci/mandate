@@ -22,3 +22,4 @@ webpki-roots = "1"
 [dev-dependencies]
 # A TLS 1.2 server for the tests, which the client must refuse.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+proptest = { version = "1", default-features = false, features = ["std"] }

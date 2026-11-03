@@ -64,7 +64,12 @@ pub fn clock(t: &str) -> String {
 
 /// "3 Nov", in local time.
 pub fn date(t: &str) -> String {
-    unix(t).map(|u| strftime(u, c"%e %b").trim_start().to_string()).unwrap_or_default()
+    unix(t).map(day).unwrap_or_default()
+}
+
+/// The local day of a Unix time, as date says it.
+pub fn day(unix: i64) -> String {
+    strftime(unix, c"%e %b").trim_start().to_string()
 }
 
 /// When a routine runs right now in local time, the clock time it ends.
@@ -79,6 +84,19 @@ pub fn running(s: &crate::api::Schedule) -> Option<String> {
     let today = s.days.is_empty() || s.days.contains(&(day as u8));
     let end = start + s.length.div_ceil(60) as i64;
     (today && (start..end).contains(&minute)).then(|| strftime(now + (end - minute) * 60, c"%H:%M"))
+}
+
+/// The UTC day of a Unix time, YYYY-MM-DD, as the server pages activity.
+pub fn utc_day(unix: i64) -> String {
+    let t = unix as libc::time_t;
+    let mut buf = [0u8; 16];
+    // SAFETY: as in strftime, with gmtime_r filling tm.
+    let n = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::gmtime_r(&t, &mut tm);
+        libc::strftime(buf.as_mut_ptr().cast(), buf.len(), c"%Y-%m-%d".as_ptr(), &tm)
+    };
+    String::from_utf8_lossy(&buf[..n]).into_owned()
 }
 
 /// "39m left" or "2h 5m left" until t.

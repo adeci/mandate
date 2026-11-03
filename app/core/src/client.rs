@@ -420,12 +420,16 @@ mod tests {
     use super::*;
     use crate::SoftwareKey;
     use crate::exchange::tests::Server as Attempt;
+    use crate::http::tests::endless;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivateSec1KeyDer};
     use rustls::version::{TLS12, TLS13};
     use rustls::{ServerConfig, ServerConnection, StreamOwned, SupportedProtocolVersion};
     use serde_json::Value;
     use std::io::{self, Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, mpsc};
 
     // Two self-signed P-256 certificates with their SEC1 keys, and the
@@ -660,5 +664,88 @@ mod tests {
         );
         assert!(matches!(client.get::<Value>("now"), Err(Error::Invalid(_))), "5 MiB body");
         assert!(matches!(client.events().unwrap().next(), Some(Err(_))), "endless event");
+    }
+
+    fn events_of(b: impl Into<Vec<u8>>) -> Events {
+        Events { body: Box::new(io::Cursor::new(b.into())) }
+    }
+
+    fn event() -> impl Strategy<Value = Event> {
+        let s = || vec(any::<char>(), 0..12).prop_map(String::from_iter);
+        prop_oneof![
+            (s(), s(), s(), s()).prop_map(|(kind, id, identity, connector)| Event::Waiting {
+                kind,
+                id,
+                identity,
+                connector
+            }),
+            (s(), s(), s()).prop_map(|(id, kind, name)| Event::Exchange { id, kind, name }),
+            s().prop_map(|what| Event::Changed { what }),
+        ]
+    }
+
+    /// The event as a server may write it: after a comment and an event the
+    /// app does not know, its data over several lines, with CRLFs.
+    fn sse(e: &Event, (pretty, crlf, noise): (bool, bool, bool)) -> String {
+        let (name, data) = match e {
+            Event::Waiting { kind, id, identity, connector } => (
+                "waiting",
+                json!({ "kind": kind, "id": id, "identity": identity, "connector": connector }),
+            ),
+            Event::Exchange { id, kind, name } => {
+                ("exchange", json!({ "id": id, "kind": kind, "name": name }))
+            }
+            Event::Changed { what } => ("changed", json!({ "what": what })),
+        };
+        let data =
+            if pretty { serde_json::to_string_pretty(&data).unwrap() } else { data.to_string() };
+        let mut s =
+            if noise { ": ping\n\nevent: later\ndata: {}\n\n".into() } else { String::new() };
+        s += &format!("event: {name}\n");
+        for line in data.lines() {
+            s += &format!("data: {line}\n");
+        }
+        s += "\n";
+        if crlf { s.replace('\n', "\r\n") } else { s }
+    }
+
+    proptest! {
+        #[test]
+        fn events_round_trip(events in vec((event(), any::<(bool, bool, bool)>()), 0..8)) {
+            let wire: String = events.iter().map(|(e, how)| sse(e, *how)).collect();
+            let got: Vec<Event> = events_of(wire).collect::<Result<_, _>>().unwrap();
+            let want: Vec<Event> = events.into_iter().map(|(e, _)| e).collect();
+            prop_assert_eq!(got, want);
+        }
+
+        /// Anything else is read to its end without a panic.
+        #[test]
+        fn any_stream(pieces in vec(prop_oneof![
+            Just("event: changed\n".as_bytes().to_vec()),
+            Just(b"event: waiting\n".to_vec()),
+            Just(b"data: {\"what\":\"keys\"}\n".to_vec()),
+            Just(b"data:".to_vec()),
+            Just(b"\n".to_vec()),
+            Just(b"\r\n".to_vec()),
+            Just(b": c\n".to_vec()),
+            vec(any::<u8>(), 0..8),
+        ], 0..32)) {
+            for _ in events_of(pieces.concat()) {}
+        }
+    }
+
+    /// An event whose data never ends, in long lines or one endless line, is
+    /// refused soon after 64 KiB.
+    #[test]
+    fn endless_events_are_bounded() {
+        let slack = 2 * MAX_LINE as usize + (8 << 10);
+        let long = format!("data: {}\n", "a".repeat(4000));
+        let streams: [(&[u8], &[u8]); 2] =
+            [(b"event: changed\n", long.as_bytes()), (b"event: changed\ndata: ", b"a")];
+        for (prefix, unit) in streams {
+            let (r, given) = endless(prefix, unit);
+            assert!(matches!(Events { body: Box::new(r) }.next(), Some(Err(_))));
+            assert!(given.load(Ordering::Relaxed) <= MAX_EVENT + slack);
+        }
     }
 }
