@@ -6,9 +6,16 @@
     url = "github:oxalica/rust-overlay";
     inputs.nixpkgs.follows = "nixpkgs";
   };
+  # The server, for the journey check.
+  inputs.mandate.url = "path:..";
 
   outputs =
-    { nixpkgs, rust-overlay, ... }:
+    {
+      nixpkgs,
+      rust-overlay,
+      mandate,
+      ...
+    }:
     let
       pkgs = import nixpkgs {
         system = "x86_64-linux";
@@ -63,6 +70,11 @@
           ANDROID_NDK_HOME = "${sdk}/ndk-bundle";
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtime;
         };
+      };
+
+      checks.x86_64-linux.journey = import ./nix/journey.nix {
+        inherit pkgs mandate android;
+        apk = import ./nix/apk.nix { inherit pkgs rust sdk; };
       };
     };
 }

@@ -33,6 +33,14 @@
 
       nixosModules.default = import ./nix/module.nix self;
 
+      apps = forAllSystems (pkgs: {
+        demo = {
+          type = "app";
+          program = lib.getExe (import ./nix/demo-vm.nix { inherit self nixpkgs pkgs; });
+          meta.description = "Boot a throwaway mandate server VM and print its setup password";
+        };
+      });
+
       checks = forAllSystems (
         pkgs:
         let
