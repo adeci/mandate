@@ -1,80 +1,75 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="448" viewBox="0 0 900 448" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
   <defs>
-    <linearGradient id="indigo" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#4338ca"/></linearGradient>
-    <linearGradient id="emerald" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#10b981"/><stop offset="1" stop-color="#047857"/></linearGradient>
-    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="14"/></filter>
-    <marker id="n" markerWidth="8" markerHeight="8" refX="6.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#8b95a7"/></marker>
-    <marker id="i" markerWidth="8" markerHeight="8" refX="6.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#818cf8"/></marker>
-    <marker id="e" markerWidth="8" markerHeight="8" refX="6.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#34d399"/></marker>
+    <marker id="n" markerWidth="8" markerHeight="8" refX="6.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#7d8590"/></marker>
+    <marker id="g" markerWidth="8" markerHeight="8" refX="6.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#3fb950"/></marker>
   </defs>
 
   <!-- Its own dark canvas, so it reads the same in any theme. -->
-  <rect width="900" height="448" rx="18" fill="#0b1020"/>
-  <rect x="0.5" y="0.5" width="899" height="447" rx="18" fill="none" stroke="#1e2638"/>
+  <rect width="900" height="448" rx="12" fill="#0d1117"/>
+  <rect x="0.5" y="0.5" width="899" height="447" rx="12" fill="none" stroke="#21262d"/>
 
-  <g font-size="11" font-weight="600" letter-spacing="1.2" fill="#6b7a99">
-    <rect x="24" y="36" width="212" height="214" rx="14" fill="none" stroke="#2a3448" stroke-dasharray="4 5"/>
+  <g font-size="11" letter-spacing="1" fill="#7d8590" stroke="#30363d" stroke-dasharray="3 4">
+    <rect x="24" y="36" width="212" height="214" rx="8" fill="none"/>
+    <rect x="290" y="36" width="320" height="388" rx="8" fill="none"/>
+    <rect x="664" y="36" width="212" height="214" rx="8" fill="none"/>
+  </g>
+  <g font-size="11" letter-spacing="1" fill="#7d8590">
     <text x="40" y="60">AGENT MACHINE</text>
-    <rect x="290" y="36" width="320" height="388" rx="14" fill="none" stroke="#2a3448" stroke-dasharray="4 5"/>
     <text x="306" y="60">SERVER MACHINE</text>
-    <rect x="664" y="36" width="212" height="214" rx="14" fill="none" stroke="#2a3448" stroke-dasharray="4 5"/>
     <text x="680" y="60">YOUR DEVICES</text>
   </g>
 
-  <rect x="342" y="166" width="216" height="68" rx="14" fill="#6366f1" opacity="0.45" filter="url(#glow)"/>
-  <rect x="704" y="166" width="140" height="68" rx="14" fill="#10b981" opacity="0.35" filter="url(#glow)"/>
+  <rect x="56" y="82" width="148" height="38" rx="6" fill="none" stroke="#30363d" stroke-dasharray="3 4"/>
+  <text x="130" y="105" text-anchor="middle" font-size="12" fill="#7d8590">any agents …</text>
+  <rect x="52" y="170" width="156" height="60" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="130" y="196" text-anchor="middle" font-size="15" font-weight="600" fill="#e6edf3">agent identity</text>
+  <text x="130" y="215" text-anchor="middle" font-size="11" fill="#7d8590">mandate CLI</text>
 
-  <rect x="56" y="82" width="148" height="38" rx="19" fill="none" stroke="#2a3448" stroke-dasharray="4 4"/>
-  <text x="130" y="105" text-anchor="middle" font-size="12" fill="#6b7a99">any agents …</text>
-  <rect x="52" y="170" width="156" height="60" rx="12" fill="#111827" stroke="#2a3448"/>
-  <text x="130" y="196" text-anchor="middle" font-size="15" font-weight="600" fill="#e5e7eb">agent identity</text>
-  <text x="130" y="215" text-anchor="middle" font-size="11" fill="#8b95a7">mandate CLI</text>
+  <rect x="330" y="160" width="240" height="80" rx="8" fill="#e6edf3"/>
+  <text x="450" y="196" text-anchor="middle" font-size="17" font-weight="700" fill="#0d1117">mandate</text>
+  <text x="450" y="218" text-anchor="middle" font-size="11" fill="#57606a">grants · approvals · one HTTPS port</text>
+  <rect x="352" y="318" width="196" height="58" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="450" y="343" text-anchor="middle" font-size="15" font-weight="600" fill="#e6edf3">connector</text>
+  <text x="450" y="362" text-anchor="middle" font-size="11" fill="#7d8590">one account · its login</text>
+  <rect x="352" y="388" width="196" height="26" rx="6" fill="none" stroke="#30363d" stroke-dasharray="3 4"/>
+  <text x="450" y="405" text-anchor="middle" font-size="11" fill="#7d8590">more connectors …</text>
 
-  <rect x="330" y="160" width="240" height="80" rx="14" fill="url(#indigo)"/>
-  <text x="450" y="196" text-anchor="middle" font-size="17" font-weight="700" fill="#fff">mandate</text>
-  <text x="450" y="218" text-anchor="middle" font-size="11" fill="#c7d2fe">grants · approvals · one HTTPS port</text>
-  <rect x="352" y="318" width="196" height="58" rx="12" fill="#111827" stroke="#2a3448"/>
-  <text x="450" y="343" text-anchor="middle" font-size="15" font-weight="600" fill="#e5e7eb">connector</text>
-  <text x="450" y="362" text-anchor="middle" font-size="11" fill="#8b95a7">one account · its login</text>
-  <rect x="352" y="388" width="196" height="26" rx="13" fill="none" stroke="#2a3448" stroke-dasharray="4 4"/>
-  <text x="450" y="405" text-anchor="middle" font-size="11" fill="#6b7a99">more connectors …</text>
+  <rect x="692" y="160" width="164" height="80" rx="8" fill="#e6edf3"/>
+  <text x="774" y="196" text-anchor="middle" font-size="17" font-weight="700" fill="#0d1117">mandate app</text>
+  <text x="774" y="218" text-anchor="middle" font-size="11" fill="#57606a">phone · desktop</text>
+  <rect x="692" y="318" width="164" height="58" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="774" y="343" text-anchor="middle" font-size="15" font-weight="600" fill="#e6edf3">your accounts</text>
+  <text x="774" y="362" text-anchor="middle" font-size="11" fill="#7d8590">WhatsApp · Signal · email · …</text>
 
-  <rect x="692" y="160" width="164" height="80" rx="14" fill="url(#emerald)"/>
-  <text x="774" y="196" text-anchor="middle" font-size="17" font-weight="700" fill="#fff">mandate app</text>
-  <text x="774" y="218" text-anchor="middle" font-size="11" fill="#a7f3d0">phone · desktop</text>
-  <rect x="692" y="318" width="164" height="58" rx="12" fill="#111827" stroke="#2a3448"/>
-  <text x="774" y="343" text-anchor="middle" font-size="15" font-weight="600" fill="#e5e7eb">your accounts</text>
-  <text x="774" y="362" text-anchor="middle" font-size="11" fill="#8b95a7">WhatsApp · Signal · email · …</text>
-
-  <g fill="none" stroke-width="1.6">
-    <path d="M130,120 V166" stroke="#8b95a7" marker-end="url(#n)"/>
-    <path d="M208,200 H326" stroke="#8b95a7" marker-end="url(#n)"/>
-    <path d="M572,186 C612,140 650,140 688,184" stroke="#818cf8" marker-end="url(#i)"/>
-    <path d="M690,214 C650,260 612,260 574,216" stroke="#34d399" marker-end="url(#e)"/>
-    <path d="M450,240 V314" stroke="#8b95a7" marker-end="url(#n)"/>
-    <path d="M548,347 H688" stroke="#8b95a7" marker-end="url(#n)"/>
+  <g fill="none" stroke-width="1.5">
+    <path d="M130,120 V166" stroke="#7d8590" marker-end="url(#n)"/>
+    <path d="M208,200 H326" stroke="#7d8590" marker-end="url(#n)"/>
+    <path d="M572,186 C612,140 650,140 688,184" stroke="#7d8590" marker-end="url(#n)"/>
+    <path d="M690,214 C650,260 612,260 574,216" stroke="#3fb950" marker-end="url(#g)"/>
+    <path d="M450,240 V314" stroke="#7d8590" marker-end="url(#n)"/>
+    <path d="M548,347 H688" stroke="#7d8590" marker-end="url(#n)"/>
   </g>
 
   <!-- Numbered transitions, in the order a write takes them. -->
   <g font-size="11">
-    <rect x="241" y="190" width="56" height="20" rx="10" fill="#0b1020" stroke="#8b95a7"/>
-    <circle cx="252" cy="200" r="7" fill="#8b95a7"/><text x="252" y="204" text-anchor="middle" font-size="9" font-weight="700" fill="#0b1020">1</text>
-    <text x="263" y="204" fill="#cbd5e1">asks</text>
+    <rect x="241" y="190" width="56" height="20" rx="4" fill="#0d1117" stroke="#30363d"/>
+    <text x="252" y="204" text-anchor="middle" font-weight="700" fill="#7d8590">1</text>
+    <text x="263" y="204" fill="#c9d1d9">asks</text>
 
-    <rect x="595" y="142" width="72" height="20" rx="10" fill="#0b1020" stroke="#818cf8"/>
-    <circle cx="606" cy="152" r="7" fill="#818cf8"/><text x="606" y="156" text-anchor="middle" font-size="9" font-weight="700" fill="#0b1020">2</text>
-    <text x="617" y="156" fill="#c7d2fe">notifies</text>
+    <rect x="595" y="142" width="72" height="20" rx="4" fill="#0d1117" stroke="#30363d"/>
+    <text x="606" y="156" text-anchor="middle" font-weight="700" fill="#7d8590">2</text>
+    <text x="617" y="156" fill="#c9d1d9">notifies</text>
 
-    <rect x="591" y="238" width="80" height="20" rx="10" fill="#0b1020" stroke="#34d399"/>
-    <circle cx="602" cy="248" r="7" fill="#34d399"/><text x="602" y="252" text-anchor="middle" font-size="9" font-weight="700" fill="#0b1020">3</text>
-    <text x="613" y="252" fill="#a7f3d0">approves</text>
+    <rect x="591" y="238" width="80" height="20" rx="4" fill="#0d1117" stroke="#3fb950"/>
+    <text x="602" y="252" text-anchor="middle" font-weight="700" fill="#3fb950">3</text>
+    <text x="613" y="252" fill="#c9d1d9">approves</text>
 
-    <rect x="402" y="267" width="96" height="20" rx="10" fill="#0b1020" stroke="#8b95a7"/>
-    <circle cx="413" cy="277" r="7" fill="#8b95a7"/><text x="413" y="281" text-anchor="middle" font-size="9" font-weight="700" fill="#0b1020">4</text>
-    <text x="424" y="281" fill="#cbd5e1">signed write</text>
+    <rect x="402" y="267" width="96" height="20" rx="4" fill="#0d1117" stroke="#30363d"/>
+    <text x="413" y="281" text-anchor="middle" font-weight="700" fill="#7d8590">4</text>
+    <text x="424" y="281" fill="#c9d1d9">signed write</text>
 
-    <rect x="580" y="337" width="76" height="20" rx="10" fill="#0b1020" stroke="#8b95a7"/>
-    <circle cx="591" cy="347" r="7" fill="#8b95a7"/><text x="591" y="351" text-anchor="middle" font-size="9" font-weight="700" fill="#0b1020">5</text>
-    <text x="602" y="351" fill="#cbd5e1">its login</text>
+    <rect x="580" y="337" width="76" height="20" rx="4" fill="#0d1117" stroke="#30363d"/>
+    <text x="591" y="351" text-anchor="middle" font-weight="700" fill="#7d8590">5</text>
+    <text x="602" y="351" fill="#c9d1d9">its login</text>
   </g>
 </svg>
