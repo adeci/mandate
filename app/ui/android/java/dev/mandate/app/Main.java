@@ -18,8 +18,8 @@ public final class Main extends NativeActivity {
     /** A mandate://pair link, or the waiting item a notification is about. */
     private static native void opened(String link, String item);
 
-    /** The system bars and cutout at the top and bottom, in logical px. */
-    private static native void insets(float top, float bottom);
+    /** The system bars and cutout at the top and bottom, in logical px, and whether the soft keyboard shows. */
+    private static native void insets(float top, float bottom, boolean keyboard);
 
     @Override
     protected void onCreate(Bundle saved) {
@@ -34,7 +34,7 @@ public final class Main extends NativeActivity {
                             int bars = WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout();
                             Insets i = Insets.max(all.getInsets(bars), all.getInsets(WindowInsets.Type.ime()));
                             float density = getResources().getDisplayMetrics().density;
-                            insets(i.top / density, i.bottom / density);
+                            insets(i.top / density, i.bottom / density, all.isVisible(WindowInsets.Type.ime()));
                             return view.onApplyWindowInsets(all);
                         });
     }

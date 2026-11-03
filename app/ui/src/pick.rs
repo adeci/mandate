@@ -164,12 +164,16 @@ impl Shell {
                 d.child(self.picker(t, cx, |c, cx| {
                     let conn =
                         self.picker.as_ref().map(|p| p.connector.clone()).unwrap_or_default();
-                    let is =
-                        |kind: &str| hidden.contains(&(conn.clone(), kind.into(), c.id.clone()));
-                    let mut actions = vec![("chat", "Hide chat")];
-                    if c.kind == "dm" {
-                        actions.push(("person", "Hide person"));
-                    }
+                    let is = |kind: &str, id: &str| {
+                        hidden.contains(&(conn.clone(), kind.into(), id.into()))
+                    };
+                    // The chat itself, then each person in it, hidden by
+                    // their own ID: a DM's one person, a group's members.
+                    let chat = (("chat", c.id.clone()), "Hide chat".to_string(), display(c));
+                    let people = c.participants.iter().map(|p| {
+                        let name = if p.name.is_empty() { p.id.clone() } else { p.name.clone() };
+                        (("person", p.id.clone()), format!("Hide {name}"), name)
+                    });
                     div()
                         .flex()
                         .flex_wrap()
@@ -178,16 +182,20 @@ impl Shell {
                         .py(lines(0.25))
                         .child(div().flex_1().child(display(c)))
                         .child(t.alt(c.kind.clone()))
-                        .children(actions.into_iter().map(|(kind, label)| {
-                            if is(kind) {
-                                return t.alt(format!("[{kind} hidden]")).into_any_element();
-                            }
-                            let (conn, id, name) = (conn.clone(), c.id.clone(), display(c));
-                            link(t, id_for(kind, &c.id), label, cx, move |this, cx| {
-                                this.hide(&conn, kind, &id, &name, cx)
-                            })
-                            .into_any_element()
-                        }))
+                        .children(std::iter::once(chat).chain(people).map(
+                            |((kind, id), label, name)| {
+                                if is(kind, &id) {
+                                    let what = if kind == "chat" { "chat" } else { &name };
+                                    return t.alt(format!("[{what} hidden]")).into_any_element();
+                                }
+                                let key = id_for(kind, &format!("{}/{id}", c.id));
+                                let conn = conn.clone();
+                                link(t, key, &label, cx, move |this, cx| {
+                                    this.hide(&conn, kind, &id, &name, cx)
+                                })
+                                .into_any_element()
+                            },
+                        ))
                         .into_any_element()
                 }))
             })

@@ -19,8 +19,8 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -100,14 +100,21 @@ extern "system" fn Java_dev_mandate_app_Main_opened<'a>(
     .resolve::<LogErrorAndDefault>()
 }
 
-/// The top and bottom system-bar and cutout insets, in logical px, as bits;
-/// atomics so that rendering takes no lock.
+/// The top and bottom system-bar and cutout insets, in logical px, as bits,
+/// and whether the soft keyboard shows; atomics so that rendering takes no
+/// lock.
 static INSETS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+static KEYBOARD: AtomicBool = AtomicBool::new(false);
 
 /// The top and bottom insets the window draws under, in logical px.
 pub fn insets() -> (f32, f32) {
     let [top, bottom] = &INSETS;
     (f32::from_bits(top.load(Relaxed)), f32::from_bits(bottom.load(Relaxed)))
+}
+
+/// Whether the soft keyboard is up.
+pub fn keyboard_up() -> bool {
+    KEYBOARD.load(Relaxed)
 }
 
 #[unsafe(no_mangle)]
@@ -116,9 +123,11 @@ extern "system" fn Java_dev_mandate_app_Main_insets(
     _: JClass,
     top: jni::sys::jfloat,
     bottom: jni::sys::jfloat,
+    keyboard: jni::sys::jboolean,
 ) {
     INSETS[0].store(top.to_bits(), Relaxed);
     INSETS[1].store(bottom.to_bits(), Relaxed);
+    KEYBOARD.store(keyboard == jni::sys::JNI_TRUE, Relaxed);
     let _ = OPENED.0.unbounded_send(Opened::Insets);
 }
 

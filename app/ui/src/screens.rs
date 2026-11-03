@@ -81,9 +81,9 @@ impl Render for Shell {
             }
         };
         #[cfg(target_os = "android")]
-        let (top, bottom) = crate::android::insets();
+        let ((top, bottom), typing) = (crate::android::insets(), crate::android::keyboard_up());
         #[cfg(not(target_os = "android"))]
-        let (top, bottom) = (0., 0.);
+        let ((top, bottom), typing) = ((0., 0.), false);
         div()
             .size_full()
             .flex()
@@ -110,7 +110,8 @@ impl Render for Shell {
                         .child(screen.gap(lines(1.))),
                 ),
             )
-            .when_some(tab, |d, tab| d.child(self.tab_bar(t, tab, cx)))
+            // The soft keyboard sits where the tab bar would; it returns as the keyboard goes.
+            .when_some(tab.filter(|_| !typing), |d, tab| d.child(self.tab_bar(t, tab, cx)))
     }
 }
 

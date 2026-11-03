@@ -180,6 +180,17 @@ pub struct Container {
     pub kind: String,
     pub parent_id: String,
     pub last_activity: Option<String>,
+    /// The people in it, where the connector lists them (connector.md,
+    /// Chats); a person is hidden by their own ID, not the chat's.
+    pub participants: Vec<Person>,
+}
+
+/// One person in a chat.
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Person {
+    pub id: String,
+    pub name: String,
 }
 
 /// One step of linking a connector, as the connector describes it

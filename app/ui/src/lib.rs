@@ -331,6 +331,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let device = self.device();
+        let decided = path.clone();
         self.error = None;
         self.call(
             cx,
@@ -345,16 +346,35 @@ impl Shell {
                 envelope.sign(&*device.key)?;
                 device.client.signed(&envelope)
             },
-            |this, _, cx| {
+            move |this, _, cx| {
+                this.decided(&decided);
                 this.screen = Screen::Tab(Tab::Now);
                 this.refresh(cx);
             },
         );
     }
 
+    /// Drops a request, proposal or exchange the owner just decided, named
+    /// by any route under it, so its card leaves Now before the refresh.
+    fn decided(&mut self, path: &str) {
+        let mut parts = path.split('/');
+        let (Some(kind), Some(id)) = (parts.next(), parts.next()) else { return };
+        match kind {
+            "requests" => self.now.requests.retain(|r| r.id != id),
+            "proposals" => self.now.proposals.retain(|p| p.id != id),
+            "exchanges" => self.exchanges.retain(|e| e.id != id),
+            _ => {}
+        }
+    }
+
     /// Signs a record already shown in full: an admit or a reviewed send.
     fn approve(&mut self, mut envelope: Envelope, cx: &mut Context<Self>) {
         let device = self.device();
+        let decided = match &self.screen {
+            Screen::Review { proposal, .. } => format!("proposals/{}", proposal.id),
+            Screen::Admit { exchange, .. } => format!("exchanges/{}", exchange.id),
+            _ => String::new(),
+        };
         self.error = None;
         self.call(
             cx,
@@ -362,7 +382,8 @@ impl Shell {
                 envelope.sign(&*device.key)?;
                 device.client.signed(&envelope)
             },
-            |this, _, cx| {
+            move |this, _, cx| {
+                this.decided(&decided);
                 this.screen = Screen::Tab(Tab::Now);
                 this.refresh(cx);
             },
@@ -428,11 +449,13 @@ impl Shell {
         notice: impl FnOnce(Value) -> Option<String> + 'static,
     ) {
         let client = self.device().client;
+        let decided = path.clone();
         self.error = None;
         self.call(
             cx,
             move || client.send::<Value>(method, &path, &json!({})),
-            |this, answer, cx| {
+            move |this, answer, cx| {
+                this.decided(&decided);
                 this.screen = Screen::Tab(match this.screen {
                     Screen::Tab(tab) => tab,
                     _ => Tab::Now,
