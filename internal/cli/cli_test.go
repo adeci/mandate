@@ -126,6 +126,11 @@ func TestProposal(t *testing.T) {
 			t.Errorf("%s: exit %d (%v), want %d", status, ExitCode(err), err, exit)
 		}
 	}
+
+	c, _ = newGateway(t, map[string][]string{"POST /agent/v1/signal/send": {`202 {"id":"P1","status":"pending"}`}})
+	if err := c.run(t.Context(), []string{"signal", "send", "Fam+1=", "hi", "--wait", "0"}); ExitCode(err) != exitTryLater {
+		t.Errorf("send --wait 0: exit %d (%v)", ExitCode(err), err)
+	}
 }
 
 func TestRequest(t *testing.T) {

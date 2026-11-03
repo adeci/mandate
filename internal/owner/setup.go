@@ -333,10 +333,11 @@ func Reset(ctx context.Context, cfg *config.Config, out io.Writer) error {
 // stopServices stops mandate.target and returns how to start it again. With
 // no systemd or no target it only makes sure nothing of mandate runs.
 func stopServices(ctx context.Context, cfg *config.Config) (func() error, error) {
-	var restart func() error
+	// systemctl waits only for the jobs it was asked for, and stopping a
+	// target finishes before the units that are PartOf it, so name them too.
 	if _, err := exec.LookPath("systemctl"); err == nil &&
-		exec.CommandContext(ctx, "systemctl", "stop", "mandate.target").Run() == nil {
-		restart = exec.CommandContext(ctx, "systemctl", "start", "mandate.target").Run
+		exec.CommandContext(ctx, "systemctl", "stop", "mandate.target", "mandate-*.service").Run() == nil {
+		return exec.CommandContext(ctx, "systemctl", "start", "mandate.target").Run, nil
 	}
 	socks := []string{config.Socket("owner"), config.Socket("gateway")}
 	for name := range cfg.Connectors {
@@ -346,14 +347,10 @@ func stopServices(ctx context.Context, cfg *config.Config) (func() error, error)
 		d := net.Dialer{Timeout: time.Second}
 		if c, err := d.DialContext(ctx, "unix", sock); err == nil {
 			c.Close()
-			err := fmt.Errorf("%s answers: stop mandate's services first", sock)
-			if restart != nil {
-				err = errors.Join(err, restart())
-			}
-			return nil, err
+			return nil, fmt.Errorf("%s answers: stop mandate's services first", sock)
 		}
 	}
-	return restart, nil
+	return nil, nil
 }
 
 // wipe empties every key log and the owner side's state but never-share

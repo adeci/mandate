@@ -43,8 +43,7 @@ func (c *cli) submit(ctx context.Context, path string, args map[string]string, n
 	}
 	if wait == 0 {
 		c.show(raw, p)
-		fmt.Fprintf(c.errOut, "next: tell the owner it waits in the mandate app, then run mandate status %s\n", p.ID)
-		return nil
+		return outcome(p, 0)
 	}
 	if !c.json {
 		fmt.Fprintf(c.out, "%s pending\n", p.ID)
