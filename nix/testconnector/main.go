@@ -1,6 +1,8 @@
 // Command testconnector is the connector of the NixOS VM test: a service
 // that exists only as fixed chats and messages, whose send appends the
-// message to private/sent.jsonl, so the test can count what ran.
+// message to private/sent.jsonl, so the test can count what ran. It starts
+// linked unless the config says unlinked; after an unlink, setup runs a mock
+// dialogue through every kind of step, so the app can be tried against it.
 package main
 
 import (
@@ -19,7 +21,8 @@ import (
 )
 
 type config struct {
-	Account string `json:"account"`
+	Account  string `json:"account"`
+	Unlinked bool   `json:"unlinked"`
 }
 
 func (c *config) Validate() error {
@@ -38,6 +41,10 @@ type fake struct {
 	st      *store.Store
 	sent    string
 	mu      sync.Mutex
+	// linked is the fake session; polls counts the polls of the current
+	// waiting step, which the mock "other device" answers after a few.
+	linked bool
+	polls  int
 }
 
 func start(ctx context.Context, env *connector.Env, cfg config) (connector.Connector, error) {
@@ -49,7 +56,7 @@ func start(ctx context.Context, env *connector.Env, cfg config) (connector.Conne
 		st.Close()
 		return nil, err
 	}
-	return &fake{account: cfg.Account, st: st, sent: filepath.Join(env.PrivateDir(), "sent.jsonl")}, nil
+	return &fake{account: cfg.Account, st: st, sent: filepath.Join(env.PrivateDir(), "sent.jsonl"), linked: !cfg.Unlinked}, nil
 }
 
 func (f *fake) Close() error { return f.st.Close() }
@@ -101,11 +108,89 @@ func (f *fake) Spec() connector.Spec {
 }
 
 func (f *fake) Health(context.Context) connector.Health {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.linked {
+		return connector.Health{State: connector.NeedsSetup, Detail: "not linked"}
+	}
 	return connector.Health{State: connector.Healthy}
 }
 
-func (f *fake) Setup(context.Context, string, map[string]string) (connector.Step, error) {
-	return connector.Step{}, &connector.Error{Status: http.StatusConflict, Message: "linked"}
+// Unlink forgets the fake session and keeps the store.
+func (f *fake) Unlink(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.linked, f.polls = false, 0
+	return nil
+}
+
+// Setup walks account (text, secret, number, choice) → qr → code → confirm
+// → done. The qr and code steps poll; the fake phone answers the fifth poll.
+func (f *fake) Setup(_ context.Context, step string, values map[string]string) (connector.Step, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.linked {
+		return connector.Step{}, &connector.Error{Status: http.StatusConflict, Message: "linked"}
+	}
+	account := connector.Step{
+		ID: "account", Title: "Link the test service",
+		Text: "The account to link. Any password but \"wrong\" works.",
+		Fields: []connector.Field{
+			{Name: "account", Label: "Account", Kind: connector.TextField, Required: true},
+			{Name: "password", Label: "Password", Kind: connector.SecretField, Required: true},
+			{Name: "device", Label: "Device number", Kind: connector.NumberField},
+			{Name: "via", Label: "Link with", Kind: connector.ChoiceField, Required: true, Options: []connector.Option{
+				{Value: "qr", Label: "QR code"}, {Value: "code", Label: "Pairing code"},
+			}},
+		},
+	}
+	qr := connector.Step{
+		ID: "qr", Text: "On your phone: Test app › Linked devices › Link a device, then scan this code.",
+		QR: "test://link/7RJ4P2W5ZK3HXQ6N5M2C4YB7DE", Poll: 2,
+	}
+	code := connector.Step{ID: "code", Text: "Your phone shows a code. Check that it is this one.", Code: "4829-1375", Poll: 2}
+	confirm := connector.Step{ID: "confirm", Confirm: "Link this device as \"mandate\"? It keeps a copy of your chats."}
+	waited := func() bool {
+		if f.polls++; f.polls < 5 {
+			return false
+		}
+		f.polls = 0
+		return true
+	}
+	switch step {
+	case "":
+		f.polls = 0
+		return account, nil
+	case "account":
+		switch {
+		case values["account"] == "" || values["password"] == "":
+			return connector.Step{}, connector.Invalid("account and password are required")
+		case values["password"] == "wrong":
+			return connector.Step{}, connector.Invalid("the test service refused that password")
+		case values["via"] == "code":
+			return code, nil
+		case values["via"] == "qr":
+			return qr, nil
+		}
+		return connector.Step{}, connector.Invalid("link with qr or code")
+	case "qr":
+		if waited() {
+			return code, nil
+		}
+		return qr, nil
+	case "code":
+		if waited() {
+			return confirm, nil
+		}
+		return code, nil
+	case "confirm":
+		if values["confirm"] != "yes" {
+			return account, nil
+		}
+		f.linked = true
+		return connector.Step{ID: "done", Text: "Linked.", Done: true}, nil
+	}
+	return connector.Step{}, connector.Invalid("unknown step %q", step)
 }
 
 func (f *fake) Prepare(ctx context.Context, op string, args map[string]string) (connector.Prepared, error) {
