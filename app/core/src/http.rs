@@ -1,10 +1,13 @@
 //! HTTP/1.1 over rustls, one connection per request, with the TLS checks of
 //! owner-api.md: a pinned key, or a certificate that chains to a known root.
+//! The other end may be hostile, during the code exchange above all, so what
+//! it sends is bounded in size and time.
 
 use crate::{Error, invalid, sha256};
+use httparse::Status;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
+use rustls::crypto::{CryptoProvider, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
     ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
@@ -16,9 +19,22 @@ use std::fmt::Write as _;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CONNECT: Duration = Duration::from_secs(15);
+/// A line of a response head or of a stream. The servers' are far shorter.
+pub(crate) const MAX_LINE: u64 = 8 << 10;
+const MAX_HEAD: usize = 64 << 10;
+const MAX_BODY: u64 = 4 << 20;
+
+/// How long a request may take.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Wait {
+    /// The whole request, the answer's body included.
+    Total(Duration),
+    /// Each read, for a stream that does not end.
+    Idle(Duration),
+}
 
 /// How the app checks the server's TLS key once paired.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +84,8 @@ impl Server {
             .strip_prefix("https://")
             .ok_or_else(|| invalid("the server URL is not https://"))?;
         let authority = rest.strip_suffix('/').unwrap_or(rest);
-        if authority.is_empty() || authority.contains(['/', '?', '#', '@']) {
+        let host_bytes = |c: u8| c.is_ascii_alphanumeric() || b".-:[]".contains(&c);
+        if authority.is_empty() || !authority.bytes().all(host_bytes) {
             return Err(invalid("the server URL is not https://host[:port]"));
         }
         let (host, port) = match authority.rsplit_once(':') {
@@ -82,21 +99,38 @@ impl Server {
     }
 
     /// Sends one request on a new connection and reads the response head.
-    /// timeout bounds each read, so it must outlast long polls.
     pub fn send(
         &self,
         method: &str,
         path: &str,
         token: Option<&str>,
         body: Option<&[u8]>,
-        timeout: Duration,
+        wait: Wait,
     ) -> Result<Response, Error> {
+        // Nothing that could end the request line or a header, or leave
+        // /owner/v1/.
+        let plain = |s: &str| s.bytes().all(|c| c.is_ascii_graphic());
+        let dots = path.split(['/', '?']).any(|s| s == "." || s == "..");
+        if !plain(method)
+            || !plain(path)
+            || !path.starts_with('/')
+            || dots
+            || !token.is_none_or(plain)
+        {
+            return Err(invalid("a request's method, path or token is malformed"));
+        }
+        let (until, idle) = match wait {
+            Wait::Total(d) => (Some(Instant::now() + d), d),
+            Wait::Idle(d) => (None, d),
+        };
         let tcp = connect(&self.host, self.port)?;
-        tcp.set_read_timeout(Some(timeout))?;
+        tcp.set_read_timeout(Some(idle))?;
         tcp.set_write_timeout(Some(CONNECT))?;
         let verifier = Arc::new(Verifier { trust: self.trust, peer: Mutex::new(None) });
         let config = ClientConfig::builder_with_provider(TLS.provider.clone())
-            .with_safe_default_protocol_versions()
+            // Spelled out, since another crate of the app may build TLS 1.2
+            // into rustls.
+            .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(tls_error)?
             .dangerous()
             .with_custom_certificate_verifier(verifier.clone())
@@ -104,7 +138,7 @@ impl Server {
         let name = ServerName::try_from(self.host.clone())
             .map_err(|_| invalid("the server URL's host is not a name or an address"))?;
         let conn = ClientConnection::new(Arc::new(config), name).map_err(tls_error)?;
-        let mut stream = StreamOwned::new(conn, tcp);
+        let mut conn = Conn { tls: StreamOwned::new(conn, tcp), until, idle };
 
         let mut head = format!(
             "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
@@ -120,37 +154,52 @@ impl Server {
         head.push_str("\r\n");
         // rustls finishes the handshake, and so the checks, before it sends
         // any of this.
-        stream.write_all(head.as_bytes())?;
-        stream.write_all(body.unwrap_or_default())?;
-        stream.flush()?;
+        conn.tls.write_all(head.as_bytes())?;
+        conn.tls.write_all(body.unwrap_or_default())?;
+        conn.tls.flush()?;
         let peer =
             verifier.peer.lock().unwrap().ok_or_else(|| invalid("TLS without a certificate"))?;
 
-        let mut r = BufReader::new(stream);
-        let mut line = String::new();
-        r.read_line(&mut line)?;
-        let status = line
-            .strip_prefix("HTTP/1.1 ")
-            .and_then(|s| s.get(..3)?.parse().ok())
-            .ok_or_else(|| invalid(format!("not an HTTP/1.1 response: {line:?}")))?;
-        let (mut length, mut chunked) = (None, false);
-        loop {
-            line.clear();
-            if r.read_line(&mut line)? == 0 {
+        let mut r = BufReader::new(conn);
+        let (mut head, mut line) = (String::new(), String::new());
+        while line != "\r\n" {
+            if !read_line(&mut r, MAX_LINE, &mut line)? {
                 return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
             }
-            let Some((k, v)) = line.trim_end().split_once(':') else {
-                break;
-            };
-            let v = v.trim();
-            if k.eq_ignore_ascii_case("content-length") {
-                length = Some(v.parse().map_err(|_| invalid("bad Content-Length"))?);
-            } else if k.eq_ignore_ascii_case("transfer-encoding") {
-                chunked = v.eq_ignore_ascii_case("chunked");
+            head.push_str(&line);
+            if head.len() > MAX_HEAD {
+                return Err(invalid("response head over 64 KiB"));
+            }
+        }
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut res = httparse::Response::new(&mut headers);
+        let complete =
+            matches!(res.parse(head.as_bytes()), Ok(Status::Complete(n)) if n == head.len());
+        let (Some(1), Some(status), true) = (res.version, res.code, complete) else {
+            return Err(invalid("malformed HTTP/1.1 response head"));
+        };
+        let (mut length, mut chunked) = (None, false);
+        for h in res.headers.iter() {
+            if h.name.eq_ignore_ascii_case("content-length") {
+                let n = std::str::from_utf8(h.value)
+                    .ok()
+                    .filter(|v| v.bytes().all(|c| c.is_ascii_digit()))
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&n| n <= MAX_BODY);
+                if length.is_some() || n.is_none() {
+                    return Err(invalid("bad, repeated or oversized Content-Length"));
+                }
+                length = n;
+            } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+                if chunked || !h.value.eq_ignore_ascii_case(b"chunked") {
+                    return Err(invalid("Transfer-Encoding other than chunked"));
+                }
+                chunked = true;
             }
         }
         let body: Box<dyn BufRead + Send> = match (chunked, length) {
-            (true, _) => Box::new(BufReader::new(Chunked { r, left: 0, done: false })),
+            (true, None) => Box::new(BufReader::new(Chunked { r, left: 0, done: false })),
+            (true, Some(_)) => return Err(invalid("both Content-Length and chunked")),
             (false, Some(n)) => Box::new(r.take(n)),
             (false, None) => Box::new(r),
         };
@@ -164,7 +213,8 @@ impl Response {
         if !(200..300).contains(&self.status) {
             return Err(self.error());
         }
-        serde_json::from_reader(self.body).map_err(|e| invalid(format!("server answer: {e}")))
+        serde_json::from_reader(self.body.take(MAX_BODY))
+            .map_err(|e| invalid(format!("server answer: {e}")))
     }
 
     pub fn error(self) -> Error {
@@ -186,6 +236,23 @@ impl Response {
     }
 }
 
+/// Reads a line of at most limit bytes, its newline included; false at the
+/// end of the input.
+pub(crate) fn read_line(
+    r: &mut (impl BufRead + ?Sized),
+    limit: u64,
+    line: &mut String,
+) -> io::Result<bool> {
+    line.clear();
+    if Read::take(&mut *r, limit).read_line(line)? == 0 {
+        return Ok(false);
+    }
+    if !line.ends_with('\n') {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long, or cut off"));
+    }
+    Ok(true)
+}
+
 fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
     let mut last = io::Error::new(io::ErrorKind::NotFound, format!("{host} has no address"));
     for a in (host, port).to_socket_addrs()? {
@@ -199,6 +266,26 @@ fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
 
 fn tls_error(e: rustls::Error) -> Error {
     Error::Io(io::Error::other(e))
+}
+
+/// A connection whose reads end at the request's deadline.
+struct Conn {
+    tls: StreamOwned<ClientConnection, TcpStream>,
+    until: Option<Instant>,
+    idle: Duration,
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(until) = self.until {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            self.tls.sock.set_read_timeout(Some(left.min(self.idle)))?;
+        }
+        self.tls.read(buf)
+    }
 }
 
 /// The crypto provider and the root verifier.
@@ -249,11 +336,11 @@ impl ServerCertVerifier for Verifier {
 
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer,
-        dss: &DigitallySignedStruct,
+        _: &[u8],
+        _: &CertificateDer,
+        _: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls12_signature(message, cert, dss, &TLS.provider.signature_verification_algorithms)
+        Err(rustls::Error::General("TLS 1.2 is not offered".into()))
     }
 
     fn verify_tls13_signature(
@@ -279,12 +366,16 @@ struct Chunked<R> {
 
 impl<R: BufRead> Read for Chunked<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let bad = |what| io::Error::new(io::ErrorKind::InvalidData, what);
         if self.left == 0 && !self.done {
             let mut line = String::new();
-            self.r.read_line(&mut line)?;
-            let size = line.trim_end().split(';').next().unwrap_or_default();
-            self.left = u64::from_str_radix(size, 16)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
+            if !read_line(&mut self.r, 1 << 10, &mut line)? {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            self.left = match httparse::parse_chunk_size(line.as_bytes()) {
+                Ok(Status::Complete((n, size))) if n == line.len() => size,
+                _ => return Err(bad("bad chunk size")),
+            };
             // Trailers are left unread: the connection closes after this.
             self.done = self.left == 0;
         }
@@ -300,6 +391,9 @@ impl<R: BufRead> Read for Chunked<R> {
         if self.left == 0 {
             let mut crlf = [0; 2];
             self.r.read_exact(&mut crlf)?;
+            if crlf != *b"\r\n" {
+                return Err(bad("chunk not ended by CRLF"));
+            }
         }
         Ok(n)
     }

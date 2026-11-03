@@ -4,7 +4,7 @@
 
 use crate::envelope::{DeviceKey, Envelope};
 use crate::exchange::{self, Payload, token_sha256};
-use crate::http::{Peer, Response, Server, Trust};
+use crate::http::{MAX_LINE, Peer, Response, Server, Trust, Wait, read_line};
 use crate::log::Log;
 use crate::record::{Key, KeyEntry, Op, Record, Time};
 use crate::{Error, hex, invalid, unhex};
@@ -18,13 +18,15 @@ use std::str::FromStr;
 use std::time::Duration;
 
 /// Ordinary calls, some of which wait on a connector.
-const CALL: Duration = Duration::from_secs(60);
+const CALL: Wait = Wait::Total(Duration::from_secs(60));
 /// How long a join poll waits on the server, in seconds.
 const POLL: u64 = 60;
 /// The owner's code waits up to 2 minutes for the new party's answer.
-const CODE: Duration = Duration::from_secs(150);
+const CODE: Wait = Wait::Total(Duration::from_secs(150));
 /// The stream sends a comment every 30 seconds.
-const STREAM: Duration = Duration::from_secs(90);
+const STREAM: Wait = Wait::Idle(Duration::from_secs(90));
+/// A stream event's data; the server's are far smaller.
+const MAX_EVENT: usize = 64 << 10;
 
 /// The link the setup page shows as text and as a QR code:
 /// `mandate://pair?url=…&spki=…&secret=…`.
@@ -146,10 +148,10 @@ impl Client {
         method: &str,
         path: &str,
         body: Option<&[u8]>,
-        timeout: Duration,
+        wait: Wait,
     ) -> Result<Response, Error> {
         let path = format!("/owner/v1/{path}");
-        self.server.send(method, &path, Some(&self.token), body, timeout)
+        self.server.send(method, &path, Some(&self.token), body, wait)
     }
 
     /// GETs a route under /owner/v1/, given without that prefix.
@@ -216,6 +218,9 @@ impl Client {
         struct Confirmed {
             payload: Payload,
         }
+        if id.len() != 32 || unhex(id).is_none() {
+            return Err(invalid("an exchange ID is 16 bytes in hex"));
+        }
         let body = to_json(&json!({ "code": code }))?;
         let path = format!("exchanges/{id}/code");
         Ok(self.request("POST", &path, Some(&body), CODE)?.json::<Confirmed>()?.payload)
@@ -255,10 +260,9 @@ impl Iterator for Events {
     fn next(&mut self) -> Option<Result<Event, Error>> {
         let (mut name, mut data, mut line) = (String::new(), String::new(), String::new());
         loop {
-            line.clear();
-            match self.body.read_line(&mut line) {
-                Ok(0) => return None,
-                Ok(_) => {}
+            match read_line(&mut self.body, MAX_LINE, &mut line) {
+                Ok(false) => return None,
+                Ok(true) => {}
                 Err(e) => return Some(Err(e.into())),
             }
             let line = line.trim_end_matches(['\r', '\n']);
@@ -279,6 +283,9 @@ impl Iterator for Events {
             match field {
                 "event" => name = value.into(),
                 "data" if data.is_empty() => data = value.into(),
+                "data" if data.len() + value.len() >= MAX_EVENT => {
+                    return Some(Err(invalid("stream event over 64 KiB")));
+                }
                 "data" => {
                     data.push('\n');
                     data.push_str(value);
@@ -359,10 +366,11 @@ impl Join {
             msg: String,
         }
         let path = format!("/owner/v1/join/{}?wait={POLL}", hex(&self.id));
-        let timeout = Duration::from_secs(POLL) + CALL;
-        let p: Poll = self.server.send("GET", &path, None, None, timeout)?.json()?;
+        let wait = Wait::Total(Duration::from_secs(2 * POLL));
+        let p: Poll = self.server.send("GET", &path, None, None, wait)?.json()?;
         Ok(match (p.status.as_str(), self.peer) {
-            ("", _) => return self.answer(&p.msg),
+            ("", None) => return self.answer(&p.msg),
+            ("", Some(_)) => return Err(invalid("a new try at the code after it matched")),
             ("pending", None) => JoinStatus::Pending,
             ("pending", Some(_)) => JoinStatus::Confirmed,
             ("approved", Some(_)) => JoinStatus::Approved,
@@ -393,6 +401,8 @@ impl Join {
         let peer = res.peer;
         let confirm = unhex(&res.json::<Confirm>()?.confirm).ok_or(Error::Confirm)?;
         reply.check(&confirm, &peer.spki_sha256)?;
+        // From here on the exchange talks only to the key that proved itself.
+        self.server.trust = Some(Trust::Pin(peer.spki_sha256));
         self.peer = Some(peer);
         Ok(JoinStatus::Confirmed)
     }
@@ -411,87 +421,103 @@ mod tests {
     use crate::SoftwareKey;
     use crate::exchange::tests::Server as Attempt;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivateSec1KeyDer};
-    use rustls::{ServerConfig, ServerConnection, StreamOwned};
+    use rustls::version::{TLS12, TLS13};
+    use rustls::{ServerConfig, ServerConnection, StreamOwned, SupportedProtocolVersion};
+    use serde_json::Value;
     use std::io::{self, Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::TcpListener;
     use std::sync::{Arc, mpsc};
 
-    // A self-signed P-256 certificate, its SEC1 key, and the SHA-256 of its
-    // SubjectPublicKeyInfo as openssl computes it.
+    // Two self-signed P-256 certificates with their SEC1 keys, and the
+    // SHA-256 of the first's SubjectPublicKeyInfo as openssl computes it.
     const CERT: &str = "MIIBlTCCATygAwIBAgIUdKCDbAf7nK0qkvqWApDQpMziquUwCgYIKoZIzj0EAwIwFzEVMBMGA1UEAwwMbWFuZGF0ZS10ZXN0MCAXDTI2MTEwMzA3NDY0N1oYDzIxMjYxMDEwMDc0NjQ3WjAXMRUwEwYDVQQDDAxtYW5kYXRlLXRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQpiuK1qGWxbrxKFuE7ixH38nOrKHS2KzZAuLcW3lorOMezkvFPwiFpVr5U2M8QtA6fB3hgilOBFl0ZiyqITMiKo2QwYjAdBgNVHQ4EFgQU4sSz4aA2ghrfsYhJ8mJYtqybAm4wHwYDVR0jBBgwFoAU4sSz4aA2ghrfsYhJ8mJYtqybAm4wDwYDVR0TAQH_BAUwAwEB_zAPBgNVHREECDAGhwR_AAABMAoGCCqGSM49BAMCA0cAMEQCIC1y93GGLcCj4DBPrPMAiGpReP7RGIta2qNUdBFWG_95AiBig6WmuDpB2aWyDTX9cshthb0gWBwdtYrAlPHDCmu1yg";
     const KEY: &str = "MHcCAQEEIOf-bSPuHajP8AXsEPsITZK_u-3SCLNwa9xgr9jg_RMaoAoGCCqGSM49AwEHoUQDQgAEKYritahlsW68ShbhO4sR9_Jzqyh0tis2QLi3Ft5aKzjHs5LxT8IhaVa-VNjPELQOnwd4YIpTgRZdGYsqiEzIig";
     const SPKI_SHA256: &str = "120d3a8992a6c76328727bded93323f953c13f3e6abb18aa9263a7f78809e287";
+    const OTHER_CERT: &str = "MIIBhjCCAS2gAwIBAgIUWvMEwp3XZCHsdVjb5p2kDNMGruwwCgYIKoZIzj0EAwIwGDEWMBQGA1UEAwwNbWFuZGF0ZS1vdGhlcjAgFw0yNjExMDMwODAzMzJaGA8yMTI2MTAxMDA4MDMzMlowGDEWMBQGA1UEAwwNbWFuZGF0ZS1vdGhlcjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABDH1ld9xOqecplmohxI5A4wAW0zQFTyWGNasecmdRjXTnm9-sc7g8fTS-6aH21s7bWyxUQa5-RAZF1zREY8sBpmjUzBRMB0GA1UdDgQWBBSkQ1wEQzqEjXzJEkOi93AKsOZ2_TAfBgNVHSMEGDAWgBSkQ1wEQzqEjXzJEkOi93AKsOZ2_TAPBgNVHRMBAf8EBTADAQH_MAoGCCqGSM49BAMCA0cAMEQCICJJBLII8othJlTO7dj6ZpOUfrhRjxcPe69UI1YuK_8cAiAanUF_YydnsiTukIz8lppvIuzG40_3Arkf1J9P3hCxkg";
+    const OTHER_KEY: &str = "MHcCAQEEIIOFa7iV6lnBaV_eEonVMVvf3ogYjoy58cHpFOGCDy-SoAoGCCqGSM49AwEHoUQDQgAEMfWV33E6p5ymWaiHEjkDjABbTNAVPJYY1qx5yZ1GNdOeb36xzuDx9NL7pofbWzttbLFRBrn5EBkXXNERjywGmQ";
+
+    fn spki() -> [u8; 32] {
+        unhex(SPKI_SHA256).unwrap().try_into().unwrap()
+    }
+
+    fn tls(cert: &str, key: &str, version: &'static SupportedProtocolVersion) -> Arc<ServerConfig> {
+        let b64 = |s: &str| URL_SAFE_NO_PAD.decode(s).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[version])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(b64(cert))],
+                PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(b64(key))),
+            )
+            .unwrap();
+        Arc::new(config)
+    }
 
     struct Request {
         line: String,
         auth: String,
-        body: Vec<u8>,
+        body: Value,
     }
 
-    /// Serves TLS on 127.0.0.1, one request per connection, answering with
-    /// handle's status and body; the stream's chunked, the rest not.
-    fn serve(mut handle: impl FnMut(Request) -> (u16, String) + Send + 'static) -> u16 {
-        let b64 = |s: &str| URL_SAFE_NO_PAD.decode(s).unwrap();
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![CertificateDer::from(b64(CERT))],
-                PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(b64(KEY))),
-            )
-            .unwrap();
-        let config = Arc::new(config);
+    /// A mock owner side on 127.0.0.1. Connection n, from 1, gets the TLS
+    /// config tls(n), then the bytes handle answers its one request with.
+    fn serve(
+        tls: impl Fn(usize) -> Arc<ServerConfig> + Send + 'static,
+        mut handle: impl FnMut(Request) -> Vec<u8> + Send + 'static,
+    ) -> String {
         let ln = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = ln.local_addr().unwrap().port();
+        let url = format!("https://{}", ln.local_addr().unwrap());
         std::thread::spawn(move || {
-            for tcp in ln.incoming().flatten() {
-                let s = StreamOwned::new(ServerConnection::new(config.clone()).unwrap(), tcp);
-                // A client that refuses the key ends its connection here.
-                let _ = answer(s, &mut handle);
+            for (n, tcp) in ln.incoming().flatten().enumerate() {
+                let mut s = StreamOwned::new(ServerConnection::new(tls(n + 1)).unwrap(), tcp);
+                // A client that refuses the key, or stops reading, ends here.
+                let _ = read_request(&mut s).and_then(|req| {
+                    s.write_all(&handle(req))?;
+                    s.conn.send_close_notify();
+                    s.flush()
+                });
             }
         });
-        port
+        url
     }
 
-    fn answer(
-        mut s: StreamOwned<ServerConnection, TcpStream>,
-        handle: &mut impl FnMut(Request) -> (u16, String),
-    ) -> io::Result<()> {
-        let mut r = io::BufReader::new(&mut s);
-        let mut req = Request { line: String::new(), auth: String::new(), body: Vec::new() };
-        r.read_line(&mut req.line)?;
+    fn read_request(s: &mut impl Read) -> io::Result<Request> {
+        let mut r = io::BufReader::new(s);
+        let (mut line, mut auth, mut length) = (String::new(), String::new(), 0);
+        r.read_line(&mut line)?;
         loop {
             let mut h = String::new();
             r.read_line(&mut h)?;
-            let Some((k, v)) = h.trim_end().split_once(": ") else {
-                break;
-            };
+            let Some((k, v)) = h.trim_end().split_once(": ") else { break };
             match k {
-                "Authorization" => req.auth = v.into(),
-                "Content-Length" => req.body.resize(v.parse().unwrap(), 0),
+                "Authorization" => auth = v.into(),
+                "Content-Length" => length = v.parse().unwrap(),
                 _ => {}
             }
         }
-        r.read_exact(&mut req.body)?;
-        let stream = req.line.starts_with("GET /owner/v1/stream ");
-        let (status, body) = handle(req);
-        if stream {
-            write!(s, "HTTP/1.1 {status} X\r\nTransfer-Encoding: chunked\r\n\r\n")?;
-            write!(s, "{:x}\r\n{body}\r\n0\r\n\r\n", body.len())?;
-        } else {
-            write!(s, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{body}", body.len())?;
-        }
-        s.conn.send_close_notify();
-        s.flush()
+        let mut body = vec![0; length];
+        r.read_exact(&mut body)?;
+        let body = serde_json::from_slice(&body).unwrap_or_default();
+        Ok(Request { line: line.trim_end().into(), auth, body })
+    }
+
+    fn reply(status: u16, body: &str) -> Vec<u8> {
+        format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into()
+    }
+
+    fn chunked(body: &str) -> Vec<u8> {
+        let head = "HTTP/1.1 200 X\r\nTransfer-Encoding: chunked\r\n\r\n";
+        format!("{head}{:x}\r\n{body}\r\n0\r\n\r\n", body.len()).into()
     }
 
     /// Pairs a phone, joins a laptop by code with one wrong try, and reads
-    /// the stream, against a mock owner side.
+    /// the stream, against a mock owner side. After the code matched, the
+    /// mock tries a new code and answers from another key once.
     #[test]
     fn pair_join_stream() {
-        let spki: [u8; 32] = unhex(SPKI_SHA256).unwrap().try_into().unwrap();
+        let spki = spki();
         let (phone, laptop) = (SoftwareKey::generate(), SoftwareKey::generate());
         let (phone_token, laptop_token) = (crate::new_token(), crate::new_token());
         let (code_tx, code_rx) = mpsc::channel::<String>();
@@ -499,29 +525,32 @@ mod tests {
         let id = [9; 16];
         let (mut step, mut attempt) = (0, None);
         let stream_auth = format!("Bearer {laptop_token}");
-        let port = serve(move |req| {
+        let (ours, other) = (tls(CERT, KEY, &TLS13), tls(OTHER_CERT, OTHER_KEY, &TLS13));
+        let pick = move |n| if n == 9 { other.clone() } else { ours.clone() };
+        let url = serve(pick, move |req| {
             step += 1;
-            let line = req.line.trim_end();
-            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let body = &req.body;
             let hex_field = |k: &str| unhex(body[k].as_str().unwrap()).unwrap();
-            let ok = |v: serde_json::Value| (200, v.to_string());
+            let ok = |v: Value| reply(200, &v.to_string());
             match step {
                 1 => {
-                    assert_eq!(line, "POST /owner/v1/pair HTTP/1.1");
+                    assert_eq!(req.line, "POST /owner/v1/pair HTTP/1.1");
                     let entry: Envelope = serde_json::from_value(body["entry"].clone()).unwrap();
                     assert_eq!(body["secret"], "c2VjcmV0");
                     let log = Log::new([entry]).unwrap();
                     ok(json!({ "kind": "key", "id": log.trusted().next().unwrap().id }))
                 }
                 2 => {
-                    assert_eq!(line, "POST /owner/v1/join HTTP/1.1");
-                    assert_eq!(body, json!({ "kind": "device", "name": "MacBook" }));
-                    (201, json!({ "id": hex(&id) }).to_string())
+                    assert_eq!(req.line, "POST /owner/v1/join HTTP/1.1");
+                    assert_eq!(*body, json!({ "kind": "device", "name": "MacBook" }));
+                    reply(201, &json!({ "id": hex(&id) }).to_string())
                 }
-                3 | 5 => {
-                    assert_eq!(line, format!("GET /owner/v1/join/{}?wait=60 HTTP/1.1", hex(&id)));
-                    let code = code_rx.recv().unwrap();
-                    let a = Attempt::start("device", id, &code);
+                3 | 5 | 7 => {
+                    assert_eq!(
+                        req.line,
+                        format!("GET /owner/v1/join/{}?wait=60 HTTP/1.1", hex(&id))
+                    );
+                    let a = Attempt::start("device", id, &code_rx.recv().unwrap());
                     let msg = hex(&a.msg);
                     attempt = Some(a);
                     ok(json!({ "msg": msg }))
@@ -534,27 +563,25 @@ mod tests {
                             payload_tx.send(payload).unwrap();
                             ok(json!({ "confirm": hex(&confirm) }))
                         }
-                        Err(_) => (403, r#"{"error":"wrong code","code":"forbidden"}"#.into()),
+                        Err(_) => reply(403, r#"{"error":"wrong code","code":"forbidden"}"#),
                     }
                 }
-                7 => ok(json!({ "status": "pending" })),
-                8 => ok(json!({ "status": "approved" })),
-                9 if req.auth == stream_auth => (200, concat!(
+                8 => ok(json!({ "status": "pending" })),
+                9 => ok(json!({ "status": "approved" })),
+                10 if req.auth == stream_auth => chunked(concat!(
                     ": open\n\n",
                     "event: changed\ndata: {\"what\":\"keys\"}\n\n",
                     ": ping\n\n",
                     "event: later\ndata: {}\n\n",
                     "event: waiting\ndata: {\"kind\":\"request\",\"id\":\"R\",\"identity\":\"I\",",
                     "\"connector\":\"signal\"}\n\n",
-                ).into()),
-                _ => (500, format!("unexpected {line}")),
+                )),
+                _ => reply(500, &req.line),
             }
         });
-        let url = format!("https://127.0.0.1:{port}");
 
-        let link = format!(
-            "mandate://pair?url=https%3A%2F%2F127.0.0.1%3A{port}&spki={SPKI_SHA256}&secret=c2VjcmV0"
-        );
+        let escaped = url.replace(':', "%3A").replace('/', "%2F");
+        let link = format!("mandate://pair?url={escaped}&spki={SPKI_SHA256}&secret=c2VjcmV0");
         let link: PairLink = link.parse().unwrap();
         assert_eq!(
             link,
@@ -574,7 +601,10 @@ mod tests {
             token_sha256: token_sha256(&laptop_token),
         };
         assert_eq!(payload_rx.recv().unwrap(), want);
+        code_tx.send(join.code().into()).unwrap();
+        assert!(matches!(join.poll(), Err(Error::Invalid(_))), "a new try after the match");
         assert_eq!(join.poll().unwrap(), JoinStatus::Confirmed);
+        assert!(matches!(join.poll(), Err(Error::Io(_))), "approved by another key");
         assert_eq!(join.poll().unwrap(), JoinStatus::Approved);
         let client = join.into_client().unwrap();
         assert_eq!(client.trust(), Trust::Pin(spki));
@@ -595,6 +625,40 @@ mod tests {
 
         // A pinned client refuses another key before it sends anything.
         let other = Client::new(&url, Trust::Pin([0; 32]), &laptop_token).unwrap();
-        assert!(matches!(other.get::<serde_json::Value>("now"), Err(Error::Io(_))));
+        assert!(matches!(other.get::<Value>("now"), Err(Error::Io(_))));
+    }
+
+    /// A server speaking only TLS 1.2, then answers past their bounds: an
+    /// endless header line, a body over 4 MiB, and an endless event.
+    #[test]
+    fn hostile_answers() {
+        let old = serve(|_| tls(CERT, KEY, &TLS12), |_| reply(200, "{}"));
+        let client = Client::new(&old, Trust::Pin(spki()), &crate::new_token()).unwrap();
+        assert!(matches!(client.get::<Value>("now"), Err(Error::Io(_))), "TLS 1.2");
+
+        let mut step = 0;
+        let url = serve(
+            |_| tls(CERT, KEY, &TLS13),
+            move |_| {
+                step += 1;
+                let a = |n| "a".repeat(n);
+                match step {
+                    1 => format!("HTTP/1.1 200 X\r\nX-Long: {}\r\n\r\n{{}}", a(1 << 20)).into(),
+                    2 => chunked(&format!("\"{}\"", a(5 << 20))),
+                    _ => chunked(&format!(
+                        "event: changed\n{}",
+                        format!("data: {}\n", a(1000)).repeat(100)
+                    )),
+                }
+            },
+        );
+        let client = Client::new(&url, Trust::Pin(spki()), &crate::new_token()).unwrap();
+        let long = client.get::<Value>("now");
+        assert!(
+            matches!(&long, Err(Error::Io(e)) if e.kind() == io::ErrorKind::InvalidData),
+            "{long:?}"
+        );
+        assert!(matches!(client.get::<Value>("now"), Err(Error::Invalid(_))), "5 MiB body");
+        assert!(matches!(client.events().unwrap().next(), Some(Err(_))), "endless event");
     }
 }
