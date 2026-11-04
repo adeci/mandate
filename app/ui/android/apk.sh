@@ -28,6 +28,9 @@ mapfile -t classes < <(find "$out/classes" -name '*.class')
 "$tools/d8" --release --min-api 30 --lib "$android" --output "$out" "${classes[@]}"
 (cd "$out" && zip -qr unaligned.apk lib classes.dex)
 "$tools/zipalign" -f -P 16 4 "$out/unaligned.apk" "$out/mandate.apk"
-[ -f build/debug.keystore ] || keytool -genkeypair -keystore build/debug.keystore \
+# Android only lets an app update under the key it was first signed with, so
+# a device's builds need one keystore that outlives build directories.
+ks=${MANDATE_KEYSTORE:-build/debug.keystore}
+[ -f "$ks" ] || keytool -genkeypair -keystore "$ks" \
 	-storepass android -alias debug -keyalg RSA -validity 10000 -dname CN=debug
-"$tools/apksigner" sign --ks build/debug.keystore --ks-pass pass:android "$out/mandate.apk"
+"$tools/apksigner" sign --ks "$ks" --ks-pass pass:android "$out/mandate.apk"
