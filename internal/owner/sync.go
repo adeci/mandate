@@ -103,8 +103,11 @@ func (s *Server) loop(ctx context.Context) {
 func (s *Server) housekeep(ctx context.Context) {
 	s.mu.Lock()
 	now := s.now()
-	if s.st.expire(now) {
+	if changed, expired := s.st.expire(now); changed {
 		_ = s.commit("now") // logged; the next change saves again
+		for _, a := range expired {
+			s.note(a)
+		}
 	}
 	s.expireJoins(now)
 	s.mu.Unlock()

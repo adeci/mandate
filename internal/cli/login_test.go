@@ -17,48 +17,48 @@ import (
 	"github.com/adeci/mandate/internal/exchange"
 )
 
-// joinServer plays the owner side of the code exchange: once the CLI shows
-// its code, the owner types typed(code), and a wrong code ends the exchange.
+// joinServer plays the owner side of an exchange the owner opened with
+// code "123456": three wrong codes end it, and the right one is approved at
+// once.
 type joinServer struct {
-	typed func(code string) string
-	spki  func(sum []byte) []byte // what front reports as the TLS key
-	codes chan string
+	spki func(sum []byte) []byte // what front reports as the TLS key
 
 	mu       sync.Mutex
-	id       []byte
 	attempt  *exchange.Server
+	wrong    int
 	approved bool
-	ended    bool
 	payload  exchange.Payload
 }
+
+var joinID = []byte("0123456789abcdef")
 
 func (j *joinServer) start(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	var srv *httptest.Server
 	mux.HandleFunc("POST /agent/v1/join", func(w http.ResponseWriter, _ *http.Request) {
-		j.id = []byte("0123456789abcdef")
+		j.mu.Lock()
+		defer j.mu.Unlock()
+		if j.wrong == 3 {
+			http.Error(w, `{"error":"nothing is waiting for a login"}`, http.StatusNotFound)
+			return
+		}
+		a, err := exchange.Start(exchange.Agent, joinID, "123456")
+		if err != nil {
+			t.Error(err)
+		}
+		j.attempt = a
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]string{"id": hex.EncodeToString(j.id)})
+		json.NewEncoder(w).Encode(map[string]string{"id": hex.EncodeToString(joinID), "msg": hex.EncodeToString(a.Msg())})
 	})
 	mux.HandleFunc("GET /agent/v1/join/{id}", func(w http.ResponseWriter, _ *http.Request) {
 		j.mu.Lock()
 		defer j.mu.Unlock()
-		switch {
-		case j.approved:
-			json.NewEncoder(w).Encode(map[string]string{"status": "approved"})
-		case j.ended:
-			json.NewEncoder(w).Encode(map[string]string{"status": "ended"})
-		case j.attempt == nil:
-			a, err := exchange.Start(exchange.Agent, j.id, j.typed(<-j.codes))
-			if err != nil {
-				t.Error(err)
-			}
-			j.attempt = a
-			fallthrough
-		default:
-			json.NewEncoder(w).Encode(map[string]string{"msg": hex.EncodeToString(j.attempt.Msg())})
+		status := "ended"
+		if j.approved {
+			status = "approved"
 		}
+		json.NewEncoder(w).Encode(map[string]string{"status": status})
 	})
 	mux.HandleFunc("POST /agent/v1/join/{id}", func(w http.ResponseWriter, r *http.Request) {
 		var body struct{ Msg, Confirm, Sealed string }
@@ -71,8 +71,9 @@ func (j *joinServer) start(t *testing.T) *httptest.Server {
 		defer j.mu.Unlock()
 		p, server, err := j.attempt.Finish(msg, confirm, sealed, j.spki(sum[:]))
 		if err != nil {
-			j.ended = true
-			http.Error(w, `{"error":"wrong code"}`, http.StatusForbidden)
+			j.wrong++
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]any{"error": "wrong code", "attempts_left": 3 - j.wrong})
 			return
 		}
 		j.approved, j.payload = true, p
@@ -93,39 +94,28 @@ func (j *joinServer) start(t *testing.T) *httptest.Server {
 	return srv
 }
 
-// codeOut passes the code the CLI prints on to the server.
-type codeOut struct {
-	bytes.Buffer
-	codes chan string
-}
-
-func (o *codeOut) Write(p []byte) (int, error) {
-	if code, ok := strings.CutPrefix(string(p), "code: "); ok {
-		o.codes <- strings.TrimSpace(code)
-	}
-	return o.Buffer.Write(p)
-}
-
 func TestLogin(t *testing.T) {
 	t.Parallel()
-	same := func(code string) string { return code }
+	same := func(b []byte) []byte { return b }
 	for name, tc := range map[string]struct {
-		typed  func(string) string
+		typed  string // stdin
 		spki   func([]byte) []byte
 		rooted bool
+		says   string // on stderr
 		err    string
 	}{
-		"pinned": {typed: same, spki: func(b []byte) []byte { return b }},
-		"rooted": {typed: same, spki: func(b []byte) []byte { return b }, rooted: true},
-		"wrong code": {
-			typed: func(code string) string { return strings.Map(func(r rune) rune { return '0' + (r-'0'+1)%10 }, code) },
-			spki:  func(b []byte) []byte { return b }, err: "ended",
+		"pinned":           {typed: "123456\n", spki: same, says: "Code confirmed"},
+		"rooted":           {typed: "123 456\n", spki: same, rooted: true, says: "Code confirmed"},
+		"wrong then right": {typed: "111111\n12345\n123456", spki: same, says: "Wrong code; attempts left: 2.\nCode from the mandate app: The code is 6 digits."},
+		"wrong three times": {
+			typed: "111111\n222222\n333333\n123456\n", spki: same, says: "attempts left: 1.", err: "wrong code three times",
 		},
-		"other TLS key": {typed: same, spki: func([]byte) []byte { return make([]byte, 32) }, err: "intercepting"},
+		"no code":       {typed: "", spki: same, err: "no code given"},
+		"other TLS key": {typed: "123456\n", spki: func([]byte) []byte { return make([]byte, 32) }, err: "intercepting"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			j := &joinServer{typed: tc.typed, spki: tc.spki, codes: make(chan string, 1)}
+			j := &joinServer{spki: tc.spki}
 			srv := j.start(t)
 			roots := x509.NewCertPool()
 			if tc.rooted {
@@ -133,9 +123,12 @@ func TestLogin(t *testing.T) {
 			}
 			home := t.TempDir()
 			env := map[string]string{"HOME": home}
-			out := &codeOut{codes: j.codes}
-			c := &cli{out: out, errOut: &bytes.Buffer{}, getenv: func(k string) string { return env[k] }, roots: roots}
+			out, errOut := &bytes.Buffer{}, &bytes.Buffer{}
+			c := &cli{in: strings.NewReader(tc.typed), out: out, errOut: errOut, getenv: func(k string) string { return env[k] }, roots: roots}
 			err := c.run(t.Context(), []string{"login", srv.URL, "--name", "laptop"})
+			if !strings.Contains(errOut.String(), tc.says) {
+				t.Errorf("stderr %q, want %q", errOut, tc.says)
+			}
 			path := filepath.Join(home, ".config", "mandate", "credentials.json")
 			if tc.err != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.err) {
@@ -147,7 +140,7 @@ func TestLogin(t *testing.T) {
 				return
 			}
 			if err != nil {
-				t.Fatalf("login: %v\n%s", err, out)
+				t.Fatalf("login: %v\n%s", err, errOut)
 			}
 			fi, err := os.Stat(path)
 			if err != nil || fi.Mode().Perm() != 0o600 {

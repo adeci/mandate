@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -16,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -171,65 +173,33 @@ func (c *cli) login(ctx context.Context, args []string) error {
 	c.url, c.token = "https://"+u.Host, ""
 	c.http = client(key.config(u.Hostname(), c.roots))
 
-	var started struct {
-		ID string `json:"id"`
-	}
-	if _, _, err := c.do(ctx, requestTimeout, http.MethodPost, "/agent/v1/join",
-		map[string]string{"kind": exchange.Agent, "name": *name}, &started); err != nil {
-		return err
-	}
-	id, err := hex.DecodeString(started.ID)
-	if err != nil || len(id) != 16 {
-		return fmt.Errorf("the server answered exchange id %q", started.ID)
-	}
-	code := exchange.NewCode()
-	fmt.Fprintf(c.out, "code: %s\n", code)
-	fmt.Fprintf(c.errOut, "In the mandate app, the owner picks %q and types this code. Waiting up to 10 minutes.\n", *name)
-
 	token := exchange.NewToken()
 	payload := exchange.Payload{TokenSHA256: exchange.TokenSHA256(token)}
-	at := "/agent/v1/join/" + started.ID
-	confirmed := false
-	for {
-		var poll struct {
-			Msg    string `json:"msg"`
-			Status string `json:"status"`
+	in := bufio.NewReader(c.in)
+	var id string
+	for id == "" {
+		fmt.Fprint(c.errOut, "Code from the mandate app: ")
+		line, err := in.ReadString('\n')
+		code := strings.Join(strings.Fields(line), "")
+		switch {
+		case code == "" && err != nil:
+			return errors.New("no code given; the owner opens Add an agent in the mandate app, which shows it")
+		case len(code) != 6 || strings.Trim(code, "0123456789") != "":
+			fmt.Fprintln(c.errOut, "The code is 6 digits.")
+		default:
+			if id, err = c.tryCode(ctx, *name, code, payload, key); err != nil {
+				return err
+			}
 		}
-		if _, _, err := c.do(ctx, time.Minute+requestTimeout, http.MethodGet, at+"?wait=60", nil, &poll); err != nil {
+	}
+	fmt.Fprintln(c.errOut, "Code confirmed; waiting for the owner to let this machine in.")
+	for {
+		var poll struct{ Status string }
+		if _, _, err := c.do(ctx, time.Minute+requestTimeout, http.MethodGet, "/agent/v1/join/"+id+"?wait=60", nil, &poll); err != nil {
 			return err
 		}
-		switch {
-		case poll.Msg != "":
-			msg, err := hex.DecodeString(poll.Msg)
-			if err != nil {
-				return fmt.Errorf("the server's message: %w", err)
-			}
-			reply, err := exchange.Respond(exchange.Agent, id, code, msg, payload)
-			if err != nil {
-				return err
-			}
-			var answer struct {
-				Confirm string `json:"confirm"`
-			}
-			_, _, err = c.do(ctx, requestTimeout, http.MethodPost, at, map[string]string{
-				"msg":     hex.EncodeToString(reply.Msg),
-				"confirm": hex.EncodeToString(reply.Confirm),
-				"sealed":  hex.EncodeToString(reply.Sealed),
-			}, &answer)
-			if api, ok := errors.AsType[*apiError](err); ok && api.status == http.StatusForbidden {
-				fmt.Fprintln(c.errOut, "The owner typed a different code; waiting for another try.")
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			confirm, err := hex.DecodeString(answer.Confirm)
-			if err != nil || reply.Check(confirm, key.spki()) != nil {
-				return errors.New("the server's confirmation does not match the TLS key it showed, so something between here and mandate may be intercepting; nothing was saved, tell the owner")
-			}
-			confirmed = true
-			fmt.Fprintln(c.errOut, "Code confirmed; waiting for the owner to approve.")
-		case poll.Status == "approved" && confirmed:
+		switch poll.Status {
+		case "approved":
 			cr := credentials{URL: c.url, Token: token}
 			if !key.rooted {
 				cr.SPKISHA256 = hex.EncodeToString(key.spki())
@@ -239,10 +209,48 @@ func (c *cli) login(ctx context.Context, args []string) error {
 			}
 			fmt.Fprintf(c.out, "logged in to %s as %s\n", c.url, *name)
 			return nil
-		case poll.Status == "approved":
-			return errors.New("the exchange was approved before this side confirmed the code; run mandate login again")
-		case poll.Status == "ended":
-			return errors.New("the code exchange ended after three wrong codes or 10 minutes; run mandate login again")
+		case "ended":
+			return errors.New("the login ended before the owner let this machine in; run mandate login again")
 		}
 	}
+}
+
+// tryCode runs one attempt at code. It answers the exchange ID once the code
+// is confirmed, or "" after a wrong code with attempts left.
+func (c *cli) tryCode(ctx context.Context, name, code string, p exchange.Payload, key *serverKey) (string, error) {
+	var started struct{ ID, Msg string }
+	if _, _, err := c.do(ctx, requestTimeout, http.MethodPost, "/agent/v1/join",
+		map[string]string{"kind": exchange.Agent, "name": name}, &started); err != nil {
+		return "", err
+	}
+	id, err1 := hex.DecodeString(started.ID)
+	msg, err2 := hex.DecodeString(started.Msg)
+	if err1 != nil || err2 != nil || len(id) != 16 {
+		return "", fmt.Errorf("the server answered exchange %q with message %q", started.ID, started.Msg)
+	}
+	reply, err := exchange.Respond(exchange.Agent, id, code, msg, p)
+	if err != nil {
+		return "", err
+	}
+	var answer struct{ Confirm string }
+	_, _, err = c.do(ctx, requestTimeout, http.MethodPost, "/agent/v1/join/"+started.ID, map[string]string{
+		"msg":     hex.EncodeToString(reply.Msg),
+		"confirm": hex.EncodeToString(reply.Confirm),
+		"sealed":  hex.EncodeToString(reply.Sealed),
+	}, &answer)
+	if api, ok := errors.AsType[*apiError](err); ok && api.status == http.StatusForbidden {
+		if api.attemptsLeft == 0 {
+			return "", errors.New("wrong code three times, so the login ended; ask the owner to open Add an agent in the mandate app again")
+		}
+		fmt.Fprintf(c.errOut, "Wrong code; attempts left: %d.\n", api.attemptsLeft)
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	confirm, err := hex.DecodeString(answer.Confirm)
+	if err != nil || reply.Check(confirm, key.spki()) != nil {
+		return "", errors.New("the server's confirmation does not match the TLS key it showed, so something between here and mandate may be intercepting; nothing was saved, tell the owner")
+	}
+	return started.ID, nil
 }

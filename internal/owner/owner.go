@@ -6,6 +6,7 @@ package owner
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -43,6 +44,8 @@ func Serve(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
+	s.certVerified = cfg.TLS.Mode != "own"
+	_, s.agentPort, _ = net.SplitHostPort(cmp.Or(cfg.AgentListen, cfg.Listen))
 	ln, err := peer.Listen(config.Socket("owner"))
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
@@ -74,6 +77,12 @@ type Server struct {
 	executing sync.WaitGroup
 
 	names chatNames
+
+	// certVerified: the TLS certificate chains to a CA (mode acme or cert),
+	// so the app checks it and people compare no key.
+	certVerified bool
+	// agentPort is the port agents log in on.
+	agentPort string
 }
 
 func newServer(dir string, conns map[string]*connector.Client, gatewaySock string, log *slog.Logger) (*Server, error) {
@@ -155,6 +164,11 @@ func (s *Server) serve(ctx context.Context, ln net.Listener, front, gateway uint
 	return err
 }
 
+// serverInfo tells the app what agents log in with.
+func (s *Server) serverInfo(w http.ResponseWriter, r *http.Request) {
+	reply(w, http.StatusOK, map[string]string{"agent_url": "https://" + net.JoinHostPort(hostOnly(r.Host), s.agentPort)})
+}
+
 func (s *Server) handler(front, gateway uint32) http.Handler {
 	app := http.NewServeMux()
 	app.HandleFunc("GET /setup", s.setupPage)
@@ -164,7 +178,9 @@ func (s *Server) handler(front, gateway uint32) http.Handler {
 	app.HandleFunc("GET /owner/v1/join/{id}", s.joinPoll("device"))
 	app.HandleFunc("POST /owner/v1/join/{id}", s.joinAnswer("device"))
 	authed := func(pattern string, h http.HandlerFunc) { app.HandleFunc(pattern, s.device(h)) }
+	authed("GET /owner/v1/server", s.serverInfo)
 	authed("GET /owner/v1/now", s.getNow)
+	authed("GET /owner/v1/activity", s.getActivity)
 	authed("GET /owner/v1/stream", s.stream)
 	authed("POST /owner/v1/signed", s.signed)
 	authed("POST /owner/v1/requests/{id}/challenge", s.requestChallenge)
@@ -178,7 +194,8 @@ func (s *Server) handler(front, gateway uint32) http.Handler {
 	authed("POST /owner/v1/grants/{id}/close", s.closeGrant)
 	authed("POST /owner/v1/stop-all", s.stopAll)
 	authed("GET /owner/v1/exchanges", s.listJoins)
-	authed("POST /owner/v1/exchanges/{id}/code", s.joinCode)
+	authed("POST /owner/v1/exchanges", s.openJoin)
+	authed("DELETE /owner/v1/exchanges/{id}", s.cancelJoin)
 	authed("POST /owner/v1/exchanges/{id}/challenge", s.joinChallenge)
 	authed("GET /owner/v1/identities", s.listIdentities)
 	authed("PATCH /owner/v1/identities/{id}", s.renameIdentity)

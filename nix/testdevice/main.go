@@ -1,9 +1,10 @@
 // Command testdevice plays the owner's app in the NixOS VM test: it pairs
-// from a setup link or joins as another device, calls the owner API with
-// its device token, and signs challenges with its P-256 key.
+// from a setup link or joins as another device with the code an exchange
+// showed, calls the owner API with its device token, and signs challenges
+// with its P-256 key.
 //
 //	testdevice [--state FILE] pair LINK [NAME]
-//	testdevice [--state FILE] join URL SPKI [NAME]
+//	testdevice [--state FILE] join URL SPKI CODE [NAME]
 //	testdevice [--state FILE] call METHOD PATH [BODY]
 //	testdevice [--state FILE] sign PATH [BODY]
 //
@@ -67,8 +68,8 @@ func run(ctx context.Context, state string, args []string) error {
 	switch {
 	case args[0] == "pair" && len(args) <= 3 && len(args) >= 2:
 		return pair(ctx, state, args[1], name(2))
-	case args[0] == "join" && len(args) <= 4 && len(args) >= 3:
-		return join(ctx, state, args[1], args[2], name(3))
+	case args[0] == "join" && len(args) <= 5 && len(args) >= 4:
+		return join(ctx, state, args[1], args[2], args[3], name(4))
 	case args[0] == "call" && (len(args) == 3 || len(args) == 4):
 		d, err := load(state)
 		if err != nil {
@@ -269,10 +270,14 @@ func pair(ctx context.Context, state, link, name string) error {
 	return emit(out)
 }
 
-// join is the new device's side of the code exchange: it shows the code,
-// answers the owner's tries at it, and waits for the key add.
-func join(ctx context.Context, state, u, spki, name string) error {
+// join is the new device's side of the code exchange: it tries the code,
+// then waits for the key add.
+func join(ctx context.Context, state, u, spki, code, name string) error {
 	d, _, k, err := newDevice(u, spki, name, nil)
+	if err != nil {
+		return err
+	}
+	pinned, err := hex.DecodeString(spki)
 	if err != nil {
 		return err
 	}
@@ -280,22 +285,34 @@ func join(ctx context.Context, state, u, spki, name string) error {
 	d.Token = ""
 	payload := exchange.Payload{Key: &k, TokenSHA256: exchange.TokenSHA256(token)}
 
-	var started struct{ ID string }
+	var started struct{ ID, Msg string }
 	if err := d.callJSON(ctx, http.MethodPost, "/owner/v1/join", map[string]string{"kind": exchange.Device, "name": name}, &started); err != nil {
 		return err
 	}
-	id, err := hex.DecodeString(started.ID)
+	id, err1 := hex.DecodeString(started.ID)
+	msg, err2 := hex.DecodeString(started.Msg)
+	if err := errors.Join(err1, err2); err != nil {
+		return err
+	}
+	r, err := exchange.Respond(exchange.Device, id, code, msg, payload)
 	if err != nil {
 		return err
 	}
-	code := exchange.NewCode()
-	fmt.Printf("code: %s\n", code)
-	pinned, err := hex.DecodeString(spki)
+	var answer struct{ Confirm string }
+	if err := d.callJSON(ctx, http.MethodPost, "/owner/v1/join/"+started.ID, map[string]string{
+		"msg": hex.EncodeToString(r.Msg), "confirm": hex.EncodeToString(r.Confirm), "sealed": hex.EncodeToString(r.Sealed),
+	}, &answer); err != nil {
+		return err
+	}
+	confirm, err := hex.DecodeString(answer.Confirm)
 	if err != nil {
+		return err
+	}
+	if err := r.Check(confirm, pinned); err != nil {
 		return err
 	}
 	for {
-		var poll struct{ Msg, Status string }
+		var poll struct{ Status string }
 		if err := d.callJSON(ctx, http.MethodGet, "/owner/v1/join/"+started.ID+"?wait=30", nil, &poll); err != nil {
 			return err
 		}
@@ -305,33 +322,6 @@ func join(ctx context.Context, state, u, spki, name string) error {
 			return d.save(state)
 		case "ended":
 			return errors.New("the exchange ended")
-		case "pending":
-			continue
-		}
-		msg, err := hex.DecodeString(poll.Msg)
-		if err != nil {
-			return err
-		}
-		r, err := exchange.Respond(exchange.Device, id, code, msg, payload)
-		if err != nil {
-			return err
-		}
-		status, body, err := d.call(ctx, http.MethodPost, "/owner/v1/join/"+started.ID, fmt.Sprintf(
-			`{"msg":%q,"confirm":%q,"sealed":%q}`, hex.EncodeToString(r.Msg), hex.EncodeToString(r.Confirm), hex.EncodeToString(r.Sealed)))
-		if err != nil {
-			return err
-		}
-		if status == http.StatusForbidden {
-			continue // a wrong code; the owner may try again
-		}
-		answer, _ := body.(map[string]any)
-		confirm, _ := answer["confirm"].(string)
-		cb, err := hex.DecodeString(confirm)
-		if status != http.StatusOK || err != nil {
-			return fmt.Errorf("answer: %d %v", status, body)
-		}
-		if err := r.Check(cb, pinned); err != nil {
-			return err
 		}
 	}
 }

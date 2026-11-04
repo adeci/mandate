@@ -50,7 +50,8 @@ mandate login https://your-server
 ```
 
 This creates an agent identity for the machine: every agent on it reaches
-mandate through it. Type the code it shows into the app to let it in.
+mandate through it. Open Add an agent in the app, then type the code it shows
+when the command asks.
 
 ## Connectors
 

@@ -84,7 +84,8 @@ func unixClient(sock string) *http.Client {
 
 // start runs the owner side with a fake gateway that records each live set.
 // The test process is both front and gateway.
-func start(t *testing.T, conns map[string]*connector.Client) *harness {
+// opts adjust the server before it serves.
+func start(t *testing.T, conns map[string]*connector.Client, opts ...func(*Server)) *harness {
 	t.Helper()
 	socks := sockDir(t)
 	lives := make(chan live, 100)
@@ -113,6 +114,9 @@ func start(t *testing.T, conns map[string]*connector.Client) *harness {
 	}
 	c := &clock{t: time.Now().UTC().Truncate(time.Second)}
 	s.now = c.now
+	for _, o := range opts {
+		o(s)
+	}
 	ln, err := peer.Listen(filepath.Join(socks, "owner"))
 	if err != nil {
 		t.Fatal(err)
@@ -218,6 +222,17 @@ func (h *harness) openSetup() {
 	}
 }
 
+// setupPageText fetches the setup page.
+func (h *harness) setupPageText() (int, string) {
+	resp, err := h.http.Get("http://owner/setup")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	page, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(page)
+}
+
 var secretParam = regexp.MustCompile(`secret=([A-Za-z0-9_-]+)`)
 
 // setupSecret submits the setup password and returns the pairing secret
@@ -236,8 +251,13 @@ func (h *harness) setupSecret(password string) (int, string) {
 	if m == nil {
 		return resp.StatusCode, ""
 	}
-	if !bytes.Contains(page, []byte(testSPKI)) || !bytes.Contains(page, []byte("<svg")) {
-		h.t.Error("the setup page lacks the fingerprint or the QR code")
+	// People compare the key only when no CA vouches for the certificate.
+	shown, hidden := "f910 152c 80be 10ee 2280", "Certificate verified"
+	if h.s.certVerified {
+		shown, hidden = "<p class=\"key\">box.example</p>", "f910 152c"
+	}
+	if !bytes.Contains(page, []byte(shown)) || bytes.Contains(page, []byte(hidden)) || !bytes.Contains(page, []byte("<svg")) {
+		h.t.Errorf("the setup page lacks %q or the QR code, or shows %q:\n%s", shown, hidden, page)
 	}
 	return resp.StatusCode, string(m[1])
 }
@@ -266,62 +286,67 @@ func (h *harness) pair() device {
 	return d
 }
 
-// join runs a code exchange as the new party, with the owner typing code,
-// and returns the exchange ID. base is /internal for an agent, through the
-// gateway, and /owner/v1 for a device.
-func (h *harness) join(base, kind, name, code, typed string, p exchange.Payload, owner device) (string, int, map[string]any) {
+// open opens an exchange as the owner and returns its ID and code.
+func (h *harness) open(owner device, kind string) (string, string) {
 	h.t.Helper()
-	var started struct{ ID string }
-	if st := h.do("POST", base+"/join", "", map[string]string{"kind": kind, "name": name}, &started, "X-Forwarded-For", "192.0.2.7"); st != http.StatusCreated {
-		h.t.Fatalf("start exchange = %d", st)
+	var ex struct{ ID, Code string }
+	if st := h.do("POST", "/owner/v1/exchanges", owner.token, map[string]string{"kind": kind}, &ex); st != http.StatusCreated {
+		h.t.Fatalf("open exchange = %d", st)
 	}
-	var waiting []map[string]any
-	h.do("GET", "/owner/v1/exchanges", owner.token, nil, &waiting)
-	if !slices.ContainsFunc(waiting, func(j map[string]any) bool { return j["id"] == started.ID && j["address"] == "192.0.2.7" }) {
-		h.t.Fatalf("exchanges = %v", waiting)
-	}
+	return ex.ID, ex.Code
+}
 
-	type outcome struct {
-		st  int
-		out map[string]any
+// join tries code as the new party and returns the status and body of its
+// answer. base is /internal for an agent, through the gateway, and
+// /owner/v1 for a device.
+func (h *harness) join(base, kind, code string, p exchange.Payload) (int, map[string]any) {
+	h.t.Helper()
+	var started struct{ ID, Msg string }
+	if st := h.do("POST", base+"/join", "", map[string]string{"kind": kind, "name": "laptop"}, &started, "X-Forwarded-For", "192.0.2.7"); st != http.StatusCreated {
+		h.t.Fatalf("join = %d", st)
 	}
-	typedc := make(chan outcome, 1)
-	go func() {
-		var out map[string]any
-		st := h.do("POST", "/owner/v1/exchanges/"+started.ID+"/code", owner.token, map[string]string{"code": typed}, &out)
-		typedc <- outcome{st, out}
-	}()
-
-	var poll struct{ Msg string }
-	h.do("GET", base+"/join/"+started.ID+"?wait=10", "", nil, &poll)
-	msg, _ := hex.DecodeString(poll.Msg)
+	msg, _ := hex.DecodeString(started.Msg)
 	id, _ := hex.DecodeString(started.ID)
 	r, err := exchange.Respond(kind, id, code, msg, p)
 	if err != nil {
 		h.t.Fatal(err)
 	}
 	answer := map[string]string{"msg": hex.EncodeToString(r.Msg), "confirm": hex.EncodeToString(r.Confirm), "sealed": hex.EncodeToString(r.Sealed)}
-	var confirmed struct{ Confirm string }
-	st := h.do("POST", base+"/join/"+started.ID, "", answer, &confirmed, "Mandate-Spki-Sha256", testSPKI)
+	var out map[string]any
+	st := h.do("POST", base+"/join/"+started.ID, "", answer, &out, "Mandate-Spki-Sha256", testSPKI)
 	if st == http.StatusOK {
-		confirm, _ := hex.DecodeString(confirmed.Confirm)
+		confirm, _ := hex.DecodeString(out["confirm"].(string))
 		spki, _ := hex.DecodeString(testSPKI)
 		if err := r.Check(confirm, spki); err != nil {
 			h.t.Errorf("server_confirm: %v", err)
 		}
 	}
-	o := <-typedc
-	return started.ID, o.st, o.out
+	return st, out
+}
+
+// confirmed checks that exchange id waits for the owner with p.
+func (h *harness) confirmed(owner device, id string, p exchange.Payload) {
+	h.t.Helper()
+	var waiting []struct {
+		ID, State, Name, Address string
+		Payload                  exchange.Payload
+	}
+	h.do("GET", "/owner/v1/exchanges", owner.token, nil, &waiting)
+	if len(waiting) != 1 || waiting[0].ID != id || waiting[0].State != "confirmed" || waiting[0].Name != "laptop" ||
+		waiting[0].Address != "192.0.2.7" || waiting[0].Payload.TokenSHA256 != p.TokenSHA256 {
+		h.t.Fatalf("exchanges = %+v", waiting)
+	}
 }
 
 // agent lets in an agent identity and returns its ID.
 func (h *harness) agent(owner device) string {
 	h.t.Helper()
+	id, code := h.open(owner, exchange.Agent)
 	p := exchange.Payload{TokenSHA256: exchange.TokenSHA256(exchange.NewToken())}
-	id, st, _ := h.join("/internal", exchange.Agent, "laptop", "123456", "123456", p, owner)
-	if st != http.StatusOK {
-		h.t.Fatalf("code = %d", st)
+	if st, out := h.join("/internal", exchange.Agent, code, p); st != http.StatusOK {
+		h.t.Fatalf("join = %d %v", st, out)
 	}
+	h.confirmed(owner, id, p)
 	env := h.challenge(owner, "/owner/v1/exchanges/"+id+"/challenge", nil)
 	st, ident := h.sign(owner, env)
 	if st != http.StatusOK {
@@ -383,12 +408,12 @@ func hasGrant(l live, id string) bool {
 
 func TestFirstPairing(t *testing.T) {
 	h := start(t, nil)
-	if st := h.do("GET", "/setup", "", nil, nil); st != http.StatusNotFound {
-		t.Fatalf("setup page without a password = %d", st)
+	if st, page := h.setupPageText(); st != http.StatusOK || !strings.Contains(page, "waiting to be set up") || strings.Contains(page, "<form") {
+		t.Fatalf("setup page without a password = %d %q", st, page)
 	}
 	h.openSetup()
-	if st := h.do("GET", "/setup", "", nil, nil); st != http.StatusOK {
-		t.Fatalf("setup page = %d", st)
+	if st, page := h.setupPageText(); st != http.StatusOK || !strings.Contains(page, "<form") {
+		t.Fatalf("setup page = %d %q", st, page)
 	}
 	if st, secret := h.setupSecret("WRONG-WRONG-WRONG"); st != http.StatusForbidden || secret != "" {
 		t.Fatalf("wrong password = %d, secret %q", st, secret)
@@ -422,6 +447,108 @@ func TestFirstPairing(t *testing.T) {
 	}
 }
 
+func TestWiderThanAsked(t *testing.T) {
+	h := start(t, nowhere())
+	owner := h.pair()
+	agent := h.agent(owner)
+	req := h.request(agent) // for 1800, horizon 86400
+	env := h.challenge(owner, "/owner/v1/requests/"+req+"/challenge", map[string]any{"for": 7200, "horizon": 0})
+	var g record.Grant
+	if err := json.Unmarshal(env.Record, &g); err != nil {
+		t.Fatal(err)
+	}
+	if g.Until.Sub(g.From.Time) != 2*time.Hour || g.Horizon != 0 {
+		t.Errorf("grant = %s", env.Record)
+	}
+	if st, _ := h.sign(owner, env); st != http.StatusOK {
+		t.Errorf("sign = %d", st)
+	}
+}
+
+type activityPage struct {
+	Entries []activity
+	Next    string
+}
+
+func TestDecisionInActivity(t *testing.T) {
+	h := start(t, nowhere())
+	owner := h.pair()
+	agent := h.agent(owner)
+	req := h.request(agent)
+	if st := h.do("POST", "/owner/v1/requests/"+req+"/deny", owner.token, nil, nil); st != http.StatusOK {
+		t.Fatalf("deny = %d", st)
+	}
+	var page activityPage
+	if st := h.do("GET", "/owner/v1/activity", owner.token, nil, &page); st != http.StatusOK {
+		t.Fatalf("activity = %d", st)
+	}
+	var kinds []string
+	for _, e := range page.Entries {
+		kinds = append(kinds, e.Kind)
+	}
+	if want := []string{"request.denied", "request.asked", "agent.admitted", "device.joined"}; !slices.Equal(kinds, want) || page.Next != "" {
+		t.Fatalf("kinds = %v, next %q, want %v", kinds, page.Next, want)
+	}
+	denied := page.Entries[0]
+	if denied.Identity != agent || denied.Connector != "test" || len(denied.Chats) != 2 || denied.Chats[0] != (chat{"c1", "Family"}) {
+		t.Errorf("denied = %+v", denied)
+	}
+}
+
+func TestActivityPaging(t *testing.T) {
+	h := start(t, nil)
+	owner := h.pair() // device.joined, now
+	at := func(day, sec int) time.Time { return time.Date(2026, 1, day, 12, 0, sec, 0, time.UTC) }
+	var reads []map[string]any
+	for _, e := range []struct {
+		at   time.Time
+		verb string
+	}{{at(3, 0), "d3a"}, {at(1, 1), "d1b"}, {at(2, 0), "d2"}, {at(1, 0), "d1a"}, {at(3, 0), "d3b"}} {
+		reads = append(reads, map[string]any{"at": e.at, "identity": "x", "connector": "test", "verb": e.verb, "chats": []chat{}, "count": 1})
+	}
+	if st := h.do("POST", "/internal/activity", "", reads, nil); st != http.StatusOK {
+		t.Fatalf("post activity = %d", st)
+	}
+	var got []string
+	pages := 0
+	for before := ""; ; {
+		var page activityPage
+		path := "/owner/v1/activity?limit=2"
+		if before != "" {
+			path += "&before=" + url.QueryEscape(before)
+		}
+		if st := h.do("GET", path, owner.token, nil, &page); st != http.StatusOK {
+			t.Fatalf("activity = %d", st)
+		}
+		pages++
+		for _, e := range page.Entries {
+			got = append(got, e.Kind+" "+e.Detail)
+		}
+		if before = page.Next; before == "" || pages > 5 {
+			break
+		}
+	}
+	// Same second: the later line is newer.
+	want := []string{"device.joined Pixel 9", "read d3b", "read d3a", "read d2", "read d1b", "read d1a"}
+	if !slices.Equal(got, want) || pages != 3 {
+		t.Errorf("pages = %d, entries = %v, want %v", pages, got, want)
+	}
+	if st := h.do("GET", "/owner/v1/activity?before=yesterday", owner.token, nil, nil); st != http.StatusBadRequest {
+		t.Errorf("bad cursor = %d", st)
+	}
+}
+
+func TestCertifiedServer(t *testing.T) {
+	h := start(t, nil, func(s *Server) { s.certVerified, s.agentPort = true, "8444" })
+	owner := h.pair()
+	var info struct {
+		AgentURL string `json:"agent_url"`
+	}
+	if st := h.do("GET", "/owner/v1/server", owner.token, nil, &info); st != http.StatusOK || info.AgentURL != "https://owner:8444" {
+		t.Errorf("server = %d %+v", st, info)
+	}
+}
+
 func TestChallengeRules(t *testing.T) {
 	h := start(t, nowhere())
 	owner := h.pair()
@@ -431,8 +558,8 @@ func TestChallengeRules(t *testing.T) {
 	if picked := h.challenge(owner, "/owner/v1/requests/"+req+"/challenge", map[string]any{"chats": []string{"c3"}}); !bytes.Contains(picked.Record, []byte(`"chats":["c3"]`)) {
 		t.Errorf("a chat the owner picked = %s", picked.Record)
 	}
-	if st := h.do("POST", "/owner/v1/requests/"+req+"/challenge", owner.token, map[string]any{"horizon": 0}, nil); st != http.StatusBadRequest {
-		t.Errorf("widening the history = %d", st)
+	if st := h.do("POST", "/owner/v1/requests/"+req+"/challenge", owner.token, map[string]any{"horizon": -1}, nil); st != http.StatusBadRequest {
+		t.Errorf("a negative history = %d", st)
 	}
 	first := h.challenge(owner, "/owner/v1/requests/"+req+"/challenge", map[string]any{"chats": []string{"c1"}})
 	other := h.challenge(owner, "/owner/v1/requests/"+req+"/challenge", nil)
@@ -488,21 +615,32 @@ func TestDeviceJoinAndRevocation(t *testing.T) {
 	laptop := newDevice(t, "MacBook")
 	p := exchange.Payload{Key: &laptop.key, TokenSHA256: exchange.TokenSHA256(laptop.token)}
 
-	id, st, out := h.join("/owner/v1", exchange.Device, "MacBook", "654321", "111111", p, phone)
-	if st != http.StatusForbidden || out["attempts_left"] != 2.0 {
-		t.Fatalf("wrong code = %d %v", st, out)
+	ask := map[string]string{"kind": exchange.Device, "name": "laptop"}
+	if st := h.do("POST", "/owner/v1/join", "", ask, nil); st != http.StatusNotFound {
+		t.Errorf("join with nothing open = %d", st)
 	}
-	var poll struct{ Msg string }
-	if st := h.do("GET", "/owner/v1/join/"+id, "", nil, &poll); st != http.StatusOK || poll.Msg != "" {
-		t.Errorf("poll after a wrong code = %d %+v", st, poll)
+	first, _ := h.open(phone, exchange.Device)
+	id, code := h.open(phone, exchange.Device)
+	var poll struct{ Status string }
+	if h.do("GET", "/owner/v1/join/"+first, "", nil, &poll); poll.Status != "ended" {
+		t.Errorf("replaced exchange = %q", poll.Status)
 	}
-	if st := h.do("GET", "/internal/join/"+id, "", nil, nil); st != http.StatusNotFound {
-		t.Errorf("device exchange through the agent route = %d", st)
+	if st := h.do("POST", "/internal/join", "", map[string]string{"kind": exchange.Agent, "name": "laptop"}, nil); st != http.StatusNotFound {
+		t.Errorf("agent join with a device exchange open = %d", st)
 	}
 
-	id, st, out = h.join("/owner/v1", exchange.Device, "MacBook", "654321", "654321", p, phone)
-	if st != http.StatusOK || out["payload"] == nil {
-		t.Fatalf("code = %d %v", st, out)
+	if st, out := h.join("/owner/v1", exchange.Device, wrong(code), p); st != http.StatusForbidden || out["attempts_left"] != 2.0 {
+		t.Fatalf("wrong code = %d %v", st, out)
+	}
+	if st := h.do("POST", "/owner/v1/exchanges/"+id+"/challenge", phone.token, nil, nil); st != http.StatusConflict {
+		t.Errorf("challenge before the code = %d", st)
+	}
+	if st, out := h.join("/owner/v1", exchange.Device, code, p); st != http.StatusOK {
+		t.Fatalf("right code = %d %v", st, out)
+	}
+	h.confirmed(phone, id, p)
+	if st := h.do("POST", "/owner/v1/join", "", ask, nil); st != http.StatusNotFound {
+		t.Errorf("join once confirmed = %d", st)
 	}
 	if st := h.do("GET", "/owner/v1/keys", laptop.token, nil, nil); st != http.StatusUnauthorized {
 		t.Errorf("token before approval = %d", st)
@@ -529,6 +667,50 @@ func TestDeviceJoinAndRevocation(t *testing.T) {
 	}
 	if st := h.do("POST", "/owner/v1/keys/"+phone.key.ID+"/remove/challenge", phone.token, nil, nil); st != http.StatusConflict {
 		t.Errorf("removing the last key = %d", st)
+	}
+}
+
+// wrong is another code than code.
+func wrong(code string) string { return code[:5] + string('0'+(code[5]-'0'+1)%10) }
+
+func TestExchangeEnds(t *testing.T) {
+	h := start(t, nil)
+	owner := h.pair()
+	p := exchange.Payload{TokenSHA256: exchange.TokenSHA256(exchange.NewToken())}
+	ask := map[string]string{"kind": exchange.Agent, "name": "laptop"}
+	poll := func(id string) string {
+		var out struct{ Status string }
+		h.do("GET", "/internal/join/"+id, "", nil, &out)
+		return out.Status
+	}
+
+	id, code := h.open(owner, exchange.Agent)
+	h.do("POST", "/internal/join", "", ask, nil) // an attempt nobody answers
+	if st := h.do("POST", "/internal/join", "", ask, nil); st != http.StatusConflict {
+		t.Errorf("a second attempt at once = %d", st)
+	}
+	h.clock.add(attemptTTL)
+	for left := 2.0; left >= 0; left-- {
+		if st, out := h.join("/internal", exchange.Agent, wrong(code), p); st != http.StatusForbidden || out["attempts_left"] != left {
+			t.Fatalf("wrong code = %d %v, want %v left", st, out, left)
+		}
+	}
+	if s := poll(id); s != "ended" {
+		t.Errorf("after three wrong codes = %q", s)
+	}
+	if st := h.do("POST", "/internal/join", "", ask, nil); st != http.StatusNotFound {
+		t.Errorf("join after three wrong codes = %d", st)
+	}
+
+	id, _ = h.open(owner, exchange.Agent)
+	if st := h.do("DELETE", "/owner/v1/exchanges/"+id, owner.token, nil, nil); st != http.StatusOK || poll(id) != "ended" {
+		t.Errorf("cancel = %d %q", st, poll(id))
+	}
+	id, _ = h.open(owner, exchange.Agent)
+	h.clock.add(joinTTL)
+	var waiting []any
+	if h.do("GET", "/owner/v1/exchanges", owner.token, nil, &waiting); len(waiting) != 0 || poll(id) != "ended" {
+		t.Errorf("after 10 minutes: %v %q", waiting, poll(id))
 	}
 }
 

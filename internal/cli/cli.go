@@ -73,13 +73,15 @@ func usage(text string, err error) error {
 
 // apiError is a refusal from mandate.
 type apiError struct {
-	status int
-	msg    string
+	status       int
+	msg          string
+	attemptsLeft int // after a wrong code
 }
 
 func (e *apiError) Error() string { return e.msg }
 
 type cli struct {
+	in          io.Reader // the login code
 	out, errOut io.Writer
 	tty         bool
 	getenv      func(string) string
@@ -97,7 +99,7 @@ type cli struct {
 func Run(ctx context.Context, args []string) error {
 	fi, err := os.Stdout.Stat()
 	tty := err == nil && fi.Mode()&os.ModeCharDevice != 0
-	c := &cli{out: os.Stdout, errOut: os.Stderr, tty: tty, getenv: os.Getenv}
+	c := &cli{in: os.Stdin, out: os.Stdout, errOut: os.Stderr, tty: tty, getenv: os.Getenv}
 	return c.run(ctx, args)
 }
 
@@ -282,6 +284,7 @@ func (c *cli) send(ctx context.Context, method, path string, body any) (*http.Re
 	var e struct {
 		Error             string `json:"error"`
 		RetryAfterSeconds int    `json:"retry_after_seconds"`
+		AttemptsLeft      int    `json:"attempts_left"`
 	}
 	if json.Unmarshal(data, &e) != nil || e.Error == "" {
 		e.Error = strings.TrimSpace(string(data))
@@ -290,5 +293,5 @@ func (c *cli) send(ctx context.Context, method, path string, body any) (*http.Re
 	if e.RetryAfterSeconds > 0 {
 		msg += fmt.Sprintf("; retry in %s", time.Duration(e.RetryAfterSeconds)*time.Second)
 	}
-	return nil, &apiError{status: resp.StatusCode, msg: msg}
+	return nil, &apiError{status: resp.StatusCode, msg: msg, attemptsLeft: e.AttemptsLeft}
 }

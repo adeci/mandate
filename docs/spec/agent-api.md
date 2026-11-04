@@ -43,36 +43,41 @@ A refusal is a non-2xx status with `error`, written for the agent:
 ## Code exchange
 
 A new party (`mandate login`, or a new device's app, see
-[owner-api.md](owner-api.md)) joins by showing a 6-digit code that the owner
-types into the app. A PAKE turns the code into a shared key, so a relayed or
+[owner-api.md](owner-api.md)) joins with a 6-digit code that the owner's app
+shows. The owner starts every exchange, so nothing reaches the owner unless
+they asked for it. A PAKE turns the code into a shared key, so a relayed or
 mistyped code fails and nobody can guess it offline.
 
-1. The new party draws a random 6-digit code and shows it. The code never
-   goes over the wire.
-2. It starts the exchange: `POST {base}/join` with `{"kind": "agent", "name": "laptop"}`
-   → `201 {"id": "<32 hex>"}`. For agents `{base}` is `/agent/v1`. `name`
-   defaults to the hostname.
-3. The owner sees the pending item in the app (name, source address, time),
-   picks it, types the code and unlocks the device. The server, as CPace
-   initiator, sends `Ya`.
-4. The new party polls `GET {base}/join/{id}?wait=SECONDS` → `{"msg": "<Ya hex>"}`,
-   or `{"status": "pending"}` while the owner has not typed the code, runs
-   CPace as responder and posts:
+1. The owner opens the exchange in the app (`POST /owner/v1/exchanges`). The
+   server draws the code and keeps it only in memory; the app shows it, and
+   for an agent the `mandate login` command too.
+2. The new party, given the code, starts an attempt:
+   `POST {base}/join` with `{"kind": "agent", "name": "laptop"}`
+   → `201 {"id": "<32 hex>", "msg": "<Ya hex>"}`, the server being CPace
+   initiator over the exchange's code. For agents `{base}` is `/agent/v1`.
+   `name` defaults to the hostname. With no exchange of that kind open, the
+   answer is `404` and nothing reaches the owner.
+3. It runs CPace as responder with the code and posts
    `POST {base}/join/{id}` with `{"msg": "<Yb>", "confirm": "<party_confirm>", "sealed": "<sealed>"}`,
    all in lowercase hex, as is `server_confirm` below.
-5. The server checks `party_confirm`. If it fails, the answer is `403`, the
-   attempt counts as a wrong code, and the new party polls again for the
-   owner's next try. If it holds, the server answers
-   `{"confirm": "<server_confirm>"}`. The new party checks it against the
-   TLS key of this connection.
-6. The owner's device signs the record for the payload: the `identity`
+4. The server checks `party_confirm`. If it fails, the answer is
+   `403 {"error", "attempts_left"}`, and the new party may start another
+   attempt. If it holds, the server answers `{"confirm": "<server_confirm>"}`,
+   which the new party checks against the TLS key of this connection. The
+   exchange is now `confirmed`, and the owner's app shows the name and the
+   source address.
+5. The owner's device signs the record for the payload: the `identity`
    record for an agent, the `key` `add` entry for a device
-   ([records.md](records.md)). The new party's poll then answers
-   `{"status": "approved"}`, and its token works.
+   ([records.md](records.md)). The new party polls
+   `GET {base}/join/{id}?wait=SECONDS` → `{"status": "<state>"}`, which
+   waits while it is `open` or `confirmed`, until `approved`, and its token
+   works, or `ended`.
 
-Three wrong codes or 10 minutes end the exchange (`{"status": "ended"}`).
-`join` needs no token, so at most 3 exchanges wait at once and one address
-may start 5 an hour; beyond that, `429`.
+An exchange is `open`, then `confirmed`, then `approved` or `ended`. At most
+one of each kind is open or confirmed; opening another ends it. One attempt
+runs at a time (`409` for another, until it is answered or a minute old).
+Three wrong codes or 10 minutes end the exchange. `join` needs no token, so
+one address may start 5 attempts an hour; beyond that, `429`.
 
 ### Derivations
 
@@ -138,7 +143,11 @@ sealed         3b3b1c233fad60e0e148b7ac79f6a6845841af004b042d709ed21d95a840babe
                77b217
 ```
 
-The CLI keeps the result in `~/.config/mandate/credentials.json`, mode 0600:
+`mandate login URL [--name NAME]` prompts `Code from the mandate app: ` and
+reads the code from the terminal, or from stdin when that isn't one; no flag
+takes it, so it stays out of shell history. After a wrong code it asks again
+while attempts are left. It keeps the result in
+`~/.config/mandate/credentials.json`, mode 0600:
 
 ```json
 {"url": "https://host:8443", "token": "9f2c…", "spki_sha256": "4b1a…"}

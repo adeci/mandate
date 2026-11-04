@@ -18,7 +18,7 @@ Pairing gives the app the server's SPKI SHA-256, which it checks on first connec
 
 **First device.**
 
-1. `sudo mandate setup` prints the `/setup` address, a setup password (also kept in a root-only file) and the server key's fingerprint, which the app shows before pairing.
+1. `sudo mandate setup` prints the `/setup` address, a setup password (also kept in a root-only file) and, in TLS mode `own`, the server key's fingerprint: the SPKI SHA-256's first 80 bits as five groups of four hex digits (`bf0d 5832 2e59 4fbf e037`), which the setup page and the app show too. In modes `acme` and `cert` it shows the hostname instead, since the app checks the certificate itself.
 2. The setup page asks for the password, then shows a QR code and the same link as text:
 
    ```
@@ -33,7 +33,7 @@ Pairing gives the app the server's SPKI SHA-256, which it checks on first connec
    It answers `{"kind": "key", "id": "<key id>"}`.
 4. That spends the secret and the setup password.
 
-The setup page exists only before the first pairing and again after `mandate reset`. Whoever pairs first owns the server: if the app's pairing succeeds, its key is seq 0 and nobody paired before it; if the secret is already spent, run `mandate reset`.
+The setup page exists only before the first pairing and again after `mandate reset`; until `sudo mandate setup` has made a password, it only says to run that and reload. Whoever pairs first owns the server: if the app's pairing succeeds, its key is seq 0 and nobody paired before it; if the secret is already spent, run `mandate reset`.
 
 **Another device.** It uses the code exchange in [`agent-api.md`, Code exchange](agent-api.md#code-exchange):
 
@@ -42,9 +42,8 @@ The setup page exists only before the first pairing and again after `mandate res
 
 On an existing device, the owner:
 
-1. picks the exchange from `GET /owner/v1/exchanges`;
-2. types the code (`POST /owner/v1/exchanges/{id}/code`);
-3. signs the `add` entry from `POST /owner/v1/exchanges/{id}/challenge`.
+1. opens the exchange (`POST /owner/v1/exchanges {"kind": "device"}`) and gives the new device its code;
+2. once the exchange is `confirmed`, checks its payload against the `add` entry from `POST /owner/v1/exchanges/{id}/challenge`, and signs it.
 
 **`mandate reset`** (root) stops `mandate.target`, then wipes:
 
@@ -87,8 +86,9 @@ Chat names that start with `~` were chosen by other people. The app shows chat I
 
 | route | |
 |---|---|
-| `GET /owner/v1/now` | What waits (access requests and proposals), open grants, routines, stopped routines, and one day's activity: each read and write by an identity, with time, connector, chats and message count, never message text. `?day=YYYY-MM-DD&before=<RFC 3339 time>` pages back. |
-| `POST /owner/v1/requests/{id}/challenge` | `{chats?, for?, horizon?, zone?}`: a grant answering the request. `chats`: any chats of the connector, chosen by the owner; the matched ones are a suggestion. `for` and `horizon` at most what was asked. `zone` is the device's IANA zone, for a routine. |
+| `GET /owner/v1/now` | What waits (access requests and proposals), open grants, routines and stopped routines. |
+| `GET /owner/v1/activity` | `?before=<next>&limit=` (at most 500, default 100): the history, newest first, as `{entries, next}`; `next` is absent on the last page. |
+| `POST /owner/v1/requests/{id}/challenge` | `{chats?, for?, horizon?, zone?}`: a grant answering the request. `chats`: any chats of the connector, chosen by the owner; the matched ones are a suggestion, and an extend keeps its chats. `for` and `horizon`: any the owner chooses, wider or narrower than asked; a routine's window is its schedule. `zone` is the device's IANA zone, for a routine. |
 | `POST /owner/v1/requests/{id}/deny` | |
 | `GET /owner/v1/proposals/{id}` | The display fields, which of them can be edited, and the agent's note. |
 | `POST /owner/v1/proposals/{id}/challenge` | `{edits: {param: value}}`: the write record. |
@@ -98,12 +98,14 @@ Chat names that start with `~` were chosen by other people. The app shows chat I
 | `POST /owner/v1/grants/{id}/resume/challenge` | A paused routine, under a new ID. |
 | `POST /owner/v1/grants/{id}/close` | Ends a window or pauses a routine. |
 | `POST /owner/v1/stop-all` | Closes every grant, denies every waiting request, and cancels every challenge. Proposals stay. Returns `{grants, requests}`. |
-| `GET /owner/v1/exchanges` | Code exchanges waiting: `[{id, kind, name, address, started_at}]`. |
-| `POST /owner/v1/exchanges/{id}/code` | `{code}`. Returns `200 {payload}` once the new party confirms, or `403 {attempts_left}`. |
-| `POST /owner/v1/exchanges/{id}/challenge` | The `identity` record (kind `agent`) or the key `add` entry (kind `device`) for the payload. |
+| `POST /owner/v1/exchanges` | `{kind}`, `agent` or `device`: opens a code exchange, ending the one of that kind open before. Returns `201 {id, code, expires_at}`. |
+| `GET /owner/v1/exchanges` | Exchanges open or confirmed: `[{id, kind, state, name?, address?, payload?, started_at, expires_at}]`, `state` being `open` or `confirmed`. Name, address and payload are set once confirmed. |
+| `DELETE /owner/v1/exchanges/{id}` | Ends the exchange. |
+| `POST /owner/v1/exchanges/{id}/challenge` | Once confirmed: the `identity` record (kind `agent`) or the key `add` entry (kind `device`) for the payload. |
 | `GET /owner/v1/identities` | Names, first and last seen, and grants. |
 | `PATCH /owner/v1/identities/{id}` | `{name}` |
 | `DELETE /owner/v1/identities/{id}` | Ends its grants, and refuses its waiting requests and proposals. |
+| `GET /owner/v1/server` | `{agent_url}`: what `mandate login` takes, on the host the app reached and the agent port (`agent_listen`'s, else the main one). |
 | `GET /owner/v1/connectors` | Names, health, and whether setup is needed. |
 | `GET /owner/v1/connectors/{name}/setup` | Setup steps as data (`connector.md`). |
 | `POST /owner/v1/connectors/{name}/setup` | `{step, values}` |
@@ -147,14 +149,29 @@ A proposal, as `GET /owner/v1/proposals/{id}` and `now` show it; `editable` list
                "for": 1800, "horizon": 604800, "reason": "summarize the weekend plans",
                "created_at": "2026-11-03T09:14:00Z", "status": "pending"}],
  "proposals": [<proposal>],
- "grants": [<grant>], "routines": [<grant>], "stopped": [<grant>],
- "activity": [{"at": "2026-11-03T09:20:00Z", "identity": "QX3M…", "connector": "signal", "verb": "messages",
-               "chats": [{"id": "group.6f1b2c", "name": "~Family"}], "count": 20}],
- "more": false}
+ "grants": [<grant>], "routines": [<grant>], "stopped": [<grant>]}
 ```
 
 - A request without `terms` asks for every chat; a term with no chats matched nothing. A routine has `schedule` (`days`, `start`, `length`) instead of `for`; `extend` has only `for`.
-- `verb` is a read (`chats`, `messages`, `search`, `media`) or a write op. Activity is newest first, at most 500; `more` means `before` the last `at` finds more.
+
+`GET /owner/v1/activity`:
+
+```json
+{"entries": [{"at": "2026-11-03T09:20:00Z", "kind": "read", "identity": "QX3M…", "connector": "signal",
+              "chats": [{"id": "group.6f1b2c", "name": "~Family"}], "count": 20, "detail": "messages"},
+             {"at": "2026-11-03T09:15:00Z", "kind": "request.approved", "identity": "QX3M…", "connector": "signal",
+              "chats": [{"id": "group.6f1b2c", "name": "~Family"}], "detail": "30m window, 7d of history"}],
+ "next": "1793697300.4180"}
+```
+
+An entry has `at` and `kind`, and `identity`, `connector`, `chats`, `count` and `detail` where they apply. Never message text, except a write's signed display, which the owner approved. The kinds:
+
+- `read`: an agent read; `detail` is the read (`chats`, `messages`, `search`, `media` or a read op), `count` the messages.
+- `request.asked` (`detail`: the reason), `request.approved` (`detail`: window and history), `request.denied`, `request.expired`.
+- `proposal.made` (`detail`: the op), `proposal.approved`, then its outcome `proposal.done`, `proposal.failed` or `proposal.unknown` (`detail`: the signed display's text); `proposal.denied`, `proposal.expired`.
+- `grant.made` (by the owner), `grant.extended`, `grant.closed`, `routine.paused`, `routine.resumed`.
+- `agent.admitted`, `agent.deleted` (`detail`: its name); `device.joined`, `key.removed` (`detail`: the device's name).
+- `stop_all`: `count` is the grants closed.
 
 `GET /owner/v1/identities`:
 
@@ -175,7 +192,7 @@ A proposal, as `GET /owner/v1/proposals/{id}` and `now` show it; `editable` list
 {"log": [<key envelope>, …], "trusted": [{"id": "b903…", "name": "Pixel 9", "public_key": "BN4C…", "type": "p256"}]}
 ```
 
-`POST /owner/v1/exchanges/{id}/code` answers `{"payload": {"token_sha256": "…"}}` for an agent, with `key` added for a device. `GET /owner/v1/connectors/{name}/chats` answers as `GET /containers` in `connector.md`.
+An exchange's `payload` is `{"token_sha256": "…"}` for an agent, with `key` added for a device. `GET /owner/v1/connectors/{name}/chats` answers as `GET /containers` in `connector.md`.
 
 ## Stream
 
@@ -184,7 +201,7 @@ A proposal, as `GET /owner/v1/proposals/{id}` and `now` show it; `editable` list
 | event | data |
 |---|---|
 | `waiting` | `{kind: "request" \| "proposal", id, identity, connector}` |
-| `exchange` | `{id, kind, name}` |
+| `exchange` | `{id, kind, state}`, on every change of state: `open`, `confirmed`, `approved`, `ended` |
 | `changed` | `{what: "now" \| "identities" \| "connectors" \| "keys"}` |
 
 A notification shows the identity, the connector and what kind of thing it is, e.g. "praxis wants to read Signal". It never shows reasons or message text.
@@ -197,7 +214,7 @@ A notification shows the identity, the connector and what kind of thing it is, e
 
 | status | `code` | |
 |---|---|---|
-| 400 | `invalid` | malformed input, or a narrowing that widens |
+| 400 | `invalid` | malformed input |
 | 401 | `token` | missing or unknown device token |
 | 403 | `forbidden` | bad signature, untrusted key, wrong code |
 | 404 | `not_found` | |

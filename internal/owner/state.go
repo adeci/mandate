@@ -208,14 +208,16 @@ func extended(g *grant, now time.Time, seconds int) time.Time {
 }
 
 // expire moves what ran out of time to its final status and drops what is
-// no longer needed. It reports whether anything changed.
-func (st *state) expire(now time.Time) bool {
+// no longer needed. It reports whether anything changed, and what expired.
+func (st *state) expire(now time.Time) (bool, []activity) {
 	changed := false
+	var expired []activity
 	for id, r := range st.Requests {
 		switch {
 		case r.Status == "pending" && !now.Before(r.CreatedAt.Add(requestTTL)):
 			r.Status, r.DecidedAt = "expired", now
 			changed = true
+			expired = append(expired, requestActivity("request.expired", r, ""))
 		case r.Status != "pending" && now.Sub(r.DecidedAt) > keepDecided:
 			delete(st.Requests, id)
 			changed = true
@@ -226,6 +228,7 @@ func (st *state) expire(now time.Time) bool {
 		case p.Status == "pending" && !now.Before(p.ExpiresAt):
 			p.Status, p.DecidedAt = "expired", now
 			changed = true
+			expired = append(expired, proposalActivity("proposal.expired", p, p.Op))
 		case p.Status != "pending" && p.Status != "executing" && now.Sub(p.DecidedAt) > keepDecided:
 			delete(st.Proposals, id)
 			changed = true
@@ -237,7 +240,7 @@ func (st *state) expire(now time.Time) bool {
 			changed = true
 		}
 	}
-	return changed
+	return changed, expired
 }
 
 func (st *state) deleteIdentity(id string, now time.Time) {
@@ -291,47 +294,4 @@ func (st *state) live(now time.Time) live {
 		l.NeverShare = append(l.NeverShare, liveNeverShare{n.Connector, n.Kind, n.ID})
 	}
 	return l
-}
-
-// activity is a read or write by an identity, as the gateway reports it.
-type activity struct {
-	At        time.Time `json:"at"`
-	Identity  string    `json:"identity"`
-	Connector string    `json:"connector"`
-	Verb      string    `json:"verb"`
-	Chats     []chat    `json:"chats"`
-	Count     int       `json:"count"`
-}
-
-func activityFile(dir string, day time.Time) string {
-	return filepath.Join(dir, "activity", day.UTC().Format(time.DateOnly)+".jsonl")
-}
-
-func appendActivity(dir string, entries []activity) error {
-	if err := os.MkdirAll(filepath.Join(dir, "activity"), 0o700); err != nil {
-		return err
-	}
-	files := map[string][]byte{}
-	for _, a := range entries {
-		b, err := json.Marshal(a)
-		if err != nil {
-			return err
-		}
-		name := activityFile(dir, a.At)
-		files[name] = append(append(files[name], b...), '\n')
-	}
-	for name, b := range files {
-		f, err := os.OpenFile(name, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
-		if err != nil {
-			return err
-		}
-		_, err = f.Write(b)
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
-		if err != nil {
-			return fmt.Errorf("append activity: %w", err)
-		}
-	}
-	return nil
 }

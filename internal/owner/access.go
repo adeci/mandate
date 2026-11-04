@@ -1,13 +1,9 @@
 package owner
 
 import (
-	"bufio"
-	"encoding/json"
-	"errors"
-	"io/fs"
+	"fmt"
 	"maps"
 	"net/http"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -94,6 +90,7 @@ func (s *Server) postRequest(w http.ResponseWriter, r *http.Request) {
 		failErr(w, err)
 		return
 	}
+	s.note(requestActivity("request.asked", req, req.Reason))
 	s.publish("waiting", map[string]string{"kind": "request", "id": req.ID, "identity": req.Identity, "connector": req.Connector})
 	reply(w, http.StatusCreated, map[string]string{"id": req.ID})
 }
@@ -146,7 +143,7 @@ func (s *Server) waiting(req *request) bool {
 		s.now().Before(req.CreatedAt.Add(requestTTL)) && s.st.Identities[req.Identity] != nil
 }
 
-type narrowing struct {
+type answer struct {
 	Chats   []string `json:"chats"`
 	For     int      `json:"for"`
 	Horizon *int     `json:"horizon"`
@@ -154,7 +151,7 @@ type narrowing struct {
 }
 
 func (s *Server) requestChallenge(w http.ResponseWriter, r *http.Request) {
-	var n narrowing
+	var n answer
 	if !decode(w, r, &n) {
 		return
 	}
@@ -191,14 +188,19 @@ func (s *Server) requestChallenge(w http.ResponseWriter, r *http.Request) {
 		s.st.Grants[g.ID] = &grant{Envelope: env, Record: g, ChatNames: names}
 		// The request says granted once the gateway has the grant.
 		req.GrantID, req.Until = g.ID, g.Until.Time
-		return s.commit("now")
+		if err := s.commit("now"); err != nil {
+			return err
+		}
+		s.note(grantActivity("request.approved", g, names, grantDetail(g)))
+		return nil
 	}
 	s.issue(w, g, c)
 }
 
-// grantFor is the grant answering req, narrowed by n, with the names of its
-// chats and, for extend, the grant it replaces. The caller holds s.mu.
-func (s *Server) grantFor(req *request, n narrowing) (record.Grant, map[string]string, *grant, error) {
+// grantFor is the grant answering req as the owner set it in n, with the
+// names of its chats and, for extend, the grant it replaces. The caller
+// holds s.mu.
+func (s *Server) grantFor(req *request, n answer) (record.Grant, map[string]string, *grant, error) {
 	now := s.now()
 	// offered nil means every chat.
 	var offered []string
@@ -235,15 +237,20 @@ func (s *Server) grantFor(req *request, n narrowing) (record.Grant, map[string]s
 	if chats != nil && len(chats) == 0 {
 		return record.Grant{}, nil, nil, errorf(http.StatusBadRequest, "no chat to grant")
 	}
+	// The owner signs the grant, so the window and history may be wider
+	// than asked.
 	if n.Horizon != nil {
-		if *n.Horizon < 0 || horizon != 0 && (*n.Horizon == 0 || *n.Horizon > horizon) {
-			return record.Grant{}, nil, nil, errorf(http.StatusBadRequest, "the horizon widens the request")
+		if *n.Horizon < 0 {
+			return record.Grant{}, nil, nil, errorf(http.StatusBadRequest, "horizon must not be negative")
 		}
 		horizon = *n.Horizon
 	}
 	if n.For != 0 {
-		if n.For < 0 || n.For > length {
-			return record.Grant{}, nil, nil, errorf(http.StatusBadRequest, "for widens the request")
+		switch {
+		case req.Kind == "routine":
+			return record.Grant{}, nil, nil, errorf(http.StatusBadRequest, "a routine's window is its schedule")
+		case n.For < 0:
+			return record.Grant{}, nil, nil, errorf(http.StatusBadRequest, "for must be positive")
 		}
 		length = n.For
 	}
@@ -283,6 +290,19 @@ func (s *Server) extendable(identity, conn string) *grant {
 	return best
 }
 
+// requestActivity is an entry about req, with the chats its terms matched.
+func requestActivity(kind string, req *request, detail string) activity {
+	a := activity{Kind: kind, Identity: req.Identity, Connector: req.Connector, Detail: detail}
+	for _, t := range req.Terms {
+		for _, c := range t.Chats {
+			if !slices.ContainsFunc(a.Chats, func(d chat) bool { return d.ID == c.ID }) {
+				a.Chats = append(a.Chats, c)
+			}
+		}
+	}
+	return a
+}
+
 func (s *Server) denyRequest(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -298,6 +318,7 @@ func (s *Server) denyRequest(w http.ResponseWriter, r *http.Request) {
 			failErr(w, err)
 			return
 		}
+		s.note(requestActivity("request.denied", req, ""))
 		reply(w, http.StatusOK, struct{}{})
 	}
 }
@@ -340,7 +361,11 @@ func (s *Server) grantChallenge(w http.ResponseWriter, r *http.Request) {
 		holds:    func() bool { return s.st.Identities[ng.Identity] != nil },
 		apply: func(env record.Envelope, _ record.Record) error {
 			s.st.Grants[g.ID] = &grant{Envelope: env, Record: g}
-			return s.commit("now")
+			if err := s.commit("now"); err != nil {
+				return err
+			}
+			s.note(grantActivity("grant.made", g, nil, grantDetail(g)))
+			return nil
 		},
 	})
 }
@@ -371,7 +396,7 @@ func (s *Server) extendChallenge(w http.ResponseWriter, r *http.Request) {
 	g := old.Record
 	g.ID, g.CreatedAt = record.NewID(), rtime(now)
 	g.From, g.Until = rtime(now), rtime(extended(old, now, body.For))
-	s.replaceGrant(w, old, g, func() bool { return old.live(s.now()) })
+	s.replaceGrant(w, old, g, "grant.extended", "by "+span(body.For), func() bool { return old.live(s.now()) })
 }
 
 func (s *Server) resumeChallenge(w http.ResponseWriter, r *http.Request) {
@@ -388,11 +413,12 @@ func (s *Server) resumeChallenge(w http.ResponseWriter, r *http.Request) {
 	}
 	g := old.Record
 	g.ID, g.CreatedAt = record.NewID(), rtime(s.now())
-	s.replaceGrant(w, old, g, func() bool { return !old.ClosedAt.IsZero() })
+	s.replaceGrant(w, old, g, "routine.resumed", "", func() bool { return !old.ClosedAt.IsZero() })
 }
 
-// The caller holds s.mu.
-func (s *Server) replaceGrant(w http.ResponseWriter, old *grant, g record.Grant, holds func() bool) {
+// replaceGrant issues g in place of old, noting kind and detail once
+// signed. The caller holds s.mu.
+func (s *Server) replaceGrant(w http.ResponseWriter, old *grant, g record.Grant, kind, detail string, holds func() bool) {
 	s.issue(w, g, &challenge{
 		identity: g.Identity,
 		grant:    old.Record.ID,
@@ -402,7 +428,11 @@ func (s *Server) replaceGrant(w http.ResponseWriter, old *grant, g record.Grant,
 		apply: func(env record.Envelope, _ record.Record) error {
 			delete(s.st.Grants, old.Record.ID)
 			s.st.Grants[g.ID] = &grant{Envelope: env, Record: g, ChatNames: old.ChatNames}
-			return s.commit("now")
+			if err := s.commit("now"); err != nil {
+				return err
+			}
+			s.note(grantActivity(kind, g, old.ChatNames, detail))
+			return nil
 		},
 	})
 }
@@ -426,6 +456,11 @@ func (s *Server) closeGrant(w http.ResponseWriter, r *http.Request) {
 		failErr(w, err)
 		return
 	}
+	kind := "grant.closed"
+	if g.Record.Schedule != nil {
+		kind = "routine.paused"
+	}
+	s.note(grantActivity(kind, g.Record, g.ChatNames, ""))
 	reply(w, http.StatusOK, struct{}{})
 }
 
@@ -451,6 +486,7 @@ func (s *Server) stopAll(w http.ResponseWriter, _ *http.Request) {
 		failErr(w, err)
 		return
 	}
+	s.note(activity{Kind: "stop_all", Count: grants, Detail: fmt.Sprintf("%d grants closed, %d requests denied", grants, requests)})
 	reply(w, http.StatusOK, map[string]int{"grants": grants, "requests": requests})
 }
 
@@ -475,29 +511,6 @@ type requestView struct {
 }
 
 func (s *Server) getNow(w http.ResponseWriter, r *http.Request) {
-	day, before := s.now().UTC(), time.Time{}
-	if d := r.URL.Query().Get("day"); d != "" {
-		t, err := time.Parse(time.DateOnly, d)
-		if err != nil {
-			fail(w, http.StatusBadRequest, "day is YYYY-MM-DD")
-			return
-		}
-		day = t
-	}
-	if b := r.URL.Query().Get("before"); b != "" {
-		t, err := time.Parse(time.RFC3339, b)
-		if err != nil {
-			fail(w, http.StatusBadRequest, "before is an RFC 3339 time")
-			return
-		}
-		before = t
-	}
-	acts, more, err := readActivity(s.dir, day, before)
-	if err != nil {
-		s.log.Error("read activity", "err", err)
-		failErr(w, err)
-		return
-	}
 	s.mu.Lock()
 	now := s.now()
 	out := struct {
@@ -506,12 +519,9 @@ func (s *Server) getNow(w http.ResponseWriter, r *http.Request) {
 		Grants    []grantView    `json:"grants"`
 		Routines  []grantView    `json:"routines"`
 		Stopped   []grantView    `json:"stopped"`
-		Activity  []activity     `json:"activity"`
-		More      bool           `json:"more"`
 	}{
 		Requests: []requestView{}, Proposals: []proposalView{},
 		Grants: []grantView{}, Routines: []grantView{}, Stopped: []grantView{},
-		Activity: acts, More: more,
 	}
 	for _, req := range s.st.Requests {
 		if s.waiting(req) {
@@ -536,65 +546,6 @@ func (s *Server) getNow(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	s.nameChats(r.Context(), out.Grants, out.Routines, out.Stopped)
 	reply(w, http.StatusOK, out)
-}
-
-const activityPage = 500
-
-// readActivity is the day's activity before before (if set), newest first.
-func readActivity(dir string, day, before time.Time) ([]activity, bool, error) {
-	f, err := os.Open(activityFile(dir, day))
-	if errors.Is(err, fs.ErrNotExist) {
-		return []activity{}, false, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	defer f.Close()
-	var all []activity
-	sc := bufio.NewScanner(f)
-	sc.Buffer(nil, maxBody)
-	for sc.Scan() {
-		var a activity
-		if err := json.Unmarshal(sc.Bytes(), &a); err != nil {
-			continue // a line torn by a crash
-		}
-		if before.IsZero() || a.At.Before(before) {
-			all = append(all, a)
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return nil, false, err
-	}
-	slices.SortStableFunc(all, func(a, b activity) int { return b.At.Compare(a.At) })
-	if len(all) > activityPage {
-		return all[:activityPage], true, nil
-	}
-	if all == nil {
-		all = []activity{}
-	}
-	return all, false, nil
-}
-
-func (s *Server) postActivity(w http.ResponseWriter, r *http.Request) {
-	var entries []activity
-	if !decode(w, r, &entries) {
-		return
-	}
-	if err := appendActivity(s.dir, entries); err != nil {
-		s.log.Error("append activity", "err", err)
-		failErr(w, err)
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, a := range entries {
-		s.seen(a.Identity, a.At)
-	}
-	if err := s.commit("now"); err != nil {
-		failErr(w, err)
-		return
-	}
-	reply(w, http.StatusOK, struct{}{})
 }
 
 func (s *Server) listIdentities(w http.ResponseWriter, r *http.Request) {
@@ -656,7 +607,8 @@ func (s *Server) deleteIdentity(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.st.Identities[id] == nil {
+	i := s.st.Identities[id]
+	if i == nil {
 		fail(w, http.StatusNotFound, "no such identity")
 		return
 	}
@@ -666,5 +618,6 @@ func (s *Server) deleteIdentity(w http.ResponseWriter, r *http.Request) {
 		failErr(w, err)
 		return
 	}
+	s.note(activity{Kind: "agent.deleted", Identity: id, Detail: i.Name})
 	reply(w, http.StatusOK, struct{}{})
 }

@@ -32,7 +32,7 @@ const (
 // on the server, or a wrong code or TLS key on the new party.
 var ErrConfirm = errors.New("exchange: confirmation failed")
 
-// NewCode draws the code the new party shows.
+// NewCode draws the code the owner gives the new party.
 func NewCode() string {
 	var b [4]byte
 	for {
@@ -150,8 +150,8 @@ func open(isk, id, sealed []byte) ([]byte, error) {
 	return b, nil
 }
 
-// Server is one attempt of the server, the CPace initiator, at the code the
-// owner typed.
+// Server is one attempt of the server, the CPace initiator, at the code of
+// an exchange.
 type Server struct {
 	kind string
 	id   []byte

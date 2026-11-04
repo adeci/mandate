@@ -128,6 +128,10 @@ in
         assert m, (pattern, text)
         return m[1]
 
+    # Another code than code.
+    def other(code):
+        return f"{(int(code) + 1) % 1000000:06d}"
+
     with subtest("every process runs as a dynamic user in its fixed group"):
         for p in ["front", "gateway", "owner"]:
             assert server.succeed(f"systemctl show -p DynamicUser --value mandate-{p}").strip() == "yes", p
@@ -144,19 +148,23 @@ in
         assert "192.0.2.1" in server.succeed("systemctl show -p IPAddressAllow --value mandate-test")
 
     with subtest("mandate setup prints a password, which the setup page trades for a pairing link"):
+        assert "waiting to be set up" in server.succeed("curl -skf https://localhost:8443/setup")
         out = server.succeed("mandate setup")
         password = grab(r"Setup password: (\S+)", out)
-        spki = grab(r"Server key SHA-256: ([0-9a-f]{64})", out)
+        key = grab(r"Server key: ((?:[0-9a-f]{4} ){4}[0-9a-f]{4}) ", out)
         assert server.succeed("stat -c %a /var/lib/mandate/setup-password").strip() == "600"
         assert "password" in server.succeed("curl -skf https://localhost:8443/setup")
         code = server.succeed("curl -sk -o /dev/null -w '%{http_code}' --data-urlencode password=WRONG-PASS https://localhost:8443/setup")
         assert code == "403", code
         link = setup_link(password)
-        assert f"spki={spki}" in link and "url=https%3A%2F%2Flocalhost%3A8443" in link, link
+        spki = grab(r"spki=([0-9a-f]{64})", link)
+        assert spki.startswith(key.replace(" ", "")) and "url=https%3A%2F%2Flocalhost%3A8443" in link, (key, link)
+        assert f'<p class="key">{key}</p>' in server.succeed(f"curl -sk --data-urlencode password={password} https://localhost:8443/setup")
 
     with subtest("the first device pairs, which spends the link and the setup page"):
         out = device("pair", link, "phone")
         assert out["kind"] == "key", out
+        assert call("GET", "/owner/v1/server")["body"] == {"agent_url": "https://localhost:8444"}
         assert server.succeed("curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/setup") == "404"
         server.fail(f"testdevice --state /root/thief.json pair '{link}'")
         server.fail("mandate setup")
@@ -168,21 +176,21 @@ in
         for name in bundled:
             assert connectors[name]["health"]["state"] == "setup", connectors
 
-    with subtest("another device joins by code, and the first signs its key"):
-        server.succeed(
-            f"(testdevice --state /root/tablet.json join https://localhost:8443 {spki} tablet >/tmp/join.log 2>&1;"
-            " echo $? >/tmp/join.exit) >/dev/null 2>&1 &"
-        )
-        server.wait_until_succeeds("grep -q 'code: ' /tmp/join.log")
-        code = grab(r"code: (\d{6})", server.succeed("cat /tmp/join.log"))
-        [ex] = call("GET", "/owner/v1/exchanges")["body"]
-        assert ex["kind"] == "device" and ex["name"] == "tablet", ex
-        out = call("POST", f"/owner/v1/exchanges/{ex['id']}/code", {"code": code})
-        assert out["status"] == 200 and out["body"]["payload"]["key"]["name"] == "tablet", out
+    with subtest("the owner opens a device exchange; another device joins with its code, and the first signs its key"):
+        out = call("POST", "/owner/v1/exchanges", {"kind": "device"})
+        assert out["status"] == 201, out
+        ex = out["body"]
+        join = f"testdevice --state /root/tablet.json join https://localhost:8443 {spki}"
+        status, out = server.execute(f"{join} {other(ex['code'])} tablet 2>&1")
+        assert status != 0 and "403" in out and "attempts_left:2" in out, (status, out)
+        server.succeed(f"({join} {ex['code']} tablet >/tmp/join.log 2>&1; echo $? >/tmp/join.exit) >/dev/null 2>&1 &")
+        server.wait_until_succeeds("testdevice --state /root/phone.json call GET /owner/v1/exchanges | grep -q confirmed")
+        [waiting] = call("GET", "/owner/v1/exchanges")["body"]
+        assert waiting["id"] == ex["id"] and waiting["kind"] == "device" and waiting["name"] == "tablet", waiting
         out = sign(f"/owner/v1/exchanges/{ex['id']}/challenge")
         assert out["status"] == 200 and out["body"]["kind"] == "key", out
         record = out["record"]
-        assert record["op"] == "add" and record["seq"] == 1, record
+        assert record["op"] == "add" and record["seq"] == 1 and record["key"] == waiting["payload"]["key"], (record, waiting)
         server.wait_until_succeeds("test $(cat /tmp/join.exit) = 0")
         assert call("GET", "/owner/v1/now", state="/root/tablet.json")["status"] == 200
         server.wait_until_succeeds("test $(testdevice --state /root/phone.json call GET /owner/v1/keys | jq '.body.trusted | length') = 2")
@@ -191,27 +199,38 @@ in
             "curl -s --unix-socket /run/mandate/connectors/test/socket http://mandate/keys | grep -q '\"length\":2'"
         )
 
-    with subtest("an agent logs in with a code the owner types; a wrong code costs a try"):
-        laptop.succeed(
-            "(mandate login https://server:8443 --name laptop >/tmp/login.log 2>&1; echo $? >/tmp/login.exit)"
+    with subtest("an agent logs in with the code of the exchange the owner opened last; nothing else reaches the owner"):
+        token = json.loads(server.succeed("cat /root/phone.json"))["token"]
+        server.succeed(
+            f"(curl -skN -H 'Authorization: Bearer {token}' https://localhost:8443/owner/v1/stream >/tmp/events 2>&1)"
             " >/dev/null 2>&1 &"
         )
-        laptop.wait_until_succeeds("grep -q 'code: ' /tmp/login.log")
-        code = grab(r"code: (\d{6})", laptop.succeed("cat /tmp/login.log"))
-        server.wait_until_succeeds("testdevice --state /root/phone.json call GET /owner/v1/exchanges | grep -q laptop")
-        [ex] = call("GET", "/owner/v1/exchanges")["body"]
-        assert ex["kind"] == "agent" and ex["name"] == "laptop", ex
-        assert f" {ex['address']}/" in laptop.succeed("ip -o addr show eth1"), ex
-        wrong = "000000" if code != "000000" else "111111"
-        out = call("POST", f"/owner/v1/exchanges/{ex['id']}/code", {"code": wrong})
-        assert out["status"] == 403 and out["body"]["attempts_left"] == 2, out
-        out = call("POST", f"/owner/v1/exchanges/{ex['id']}/code", {"code": code})
-        assert out["status"] == 200 and "token_sha256" in out["body"]["payload"], out
+        server.wait_until_succeeds("grep -q ': open' /tmp/events")
+        status, out = laptop.execute("echo 123456 | mandate login https://server:8443 --name laptop 2>&1")
+        assert status != 0 and "nothing is waiting for a login" in out, (status, out)
+        first = call("POST", "/owner/v1/exchanges", {"kind": "agent"})["body"]
+        ex = call("POST", "/owner/v1/exchanges", {"kind": "agent"})["body"]
+        assert [e["id"] for e in call("GET", "/owner/v1/exchanges")["body"]] == [ex["id"]]
+        wrong = first["code"] if first["code"] != ex["code"] else other(ex["code"])
+        laptop.succeed(
+            f"(printf '%s\\n%s\\n' {wrong} {ex['code']} | mandate login https://server:8443 --name laptop >/tmp/login.log 2>&1;"
+            " echo $? >/tmp/login.exit) >/dev/null 2>&1 &"
+        )
+        server.wait_until_succeeds("testdevice --state /root/phone.json call GET /owner/v1/exchanges | grep -q confirmed")
+        [waiting] = call("GET", "/owner/v1/exchanges")["body"]
+        assert waiting["id"] == ex["id"] and waiting["kind"] == "agent" and waiting["name"] == "laptop", waiting
+        assert f" {waiting['address']}/" in laptop.succeed("ip -o addr show eth1"), waiting
         out = sign(f"/owner/v1/exchanges/{ex['id']}/challenge")
         assert out["status"] == 200 and out["body"]["kind"] == "identity", out
+        assert out["record"]["token_sha256"] == waiting["payload"]["token_sha256"], (out, waiting)
         identity = out["body"]["id"]
         laptop.wait_until_succeeds("test $(cat /tmp/login.exit) = 0")
+        assert "Wrong code; attempts left: 2." in laptop.succeed("cat /tmp/login.log")
         assert laptop.succeed("stat -c %a /root/.config/mandate/credentials.json").strip() == "600"
+        server.wait_until_succeeds("grep -q '\"state\":\"approved\"' /tmp/events")
+        events = [json.loads(e) for e in re.findall(r"event: exchange\ndata: (.*)", server.succeed("cat /tmp/events"))]
+        want = [(first["id"], "open"), (first["id"], "ended"), (ex["id"], "open"), (ex["id"], "confirmed"), (ex["id"], "approved")]
+        assert [(e["id"], e["state"]) for e in events] == want, events
 
     with subtest("reads wait for a grant; one narrower than asked opens only its chats, back to its horizon"):
         status, out = agent("test chats")
@@ -304,6 +323,8 @@ in
         assert "mandate request test" in out, out
         now = call("GET", "/owner/v1/now")["body"]
         assert now["requests"] == [] and now["grants"] == [], now
+        kinds = [e["kind"] for e in call("GET", "/owner/v1/activity?limit=500")["body"]["entries"]]
+        assert kinds[0] == "stop_all" and "request.asked" in kinds and "request.approved" in kinds and "read" in kinds, kinds
 
     with subtest("callers are told apart by their group"):
         for path in ["/internal/live", "/internal/requests", "/"]:

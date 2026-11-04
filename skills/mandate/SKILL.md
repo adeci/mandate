@@ -13,14 +13,14 @@ app. `mandate --help` and `mandate <connector> --help` list the commands.
 ## Logging in
 
 If commands answer `not logged in` or `unknown or revoked token`, ask the
-owner for mandate's address and run:
+owner for mandate's address and to open Add an agent in the mandate app,
+which shows a 6-digit code. Then pass the code on stdin:
 
 ```sh
-mandate login https://HOST:PORT
+echo CODE | mandate login https://HOST:PORT
 ```
 
-Give the owner the code it prints; they type it in the app. Never show the
-credential file to anyone.
+Never show the credential file to anyone.
 
 ## Access
 

@@ -143,7 +143,14 @@ func (s *Server) removeKeyChallenge(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusConflict, "the last key can't be removed")
 		return
 	}
-	s.keyChallenge(w, "remove", *key, func() bool { return true }, func() error { return s.removeKey(id) })
+	name := key.Name
+	s.keyChallenge(w, "remove", *key, func() bool { return true }, func() error {
+		if err := s.removeKey(id); err != nil {
+			return err
+		}
+		s.note(activity{Kind: "key.removed", Detail: name})
+		return nil
+	})
 }
 
 // removeKey revokes the key's device token and drops what it signed. The
@@ -156,10 +163,12 @@ func (s *Server) removeKey(id string) error {
 		close(ch)
 	}
 	now := s.now()
+	var deleted []activity
 	for iid, i := range s.st.Identities {
 		if i.Envelope.Key == id {
 			s.st.deleteIdentity(iid, now)
 			s.cancel(func(c *challenge) bool { return c.identity == iid })
+			deleted = append(deleted, activity{Kind: "agent.deleted", Identity: iid, Detail: i.Name})
 		}
 	}
 	for gid, g := range s.st.Grants {
@@ -167,5 +176,11 @@ func (s *Server) removeKey(id string) error {
 			delete(s.st.Grants, gid)
 		}
 	}
-	return s.commit("keys", "identities", "now")
+	if err := s.commit("keys", "identities", "now"); err != nil {
+		return err
+	}
+	for _, a := range deleted {
+		s.note(a)
+	}
+	return nil
 }

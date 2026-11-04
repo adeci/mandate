@@ -58,6 +58,7 @@ func (s *Server) postProposal(w http.ResponseWriter, r *http.Request) {
 		failErr(w, err)
 		return
 	}
+	s.note(proposalActivity("proposal.made", p, p.Op))
 	s.publish("waiting", map[string]string{"kind": "proposal", "id": p.ID, "identity": p.Identity, "connector": p.Connector})
 	reply(w, http.StatusCreated, map[string]string{"id": p.ID})
 }
@@ -214,11 +215,21 @@ func (s *Server) proposalChallenge(w http.ResponseWriter, r *http.Request) {
 			if err := s.commit("now"); err != nil {
 				return err
 			}
+			s.note(proposalActivity("proposal.approved", p, displayText(prepared.Display)))
 			s.executing.Add(1)
 			go s.execute(p.ID, p.Connector, env)
 			return nil
 		},
 	})
+}
+
+// proposalActivity is an entry about p, in the chat it writes to.
+func proposalActivity(kind string, p *proposal, detail string) activity {
+	a := activity{Kind: kind, Identity: p.Identity, Connector: p.Connector, Detail: detail}
+	if p.Prepared.Container != "" {
+		a.Chats = []chat{{ID: p.Prepared.Container}}
+	}
+	return a
 }
 
 // execute runs an approved write once and keeps the result.
@@ -250,6 +261,7 @@ func (s *Server) execute(id, conn string, env record.Envelope) {
 	if err := s.commit("now"); err != nil {
 		s.log.Error("keep write result", "proposal", id, "result", res.Status)
 	}
+	s.note(proposalActivity("proposal."+string(res.Status), p, displayText(p.Prepared.Display)))
 }
 
 func (s *Server) denyProposal(w http.ResponseWriter, r *http.Request) {
@@ -265,5 +277,6 @@ func (s *Server) denyProposal(w http.ResponseWriter, r *http.Request) {
 		failErr(w, err)
 		return
 	}
+	s.note(proposalActivity("proposal.denied", p, p.Op))
 	reply(w, http.StatusOK, struct{}{})
 }
