@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Why a join ended, and what to do next.
-const JOIN_ENDED: &str = "The join ended: three wrong codes, 10 minutes, or it was cancelled. Open Add a device on the other device again.";
+const JOIN_ENDED: &str = "That code no longer works. Get a new one from Add a device.";
 
 /// A page as drawn: the screen's kind, and the tab on the tabs.
 type Page = (Discriminant<Screen>, Option<Tab>);
@@ -355,7 +355,7 @@ impl Shell {
         let fetch = move || {
             let refused = || {
                 Error::Invalid(format!(
-                    "What the server asked to sign doesn't let {} in, so nothing was signed.",
+                    "Nothing was signed: the server asked for something other than letting {} in.",
                     exchange.name
                 ))
             };
@@ -540,9 +540,7 @@ impl Shell {
                     let refused = match tried {
                         Ok((JoinStatus::Confirmed, join)) => return Ok((join, key, token, url)),
                         Ok((JoinStatus::WrongCode { attempts_left }, _)) => {
-                            Error::Invalid(format!(
-                                "That code didn't match; {attempts_left} tries left. Check it on the other device."
-                            ))
+                            Error::Invalid(format!("Wrong code. {attempts_left} tries left."))
                         }
                         Ok(_) => Error::Invalid(JOIN_ENDED.into()),
                         Err(e) => e,
@@ -664,7 +662,7 @@ impl Shell {
             let mut envelope = device.client.challenge(&path, &body)?;
             if !check(&envelope.record()?) {
                 return Err(Error::Invalid(
-                    "What the server asked to sign isn't what you were shown, so nothing was signed."
+                    "Nothing was signed: the server asked for something other than what you saw."
                         .into(),
                 ));
             }

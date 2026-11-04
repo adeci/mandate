@@ -112,8 +112,8 @@ def lines() -> list[list[tuple[str, int, int, int, int]]]:
     return list(found.values())
 
 
-# The centre of the label's last appearance: "Pair" and "Let laptop in" are
-# also page titles above their buttons.
+# The centre of the label's last appearance: "Let laptop in" is also the
+# heading above its button.
 def find(label: str) -> tuple[int, int] | None:
     want = label.lower().split()
     at = None
@@ -234,15 +234,12 @@ with subtest("the phone boots with a PIN and a fingerprint"):
 with subtest("the app pairs by the setup page's link"):
     server.wait_for_unit("mandate.target")
     server.wait_for_open_port(8443)
-    password = grab(r"Setup password: (\S+)", server.succeed("mandate setup"))
+    path = grab(r"Initial setup\s+https://[^/]+(/setup/\S+)", server.succeed("mandate setup"))
     # Under the emulator's name for the host, so that the link points there.
-    page = server.succeed(
-        "curl -sk --connect-to 10.0.2.2:8443:localhost:8443 "
-        f"--data-urlencode password={password} https://10.0.2.2:8443/setup"
-    )
+    page = server.succeed(f"curl -sk --connect-to 10.0.2.2:8443:localhost:8443 https://10.0.2.2:8443{path}")
     link = html.unescape(grab(r'href="(mandate://pair\?[^"]+)"', page))
     adb("shell", f"am start -a android.intent.action.VIEW -d {shlex.quote(link)}")
-    see("Pair only if")
+    # Pair shows once the app has checked the server.
     tap("Pair")
     finger()
     server.wait_until_succeeds("test $(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/setup) = 404")

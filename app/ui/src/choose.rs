@@ -127,8 +127,7 @@ impl Shell {
                 };
                 (c.tokens, c.login, c.keys, c.field) = (tokens, None, Vec::new(), Field::Pin);
                 if c.tokens.is_empty() {
-                    this.error =
-                        Some("The module shows no token. Plug it in, then look again.".into());
+                    this.error = Some("No token found. Plug it in and try again.".into());
                 }
             },
         );
@@ -210,18 +209,18 @@ fn kinds(t: Theme, cx: &mut Context<Shell>) -> Div {
             .child(text.to_string())
     };
     column()
-        .child("Which key signs your approvals on this computer? It stays on the key; mandate keeps no copy.")
+        .child("Which key signs approvals on this computer?")
         .child(choice(
             "fido",
             Kind::Fido,
             "Security key (FIDO2)",
-            "A YubiKey, Nitrokey, SoloKey or any FIDO2 key. Each approval takes a touch, and its PIN. Recommended.",
+            "A YubiKey, Nitrokey, SoloKey or other FIDO2 key. Recommended.",
         ))
         .child(choice(
             "pkcs11",
             Kind::Pkcs11,
             "PKCS#11 token",
-            "A P-256 key on a smart card, a TPM or a YubiKey's PIV, through its PKCS#11 module. The token decides whether a signature takes a touch or a PIN.",
+            "A P-256 key on a smart card, a TPM or a YubiKey's PIV.",
         ))
 }
 
@@ -249,7 +248,6 @@ fn fido_step(t: Theme, c: &Choose, cx: &mut Context<Shell>) -> Div {
         .child("Your security key:")
         .child(column().border_2().border_color(t.text).children(keys))
         .child(field(t, "pin", "PIN", &c.pin, true, true, cx, |c, _| c.field = Field::Pin))
-        .child(t.alt("You touch the key next, so that it makes this computer's credential."))
         .child(
             div()
                 .flex()
@@ -262,7 +260,7 @@ fn pkcs11_step(t: Theme, c: &Choose, cx: &mut Context<Shell>) -> Div {
         .child(field(t, "module", "Module", &c.module, false, c.field == Field::Module, cx, |c, _| {
             c.field = Field::Module
         }))
-        .child(t.alt("The module's path, e.g. libykcs11.so for a YubiKey's PIV, libtpm2_pkcs11.so for a TPM, opensc-pkcs11.so for a smart card."))
+        .child(t.alt("e.g. libykcs11.so (YubiKey PIV), libtpm2_pkcs11.so (TPM), opensc-pkcs11.so (smart card)"))
         .child(div().flex().child(button(t, "tokens", "Find tokens", cx, |this, cx| {
             this.find_tokens(cx)
         })));

@@ -60,15 +60,17 @@ seen: list[str] = []
 
 def lines(n: int) -> list[list[tuple[str, int, int, int, int]]]:
     found: dict[tuple[str, ...], list[tuple[str, int, int, int, int]]] = {}
-    sh(n, "import -window root -resize 200% /tmp/ocr.png")
-    for negate in ("", "-colorspace gray -threshold 50%", "-colorspace gray -negate -threshold 50%"):
-        tsv = sh(n, f"magick /tmp/ocr.png {negate} png:- | tesseract stdin stdout tsv 2>/dev/null")
+    sh(n, "import -window root /tmp/ocr.png")
+    # A boxed one-word button ("PAIR") only reads at 3x.
+    passes = [(2, ""), (2, "-colorspace gray -threshold 50%"), (2, "-colorspace gray -negate -threshold 50%"), (3, "")]
+    for scale, opts in passes:
+        tsv = sh(n, f"magick /tmp/ocr.png -resize {scale}00% {opts} png:- | tesseract stdin stdout tsv 2>/dev/null")
         for row in tsv.splitlines()[1:]:
             f = row.split("\t")
             word = re.sub(r"\W", "", f[-1]).lower() if len(f) == 12 else ""
             if word:
-                x, y, w, h = (int(v) // 2 for v in f[6:10])
-                found.setdefault((negate, *f[1:5]), []).append((word, x, y, x + w, y + h))
+                x, y, w, h = (int(v) // scale for v in f[6:10])
+                found.setdefault((str(scale), opts, *f[1:5]), []).append((word, x, y, x + w, y + h))
     seen[:] = [" ".join(w[0] for w in line) for line in found.values()]
     return list(found.values())
 
@@ -200,15 +202,14 @@ with subtest("a session with a notification daemon, a keyring, a FIDO2 key and a
     server.wait_for_open_port(8443)
 
 with subtest("the first run pairs by the setup page's link, with the FIDO2 key"):
-    password = grab(r"Setup password: (\S+)", server.succeed("mandate setup"))
-    page = desktop.succeed(f"curl -sk --data-urlencode password={password} https://server:8443/setup")
+    setup = grab(r"Initial setup  (\S+)", server.succeed("mandate setup"))
+    page = desktop.succeed(f"curl -sk {shlex.quote(setup)}")
     link = html.unescape(grab(r'href="(mandate://pair\?[^"]+)"', page))
     # The link goes through the x-scheme-handler, as a browser hands it on.
     sh(1, "xdg-mime query default x-scheme-handler/mandate | grep -q dev.mandate.app.desktop")
     spawn(1, "app1", f"xdg-open {shlex.quote(link)}")
-    # OCR misses the boxed PAIR, which sits centered two lines under the warning.
-    _, y = see(1, "setup printed")
-    sh(1, f"xdotool mousemove 640 {y + 42} click 1")
+    see(1, "Initial setup")
+    tap(1, "Pair")
     see(1, "Security key")
     shot(1, "chooser-light")
     tap(1, "Security key")
@@ -216,8 +217,8 @@ with subtest("the first run pairs by the setup page's link, with the FIDO2 key")
     typed(1, PIN)
     shot(1, "chooser-fido-light")
     tap(1, "Use this key")
-    see(1, "Stop all access")
-    server.wait_until_succeeds("test $(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/setup) = 404")
+    see(1, "Waiting for you")
+    desktop.wait_until_fails(f"curl -sk {shlex.quote(setup)} | grep -q mandate://pair")
     keys(1, 1)
     spawn(1, "background", "mandate-app --background")
 
@@ -311,9 +312,9 @@ with subtest("a second run joins with a PKCS#11 key and the code the first shows
     typed(2, HSM_PIN, enter=True)
     tap(2, "Make a new key")
     tap(1, "Let this device in")
-    until("the PIN prompt or the join", lambda: find(1, "to sign") or find(2, "Stop all access"))
+    until("the PIN prompt or the join", lambda: find(1, "to sign") or find(2, "Waiting for you"))
     sign(1, PIN)
-    see(2, "Stop all access")
+    see(2, "Waiting for you")
     keys(2, 2)
     # No Secret Service runs there: the token sits in the 0600 file.
     desktop.succeed("test $(stat -c %a /tmp/data2/mandate/device.json) = 600 && grep -q '\"token\"' /tmp/data2/mandate/device.json")

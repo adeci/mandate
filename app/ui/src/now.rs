@@ -62,14 +62,9 @@ impl Shell {
             .gap(lines(1.))
             .child(t.heading("Waiting for you"))
             .when(waiting.is_empty(), |d| {
-                let (first, then) = match &self.search {
-                    Some(q) => (
-                        format!("Nothing here matches \"{q}\"."),
-                        "Clear the search to see everything.",
-                    ),
-                    None => {
-                        ("Nothing needs you right now.".into(), "Agents' requests show up here.")
-                    }
+                let empty = match &self.search {
+                    Some(q) => format!("Nothing matches \"{q}\"."),
+                    None => "Nothing waiting.".into(),
                 };
                 d.child(
                     column()
@@ -78,8 +73,7 @@ impl Shell {
                         .border_color(t.alt)
                         .px(chars(1.))
                         .py(lines(1.))
-                        .child(first)
-                        .child(t.alt(then)),
+                        .child(empty),
                 )
             })
             .children(waiting)
@@ -183,10 +177,6 @@ impl Shell {
                 ))
             })
             .children(reason(t, &r.reason))
-            .when(named && !nothing && a.chats.is_empty(), |d| {
-                d.child(t.alt("tick the chats to grant"))
-            })
-            .when(nothing, |d| d.child(t.alt("pick the chats to grant")))
             .child(button(t, id_for("deny", &id), "Deny", cx, move |this, cx| {
                 let notice = format!("You denied {name}'s request.");
                 this.post("POST", deny.clone(), cx, move |_| Some(notice))
@@ -291,12 +281,17 @@ impl Shell {
         }
         panel(t)
             .mt(lines(2.))
-            .child("Close every grant, pause every routine and deny every waiting request? Waiting sends stay.")
+            .child("Close all grants, pause routines and deny waiting requests?")
             .child(
                 div()
                     .flex()
                     .gap(chars(1.))
-                    .child(button(t, "stop-all", "Stop all", cx, |this, cx| this.stop_all(cx)).flex_1().bg(t.text).text_color(t.bg))
+                    .child(
+                        button(t, "stop-all", "Stop all", cx, |this, cx| this.stop_all(cx))
+                            .flex_1()
+                            .bg(t.text)
+                            .text_color(t.bg),
+                    )
                     .child(
                         button(t, "cancel", "Cancel", cx, |this, cx| {
                             this.stopping = false;

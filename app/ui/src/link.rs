@@ -76,7 +76,7 @@ impl Shell {
     }
 
     pub(crate) fn unlink(&mut self, name: String, cx: &mut Context<Self>) {
-        let notice = format!("{} is unlinked. Its stored messages stay.", connector(&name));
+        let notice = format!("{} unlinked.", connector(&name));
         self.post("POST", format!("connectors/{}/unlink", segment(&name)), cx, move |_| {
             Some(notice)
         });
@@ -85,9 +85,8 @@ impl Shell {
     pub(crate) fn link_screen(&self, t: Theme, cx: &mut Context<Self>) -> Div {
         let Screen::Link { name, step, values, focus } = &self.screen else { return column() };
         let Some(step) = step else {
-            return column().child(t.alt(format!("Asking {} how to link…", connector(name))));
+            return column().child(t.alt("Loading…"));
         };
-        let typing = step.fields.iter().any(|f| f.kind != "choice");
         let filled = step
             .fields
             .iter()
@@ -138,14 +137,8 @@ impl Shell {
                 )
             })
             .when(step.poll > 0, |d| d.child(t.alt("Waiting for the other device…")))
-            .when(!step.fields.is_empty(), |d| {
-                d.child(if filled {
-                    button(t, "continue", "Continue", cx, |this, cx| this.submit_step(cx))
-                        .into_any_element()
-                } else {
-                    t.alt(if typing { "Fill in the fields to go on." } else { "Choose to go on." })
-                        .into_any_element()
-                })
+            .when(!step.fields.is_empty() && filled, |d| {
+                d.child(button(t, "continue", "Continue", cx, |this, cx| this.submit_step(cx)))
             })
     }
 }

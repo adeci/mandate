@@ -38,7 +38,7 @@ const PLUG_IN: &str = "Plug in your security key.";
 const AGAIN: &str = "Your security key wants its PIN again.";
 const NO_PIN: &str =
     "Set a PIN on your security key first, e.g. with `ykman fido access change-pin`.";
-const GONE: &str = "The security key stopped answering. Plug it back in and try again.";
+const GONE: &str = "The security key stopped responding. Plug it back in.";
 
 /// A FIDO2 authenticator found on hidraw.
 #[derive(Clone)]
@@ -386,10 +386,10 @@ fn status(code: u8) -> Error {
     key_error(match code {
         // OPERATION_DENIED, KEEPALIVE_CANCEL, USER_ACTION_TIMEOUT
         0x27 | 0x2d | 0x2f => "No touch, so nothing was signed.",
-        NO_CREDENTIALS => "This security key doesn't hold this computer's credential.",
+        NO_CREDENTIALS => "Wrong security key. Use the one this computer joined with.",
         PIN_INVALID => "Wrong PIN.",
-        0x32 => "Your security key's PIN is blocked. Reset the key to use it again.",
-        0x34 => "Too many wrong PINs in a row. Unplug the key and plug it back in.",
+        0x32 => "Your security key's PIN is blocked. Reset the key.",
+        0x34 => "Too many wrong PINs. Unplug the key and plug it back in.",
         0x35 => NO_PIN,
         0x37 => "Your security key wants a new PIN, e.g. with `ykman fido access change-pin`.",
         PIN_AUTH_INVALID | PUAT_REQUIRED | PIN_TOKEN_EXPIRED => AGAIN,
@@ -413,7 +413,7 @@ fn io_error(e: io::Error) -> Error {
     key_error(match e.kind() {
         io::ErrorKind::NotFound => PLUG_IN,
         io::ErrorKind::PermissionDenied => {
-            "This user may not use the security key. It needs the FIDO udev rules, e.g. from the libfido2 package."
+            "Can't open the security key. Install the FIDO udev rules (libfido2)."
         }
         _ => GONE,
     })
@@ -439,7 +439,7 @@ impl Device {
             let r = dev.recv(HID_INIT, deadline)?;
             if r.len() >= 17 && r[..8] == nonce {
                 if r[16] & 0x04 == 0 {
-                    return Err(key_error("This security key only speaks U2F, not FIDO2."));
+                    return Err(key_error("This key is U2F only. Use a FIDO2 key."));
                 }
                 dev.cid.copy_from_slice(&r[8..12]);
                 return Ok(dev);

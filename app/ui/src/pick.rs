@@ -160,7 +160,6 @@ impl Shell {
             .map(|h| (h.connector.clone(), h.kind.clone(), h.id.clone()))
             .collect();
         column()
-            .child("Pick a chat or a person to keep out of every read, whatever the grants say.")
             .child(div().font_weight(MEDIUM).child("CONNECTOR"))
             .child(div().flex().flex_wrap().gap(chars(1.)).children(conns))
             .when(self.picker.is_some(), |d| {
@@ -369,20 +368,34 @@ impl Shell {
                 d.child(heading("CHATS"))
                     .child(
                         chips(div())
-                            .child(chip(t, "every", "every chat", g.chats.is_none(), cx, |this, cx| {
-                                if let Screen::Grant(g) = &mut this.screen {
-                                    g.chats = None;
-                                }
-                                this.close_picker(cx);
-                            }))
-                            .child(chip(t, "only", "only these", g.chats.is_some(), cx, move |this, cx| {
-                                if let Screen::Grant(g) = &mut this.screen
-                                    && g.chats.is_none()
-                                {
-                                    g.chats = Some(BTreeMap::new());
-                                }
-                                this.open_picker(crate::pick::Pick::Grant, conn.clone(), cx);
-                            })),
+                            .child(chip(
+                                t,
+                                "every",
+                                "every chat",
+                                g.chats.is_none(),
+                                cx,
+                                |this, cx| {
+                                    if let Screen::Grant(g) = &mut this.screen {
+                                        g.chats = None;
+                                    }
+                                    this.close_picker(cx);
+                                },
+                            ))
+                            .child(chip(
+                                t,
+                                "only",
+                                "only these",
+                                g.chats.is_some(),
+                                cx,
+                                move |this, cx| {
+                                    if let Screen::Grant(g) = &mut this.screen
+                                        && g.chats.is_none()
+                                    {
+                                        g.chats = Some(BTreeMap::new());
+                                    }
+                                    this.open_picker(crate::pick::Pick::Grant, conn.clone(), cx);
+                                },
+                            )),
                     )
                     .when(g.chats.is_some(), |d| {
                         d.children(picked).when(picking, |d| {
@@ -405,7 +418,6 @@ impl Shell {
                                 .child(display(c))
                                 .into_any_element()
                             }))
-                            .child(t.alt("Each chat is granted on its own. Chats created later are not included."))
                         })
                     })
             })
@@ -413,7 +425,14 @@ impl Shell {
             .child(
                 chips(div())
                     .child(chip(t, "once", "now, for", !g.routine, cx, set(|g| g.routine = false)))
-                    .child(chip(t, "routine", "on a schedule", g.routine, cx, set(|g| g.routine = true))),
+                    .child(chip(
+                        t,
+                        "routine",
+                        "on a schedule",
+                        g.routine,
+                        cx,
+                        set(|g| g.routine = true),
+                    )),
             )
             .when(!g.routine, |d| d.child(chips(div()).children(fors)))
             .when(g.routine, |d| {
@@ -424,16 +443,30 @@ impl Shell {
                             .items_center()
                             .gap(chars(1.))
                             .child("at")
-                            .child(button(t, "earlier", "-", cx, set(|g| g.start = (g.start + 1410) % 1440)))
+                            .child(button(
+                                t,
+                                "earlier",
+                                "-",
+                                cx,
+                                set(|g| g.start = (g.start + 1410) % 1440),
+                            ))
                             .child(div().font_weight(MEDIUM).child(words::time_of_day(&g.start())))
-                            .child(button(t, "later", "+", cx, set(|g| g.start = (g.start + 30) % 1440))),
+                            .child(button(
+                                t,
+                                "later",
+                                "+",
+                                cx,
+                                set(|g| g.start = (g.start + 30) % 1440),
+                            )),
                     )
                     .child(chips(div()).children(lengths))
                     .child(t.alt(format!("in {}", words::zone())))
             })
             .child(heading("MESSAGES FROM"))
             .child(chips(div()).children(horizons))
-            .child(approve(t, "grant", label.into(), ready, cx, move |this, cx| this.grant(&ng, cx)))
+            .child(approve(t, "grant", label.into(), ready, cx, move |this, cx| {
+                this.grant(&ng, cx)
+            }))
     }
 
     fn grant(&mut self, g: &NewGrant, cx: &mut Context<Self>) {

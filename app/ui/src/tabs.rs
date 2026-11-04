@@ -13,9 +13,7 @@ use serde_json::json;
 impl Shell {
     pub(crate) fn agents_tab(&self, t: Theme, cx: &mut Context<Self>) -> Div {
         let add = button(t, "add-agent", "Add an agent", cx, |this, cx| this.invite("agent", cx));
-        let empty = self.identities.is_empty().then(|| {
-            t.alt("No agents yet. Add one: you get a code to give it, and it logs in with that.")
-        });
+        let empty = self.identities.is_empty().then(|| t.alt("No agents yet."));
         let agents = self.identities.iter().filter(|a| self.shown(&a.name)).map(|a| {
             let seen = a.last_seen.as_deref().map_or("not connected yet".into(), |s| {
                 format!("last seen {} {}", words::date(s), words::clock(s))
@@ -29,7 +27,7 @@ impl Shell {
                         .child(bold(a.name.clone()))
                         .child(t.alt(format!("created {} · {seen}", words::date(&a.created_at)))),
                 )
-                .when(open.is_empty(), |d| d.child(t.alt("No grants: this agent reads nothing.")))
+                .when(open.is_empty(), |d| d.child(t.alt("No grants.")))
                 .children(open.into_iter().map(|g| grant_line(t, g)))
                 .child(div().flex().child(button(
                     t,
@@ -120,10 +118,7 @@ impl Shell {
         }
         let key = format!("unlink {name}");
         let confirm = self.confirming.as_deref() == Some(key.as_str());
-        let warning = format!(
-            "Unlink {}? It forgets the session; agents read only what is stored until you link it again.",
-            connector(&name)
-        );
+        let warning = format!("Unlink {}?", connector(&name));
         column().gap(lines(0.5)).when(confirm, |d| d.child(warning)).child(
             link(
                 t,
@@ -187,11 +182,11 @@ impl Shell {
             )
         });
         let end = match (&history.next, history.entries.is_empty()) {
-            (Some(_), _) => t.alt("Loading more…"),
-            (None, true) => t.alt("Nothing has happened yet."),
-            (None, false) => t.alt("That is everything."),
+            (Some(_), _) => Some(t.alt("Loading more…")),
+            (None, true) => Some(t.alt("Nothing yet.")),
+            (None, false) => None,
         };
-        column().gap(lines(1.)).children(sections).child(end)
+        column().gap(lines(1.)).children(sections).children(end)
     }
 
     /// One plain line for an entry: who did what, and how it ended.
@@ -367,17 +362,13 @@ impl Shell {
             .gap(lines(1.))
             .child(t.heading("Devices"))
             .child(column().border_2().border_color(t.text).children(devices))
-            .child(t.alt("Each device can approve. Another device joins with a code this one shows."))
             .child(div().flex().child(add_device))
             .when_some(this_key, |d, rows| {
-                d.child(t.heading("This computer's key"))
-                    .child(table(t, rows))
-                    .child(t.alt("It signs every approval from this computer."))
+                d.child(t.heading("This computer's key")).child(table(t, rows))
             })
             .child(t.heading("Never share"))
             .child(if self.hidden.is_empty() {
-                t.alt("Nothing is hidden. Chats and people hidden here stay out of every read, whatever the grants say.")
-                    .into_any_element()
+                t.alt("Nothing hidden.").into_any_element()
             } else {
                 column().border_2().border_color(t.text).children(hidden).into_any_element()
             })

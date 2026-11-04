@@ -93,7 +93,7 @@ impl Render for Shell {
         };
         let title = match &self.screen {
             Screen::Welcome => "",
-            Screen::Pair { .. } => "Pair",
+            Screen::Pair { .. } => "Initial setup",
             Screen::Join { .. } | Screen::Joining => "Join",
             Screen::Invite { kind: "agent", .. } => "Add an agent",
             Screen::Invite { .. } => "Add a device",
@@ -479,7 +479,7 @@ impl Shell {
                 .h(lines(2.5))
                 .child(icon("search", t.alt))
                 .child(if q.is_empty() {
-                    t.alt("Search this page").flex_1()
+                    t.alt("Search").flex_1()
                 } else {
                     div().flex_1().child(q.clone())
                 })
@@ -542,15 +542,16 @@ fn welcome(t: Theme, cx: &mut Context<Shell>) -> Div {
     column()
         .child(wordmark())
         .child("A self-hosted gateway to your personal accounts for AI agents.")
-        .child(t.alt(
-            "Agents read only what you grant, for as long as you grant it. Anything they want to send waits until you approve it here.",
-        ))
+        .child(t.alt("Agents read and send only what you approve."))
         .child(button(t, "start", "Get started", cx, |this, cx| {
             this.go(Screen::Pair { text: String::new() }, cx)
         }))
         .child(div().flex().flex_wrap().gap_x(chars(1.)).child(t.alt("Already set up?")).child(
             link(t, "join", "Join as another device", cx, |this, cx| {
-                this.go(Screen::Join { url: String::new(), code: String::new(), code_field: false }, cx)
+                this.go(
+                    Screen::Join { url: String::new(), code: String::new(), code_field: false },
+                    cx,
+                )
             }),
         ))
 }
@@ -613,7 +614,7 @@ fn pair(
 ) -> Div {
     let Some(link) = text.parse::<PairLink>().ok() else {
         let open = if cfg!(target_os = "android") {
-            "Scan the QR code on the setup page with your phone's camera."
+            "Scan the QR code on the setup page."
         } else {
             "Open the pairing link on the setup page."
         };
@@ -624,7 +625,7 @@ fn pair(
         return column()
             .child(open)
             .children(scan)
-            .child(t.alt("Or paste the link here:").mt(lines(1.)))
+            .child(t.alt("Or paste the link").mt(lines(1.)))
             .child(field(t, "link", text, "mandate://pair?…", true, |_| {}, cx));
     };
     let host = link.url.strip_prefix("https://").unwrap_or(&link.url).to_string();
@@ -648,7 +649,6 @@ fn pair(
         return column()
             .child(host)
             .child(div().font_weight(MEDIUM).child("✓ Certificate verified"))
-            .child(t.alt("The app checked the server's certificate and key itself."))
             .child(pair);
     }
     column()
@@ -657,7 +657,6 @@ fn pair(
             t,
             vec![("Key".into(), div().font_weight(BOLD).child(short).into_any_element())],
         ))
-        .child("Pair only if this key matches what mandate setup printed.")
         .child(pair)
 }
 
@@ -681,7 +680,7 @@ fn join(t: Theme, url: &str, code: &str, code_field: bool, cx: &mut Context<Shel
         }
     };
     column()
-        .child("On a device already in, open Settings and tap Add a device. Type what it shows:")
+        .child("From Settings › Add a device on your other device:")
         .child(t.alt("Server address"))
         .child(field(t, "url", url, "https://…", !code_field, to(false), cx))
         .child(t.alt("Code"))
@@ -693,9 +692,8 @@ fn join(t: Theme, url: &str, code: &str, code_field: bool, cx: &mut Context<Shel
 
 fn joining(t: Theme) -> Div {
     column()
-        .child(bold(DEVICE_JOIN.to_string()))
-        .child("The code matches. Let this device in on the other one.")
-        .child(t.alt("Waiting for the other device…"))
+        .child("Code accepted. Let this device in on your other device.")
+        .child(t.alt("Waiting…"))
 }
 
 impl Shell {
@@ -737,25 +735,20 @@ impl Shell {
             )
         } else {
             (
-                "On the new device, open mandate, tap Already set up?, and type this server's address:",
+                "On the new device, tap Already set up? and enter:",
                 line(self.server.clone(), copy("copy-url", self.server.clone(), cx)),
             )
         };
-        let then =
-            if kind == "agent" { "When it asks, type this code:" } else { "Then this code:" };
         column()
             .child(first)
             .child(there)
-            .child(then)
+            .child("Then type this code:")
             .child(div().flex().items_center().gap(chars(2.)).child(big).child(copy(
                 "copy-code",
                 code,
                 cx,
             )))
-            .child(t.alt(format!(
-                "Waiting for the {kind}… The code works once, until {}.",
-                words::clock(&opened.expires_at)
-            )))
+            .child(t.alt(format!("Expires {}.", words::clock(&opened.expires_at))))
             .child(link(t, "cancel-invite", "Cancel", cx, |this, cx| this.cancel_invite(cx)))
     }
 }
@@ -770,7 +763,6 @@ fn admit(t: Theme, ex: &Exchange, envelope: &Envelope, cx: &mut Context<Shell>) 
         });
         return column()
             .child(bold(DEVICE_JOIN.to_string()))
-            .child("The code matches.")
             .child(table(t, device_rows(ex)))
             .child(column().child(device_warning(t)).child(admit))
             .child(later);
@@ -781,10 +773,6 @@ fn admit(t: Theme, ex: &Exchange, envelope: &Envelope, cx: &mut Context<Shell>) 
     }
     column()
         .child(bold(format!("Let {} in?", ex.name)))
-        .child(format!(
-            "The code matches. Once in, {} can ask to read your chats. It reads nothing until you approve.",
-            ex.name
-        ))
         .child(table(t, rows))
         .child(approve(
             t,
@@ -812,9 +800,13 @@ pub fn device_rows(ex: &Exchange) -> Vec<(String, AnyElement)> {
 /// The warning shown before letting a device in: an agent can start a join
 /// from its own machine and ask the owner to type the code.
 pub fn device_warning(t: Theme) -> Div {
-    div().border_2().border_color(t.text).px(chars(1.)).py(lines(0.5)).font_weight(MEDIUM).child(
-        "A device can approve anything: reads, sends, and other devices. Only let it in if you just started this on your own phone or computer.",
-    )
+    div()
+        .border_2()
+        .border_color(t.text)
+        .px(chars(1.))
+        .py(lines(0.5))
+        .font_weight(MEDIUM)
+        .child("Only let it in if you started this yourself: a device can approve anything.")
 }
 
 pub fn column() -> Div {
