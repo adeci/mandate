@@ -70,19 +70,38 @@ let
       };
     };
 
+  # The vendored modules are a fixed-output derivation: Nix reuses it while
+  # vendorHash stays the same. Our own module (the replace to ../..) would
+  # go stale in it, so it is vendored from the source at build time instead,
+  # and vendorHash covers third-party modules only.
+  ownModule = "vendor/github.com/adeci/mandate";
   connectorWith =
     {
       buildInputs ? [ ],
     }:
     name: description:
-    module {
+    (module {
       pname = "mandate-${name}";
       modRoot = "connectors/${name}";
       files = [ (../connectors + "/${name}") ];
       # Go names the binary after its directory.
       postInstall = "mv $out/bin/${name} $out/bin/mandate-${name}";
       inherit buildInputs description;
-    };
+    }).overrideAttrs
+      {
+        modPostBuild = "rm -r ${ownModule}";
+        # As go mod vendor does: each package's files, without tests. The
+        # vendoring derivation runs preBuild too, before vendor/ exists.
+        preBuild = ''
+          if [ -f vendor/modules.txt ]; then
+            chmod -R u+w vendor
+            sed -n 's|^github.com/adeci/mandate/||p' vendor/modules.txt | while read -r pkg; do
+              mkdir -p "${ownModule}/$pkg"
+              find "../../$pkg" -maxdepth 1 -type f ! -name '*_test.go' -exec cp -t "${ownModule}/$pkg" {} +
+            done
+          fi
+        '';
+      };
   connector = connectorWith { };
 in
 {

@@ -60,6 +60,20 @@
         // {
           treefmt = (treefmtFor pkgs).config.build.check self;
           conformance = import ./nix/conformance.nix { inherit self pkgs; };
+          # vendorHash must not cover our own module, or it goes stale.
+          vendor-own =
+            let
+              connectors = removeAttrs packages [ "mandate" ];
+            in
+            pkgs.runCommand "mandate-vendor-own" { } ''
+              for m in ${toString (lib.mapAttrsToList (_: p: p.goModules) connectors)}; do
+                if [ -e "$m/github.com/adeci/mandate" ]; then
+                  echo "$m vendors github.com/adeci/mandate" >&2
+                  exit 1
+                fi
+              done
+              touch $out
+            '';
         }
         // lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
           vm = pkgs.testers.runNixOSTest (import ./nix/vm-test.nix { inherit self pkgs; });
