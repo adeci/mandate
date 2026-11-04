@@ -40,8 +40,8 @@ curl -fsSL https://github.com/adeci/mandate/releases/latest/download/install.sh 
 sudo mandate setup
 ```
 
-mandate listens on one HTTPS port; how you reach it is up to you. Open the
-setup page and pair the mandate app on your phone or desktop.
+mandate listens on one HTTPS port; how you reach it is up to you. `sudo mandate
+setup` prints a link: open it and pair the mandate app on your phone or desktop.
 
 ## Agent identities
 

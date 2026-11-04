@@ -1,6 +1,6 @@
 # Owner API
 
-The app talks to the owner side under `/owner/v1/`, on the one HTTPS port. `front` terminates TLS and forwards `/owner/` and `/setup` to the owner side's socket.
+The app talks to the owner side under `/owner/v1/`, on the one HTTPS port. `front` terminates TLS and forwards `/owner/`, `/setup` and `/setup/` to the owner side's socket.
 
 Bodies are JSON, and durations are in integer seconds. Records and envelopes are as in `records.md`.
 
@@ -18,8 +18,14 @@ Pairing gives the app the server's SPKI SHA-256, which it checks on first connec
 
 **First device.**
 
-1. `sudo mandate setup` prints the `/setup` address, a setup password (also kept in a root-only file) and, in TLS mode `own`, the server key's fingerprint: the SPKI SHA-256's first 80 bits as five groups of four hex digits (`bf0d 5832 2e59 4fbf e037`), which the setup page and the app show too. In modes `acme` and `cert` it shows the hostname instead, since the app checks the certificate itself.
-2. The setup page asks for the password, then shows a QR code and the same link as text:
+1. `sudo mandate setup` makes a setup password (also kept in a root-only file) and prints the setup link, `https://HOST:PORT/setup/<password>`, and, in TLS mode `own` only, the server key's fingerprint: the SPKI SHA-256's first 80 bits as five groups of four hex digits (`bf0d 5832 2e59 4fbf e037`), which the setup page and the app show too:
+
+   ```
+   Initial setup  https://box.example:8443/setup/JIWH-MKI6-LCU4-FE27
+   Key            bf0d 5832 2e59 4fbf e037
+   ```
+
+2. The setup link shows a QR code and the same link as text (a wrong or spent password gets what `/setup` shows; there, a form takes the password instead):
 
    ```
    mandate://pair?url=https%3A%2F%2Fbox.example%3A8443&spki=<hex>&secret=<32 bytes, base64url>
@@ -33,7 +39,7 @@ Pairing gives the app the server's SPKI SHA-256, which it checks on first connec
    It answers `{"kind": "key", "id": "<key id>"}`.
 4. That spends the secret and the setup password.
 
-The setup page exists only before the first pairing and again after `mandate reset`; until `sudo mandate setup` has made a password, it only says to run that and reload. Whoever pairs first owns the server: if the app's pairing succeeds, its key is seq 0 and nobody paired before it; if the secret is already spent, run `mandate reset`.
+The setup page exists only before the first pairing and again after `mandate reset`; until `sudo mandate setup` has made a password, it only says to run that. Whoever pairs first owns the server: if the app's pairing succeeds, its key is seq 0 and nobody paired before it; if the secret is already spent, run `mandate reset`.
 
 **Another device.** It uses the code exchange in [`agent-api.md`, Code exchange](agent-api.md#code-exchange):
 

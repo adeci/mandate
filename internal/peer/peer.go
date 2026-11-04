@@ -15,6 +15,7 @@ import (
 	"os/user"
 	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -55,13 +56,21 @@ func ConnContext(ctx context.Context, c net.Conn) context.Context {
 	return context.WithValue(ctx, gidKey{}, gid)
 }
 
+// LogPath is p as logs may show it: a setup link's password is left out.
+func LogPath(p string) string {
+	if strings.HasPrefix(p, "/setup/") {
+		return "/setup/…"
+	}
+	return p
+}
+
 // Allow admits callers whose primary group is one of gids to h and answers
 // anyone else 403.
 func Allow(log *slog.Logger, h http.Handler, gids ...uint32) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gid, ok := r.Context().Value(gidKey{}).(uint32)
 		if !ok || !slices.Contains(gids, gid) {
-			log.Warn("caller refused", "gid", gid, "known", ok, "method", r.Method, "path", r.URL.Path)
+			log.Warn("caller refused", "gid", gid, "known", ok, "method", r.Method, "path", LogPath(r.URL.Path))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusForbidden)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "this caller may not use " + r.Method + " " + r.URL.Path})

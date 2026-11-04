@@ -94,6 +94,11 @@ type gateway struct {
 
 	liveMu sync.Mutex // serializes pushes
 	live   atomic.Pointer[live]
+
+	// stopping is done once shutdown begins; long polls, which never go
+	// idle, end on it.
+	stopping context.Context
+	stop     context.CancelFunc
 }
 
 func newGateway(o options) (*gateway, error) {
@@ -109,10 +114,18 @@ func newGateway(o options) (*gateway, error) {
 		activity: &activity{owner: toOwner, log: o.log},
 	}
 	g.live.Store(l)
+	g.stopping, g.stop = context.WithCancel(context.Background())
 	for name, p := range o.connectors {
 		g.conns[name] = &conn{name: name, client: connector.Dial(name, p.socket), store: p.store}
 	}
 	return g, nil
+}
+
+// longPoll is ctx, also done once shutdown begins.
+func (g *gateway) longPoll(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(g.stopping, cancel)
+	return ctx, func() { stop(); cancel() }
 }
 
 func (g *gateway) serve(ctx context.Context, ln net.Listener) error {
@@ -123,6 +136,7 @@ func (g *gateway) serve(ctx context.Context, ln net.Listener) error {
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
+	srv.RegisterOnShutdown(g.stop)
 	actx, stopActivity := context.WithCancel(context.Background())
 	activityDone := make(chan struct{})
 	go func() { g.activity.run(actx); close(activityDone) }()
@@ -131,9 +145,9 @@ func (g *gateway) serve(ctx context.Context, ln net.Listener) error {
 	var err error
 	select {
 	case <-ctx.Done():
-		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// Long polls end on g.stopping; the rest gets a few seconds.
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		// Long polls never go idle; close what is left.
 		if srv.Shutdown(shutdown) != nil {
 			srv.Close()
 		}

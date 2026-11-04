@@ -68,6 +68,8 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 			io.WriteString(w, ": ping\n\n")
 		case <-r.Context().Done():
 			return
+		case <-s.stopping.Done():
+			return
 		}
 		if rc.Flush() != nil {
 			return

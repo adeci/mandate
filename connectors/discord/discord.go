@@ -219,15 +219,16 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 	if _, err := cfg.store.DB().ExecContext(ctx, handlesSchema); err != nil {
 		return nil, fmt.Errorf("create handles table: %w", err)
 	}
-	// When ctx is done the worker stops before the socket shuts down, so a
-	// call still waiting for its slot is answered right away instead of
-	// holding up the exit.
+	// The worker stops when ctx is done or on Close, which the SDK calls
+	// once the socket has shut down; its ctx outlives the signal.
+	ctx, cancel := context.WithCancel(ctx)
 	gw := newGateway(cfg.gatewayURL, cfg.dialGateway, cfg.clock, cfg.rng, cfg.store, cfg.log)
 	w := &worker{
 		svc:   newService(cfg.store, up, gw, cfg.clock),
 		token: cfg.token,
 		clock: cfg.clock,
 		ctx:   ctx,
+		stop:  cancel,
 		jobs:  make(chan *job),
 		fail:  cfg.fail,
 		done:  make(chan struct{}),
@@ -246,6 +247,7 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 }
 
 func (w *worker) Close() error {
+	w.stop()
 	<-w.done
 	return nil
 }
@@ -272,6 +274,7 @@ type worker struct {
 	token    connector.Secret
 	clock    clock
 	ctx      context.Context // canceled when the service stops
+	stop     context.CancelFunc
 	jobs     chan *job
 	fail     func(error) // for stop conditions a restart may clear
 	stopped  error       // set after a stop condition; later calls fail fast

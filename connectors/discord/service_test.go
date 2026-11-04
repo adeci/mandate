@@ -298,7 +298,11 @@ func (h *harness) start() {
 		cancel(nil)
 		h.t.Fatal(err)
 	}
-	h.cancel = func() { cancel(nil) }
+	// As connector.Main runs it: the signal stops serving, and the worker
+	// stops on Close, with its ctx still live.
+	serveCtx, stopServe := context.WithCancel(context.Background())
+	context.AfterFunc(ctx, stopServe)
+	h.cancel = stopServe
 	h.w = w
 	srv, err := connector.NewServer(w, "discord", h.dir, uint32(os.Getgid()), uint32(os.Getgid()), cfg.log)
 	if err != nil {
@@ -311,7 +315,9 @@ func (h *harness) start() {
 		h.t.Fatal(err)
 	}
 	go func() {
-		h.done <- errors.Join(srv.Serve(ctx, ln), w.Close())
+		err := errors.Join(srv.Serve(serveCtx, ln), w.Close())
+		cancel(nil)
+		h.done <- err
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for {

@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/adeci/mandate/connector"
+	"github.com/adeci/mandate/internal/config"
 	"github.com/adeci/mandate/internal/exchange"
 	"github.com/adeci/mandate/internal/peer"
 	"github.com/adeci/mandate/record"
@@ -61,6 +62,7 @@ type harness struct {
 	http  *http.Client
 	clock *clock
 	lives chan live
+	stop  func() // shuts the owner side down and waits
 }
 
 // sockDir is short: t.TempDir's paths can pass the socket path limit.
@@ -123,15 +125,19 @@ func start(t *testing.T, conns map[string]*connector.Client, opts ...func(*Serve
 	}
 	gid := uint32(os.Getgid())
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error)
+	done := make(chan error, 1)
 	go func() { done <- s.serve(ctx, ln, gid, gid) }()
-	t.Cleanup(func() {
-		cancel()
-		if err := <-done; err != nil {
-			t.Error(err)
-		}
-	})
-	return &harness{t, s, unixClient(filepath.Join(socks, "owner")), c, lives}
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			if err := <-done; err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	t.Cleanup(stop)
+	return &harness{t, s, unixClient(filepath.Join(socks, "owner")), c, lives, stop}
 }
 
 // nowhere is a connector that never answers.
@@ -224,7 +230,14 @@ func (h *harness) openSetup() {
 
 // setupPageText fetches the setup page.
 func (h *harness) setupPageText() (int, string) {
-	resp, err := h.http.Get("http://owner/setup")
+	return h.page("/setup")
+}
+
+// page fetches a page as front forwards it.
+func (h *harness) page(path string) (int, string) {
+	req, _ := http.NewRequest(http.MethodGet, "http://box.example:8443"+path, nil)
+	req.Header.Set("Mandate-Spki-Sha256", testSPKI)
+	resp, err := h.http.Do(req)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -252,12 +265,9 @@ func (h *harness) setupSecret(password string) (int, string) {
 		return resp.StatusCode, ""
 	}
 	// People compare the key only when no CA vouches for the certificate.
-	shown, hidden := "f910 152c 80be 10ee 2280", "Certificate verified"
-	if h.s.certVerified {
-		shown, hidden = "<p class=\"key\">box.example</p>", "f910 152c"
-	}
-	if !bytes.Contains(page, []byte(shown)) || bytes.Contains(page, []byte(hidden)) || !bytes.Contains(page, []byte("<svg")) {
-		h.t.Errorf("the setup page lacks %q or the QR code, or shows %q:\n%s", shown, hidden, page)
+	key := strings.Contains(string(page), `<p class="key">Key f910 152c 80be 10ee 2280</p>`)
+	if key == h.s.certVerified || !bytes.Contains(page, []byte("<svg")) {
+		h.t.Errorf("the pairing page (certificate verified %v) shows the key %v, or lacks the QR code:\n%s", h.s.certVerified, key, page)
 	}
 	return resp.StatusCode, string(m[1])
 }
@@ -415,6 +425,14 @@ func TestFirstPairing(t *testing.T) {
 	if st, page := h.setupPageText(); st != http.StatusOK || !strings.Contains(page, "<form") {
 		t.Fatalf("setup page = %d %q", st, page)
 	}
+	// The link mandate setup prints opens the pairing page; a wrong one
+	// gets the form.
+	if st, page := h.page("/setup/WRONG-WRONG-WRONG"); st != http.StatusOK || !strings.Contains(page, "<form") || strings.Contains(page, "<svg") {
+		t.Fatalf("a wrong setup link = %d %q", st, page)
+	}
+	if st, page := h.page("/setup/" + testPassword); st != http.StatusOK || !strings.Contains(page, "<svg") || !strings.Contains(page, "Key f910 152c 80be 10ee 2280") {
+		t.Fatalf("the setup link = %d %q", st, page)
+	}
 	if st, secret := h.setupSecret("WRONG-WRONG-WRONG"); st != http.StatusForbidden || secret != "" {
 		t.Fatalf("wrong password = %d, secret %q", st, secret)
 	}
@@ -535,6 +553,55 @@ func TestActivityPaging(t *testing.T) {
 	}
 	if st := h.do("GET", "/owner/v1/activity?before=yesterday", owner.token, nil, nil); st != http.StatusBadRequest {
 		t.Errorf("bad cursor = %d", st)
+	}
+}
+
+func TestShutdownEndsStreams(t *testing.T) {
+	h := start(t, nowhere())
+	owner := h.pair()
+	agent := h.agent(owner)
+	req := h.request(agent)
+	streams := make(chan error, 2)
+	go func() {
+		r, _ := http.NewRequest(http.MethodGet, "http://owner/owner/v1/stream", nil)
+		r.Header.Set("Authorization", "Bearer "+owner.token)
+		resp, err := h.http.Do(r)
+		if err == nil {
+			_, err = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		streams <- err
+	}()
+	go func() {
+		resp, err := h.http.Get("http://owner/internal/requests/" + req + "?identity=" + agent + "&wait=900")
+		if err == nil {
+			resp.Body.Close()
+		}
+		streams <- err
+	}()
+	time.Sleep(200 * time.Millisecond) // both are open
+	began := time.Now()
+	h.stop()
+	if d := time.Since(began); d > 2*time.Second {
+		t.Errorf("shutdown took %v with a stream and a long poll open", d)
+	}
+	for range 2 {
+		<-streams
+	}
+}
+
+func TestSetupOutput(t *testing.T) {
+	var b strings.Builder
+	writeSetup(&b, setupURL(&config.Config{Listen: ":8443"}, "box.example", testPassword), "6ffd 8c34 742e fa9a 1c18")
+	want := "Initial setup  https://box.example:8443/setup/" + testPassword + "\n" +
+		"Key            6ffd 8c34 742e fa9a 1c18\n"
+	if b.String() != want {
+		t.Errorf("own key:\n%s\nwant\n%s", b.String(), want)
+	}
+	b.Reset()
+	writeSetup(&b, setupURL(&config.Config{Listen: ":443"}, "mandate.example", testPassword), "")
+	if want := "Initial setup  https://mandate.example/setup/" + testPassword + "\n"; b.String() != want {
+		t.Errorf("certificate:\n%s\nwant\n%s", b.String(), want)
 	}
 }
 

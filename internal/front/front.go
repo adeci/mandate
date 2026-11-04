@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/adeci/mandate/internal/config"
+	"github.com/adeci/mandate/internal/peer"
 )
 
 const maxBody = 1 << 20
@@ -47,11 +48,14 @@ func Serve(ctx context.Context, cfg *config.Config) error {
 // serve answers everything on ln and only the agent API on agentLn, if any.
 func serve(ctx context.Context, tc *tls.Config, ln, agentLn net.Listener) error {
 	gateway, owner := proxy(config.Socket("gateway")), proxy(config.Socket("owner"))
+	// Streams and long polls never go idle; they end once shutdown begins.
+	stopping, stop := context.WithCancel(context.Background())
+	defer stop()
 	lns := []net.Listener{ln}
-	handlers := []http.Handler{handler(gateway, owner)}
+	handlers := []http.Handler{handler(stopping, gateway, owner)}
 	if agentLn != nil {
 		lns = append(lns, agentLn)
-		handlers = append(handlers, handler(gateway, nil))
+		handlers = append(handlers, handler(stopping, gateway, nil))
 	}
 	srvs := make([]*http.Server, len(lns))
 	errc := make(chan error, len(lns))
@@ -66,6 +70,7 @@ func serve(ctx context.Context, tc *tls.Config, ln, agentLn net.Listener) error 
 			IdleTimeout:       2 * time.Minute,
 			MaxHeaderBytes:    64 << 10,
 		}
+		srvs[i].RegisterOnShutdown(stop)
 		go func() { errc <- srvs[i].Serve(l) }()
 	}
 	var err error
@@ -74,10 +79,10 @@ func serve(ctx context.Context, tc *tls.Config, ln, agentLn net.Listener) error 
 	case err = <-errc:
 		err = fmt.Errorf("serve: %w", err)
 	}
-	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Streams and long polls end on stopping; the rest gets a few seconds.
+	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	for _, srv := range srvs {
-		// Streams and long polls never go idle; close what is left.
 		if srv.Shutdown(shutdown) != nil {
 			srv.Close()
 		}
@@ -85,8 +90,9 @@ func serve(ctx context.Context, tc *tls.Config, ln, agentLn net.Listener) error 
 	return err
 }
 
-// handler routes to owner too unless it is nil.
-func handler(gateway, owner http.Handler) http.Handler {
+// handler routes to owner too unless it is nil. Streams and long polls
+// end once stopping is done.
+func handler(stopping context.Context, gateway, owner http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		var h http.Handler
@@ -96,7 +102,7 @@ func handler(gateway, owner http.Handler) http.Handler {
 		case p != path.Clean(p) && p != path.Clean(p)+"/":
 		case strings.HasPrefix(p, "/agent/"):
 			h = gateway
-		case strings.HasPrefix(p, "/owner/"), p == "/setup":
+		case strings.HasPrefix(p, "/owner/"), p == "/setup", strings.HasPrefix(p, "/setup/"):
 			h = owner
 		}
 		if h == nil {
@@ -108,6 +114,12 @@ func handler(gateway, owner http.Handler) http.Handler {
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+		if p == "/owner/v1/stream" || r.URL.Query().Has("wait") {
+			ctx, cancel := context.WithCancel(r.Context())
+			defer cancel()
+			defer context.AfterFunc(stopping, cancel)()
+			r = r.WithContext(ctx)
+		}
 		h.ServeHTTP(w, r)
 	})
 }
@@ -141,7 +153,7 @@ func proxy(sock string) *httputil.ReverseProxy {
 				return
 			}
 			if r.Context().Err() == nil {
-				log.Printf("%s %s: %v", r.Method, r.URL.Path, err)
+				log.Printf("%s %s: %v", r.Method, peer.LogPath(r.URL.Path), err)
 			}
 			w.WriteHeader(http.StatusBadGateway)
 		},

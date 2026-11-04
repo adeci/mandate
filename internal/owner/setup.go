@@ -71,7 +71,7 @@ func (s *Server) setupOpen() (setupHash, bool) {
 var setupTmpl = template.Must(template.New("setup").Parse(`<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>mandate setup</title>
+<title>Initial setup</title>
 <style>
 :root{--fg:#000;--bg:#fff;--grey:#666;--lh:1.5rem;color-scheme:light dark}
 @media (prefers-color-scheme:dark){:root{--fg:#fff;--bg:#000;--grey:#aaa}}
@@ -91,23 +91,17 @@ button:hover,button:focus-visible{color:var(--fg);background:var(--bg)}
 svg{display:block;width:100%;height:auto;margin:0 0 var(--lh);border:2px solid var(--fg)}
 .key{font-size:1.25rem;font-weight:700;text-align:center;letter-spacing:.06em;padding:calc(var(--lh)/2) 0;border:2px solid var(--fg)}
 a{color:inherit}
-code{word-break:break-all}
+code{font:inherit;font-weight:700}
+a code{font-weight:inherit;word-break:break-all}
 </style>
 <main>
-{{if .Link}}<h1>Pair your first device</h1>
-<p>Scan this with your phone's camera, or open the link on the device with the mandate app.</p>
-{{.QR}}
-{{if .Key}}<p>Before pairing, the app shows the server key. It must be:</p>
-<p class="key">{{.Key}}</p>
-{{else}}<p class="key">{{.Host}}</p>
-<p>Certificate verified: the app checks it itself, so there is nothing to compare.</p>
+<h1>Initial setup</h1>
+{{if .Link}}{{.QR}}
+{{if .Key}}<p class="key">Key {{.Key}}</p>
 {{end}}<p class="grey"><a href="{{.Href}}"><code>{{.Link}}</code></a></p>
-{{else if .Waiting}}<h1>mandate</h1>
-<p>mandate is waiting to be set up. On the server, run <code>sudo mandate setup</code> to get the setup password, then reload this page.</p>
-{{else}}<h1>Pair with mandate</h1>
-{{if .Wrong}}<p><strong>That password is not right.</strong></p>{{end}}
-<form method="post"><p><label>Setup password<input name="password" autocomplete="off" autocapitalize="characters" spellcheck="false" required autofocus></label></p>
-<p class="grey"><code>sudo mandate setup</code> printed it on the server.</p>
+{{else if .Waiting}}<p>mandate is waiting to be set up. On the server, run <code>sudo mandate setup</code> and open the link it prints.</p>
+{{else}}{{if .Wrong}}<p><strong>That password is not right.</strong></p>{{end}}
+<form method="post" action="/setup"><p><label>Setup password<input name="password" autocomplete="off" autocapitalize="characters" spellcheck="false" required autofocus></label></p>
 <p><button>Continue</button></p></form>
 {{end}}</main>`))
 
@@ -118,10 +112,8 @@ type setupPage struct {
 	Link    string
 	Href    template.URL
 	QR      template.HTML
-	// Key is the server key's fingerprint in own-key TLS mode; otherwise
-	// Host is the name the certificate is checked for.
-	Key  string
-	Host string
+	// Key is the server key's fingerprint, in own-key TLS mode only.
+	Key string
 }
 
 func renderSetup(w http.ResponseWriter, status int, p setupPage) {
@@ -148,10 +140,11 @@ func (s *Server) setupPage(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// setupPassword answers the password form, the fallback for the link
+// mandate setup prints.
 func (s *Server) setupPassword(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	password := r.PostFormValue("password")
-	spki := r.Header.Get("Mandate-Spki-Sha256")
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	h, ok := s.setupOpen()
@@ -163,6 +156,27 @@ func (s *Server) setupPassword(w http.ResponseWriter, r *http.Request) {
 		renderSetup(w, http.StatusForbidden, setupPage{Wrong: true})
 		return
 	}
+	s.pairingPage(w, r)
+}
+
+// setupLink opens the pairing page straight from the link mandate setup
+// prints; a wrong or spent password gets the page /setup shows.
+func (s *Server) setupLink(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	h, ok := s.setupOpen()
+	if ok && subtle.ConstantTimeCompare([]byte(hashPassword(r.PathValue("password"))), []byte(h.SHA256)) == 1 {
+		defer s.mu.Unlock()
+		s.pairingPage(w, r)
+		return
+	}
+	s.mu.Unlock()
+	s.setupPage(w, r)
+}
+
+// pairingPage shows the pairing link as a QR code. The caller holds s.mu
+// and has checked the setup password.
+func (s *Server) pairingPage(w http.ResponseWriter, r *http.Request) {
+	spki := r.Header.Get("Mandate-Spki-Sha256")
 	if r.Host == "" || len(spki) != 64 {
 		http.Error(w, "this page must be reached through mandate's HTTPS port", http.StatusBadRequest)
 		return
@@ -179,9 +193,7 @@ func (s *Server) setupPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := setupPage{Link: link, Href: template.URL(link), QR: template.HTML(svg)}
-	if s.certVerified {
-		p.Host = hostOnly(r.Host)
-	} else {
+	if !s.certVerified {
 		p.Key = fingerprint(spki)
 	}
 	renderSetup(w, http.StatusOK, p)
@@ -356,26 +368,43 @@ func printSetup(ctx context.Context, cfg *config.Config, out io.Writer, password
 	if host == "" {
 		host, _ = os.Hostname()
 	}
-	_, port, _ := net.SplitHostPort(cfg.Listen)
-	fmt.Fprintf(out, "Open https://%s/setup\nSetup password: %s\n", net.JoinHostPort(host, port), password)
-	if cfg.TLS.Mode != "own" {
-		fmt.Fprintf(out, "Server: %s; the app checks its certificate itself, so there is nothing to compare\n", host)
-		return
+	key := ""
+	if cfg.TLS.Mode == "own" {
+		key = serverKey(ctx, cfg)
 	}
+	writeSetup(out, setupURL(cfg, host, password), key)
+}
+
+// setupURL is the link that opens the pairing page with password.
+func setupURL(cfg *config.Config, host, password string) string {
+	addr := host
+	if _, port, _ := net.SplitHostPort(cfg.Listen); port != "443" {
+		addr = net.JoinHostPort(host, port)
+	}
+	return "https://" + addr + "/setup/" + password
+}
+
+// writeSetup prints the setup link and, in own-key mode, the key people
+// compare with the app's.
+func writeSetup(out io.Writer, link, key string) {
+	fmt.Fprintf(out, "Initial setup  %s\n", link)
+	if key != "" {
+		fmt.Fprintf(out, "Key            %s\n", key)
+	}
+}
+
+// serverKey is the fingerprint people compare in own-key mode.
+func serverKey(ctx context.Context, cfg *config.Config) string {
 	// Front may have just been started.
 	var spki string
 	var err error
 	for range 10 {
 		if spki, err = front.SPKI(ctx, cfg); err == nil {
-			break
+			return fingerprint(spki)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	if err != nil {
-		fmt.Fprintf(out, "Server key: unknown (%v); the setup page shows it\n", err)
-		return
-	}
-	fmt.Fprintf(out, "Server key: %s (the app shows the same before pairing)\n", fingerprint(spki))
+	return fmt.Sprintf("unknown (%v); the setup page shows it", err)
 }
 
 // Reset stops mandate, forgets the paired devices with the key logs,

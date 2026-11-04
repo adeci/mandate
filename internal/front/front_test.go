@@ -102,7 +102,8 @@ func TestRouting(t *testing.T) {
 		{false, "POST", "/owner/v1/pair", "owner /owner/v1/pair"},
 		{false, "GET", "/setup", "owner /setup"},
 		{false, "GET", "/", ""},
-		{false, "GET", "/setup/x", ""},
+		{false, "GET", "/setup/x", "owner /setup/x"},
+		{false, "GET", "/setup/../internal/live", ""},
 		{false, "GET", "/internal/live", ""},
 		{false, "GET", "/agent/../internal/live", ""},
 		{false, "GET", "/owner/v1/%2e%2e/%2e%2e/internal/live", ""},
@@ -111,6 +112,7 @@ func TestRouting(t *testing.T) {
 		{true, "GET", "/agent/v1/connectors", "gateway /agent/v1/connectors"},
 		{true, "POST", "/owner/v1/pair", ""},
 		{true, "GET", "/setup", ""},
+		{true, "GET", "/setup/x", ""},
 		{true, "GET", "/agent/../owner/v1/now", ""},
 	} {
 		to := addr

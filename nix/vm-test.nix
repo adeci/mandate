@@ -62,6 +62,7 @@ in
     import json
     import re
     import shlex
+    import time
 
     start_all()
     server.wait_for_unit("mandate.target")
@@ -119,8 +120,16 @@ in
         out = server.succeed("cat /var/lib/mandate/connectors/test/private/sent.jsonl 2>/dev/null || true")
         return [json.loads(line) for line in out.splitlines()]
 
-    def setup_link(password):
-        page = server.succeed(f"curl -sk --data-urlencode password={password} https://localhost:8443/setup")
+    # What mandate setup and reset print, and nothing else: the setup link
+    # and, in own-key mode, the key.
+    def printed(out):
+        m = re.fullmatch(r"Initial setup  (https://server:8443/setup/(\S+))\nKey            ((?:[0-9a-f]{4} ){4}[0-9a-f]{4})\n", out)
+        assert m, out
+        return m[1].replace("server:8443", "localhost:8443"), m[2], m[3]
+
+    # The pairing link on the page the setup link opens.
+    def setup_link(url):
+        page = server.succeed(f"curl -sk {url}")
         return html.unescape(grab(r'href="(mandate://pair\?[^"]+)"', page))
 
     def grab(pattern, text):
@@ -147,25 +156,29 @@ in
         assert server.succeed("systemctl show -p MemoryDenyWriteExecute --value mandate-signal").strip() == "yes"
         assert "192.0.2.1" in server.succeed("systemctl show -p IPAddressAllow --value mandate-test")
 
-    with subtest("mandate setup prints a password, which the setup page trades for a pairing link"):
+    with subtest("mandate setup prints a link that opens the pairing page; the form is the fallback"):
         assert "waiting to be set up" in server.succeed("curl -skf https://localhost:8443/setup")
-        out = server.succeed("mandate setup")
-        password = grab(r"Setup password: (\S+)", out)
-        key = grab(r"Server key: ((?:[0-9a-f]{4} ){4}[0-9a-f]{4}) ", out)
+        url, password, key = printed(server.succeed("mandate setup"))
         assert server.succeed("stat -c %a /var/lib/mandate/setup-password").strip() == "600"
-        assert "password" in server.succeed("curl -skf https://localhost:8443/setup")
+        page = server.succeed("curl -skf https://localhost:8443/setup/WRONG-PASS")
+        assert "<form" in page and "<svg" not in page, page
         code = server.succeed("curl -sk -o /dev/null -w '%{http_code}' --data-urlencode password=WRONG-PASS https://localhost:8443/setup")
         assert code == "403", code
-        link = setup_link(password)
+        page = server.succeed(f"curl -sk {url}")
+        assert f'<p class="key">Key {key}</p>' in page and "<svg" in page, page
+        link = setup_link(url)
         spki = grab(r"spki=([0-9a-f]{64})", link)
         assert spki.startswith(key.replace(" ", "")) and "url=https%3A%2F%2Flocalhost%3A8443" in link, (key, link)
-        assert f'<p class="key">{key}</p>' in server.succeed(f"curl -sk --data-urlencode password={password} https://localhost:8443/setup")
+        page = server.succeed(f"curl -sk --data-urlencode password={password} https://localhost:8443/setup")
+        assert f"spki={spki}" in html.unescape(page), page
+        assert password not in server.succeed("journalctl -u mandate-front -u mandate-owner")
 
     with subtest("the first device pairs, which spends the link and the setup page"):
         out = device("pair", link, "phone")
         assert out["kind"] == "key", out
         assert call("GET", "/owner/v1/server")["body"] == {"agent_url": "https://localhost:8444"}
         assert server.succeed("curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/setup") == "404"
+        assert server.succeed(f"curl -sk -o /dev/null -w '%{{http_code}}' {url}") == "404"
         server.fail(f"testdevice --state /root/thief.json pair '{link}'")
         server.fail("mandate setup")
         server.wait_until_succeeds("test $(testdevice --state /root/phone.json call GET /owner/v1/keys | jq '.body.trusted | length') = 1")
@@ -352,8 +365,13 @@ in
             assert code == want, (group, method, path, code, out)
 
     with subtest("mandate reset starts over, keeping never-share and spent approvals"):
+        began = time.monotonic()
         out = server.succeed("mandate reset")
-        new_password = grab(r"Setup password: (\S+)", out)
+        took = time.monotonic() - began
+        print(f"mandate reset took {took:.1f}s")
+        # Every unit exits promptly on SIGTERM, well inside systemd's 90 s.
+        assert took < 20, took
+        new_url, new_password, _ = printed(out)
         assert new_password != password
         server.wait_for_open_port(8443)
         server.wait_until_succeeds("test -S /run/mandate/owner/socket")
@@ -364,7 +382,7 @@ in
         status, out = agent("test chats")
         assert status != 0 and "mandate login" in out, (status, out)
         # The app pairs again with the key it had.
-        assert device("pair", setup_link(new_password), "phone")["kind"] == "key"
+        assert device("pair", setup_link(new_url), "phone")["kind"] == "key"
         server.wait_until_succeeds(
             "setpriv --reuid=60999 --regid=$(getent group mandate-gateway | cut -d: -f3) --clear-groups "
             "curl -s --unix-socket /run/mandate/connectors/test/socket http://mandate/keys | grep -q '\"length\":1'"

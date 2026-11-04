@@ -75,6 +75,10 @@ type Server struct {
 
 	push      chan struct{}
 	executing sync.WaitGroup
+	// stopping is done once shutdown begins; streams and long polls, which
+	// never go idle, end on it.
+	stopping context.Context
+	stop     context.CancelFunc
 
 	names chatNames
 
@@ -116,6 +120,7 @@ func newServer(dir string, conns map[string]*connector.Client, gatewaySock strin
 		subs:       map[chan event]struct{}{},
 		push:       make(chan struct{}, 1),
 	}
+	s.stopping, s.stop = context.WithCancel(context.Background())
 	// A write that was running when mandate stopped may have reached the
 	// service; it is never run again.
 	stale := false
@@ -142,6 +147,7 @@ func (s *Server) serve(ctx context.Context, ln net.Listener, front, gateway uint
 		ConnContext:       peer.ConnContext,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	srv.RegisterOnShutdown(s.stop)
 	done := make(chan struct{})
 	go func() { s.loop(ctx); close(done) }()
 	errc := make(chan error, 1)
@@ -149,8 +155,9 @@ func (s *Server) serve(ctx context.Context, ln net.Listener, front, gateway uint
 	var err error
 	select {
 	case <-ctx.Done():
-		shutdown, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
-		// Streams and long polls never go idle; close what is left.
+		// Streams and long polls end on s.stopping; the rest gets a few
+		// seconds.
+		shutdown, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 		if srv.Shutdown(shutdown) != nil {
 			srv.Close()
 		}
@@ -173,6 +180,7 @@ func (s *Server) handler(front, gateway uint32) http.Handler {
 	app := http.NewServeMux()
 	app.HandleFunc("GET /setup", s.setupPage)
 	app.HandleFunc("POST /setup", s.setupPassword)
+	app.HandleFunc("GET /setup/{password}", s.setupLink)
 	app.HandleFunc("POST /owner/v1/pair", s.pair)
 	app.HandleFunc("POST /owner/v1/join", s.joinStart("device"))
 	app.HandleFunc("GET /owner/v1/join/{id}", s.joinPoll("device"))
@@ -224,6 +232,7 @@ func (s *Server) handler(front, gateway uint32) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/owner/", peer.Allow(s.log, app, front))
 	mux.Handle("/setup", peer.Allow(s.log, app, front))
+	mux.Handle("/setup/", peer.Allow(s.log, app, front))
 	mux.Handle("/internal/", peer.Allow(s.log, internal, gateway))
 	return mux
 }
@@ -291,6 +300,8 @@ func (s *Server) await(ctx context.Context, wait time.Duration, cond func() bool
 		case <-t.C:
 			return
 		case <-ctx.Done():
+			return
+		case <-s.stopping.Done():
 			return
 		}
 	}

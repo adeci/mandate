@@ -332,7 +332,9 @@ func (g *gateway) requestStatus(w http.ResponseWriter, r *http.Request, cl *call
 		return
 	}
 	var st requestStatus
-	if err := g.toOwner.do(r.Context(), http.MethodGet, "/internal/requests/"+id+query(cl.identity, wait), nil, &st); err != nil {
+	ctx, cancel := g.longPoll(r.Context())
+	defer cancel()
+	if err := g.toOwner.do(ctx, http.MethodGet, "/internal/requests/"+id+query(cl.identity, wait), nil, &st); err != nil {
 		relay(w, cl, "request status", err)
 		return
 	}

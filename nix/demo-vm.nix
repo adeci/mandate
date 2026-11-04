@@ -49,12 +49,13 @@ pkgs.writeShellApplication {
     vm=$!
     trap 'kill $vm 2>/dev/null || true; wait $vm || true; rm -f "$log"' EXIT
     echo "Booting the mandate demo VM; its console is in $log."
-    until grep -q '^Server key' "$log"; do
+    until grep -q '^Key ' "$log"; do
       kill -0 $vm 2>/dev/null || { tail -n 20 "$log" >&2; exit 1; }
       sleep 1
     done
-    grep -E '^(Setup password|Server key)' "$log" | tr -d '\r'
-    echo "Open https://localhost:8443/setup, or https://10.0.2.2:8443/setup in an Android emulator."
+    # The VM's own name for itself means nothing outside it.
+    grep -E '^(Initial setup|Key) ' "$log" | tr -d '\r' | sed -E 's#https://[^/]+/#https://localhost:8443/#'
+    echo "In an Android emulator, use 10.0.2.2 instead of localhost."
     echo "Ctrl-C stops the VM."
     wait $vm
   '';

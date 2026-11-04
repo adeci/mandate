@@ -616,7 +616,9 @@ func (g *gateway) proposalStatus(w http.ResponseWriter, r *http.Request, cl *cal
 			Output string `json:"output,omitempty"`
 		} `json:"result,omitempty"`
 	}
-	if err := g.toOwner.do(r.Context(), http.MethodGet, "/internal/proposals/"+id+query(cl.identity, wait), nil, &st); err != nil {
+	ctx, cancel := g.longPoll(r.Context())
+	defer cancel()
+	if err := g.toOwner.do(ctx, http.MethodGet, "/internal/proposals/"+id+query(cl.identity, wait), nil, &st); err != nil {
 		relay(w, cl, "proposal status", err)
 		return
 	}
