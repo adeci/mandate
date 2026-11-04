@@ -21,6 +21,9 @@ impl Render for Shell {
         };
         let title = match &self.screen {
             Screen::Pair { .. } => "Pair",
+            Screen::Join { .. } | Screen::Joining { .. } => "Join",
+            #[cfg(not(target_os = "android"))]
+            Screen::Choose(_) => "Device key",
             Screen::Tab(Tab::Now) => "Now",
             Screen::Tab(Tab::Agents) => "Agents",
             Screen::Tab(Tab::Connections) => "Connections",
@@ -35,6 +38,10 @@ impl Render for Shell {
         };
         let screen = match &self.screen {
             Screen::Pair { text } => pair(t, text, cx),
+            Screen::Join { url } => join(t, url, cx),
+            Screen::Joining { code, status } => joining(t, code, status),
+            #[cfg(not(target_os = "android"))]
+            Screen::Choose(c) => self.choose_screen(t, c, cx),
             Screen::Tab(Tab::Now) => self.now_tab(t, cx),
             Screen::Tab(Tab::Agents) => self.agents_tab(t, cx),
             Screen::Tab(Tab::Connections) => self.connections_tab(t, cx),
@@ -81,9 +88,10 @@ impl Render for Shell {
             }
         };
         #[cfg(target_os = "android")]
-        let ((top, bottom), typing) = (crate::android::insets(), crate::android::keyboard_up());
+        let ((top, bottom), typing, pin) =
+            (crate::android::insets(), crate::android::keyboard_up(), None::<Div>);
         #[cfg(not(target_os = "android"))]
-        let ((top, bottom), typing) = ((0., 0.), false);
+        let ((top, bottom), typing, pin) = ((0., 0.), false, self.pin_prompt(t, cx));
         div()
             .size_full()
             .flex()
@@ -107,11 +115,13 @@ impl Render for Shell {
                         .gap(lines(1.))
                         .when_some(self.error.clone(), |d, e| d.child(flash(t, e)))
                         .when_some(self.notice.clone(), |d, n| d.child(flash(t, n)))
+                        .when_some(self.prompt, |d, p| d.child(flash(t, p.into())))
+                        .children(pin)
                         .child(screen.gap(lines(1.))),
                 ),
             )
             // The soft keyboard sits where the tab bar would; it returns as the keyboard goes.
-            .when_some(tab.filter(|_| !typing), |d, tab| d.child(self.tab_bar(t, tab, cx)))
+            .when_some(tab.filter(|_| !typing), |d, tab| d.child(self.tab_bar(t, tab, pad, cx)))
     }
 }
 
@@ -146,14 +156,16 @@ impl Shell {
     /// them.
     fn top_bar(&self, t: Theme, title: &str, tabs: bool, pad: f32, cx: &mut Context<Self>) -> Div {
         let paired = self.device.is_some();
+        let back = !tabs && (paired || !matches!(self.screen, Screen::Pair { .. }));
         let row = page(pad)
             .flex_row()
             .items_center()
             .h(lines(3.))
             .gap(chars(1.))
-            .when(!tabs && paired, |d| {
+            .when(back, |d| {
                 d.child(icon_button(t, "back", "arrow-left", cx, |this, cx| {
                     let back = match this.screen {
+                        _ if this.device.is_none() => Screen::Pair { text: String::new() },
                         Screen::Link { .. } => Screen::Tab(Tab::Connections),
                         Screen::Hide { .. } => Screen::Settings,
                         Screen::Grant(_) => Screen::Tab(Tab::Agents),
@@ -204,8 +216,9 @@ impl Shell {
             .children(search.map(|s| div().border_t_2().border_color(t.alt).child(s)))
     }
 
-    /// Thumb-reach tabs: icon over label, the current one in full weight.
-    fn tab_bar(&self, t: Theme, current: Tab, cx: &mut Context<Self>) -> Div {
+    /// Thumb-reach tabs: icon over label, the current one in full weight. On
+    /// a wide window they keep to the page's measure.
+    fn tab_bar(&self, t: Theme, current: Tab, pad: f32, cx: &mut Context<Self>) -> Div {
         let waiting = self.now.requests.len() + self.now.proposals.len() + self.exchanges.len();
         let attention = self.connectors.iter().filter(|c| c.health.state != "ok").count();
         let items = [
@@ -239,7 +252,7 @@ impl Shell {
                 ))
                 .child(div().text_size(px(SIZE * 0.85)).child(label))
         });
-        div().flex().border_t_2().border_color(t.text).children(cells)
+        div().border_t_2().border_color(t.text).child(page(pad).flex_row().children(cells))
     }
 }
 
@@ -247,8 +260,13 @@ fn pair(t: Theme, text: &str, cx: &mut Context<Shell>) -> Div {
     let link: Option<PairLink> = text.parse().ok();
     let have = link.is_some();
     let shown = if text.is_empty() { "mandate://pair?…" } else { text };
+    let open = if cfg!(target_os = "android") {
+        "Scan the QR code on the setup page with your phone's camera."
+    } else {
+        "Open the pairing link on the setup page."
+    };
     column()
-        .child("Scan the QR code on the setup page with your phone's camera.")
+        .child(open)
         .when_some(link, |d, link| {
             let key = hex(&link.spki_sha256);
             let groups: Vec<&str> = (0..key.len()).step_by(4).map(|i| &key[i..i + 4]).collect();
@@ -260,18 +278,64 @@ fn pair(t: Theme, text: &str, cx: &mut Context<Shell>) -> Div {
                 ],
             ))
             .child("Pair only if this key matches what mandate setup printed.")
-            .child(button(t, "pair", "Pair", cx, move |this, cx| this.pair(link.clone(), cx)))
+            .child(button(t, "pair", "Pair", cx, move |this, cx| {
+                this.new_key(crate::Next::Pair(link.clone()), cx)
+            }))
         })
         .when(!have, |d| {
-            d.child(t.alt("Or paste the link here:").mt(lines(1.))).child(
-                div()
-                    .border_2()
-                    .border_color(t.text)
-                    .px(chars(1.))
-                    .py(lines(0.5))
-                    .when(text.is_empty(), |d| d.text_color(t.alt))
-                    .child(shown.to_string()),
-            )
+            d.child(t.alt("Or paste the link here:").mt(lines(1.)))
+                .child(
+                    div()
+                        .border_2()
+                        .border_color(t.text)
+                        .px(chars(1.))
+                        .py(lines(0.5))
+                        .when(text.is_empty(), |d| d.text_color(t.alt))
+                        .child(shown.to_string()),
+                )
+                .child(t.heading("Already set up"))
+                .child("mandate is paired with another device? This one can join it.")
+                .child(div().flex().child(button(
+                    t,
+                    "join",
+                    "Join as another device",
+                    cx,
+                    |this, cx| this.go(Screen::Join { url: String::new() }, cx),
+                )))
+        })
+}
+
+fn join(t: Theme, url: &str, cx: &mut Context<Shell>) -> Div {
+    let ready = url.trim().starts_with("https://");
+    let typed = url.to_string();
+    column()
+        .child("The server's address, as the other device shows it in Settings:")
+        .child(
+            div()
+                .border_2()
+                .border_color(t.text)
+                .px(chars(1.))
+                .py(lines(0.5))
+                .when(url.is_empty(), |d| d.text_color(t.alt))
+                .child(if url.is_empty() { "https://…".into() } else { typed.clone() }),
+        )
+        .when(ready, |d| {
+            d.child(div().flex().child(button(t, "continue", "Continue", cx, move |this, cx| {
+                this.new_key(crate::Next::Join(typed.trim().to_string()), cx)
+            })))
+        })
+}
+
+fn joining(t: Theme, code: &str, status: &str) -> Div {
+    let (a, b) = code.split_at(code.len() / 2);
+    column()
+        .child(bold(DEVICE_JOIN.to_string()))
+        .child("On a device already in, open Now, tap the join, and type this code:")
+        .child(div().text_size(px(SIZE * 2.)).font_weight(BOLD).child(format!("{a} {b}")))
+        .child(if status.is_empty() {
+            t.alt("Waiting for the code…")
+        } else {
+            div().child(status.to_string())
         })
 }
 

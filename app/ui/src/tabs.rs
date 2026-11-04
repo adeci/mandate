@@ -259,11 +259,23 @@ impl Shell {
             }
             _ => "checked against the usual certificate roots".into(),
         };
+        #[cfg(target_os = "android")]
+        let this_key: Option<Vec<(String, AnyElement)>> = None;
+        #[cfg(not(target_os = "android"))]
+        let this_key = self.device.as_ref().map(|d| {
+            let rows = d.key.rows().into_iter();
+            rows.map(|(k, v)| (k.to_string(), div().child(v).into_any_element())).collect()
+        });
         column()
             .gap(lines(1.))
             .child(t.heading("Devices"))
             .child(column().border_2().border_color(t.text).children(devices))
             .child(t.alt("Each device can approve. Another device joins with a code you type on Now."))
+            .when_some(this_key, |d, rows| {
+                d.child(t.heading("This computer's key"))
+                    .child(table(t, rows))
+                    .child(t.alt("It signs every approval from this computer."))
+            })
             .child(t.heading("Never share"))
             .child(if self.hidden.is_empty() {
                 t.alt("Nothing is hidden. Chats and people hidden here stay out of every read, whatever the grants say.")

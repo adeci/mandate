@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=mandate notifications
+Comment=Notifies of what waits for your approval
+Exec=mandate-app --background
+Icon=dev.mandate.app
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

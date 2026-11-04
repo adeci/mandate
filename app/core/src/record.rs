@@ -235,6 +235,15 @@ impl Key {
         }
     }
 
+    /// A fido2 device key for its credential.
+    pub fn fido2(public_key: &[u8], credential_id: &[u8], name: &str) -> Key {
+        Key {
+            kind: KeyType::Fido2,
+            credential_id: credential_id.to_vec(),
+            ..Key::p256(public_key, name)
+        }
+    }
+
     pub(crate) fn verifying_key(&self) -> Result<VerifyingKey, Error> {
         require(
             self.credential_id.is_empty() == (self.kind == KeyType::P256),

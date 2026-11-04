@@ -1,9 +1,9 @@
 //! Envelopes, their challenge, and device keys that sign it (records.md).
 
 use crate::record::{Key, KeyType, Record, Time, b64};
-use crate::{Error, hex, invalid, random, sha256};
-use p256::ecdsa::signature::{Signer, Verifier};
-use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use crate::{Error, invalid, random, sha256};
+use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -25,14 +25,22 @@ pub struct Envelope {
     pub sig: Vec<u8>,
 }
 
-/// A device's P-256 key. Platform keystores implement it, and ask the owner
-/// to authenticate inside `sign`.
+/// A device's signing key: a platform keystore's p256 key or a FIDO2
+/// credential. Implementations ask the owner to authenticate inside `sign`.
 pub trait DeviceKey {
-    /// The 65-byte uncompressed point.
-    fn public_key(&self) -> [u8; 65];
-    /// ECDSA-P256 with SHA-256 over msg, as r||s. Keystores that answer in DER
-    /// convert with `der_signature`.
-    fn sign(&self, msg: &[u8]) -> Result<[u8; 64], Error>;
+    /// The key as the key log holds it, under the device's name.
+    fn key(&self, name: &str) -> Key;
+    /// Signs an envelope's challenge as records.md says for the key's type.
+    fn sign(&self, challenge: &[u8; 32]) -> Result<DeviceSignature, Error>;
+}
+
+/// A device key's answer to a challenge.
+pub struct DeviceSignature {
+    /// r||s.
+    pub sig: [u8; 64],
+    /// For a fido2 key, the authenticator data it signed before the
+    /// challenge; empty for a p256 key.
+    pub authenticator_data: Vec<u8>,
 }
 
 /// r||s from an ASN.1 DER ECDSA-P256 signature, as keystores answer.
@@ -42,14 +50,15 @@ pub fn der_signature(der: &[u8]) -> Result<[u8; 64], Error> {
     Ok(sig.to_bytes().into())
 }
 
-/// A device key held in memory, for tests and for the desktop until it has
-/// a keystore.
-pub struct SoftwareKey(SigningKey);
+/// A p256 device key held in memory, for the tests.
+#[cfg(test)]
+pub struct SoftwareKey(p256::ecdsa::SigningKey);
 
+#[cfg(test)]
 impl SoftwareKey {
     pub fn generate() -> SoftwareKey {
         loop {
-            if let Ok(k) = SigningKey::from_slice(&random::<32>()) {
+            if let Ok(k) = p256::ecdsa::SigningKey::from_slice(&random::<32>()) {
                 return SoftwareKey(k);
             }
         }
@@ -57,26 +66,33 @@ impl SoftwareKey {
 
     /// The key with this private scalar.
     pub fn from_bytes(d: &[u8; 32]) -> Result<SoftwareKey, Error> {
-        SigningKey::from_slice(d)
+        p256::ecdsa::SigningKey::from_slice(d)
             .map(SoftwareKey)
             .map_err(|_| Error::Key("not a P-256 private scalar".into()))
     }
 
-    pub fn to_bytes(&self) -> [u8; 32] {
-        self.0.to_bytes().into()
-    }
-}
-
-impl DeviceKey for SoftwareKey {
-    fn public_key(&self) -> [u8; 65] {
+    pub fn public_key(&self) -> [u8; 65] {
         let p = self.0.verifying_key().to_sec1_point(false);
         p.as_bytes().try_into().expect("an uncompressed point is 65 bytes")
     }
 
-    /// RFC 6979, so the same message gets the same signature.
-    fn sign(&self, msg: &[u8]) -> Result<[u8; 64], Error> {
+    /// ECDSA-P256 with SHA-256 over msg, as r||s; RFC 6979, so the same
+    /// message gets the same signature.
+    pub fn sign_msg(&self, msg: &[u8]) -> [u8; 64] {
+        use p256::ecdsa::signature::Signer;
         let sig: Signature = self.0.sign(msg);
-        Ok(sig.to_bytes().into())
+        sig.to_bytes().into()
+    }
+}
+
+#[cfg(test)]
+impl DeviceKey for SoftwareKey {
+    fn key(&self, name: &str) -> Key {
+        Key::p256(&self.public_key(), name)
+    }
+
+    fn sign(&self, challenge: &[u8; 32]) -> Result<DeviceSignature, Error> {
+        Ok(DeviceSignature { sig: self.sign_msg(challenge), authenticator_data: Vec::new() })
     }
 }
 
@@ -121,11 +137,12 @@ impl Envelope {
         Record::decode(&self.kind, &self.record)
     }
 
-    /// Signs the envelope with a p256 device key.
+    /// Signs the envelope with a device key.
     pub fn sign(&mut self, key: &dyn DeviceKey) -> Result<(), Error> {
-        self.sig = key.sign(&self.challenge())?.to_vec();
-        self.key = hex(&sha256(&key.public_key()));
-        self.authenticator_data.clear();
+        let signed = key.sign(&self.challenge())?;
+        self.sig = signed.sig.to_vec();
+        self.authenticator_data = signed.authenticator_data;
+        self.key = key.key("").id;
         Ok(())
     }
 
@@ -158,7 +175,7 @@ mod tests {
     #[test]
     fn der_signature_is_r_s() {
         let key = SoftwareKey::generate();
-        let raw = key.sign(b"msg").unwrap();
+        let raw = key.sign_msg(b"msg");
         let der = Signature::from_slice(&raw).unwrap().to_der();
         assert_eq!(der_signature(der.as_bytes()).unwrap(), raw);
         assert!(der_signature(&raw).is_err());

@@ -1,6 +1,10 @@
 #[cfg(target_os = "android")]
 mod android;
 mod api;
+#[cfg(not(target_os = "android"))]
+mod choose;
+#[cfg(not(target_os = "android"))]
+pub mod desktop;
 mod device;
 mod link;
 mod now;
@@ -14,7 +18,9 @@ use api::{Activity, Connector, Exchange, Hidden, Identity, Keys, Now, Proposal, 
 use device::Device;
 use futures::StreamExt;
 use gpui::{App, AppContext, Context, Entity, FocusHandle, KeyDownEvent, Window, WindowOptions};
-use mandate_core::{DeviceKey, Envelope, Error, Key, PairLink, Record};
+use mandate_core::{
+    Client, DeviceKey, Envelope, Error, Join, JoinStatus, PairLink, Record, new_token,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -34,6 +40,18 @@ enum Screen {
     Pair {
         text: String,
     },
+    /// Joining as another device: the server's address, as typed.
+    Join {
+        url: String,
+    },
+    /// The code to type on a device already in, and how the join goes.
+    Joining {
+        code: String,
+        status: &'static str,
+    },
+    /// Picking this computer's device key.
+    #[cfg(not(target_os = "android"))]
+    Choose(choose::Choose),
     Tab(Tab),
     Settings,
     Code {
@@ -62,6 +80,24 @@ enum Screen {
     /// The owner's own grant for an agent.
     Grant(pick::NewGrant),
 }
+
+/// What a new device key is for: pairing as the first device, or joining
+/// the server at a URL as another.
+#[derive(Clone)]
+enum Next {
+    Pair(PairLink),
+    Join(String),
+}
+
+/// The device key's PIN, asked before a signature, and the signature.
+#[cfg(not(target_os = "android"))]
+struct Unlock {
+    pin: String,
+    then: Then,
+}
+
+#[cfg(not(target_os = "android"))]
+type Then = Box<dyn FnOnce(&mut Shell, &mut Context<Shell>)>;
 
 /// How the owner narrowed a request before approving it.
 #[derive(Clone)]
@@ -114,6 +150,10 @@ pub struct Shell {
     confirming: Option<String>,
     notice: Option<String>,
     error: Option<String>,
+    /// What the device key waits for while it signs, e.g. a touch.
+    prompt: Option<&'static str>,
+    #[cfg(not(target_os = "android"))]
+    unlock: Option<Unlock>,
     /// A waiting item to open once a refresh shows it, from a notification.
     pending: Option<String>,
     focus: FocusHandle,
@@ -158,6 +198,9 @@ impl Shell {
             confirming: None,
             notice: None,
             error: None,
+            prompt: None,
+            #[cfg(not(target_os = "android"))]
+            unlock: None,
             pending: None,
             focus: cx.focus_handle(),
         };
@@ -168,7 +211,7 @@ impl Shell {
     }
 
     fn paired(&mut self, device: Device, cx: &mut Context<Self>) {
-        self.key_id = Key::p256(&device.key.public_key(), "").id;
+        self.key_id = device.key.key("").id;
         let saved: Option<Value> = std::fs::read(self.dir.join(device::FILE))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok());
@@ -180,8 +223,8 @@ impl Shell {
     /// A pairing link opened from outside the app: shown on the pairing
     /// screen for the owner to check, ignored once paired.
     pub fn take_link(&mut self, link: String, cx: &mut Context<Self>) {
-        if let Screen::Pair { text } = &mut self.screen {
-            *text = link;
+        if self.device.is_none() {
+            self.screen = Screen::Pair { text: link };
             cx.notify();
         }
     }
@@ -237,7 +280,7 @@ impl Shell {
             this.update(cx, |this, cx| {
                 match result {
                     Ok(v) => done(this, v, cx),
-                    Err(e) => this.error = Some(e.to_string()),
+                    Err(e) => (this.error, this.prompt) = (Some(e.to_string()), None),
                 }
                 cx.notify();
             })
@@ -308,17 +351,137 @@ impl Shell {
         );
     }
 
-    fn pair(&mut self, link: PairLink, cx: &mut Context<Self>) {
-        let dir = self.dir.clone();
+    /// Makes the device key for next: on Android at once, on desktop with
+    /// the authenticator or token the owner picks.
+    fn new_key(&mut self, next: Next, cx: &mut Context<Self>) {
         self.error = None;
-        self.call(
-            cx,
-            move || Device::pair(&dir, &link),
-            |this, device, cx| {
-                this.paired(device, cx);
-                this.screen = Screen::Tab(Tab::Now);
-            },
-        );
+        #[cfg(target_os = "android")]
+        self.call(cx, android::Keystore::generate, move |this, key, cx| {
+            this.with_key(next, key, cx)
+        });
+        #[cfg(not(target_os = "android"))]
+        self.go(Screen::Choose(choose::Choose::new(next)), cx);
+    }
+
+    fn with_key(&mut self, next: Next, key: device::Key, cx: &mut Context<Self>) {
+        let dir = self.dir.clone();
+        match next {
+            Next::Pair(link) => self.call(
+                cx,
+                move || Device::pair(&dir, &link, key),
+                |this, device, cx| {
+                    this.paired(device, cx);
+                    this.go(Screen::Tab(Tab::Now), cx);
+                },
+            ),
+            Next::Join(url) => self.call(
+                cx,
+                move || {
+                    let token = new_token();
+                    let join = Join::start(&url, &key, &device::name(), &token)?;
+                    Ok((join, key, token, url))
+                },
+                |this, (join, key, token, url), cx| {
+                    let code = join.code().to_string();
+                    this.go(Screen::Joining { code, status: "" }, cx);
+                    this.poll_join(join, key, token, url, cx);
+                },
+            ),
+        }
+    }
+
+    /// Follows the join on its own thread until the owner lets this device
+    /// in, or it ends.
+    fn poll_join(
+        &mut self,
+        mut join: Join,
+        key: device::Key,
+        token: String,
+        url: String,
+        cx: &mut Context<Self>,
+    ) {
+        let dir = self.dir.clone();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        std::thread::spawn(move || {
+            let done = loop {
+                match join.poll() {
+                    Ok(JoinStatus::Approved) => {
+                        break Device::joined(&dir, &url, join, key, &token);
+                    }
+                    Ok(JoinStatus::Ended) => {
+                        break Err(Error::Invalid(
+                            "The join ended: three wrong codes, or 10 minutes passed. Start again."
+                                .into(),
+                        ));
+                    }
+                    Ok(status) => {
+                        if tx.unbounded_send(Err(status)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
+            let _ = tx.unbounded_send(Ok(done));
+        });
+        cx.spawn(async move |this, cx| {
+            while let Some(update) = rx.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    match update {
+                        Ok(Ok(device)) => {
+                            this.paired(device, cx);
+                            this.go(Screen::Tab(Tab::Now), cx);
+                        }
+                        Ok(Err(e)) => {
+                            this.go(Screen::Pair { text: String::new() }, cx);
+                            this.error = Some(e.to_string());
+                        }
+                        Err(status) => {
+                            if let Screen::Joining { status: shown, .. } = &mut this.screen {
+                                *shown = match status {
+                                    JoinStatus::WrongCode => {
+                                        "That code didn't match. Type it again on the other device."
+                                    }
+                                    JoinStatus::Confirmed => {
+                                        "The code matches. Let this device in on the other one."
+                                    }
+                                    _ => "",
+                                };
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Asks for the device key's PIN when signing needs it, then runs then;
+    /// shows what the key waits for while it signs. False if it asked.
+    #[cfg(not(target_os = "android"))]
+    fn ready(
+        &mut self,
+        then: impl FnOnce(&mut Shell, &mut Context<Shell>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let key = self.device().key;
+        if key.locked() {
+            self.unlock = Some(Unlock { pin: String::new(), then: Box::new(then) });
+            cx.notify();
+            return false;
+        }
+        self.prompt = key.touch().then_some("Touch your security key.");
+        true
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn submit_pin(&mut self, cx: &mut Context<Self>) {
+        let Some(unlock) = self.unlock.take() else { return };
+        let key = self.device().key;
+        let pin = unlock.pin;
+        self.error = None;
+        self.call(cx, move || key.unlock(&pin), move |this, (), cx| (unlock.then)(this, cx));
     }
 
     /// Fetches a challenge, checks that its record says what the owner was
@@ -327,9 +490,16 @@ impl Shell {
         &mut self,
         path: String,
         body: Value,
-        check: impl FnOnce(&Record) -> bool + Send + 'static,
+        check: impl FnOnce(&Record) -> bool + Clone + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(not(target_os = "android"))]
+        {
+            let (path, body, check) = (path.clone(), body.clone(), check.clone());
+            if !self.ready(move |this, cx| this.sign(path, body, check, cx), cx) {
+                return;
+            }
+        }
         let device = self.device();
         let decided = path.clone();
         self.error = None;
@@ -347,6 +517,7 @@ impl Shell {
                 device.client.signed(&envelope)
             },
             move |this, _, cx| {
+                this.prompt = None;
                 this.decided(&decided);
                 this.screen = Screen::Tab(Tab::Now);
                 this.refresh(cx);
@@ -369,6 +540,13 @@ impl Shell {
 
     /// Signs a record already shown in full: an admit or a reviewed send.
     fn approve(&mut self, mut envelope: Envelope, cx: &mut Context<Self>) {
+        #[cfg(not(target_os = "android"))]
+        {
+            let envelope = envelope.clone();
+            if !self.ready(move |this, cx| this.approve(envelope, cx), cx) {
+                return;
+            }
+        }
         let device = self.device();
         let decided = match &self.screen {
             Screen::Review { proposal, .. } => format!("proposals/{}", proposal.id),
@@ -383,6 +561,7 @@ impl Shell {
                 device.client.signed(&envelope)
             },
             move |this, _, cx| {
+                this.prompt = None;
                 this.decided(&decided);
                 this.screen = Screen::Tab(Tab::Now);
                 this.refresh(cx);
@@ -528,7 +707,18 @@ impl Shell {
             self.find_chats(cx);
             return cx.notify();
         }
+        #[cfg(not(target_os = "android"))]
+        if let Some(unlock) = &mut self.unlock {
+            match k.key.as_str() {
+                "enter" => self.submit_pin(cx),
+                "escape" => self.unlock = None,
+                _ => type_into(&mut unlock.pin, ev, cx),
+            }
+            return cx.notify();
+        }
         match (&mut self.screen, &mut self.search) {
+            #[cfg(not(target_os = "android"))]
+            (Screen::Choose(_), _) => return self.choose_key(ev, cx),
             (Screen::Link { focus: Some(_), .. }, _) if k.key == "enter" => self.submit_step(cx),
             (Screen::Link { values, focus: Some(f), step: Some(step), .. }, _) => {
                 let number = step.fields.iter().any(|x| &x.name == f && x.kind == "number");
@@ -543,14 +733,11 @@ impl Shell {
                 q.pop();
             }
             (Screen::Tab(_), Some(q)) => q.push_str(typed),
-            (Screen::Pair { text }, _) if k.modifiers.secondary() && k.key == "v" => {
-                let pasted = cx.read_from_clipboard().and_then(|c| c.text());
-                text.push_str(pasted.unwrap_or_default().trim());
+            (Screen::Join { url }, _) if k.key == "enter" => {
+                let url = url.trim().to_string();
+                self.new_key(Next::Join(url), cx);
             }
-            (Screen::Pair { text }, _) if k.key == "backspace" => {
-                text.pop();
-            }
-            (Screen::Pair { text }, _) => text.push_str(typed),
+            (Screen::Pair { text } | Screen::Join { url: text }, _) => type_into(text, ev, cx),
             (Screen::Code { code, .. }, _) if k.key == "backspace" => {
                 code.pop();
             }
@@ -570,6 +757,43 @@ impl Shell {
     fn shown(&self, text: &str) -> bool {
         self.search.as_deref().is_none_or(|q| text.to_lowercase().contains(&q.to_lowercase()))
     }
+}
+
+/// Types into a one-line field: characters, backspace, and paste.
+fn type_into(text: &mut String, ev: &KeyDownEvent, cx: &App) {
+    let k = &ev.keystroke;
+    if k.modifiers.secondary() && k.key == "v" {
+        let pasted = cx.read_from_clipboard().and_then(|c| c.text());
+        text.push_str(pasted.unwrap_or_default().trim());
+    } else if k.key == "backspace" {
+        text.pop();
+    } else {
+        text.push_str(k.key_char.as_deref().unwrap_or_default());
+    }
+}
+
+/// What waits for the owner, for notifications: each item's ID and a line
+/// naming only its identity, connector and kind (owner-api.md).
+fn waiting(client: &Client) -> Result<Vec<(String, String)>, Error> {
+    let now: Now = client.now(None, None)?;
+    let exchanges: Vec<Exchange> = client.get("exchanges")?;
+    let exchanges = exchanges.into_iter().map(|e| {
+        let text = if e.kind == "device" {
+            screens::DEVICE_JOIN.to_string()
+        } else {
+            format!("{} wants to log in", e.name)
+        };
+        (e.id, text)
+    });
+    let requests = now
+        .requests
+        .into_iter()
+        .map(|r| (r.id, format!("{} wants to read {}", r.identity_name, r.connector)));
+    let proposals = now
+        .proposals
+        .into_iter()
+        .map(|p| (p.id, format!("{} wants to {} on {}", p.identity_name, p.op, p.connector)));
+    Ok(exchanges.chain(requests).chain(proposals).collect())
 }
 
 /// Shows or hides the phone's keyboard as a text field opens or closes.

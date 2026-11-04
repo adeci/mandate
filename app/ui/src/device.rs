@@ -1,6 +1,6 @@
 //! The paired device as saved in the app's data dir.
 
-use mandate_core::{Client, Error, PairLink, Trust};
+use mandate_core::{Client, Error, Join, PairLink, Trust};
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -9,14 +9,23 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub const FILE: &str = "device.json";
-const NAME: &str = if cfg!(target_os = "android") { "phone" } else { "desktop" };
 
-/// The device key: in the Android Keystore, or on desktop, until it has a
-/// keystore, in the file.
+/// What the device calls itself in the key log: "phone", or the computer's
+/// hostname.
+pub fn name() -> String {
+    if cfg!(target_os = "android") {
+        return "phone".into();
+    }
+    let host = fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+    if host.trim().is_empty() { "computer".into() } else { host.trim().into() }
+}
+
+/// The device key: in the Android Keystore, or on desktop on the FIDO2
+/// authenticator or PKCS#11 token the owner chose.
 #[cfg(target_os = "android")]
 pub type Key = crate::android::Keystore;
 #[cfg(not(target_os = "android"))]
-pub type Key = mandate_core::SoftwareKey;
+pub type Key = crate::desktop::Key;
 
 #[derive(Clone)]
 pub struct Device {
@@ -38,14 +47,29 @@ impl Device {
     }
 
     /// Pairs as the first device and saves what that made.
-    pub fn pair(dir: &Path, link: &PairLink) -> Result<Device, Error> {
+    pub fn pair(dir: &Path, link: &PairLink, key: Key) -> Result<Device, Error> {
         let token = mandate_core::new_token();
-        let (key, mut saved) = new_secrets(&token)?;
-        let client = Client::pair(link, &key, NAME, &token)?;
-        saved["url"] = link.url.clone().into();
+        let client = Client::pair(link, &key, &name(), &token)?;
+        Device::save(dir, &link.url, client, key, &token)
+    }
+
+    /// The device once the owner let it in from another, saved.
+    pub fn joined(
+        dir: &Path,
+        url: &str,
+        join: Join,
+        key: Key,
+        token: &str,
+    ) -> Result<Device, Error> {
+        Device::save(dir, url, join.into_client()?, key, token)
+    }
+
+    fn save(dir: &Path, url: &str, client: Client, key: Key, token: &str) -> Result<Device, Error> {
+        let mut saved = json!({ "url": url });
         if let Trust::Pin(p) = client.trust() {
             saved["pin"] = hex(&p).into();
         }
+        save_secrets(&mut saved, &key, token)?;
         fs::create_dir_all(dir)?;
         let mut f = OpenOptions::new()
             .write(true)
@@ -66,29 +90,19 @@ fn secrets(v: &Value) -> Option<(Key, String)> {
     Some((Key::load()?, crate::android::unseal(&unhex(v["sealed"].as_str()?)?)?))
 }
 
-#[cfg(not(target_os = "android"))]
-fn secrets(v: &Value) -> Option<(Key, String)> {
-    let key = Key::from_bytes(&unhex(v["key"].as_str()?)?.try_into().ok()?).ok()?;
-    Some((key, v["token"].as_str()?.into()))
-}
-
-/// A new device key, and what the file keeps of it and of the token.
 #[cfg(target_os = "android")]
-fn new_secrets(token: &str) -> Result<(Key, Value), Error> {
-    Ok((Key::generate()?, json!({"sealed": hex(&crate::android::seal(token)?)})))
+fn save_secrets(saved: &mut Value, _: &Key, token: &str) -> Result<(), Error> {
+    saved["sealed"] = hex(&crate::android::seal(token)?).into();
+    Ok(())
 }
 
 #[cfg(not(target_os = "android"))]
-fn new_secrets(token: &str) -> Result<(Key, Value), Error> {
-    let key = Key::generate();
-    let saved = json!({"key": hex(&key.to_bytes()), "token": token});
-    Ok((key, saved))
-}
+use crate::desktop::{load_secrets as secrets, save_secrets};
 
 pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn unhex(s: &str) -> Option<Vec<u8>> {
+pub fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
 }

@@ -6,7 +6,7 @@ use crate::envelope::{DeviceKey, Envelope};
 use crate::exchange::{self, Payload, token_sha256};
 use crate::http::{MAX_LINE, Peer, Response, Server, Trust, Wait, read_line};
 use crate::log::Log;
-use crate::record::{Key, KeyEntry, Op, Record, Time};
+use crate::record::{KeyEntry, Op, Record, Time};
 use crate::{Error, hex, invalid, unhex};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -123,8 +123,8 @@ impl Client {
     ) -> Result<Client, Error> {
         let server = Server::new(&link.url, Some(Trust::Pin(link.spki_sha256)))?;
         let now = Time::now();
-        let key_entry = Key::p256(&key.public_key(), name);
-        let entry = KeyEntry { seq: 0, op: Op::Add, key: key_entry, prev: String::new(), at: now };
+        let entry =
+            KeyEntry { seq: 0, op: Op::Add, key: key.key(name), prev: String::new(), at: now };
         let mut env = Envelope::new(&Record::Key(entry), now)?;
         env.sign(key)?;
         let body = json!({
@@ -338,7 +338,7 @@ impl Join {
         let id = unhex(&started.id)
             .and_then(|b| b.try_into().ok())
             .ok_or_else(|| invalid("the exchange ID is not 16 bytes in hex"))?;
-        let key = Key::p256(&key.public_key(), name);
+        let key = key.key(name);
         Ok(Join {
             server,
             id,
@@ -600,10 +600,8 @@ mod tests {
         assert_eq!(join.poll().unwrap(), JoinStatus::WrongCode);
         code_tx.send(join.code().into()).unwrap();
         assert_eq!(join.poll().unwrap(), JoinStatus::Confirmed);
-        let want = Payload {
-            key: Some(Key::p256(&laptop.public_key(), "MacBook")),
-            token_sha256: token_sha256(&laptop_token),
-        };
+        let want =
+            Payload { key: Some(laptop.key("MacBook")), token_sha256: token_sha256(&laptop_token) };
         assert_eq!(payload_rx.recv().unwrap(), want);
         code_tx.send(join.code().into()).unwrap();
         assert!(matches!(join.poll(), Err(Error::Invalid(_))), "a new try after the match");

@@ -2,7 +2,6 @@
 //! notifications that open the app, and the native half of the stream
 //! service. The Java half is in android/java.
 
-use crate::api::{Exchange, Now};
 use crate::device::{Device, FILE};
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -14,7 +13,7 @@ use jni::refs::Global;
 use jni::signature::MethodSignature;
 use jni::strings::JNIStr;
 use jni::{Env, EnvUnowned, JavaVM, jni_sig, jni_str};
-use mandate_core::{Client, DeviceKey, Error, der_signature};
+use mandate_core::{Client, DeviceKey, DeviceSignature, Error, Key, der_signature};
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
@@ -237,19 +236,19 @@ impl Keystore {
 }
 
 impl DeviceKey for Keystore {
-    fn public_key(&self) -> [u8; 65] {
-        self.0
+    fn key(&self, name: &str) -> Key {
+        Key::p256(&self.0, name)
     }
 
     /// Blocks on the owner's answer to the prompt; a cancel signs nothing.
-    fn sign(&self, msg: &[u8]) -> Result<[u8; 64], Error> {
+    fn sign(&self, challenge: &[u8; 32]) -> Result<DeviceSignature, Error> {
         let der = java(|env, c| {
             let activity = activity(env);
-            let msg = env.byte_array_from_slice(msg)?;
+            let msg = env.byte_array_from_slice(challenge)?;
             let sig = jni_sig!("(Landroid/app/Activity;[B)[B");
             keys(env, c, jni_str!("sign"), sig, &[(&activity).into(), (&msg).into()])
         })?;
-        der_signature(&der)
+        Ok(DeviceSignature { sig: der_signature(&der)?, authenticator_data: Vec::new() })
     }
 }
 
@@ -324,28 +323,7 @@ fn serve(service: &Global<JObject<'static>>, dir: &Path) -> ! {
 /// Shows what newly waits and hides what no longer does. A notification
 /// names the identity, the connector and the kind of thing, nothing else.
 fn notify(service: &Global<JObject<'static>>, client: &Client, shown: &mut HashSet<String>) {
-    let waiting = || -> Result<Vec<(String, String)>, Error> {
-        let now: Now = client.now(None, None)?;
-        let exchanges: Vec<Exchange> = client.get("exchanges")?;
-        let exchanges = exchanges.into_iter().map(|e| {
-            let text = if e.kind == "device" {
-                crate::screens::DEVICE_JOIN.to_string()
-            } else {
-                format!("{} wants to log in", e.name)
-            };
-            (e.id, text)
-        });
-        let requests = now
-            .requests
-            .into_iter()
-            .map(|r| (r.id, format!("{} wants to read {}", r.identity_name, r.connector)));
-        let proposals = now
-            .proposals
-            .into_iter()
-            .map(|p| (p.id, format!("{} wants to {} on {}", p.identity_name, p.op, p.connector)));
-        Ok(exchanges.chain(requests).chain(proposals).collect())
-    };
-    let waiting = match waiting() {
+    let waiting = match crate::waiting(client) {
         Ok(w) => w,
         Err(e) => return log::warn!("stream: {e}"),
     };

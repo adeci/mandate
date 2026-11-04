@@ -116,7 +116,7 @@ mod tests {
     use crate::envelope::h;
     use crate::jcs::tests::respell;
     use crate::record::Time;
-    use crate::{DeviceKey, SoftwareKey, unhex};
+    use crate::{SoftwareKey, unhex};
     use proptest::collection::vec;
     use proptest::prelude::*;
     use proptest::sample::Index;
@@ -359,7 +359,7 @@ mod tests {
             let mut e = approved.clone();
             e.authenticator_data[i] = byte;
             let msg = [e.authenticator_data.as_slice(), &e.challenge()].concat();
-            e.sig = yubikey.sign(&msg).unwrap().to_vec();
+            e.sig = yubikey.sign_msg(&msg).to_vec();
             let err = l.verify(&e).expect_err(name);
             assert!(!matches!(err, Error::BadSignature), "{name}: {err}");
         }

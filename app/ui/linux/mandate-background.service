@@ -1,0 +1,13 @@
+[Unit]
+Description=mandate notifications
+# A click opens the app's window, so it runs with the graphical session.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=@out@/bin/mandate-app --background
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

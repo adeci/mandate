@@ -49,6 +49,7 @@
         libxcb
         libx11
       ];
+      desktop = import ./nix/desktop.nix { inherit pkgs rust runtime; };
     in
     {
       devShells.x86_64-linux.default = pkgs.mkShell {
@@ -72,9 +73,12 @@
         };
       };
 
+      packages.x86_64-linux.desktop = desktop;
+
       checks.x86_64-linux.journey = import ./nix/journey.nix {
         inherit pkgs mandate android;
         apk = import ./nix/apk.nix { inherit pkgs rust sdk; };
       };
+      checks.x86_64-linux.desktop = import ./nix/desktop-journey.nix { inherit mandate desktop; };
     };
 }

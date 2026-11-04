@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=mandate
+Comment=Approve what your agents may read and send
+Exec=mandate-app %u
+Icon=dev.mandate.app
+Terminal=false
+Categories=Utility;Security;
+MimeType=x-scheme-handler/mandate;
+StartupWMClass=dev.mandate.app
