@@ -116,6 +116,8 @@ impl Shell {
             Some(f) if f.is_empty() => vec![t.alt("No chat matches.").into_any_element()],
             Some(f) => f.iter().map(|c| row(c, cx)).collect(),
         };
+        // The list stops at 50; a search reaches the rest.
+        let more = p.found.as_ref().is_some_and(|f| f.len() >= 50);
         column()
             .gap(lines(0.5))
             .child(
@@ -135,6 +137,7 @@ impl Shell {
                     }),
             )
             .children(results)
+            .when(more, |d| d.child(t.alt("Search for more")))
     }
 
     pub(crate) fn hide_screen(&self, t: Theme, cx: &mut Context<Self>) -> Div {
@@ -338,7 +341,8 @@ impl Shell {
             Some(c) => Some(format!("{} chats", c.len())),
         };
         let window = if g.routine {
-            format!("{} {} for {}", words::days(&g.days), g.start(), span(g.length))
+            let start = words::time_of_day(&g.start());
+            format!("{} {start} for {}", words::days(&g.days), span(g.length))
         } else {
             span(g.for_)
         };
@@ -421,7 +425,7 @@ impl Shell {
                             .gap(chars(1.))
                             .child("at")
                             .child(button(t, "earlier", "-", cx, set(|g| g.start = (g.start + 1410) % 1440)))
-                            .child(div().font_weight(MEDIUM).child(g.start()))
+                            .child(div().font_weight(MEDIUM).child(words::time_of_day(&g.start())))
                             .child(button(t, "later", "+", cx, set(|g| g.start = (g.start + 30) % 1440))),
                     )
                     .child(chips(div()).children(lengths))

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="paper">#FFFFFF</color>
+    <color name="ink">#000000</color>
+    <!-- The system splash: the icon on the app's own background. -->
+    <style name="Main" parent="android:Theme.DeviceDefault.Light.NoActionBar">
+        <item name="android:windowBackground">@color/paper</item>
+        <item name="android:windowSplashScreenBackground">@color/paper</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@color/paper</item>
+        <!-- Bar icons dark on the light app; Main.bars keeps them so as the mode changes. -->
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <!-- A light bar colour makes Android force dark nav icons (FORCE_LIGHT_NAVIGATION_BARS)
+             even after a switch to dark mode; edge-to-edge draws no bar colour anyway. -->
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

@@ -21,8 +21,6 @@ use std::time::Duration;
 const CALL: Wait = Wait::Total(Duration::from_secs(60));
 /// How long a join poll waits on the server, in seconds.
 const POLL: u64 = 60;
-/// The owner's code waits up to 2 minutes for the new party's answer.
-const CODE: Wait = Wait::Total(Duration::from_secs(150));
 /// The stream sends a comment every 30 seconds.
 const STREAM: Wait = Wait::Idle(Duration::from_secs(90));
 /// A stream event's data; the server's are far smaller.
@@ -61,6 +59,17 @@ impl FromStr for PairLink {
             }
             _ => Err(invalid("the pairing link lacks url, spki or secret")),
         }
+    }
+}
+
+impl PairLink {
+    /// Connects to the link's server before pairing, as the Pair screen
+    /// opens: its key must be the link's, and the answer says whether its
+    /// certificate also chains to a known root for its host. If it does,
+    /// the owner has nothing to compare.
+    pub fn check(&self) -> Result<bool, Error> {
+        let server = Server::new(&self.url, Some(Trust::Pin(self.spki_sha256)))?;
+        Ok(server.send("GET", "/owner/v1/pair", None, None, CALL)?.peer.chained)
     }
 }
 
@@ -170,26 +179,6 @@ impl Client {
         self.request(method, path, Some(&to_json(body)?), CALL)?.json()
     }
 
-    /// What waits, open grants, routines, stopped routines and a day's
-    /// activity; day (YYYY-MM-DD) and before page back. T is the app's view
-    /// of it, or serde_json::Value.
-    pub fn now<T: DeserializeOwned>(
-        &self,
-        day: Option<&str>,
-        before: Option<Time>,
-    ) -> Result<T, Error> {
-        let query: Vec<String> =
-            [day.map(|d| format!("day={d}")), before.map(|b| format!("before={b}"))]
-                .into_iter()
-                .flatten()
-                .collect();
-        if query.is_empty() {
-            self.get("now")
-        } else {
-            self.get(&format!("now?{}", query.join("&")))
-        }
-    }
-
     /// POSTs a …/challenge route and answers the unsigned envelope. The app
     /// shows the owner `record()`, then signs it and passes it to `signed`.
     pub fn challenge(&self, path: &str, body: &impl Serialize) -> Result<Envelope, Error> {
@@ -209,23 +198,6 @@ impl Client {
         Log::new(self.get::<Keys>("keys")?.log)
     }
 
-    /// The owner's try at a new party's code. Once the new party confirms,
-    /// its payload, which the record from `exchanges/{id}/challenge` must
-    /// match before the owner signs it. A wrong code is `Error::Api` with
-    /// status 403 and `attempts_left`.
-    pub fn exchange_code(&self, id: &str, code: &str) -> Result<Payload, Error> {
-        #[derive(Deserialize)]
-        struct Confirmed {
-            payload: Payload,
-        }
-        if id.len() != 32 || unhex(id).is_none() {
-            return Err(invalid("an exchange ID is 16 bytes in hex"));
-        }
-        let body = to_json(&json!({ "code": code }))?;
-        let path = format!("exchanges/{id}/code");
-        Ok(self.request("POST", &path, Some(&body), CODE)?.json::<Confirmed>()?.payload)
-    }
-
     /// The owner's event stream. It ends with the connection; the app
     /// reconnects, then refetches `now`.
     pub fn events(&self) -> Result<Events, Error> {
@@ -243,8 +215,10 @@ impl Client {
 pub enum Event {
     /// An access request or a proposal (`kind`) waits for the owner.
     Waiting { kind: String, id: String, identity: String, connector: String },
-    /// A code exchange waits for the owner to type its code.
-    Exchange { id: String, kind: String, name: String },
+    /// A code exchange the owner opened changed state: "open", "confirmed"
+    /// (the new party's code matched; it waits to be let in), "approved" or
+    /// "ended".
+    Exchange { id: String, kind: String, state: String },
     /// What changed: "now", "identities", "connectors" or "keys".
     Changed { what: String },
 }
@@ -297,11 +271,13 @@ impl Iterator for Events {
 }
 
 /// A new device joining by code exchange, as the new party
-/// (owner-api.md, Another device).
+/// (owner-api.md, Another device): it is given the code that the owner's
+/// device shows.
 pub struct Join {
     server: Server,
-    id: [u8; 16],
-    code: String,
+    name: String,
+    /// The exchange, once a try at the code started it.
+    id: Option<[u8; 16]>,
     payload: Payload,
     token: String,
     /// The connection that proved the server's key, once the code matched.
@@ -310,92 +286,75 @@ pub struct Join {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinStatus {
-    /// The owner has not typed the code yet.
-    Pending,
-    /// The owner typed another code; the exchange goes on for the next try.
-    WrongCode,
-    /// The code matched and the server proved its TLS key; the owner signs
-    /// next.
+    /// The code did not match; the owner's device still shows it.
+    WrongCode { attempts_left: u32 },
+    /// The code matched and the server proved its TLS key; the owner lets
+    /// the device in next.
     Confirmed,
     /// The owner signed: the device's key is trusted and its token works.
     Approved,
-    /// Three wrong codes, or 10 minutes.
+    /// Three wrong codes, 10 minutes, or the owner cancelled.
     Ended,
 }
 
 impl Join {
-    /// Starts joining the server at url as a device with key and name, and
-    /// draws the code to show.
+    /// Joins the server at url as a device with key and name. Nothing is
+    /// sent before `answer`.
     pub fn start(url: &str, key: &dyn DeviceKey, name: &str, token: &str) -> Result<Join, Error> {
-        #[derive(Deserialize)]
-        struct Started {
-            id: String,
-        }
-        let server = Server::new(url, None)?;
-        let body = to_json(&json!({ "kind": "device", "name": name }))?;
-        let started: Started =
-            server.send("POST", "/owner/v1/join", None, Some(&body), CALL)?.json()?;
-        let id = unhex(&started.id)
-            .and_then(|b| b.try_into().ok())
-            .ok_or_else(|| invalid("the exchange ID is not 16 bytes in hex"))?;
-        let key = key.key(name);
         Ok(Join {
-            server,
-            id,
-            code: exchange::new_code(),
-            payload: Payload { key: Some(key), token_sha256: token_sha256(token) },
+            server: Server::new(url, None)?,
+            name: name.into(),
+            id: None,
+            payload: Payload { key: Some(key.key(name)), token_sha256: token_sha256(token) },
             token: token.into(),
             peer: None,
         })
     }
 
-    /// The code to show the owner.
-    pub fn code(&self) -> &str {
-        &self.code
-    }
-
-    /// Waits up to a minute for the exchange to move, and moves it: answers
-    /// the owner's try at the code, and checks the server's confirmation
-    /// against the TLS key the answer came over.
-    pub fn poll(&mut self) -> Result<JoinStatus, Error> {
+    /// Tries the code: starts an attempt on the exchange the owner opened,
+    /// answers it, and checks the server's confirmation against the TLS key
+    /// the answer came over. With nothing open to join, the server's
+    /// refusal is the error.
+    pub fn answer(&mut self, code: &str) -> Result<JoinStatus, Error> {
         #[derive(Deserialize)]
-        struct Poll {
-            #[serde(default)]
-            status: String,
-            #[serde(default)]
+        struct Started {
+            id: String,
             msg: String,
         }
-        let path = format!("/owner/v1/join/{}?wait={POLL}", hex(&self.id));
-        let wait = Wait::Total(Duration::from_secs(2 * POLL));
-        let p: Poll = self.server.send("GET", &path, None, None, wait)?.json()?;
-        Ok(match (p.status.as_str(), self.peer) {
-            ("", None) => return self.answer(&p.msg),
-            ("", Some(_)) => return Err(invalid("a new try at the code after it matched")),
-            ("pending", None) => JoinStatus::Pending,
-            ("pending", Some(_)) => JoinStatus::Confirmed,
-            ("approved", Some(_)) => JoinStatus::Approved,
-            ("ended", _) => JoinStatus::Ended,
-            (status, _) => return Err(invalid(format!("unexpected join status {status:?}"))),
-        })
-    }
-
-    fn answer(&mut self, msg: &str) -> Result<JoinStatus, Error> {
         #[derive(Deserialize)]
         struct Confirm {
             confirm: String,
         }
-        let ya = unhex(msg).ok_or_else(|| invalid("the server's message is not hex"))?;
-        let reply = exchange::respond(&self.id, &self.code, &ya, &self.payload)?;
+        if self.peer.is_some() {
+            return Err(invalid("a new try at the code after it matched"));
+        }
+        let body = to_json(&json!({ "kind": "device", "name": self.name }))?;
+        let started: Started =
+            self.server.send("POST", "/owner/v1/join", None, Some(&body), CALL)?.json()?;
+        let id: [u8; 16] = unhex(&started.id)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| invalid("the exchange ID is not 16 bytes in hex"))?;
+        self.id = Some(id);
+        let ya = unhex(&started.msg).ok_or_else(|| invalid("the server's message is not hex"))?;
+        let reply = exchange::respond(&id, code, &ya, &self.payload)?;
         let body = json!({
             "msg": hex(&reply.msg),
             "confirm": hex(&reply.confirm),
             "sealed": hex(&reply.sealed),
         });
-        let path = format!("/owner/v1/join/{}", hex(&self.id));
+        let path = format!("/owner/v1/join/{}", hex(&id));
         let res = self.server.send("POST", &path, None, Some(&to_json(&body)?), CALL)?;
         match res.status {
-            403 => return Ok(JoinStatus::WrongCode),
-            410 => return Ok(JoinStatus::Ended),
+            403 => {
+                return Ok(match res.error() {
+                    Error::Api { attempts_left: Some(0), .. } => JoinStatus::Ended,
+                    Error::Api { attempts_left: Some(n), .. } => {
+                        JoinStatus::WrongCode { attempts_left: n }
+                    }
+                    _ => JoinStatus::WrongCode { attempts_left: 0 },
+                });
+            }
+            404 | 410 => return Ok(JoinStatus::Ended),
             _ => {}
         }
         let peer = res.peer;
@@ -405,6 +364,27 @@ impl Join {
         self.server.trust = Some(Trust::Pin(peer.spki_sha256));
         self.peer = Some(peer);
         Ok(JoinStatus::Confirmed)
+    }
+
+    /// Waits up to a minute, after the code matched, for the owner to let
+    /// the device in.
+    pub fn poll(&mut self) -> Result<JoinStatus, Error> {
+        #[derive(Deserialize)]
+        struct Poll {
+            status: String,
+        }
+        let (Some(id), Some(_)) = (self.id, self.peer) else {
+            return Err(invalid("the code has not matched yet"));
+        };
+        let path = format!("/owner/v1/join/{}?wait={POLL}", hex(&id));
+        let wait = Wait::Total(Duration::from_secs(2 * POLL));
+        let p: Poll = self.server.send("GET", &path, None, None, wait)?.json()?;
+        Ok(match p.status.as_str() {
+            "open" | "confirmed" => JoinStatus::Confirmed,
+            "approved" => JoinStatus::Approved,
+            "ended" => JoinStatus::Ended,
+            status => return Err(invalid(format!("unexpected join status {status:?}"))),
+        })
     }
 
     /// The joined device's client, once `poll` said Approved. Keep its
@@ -516,21 +496,20 @@ mod tests {
         format!("{head}{:x}\r\n{body}\r\n0\r\n\r\n", body.len()).into()
     }
 
-    /// Pairs a phone, joins a laptop by code with one wrong try, and reads
-    /// the stream, against a mock owner side. After the code matched, the
-    /// mock tries a new code and answers from another key once.
+    /// Pairs a phone, joins a laptop by the code the owner's device shows,
+    /// with one wrong try, and reads the stream, against a mock owner side.
+    /// After the code matched, the mock answers from another key once.
     #[test]
     fn pair_join_stream() {
         let spki = spki();
         let (phone, laptop) = (SoftwareKey::generate(), SoftwareKey::generate());
         let (phone_token, laptop_token) = (crate::new_token(), crate::new_token());
-        let (code_tx, code_rx) = mpsc::channel::<String>();
         let (payload_tx, payload_rx) = mpsc::channel();
-        let id = [9; 16];
+        let (id, code) = ([9; 16], "123456");
         let (mut step, mut attempt) = (0, None);
         let stream_auth = format!("Bearer {laptop_token}");
         let (ours, other) = (tls(CERT, KEY, &TLS13), tls(OTHER_CERT, OTHER_KEY, &TLS13));
-        let pick = move |n| if n == 9 { other.clone() } else { ours.clone() };
+        let pick = move |n| if n == 7 { other.clone() } else { ours.clone() };
         let url = serve(pick, move |req| {
             step += 1;
             let body = &req.body;
@@ -544,22 +523,16 @@ mod tests {
                     let log = Log::new([entry]).unwrap();
                     ok(json!({ "kind": "key", "id": log.trusted().next().unwrap().id }))
                 }
-                2 => {
+                2 | 4 => {
                     assert_eq!(req.line, "POST /owner/v1/join HTTP/1.1");
                     assert_eq!(*body, json!({ "kind": "device", "name": "MacBook" }));
-                    reply(201, &json!({ "id": hex(&id) }).to_string())
-                }
-                3 | 5 | 7 => {
-                    assert_eq!(
-                        req.line,
-                        format!("GET /owner/v1/join/{}?wait=60 HTTP/1.1", hex(&id))
-                    );
-                    let a = Attempt::start("device", id, &code_rx.recv().unwrap());
+                    let a = Attempt::start("device", id, code);
                     let msg = hex(&a.msg);
                     attempt = Some(a);
-                    ok(json!({ "msg": msg }))
+                    reply(201, &json!({ "id": hex(&id), "msg": msg }).to_string())
                 }
-                4 | 6 => {
+                3 | 5 => {
+                    assert_eq!(req.line, format!("POST /owner/v1/join/{} HTTP/1.1", hex(&id)));
                     let a = attempt.take().unwrap();
                     let (msg, sealed) = (hex_field("msg"), hex_field("sealed"));
                     match a.finish(&msg, &hex_field("confirm"), &sealed, &spki) {
@@ -567,12 +540,21 @@ mod tests {
                             payload_tx.send(payload).unwrap();
                             ok(json!({ "confirm": hex(&confirm) }))
                         }
-                        Err(_) => reply(403, r#"{"error":"wrong code","code":"forbidden"}"#),
+                        Err(_) => reply(
+                            403,
+                            r#"{"error":"wrong code","code":"forbidden","attempts_left":2}"#,
+                        ),
                     }
                 }
-                8 => ok(json!({ "status": "pending" })),
-                9 => ok(json!({ "status": "approved" })),
-                10 if req.auth == stream_auth => chunked(concat!(
+                6 => {
+                    assert_eq!(
+                        req.line,
+                        format!("GET /owner/v1/join/{}?wait=60 HTTP/1.1", hex(&id))
+                    );
+                    ok(json!({ "status": "confirmed" }))
+                }
+                7 => ok(json!({ "status": "approved" })),
+                8 if req.auth == stream_auth => chunked(concat!(
                     ": open\n\n",
                     "event: changed\ndata: {\"what\":\"keys\"}\n\n",
                     ": ping\n\n",
@@ -595,16 +577,13 @@ mod tests {
         assert_eq!(client.trust(), Trust::Pin(spki));
 
         let mut join = Join::start(&url, &laptop, "MacBook", &laptop_token).unwrap();
-        let wrong = format!("{:06}", (join.code().parse::<u32>().unwrap() + 1) % 1_000_000);
-        code_tx.send(wrong).unwrap();
-        assert_eq!(join.poll().unwrap(), JoinStatus::WrongCode);
-        code_tx.send(join.code().into()).unwrap();
-        assert_eq!(join.poll().unwrap(), JoinStatus::Confirmed);
+        assert!(matches!(join.poll(), Err(Error::Invalid(_))), "a poll before the code");
+        assert_eq!(join.answer("123457").unwrap(), JoinStatus::WrongCode { attempts_left: 2 });
+        assert_eq!(join.answer(code).unwrap(), JoinStatus::Confirmed);
         let want =
             Payload { key: Some(laptop.key("MacBook")), token_sha256: token_sha256(&laptop_token) };
         assert_eq!(payload_rx.recv().unwrap(), want);
-        code_tx.send(join.code().into()).unwrap();
-        assert!(matches!(join.poll(), Err(Error::Invalid(_))), "a new try after the match");
+        assert!(matches!(join.answer(code), Err(Error::Invalid(_))), "a new try after the match");
         assert_eq!(join.poll().unwrap(), JoinStatus::Confirmed);
         assert!(matches!(join.poll(), Err(Error::Io(_))), "approved by another key");
         assert_eq!(join.poll().unwrap(), JoinStatus::Approved);
@@ -677,7 +656,7 @@ mod tests {
                 identity,
                 connector
             }),
-            (s(), s(), s()).prop_map(|(id, kind, name)| Event::Exchange { id, kind, name }),
+            (s(), s(), s()).prop_map(|(id, kind, state)| Event::Exchange { id, kind, state }),
             s().prop_map(|what| Event::Changed { what }),
         ]
     }
@@ -690,8 +669,8 @@ mod tests {
                 "waiting",
                 json!({ "kind": kind, "id": id, "identity": identity, "connector": connector }),
             ),
-            Event::Exchange { id, kind, name } => {
-                ("exchange", json!({ "id": id, "kind": kind, "name": name }))
+            Event::Exchange { id, kind, state } => {
+                ("exchange", json!({ "id": id, "kind": kind, "state": state }))
             }
             Event::Changed { what } => ("changed", json!({ "what": what })),
         };

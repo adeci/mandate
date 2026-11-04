@@ -13,9 +13,6 @@ pub struct Now {
     pub grants: Vec<Grant>,
     pub routines: Vec<Grant>,
     pub stopped: Vec<Grant>,
-    pub activity: Vec<Activity>,
-    /// Asking again before the last activity's time finds more that day.
-    pub more: bool,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -101,25 +98,51 @@ pub struct Grant {
     pub closed_at: Option<String>,
 }
 
+/// One entry of the owner's history (`GET /owner/v1/activity`): a read, a
+/// request or send and its outcome, a grant changing, an agent or device.
 #[derive(Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Activity {
     pub at: String,
+    /// read, request.asked, proposal.done, stop_all and so on.
+    pub kind: String,
     pub identity: String,
     pub connector: String,
-    pub verb: String,
-    pub chats: Option<Vec<Chat>>,
-    pub count: u64,
+    pub chats: Vec<Chat>,
+    pub count: Option<u64>,
+    pub detail: String,
 }
 
+/// A page of history, newest first; next pages back from its last entry.
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct History {
+    pub entries: Vec<Activity>,
+    pub next: Option<String>,
+}
+
+/// A code exchange the owner opened (owner-api.md, Code exchange). Name,
+/// address and payload come once the new party's code matched.
 #[derive(Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Exchange {
     pub id: String,
     pub kind: String,
+    /// "open", then "confirmed" once the code matched.
+    pub state: String,
     pub name: String,
     pub address: String,
+    pub payload: Option<mandate_core::Payload>,
     pub started_at: String,
+}
+
+/// An exchange just opened, with the code to give the new party.
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Opened {
+    pub id: String,
+    pub code: String,
+    pub expires_at: String,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -146,6 +169,14 @@ pub struct Health {
     pub state: String,
     pub detail: String,
     pub until: Option<String>,
+}
+
+/// The server's own facts (`GET /owner/v1/server`).
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Server {
+    /// What `mandate login` takes on an agent's machine.
+    pub agent_url: String,
 }
 
 #[derive(Clone, Default, Deserialize)]

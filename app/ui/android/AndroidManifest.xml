@@ -7,7 +7,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <application android:label="mandate">
+    <application android:label="mandate" android:icon="@mipmap/icon" android:theme="@style/Main">
         <!-- singleTask: a second instance would be a second android_main in this process.
              stateNotNeeded: android_main leaves the process when the activity ends, also
              on a recreation, and this lets Android start it again in a new process. -->

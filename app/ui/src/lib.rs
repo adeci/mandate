@@ -14,19 +14,29 @@ mod tabs;
 mod theme;
 mod words;
 
-use api::{Activity, Connector, Exchange, Hidden, Identity, Keys, Now, Proposal, Request, Step};
+use api::{Connector, Exchange, Hidden, Identity, Keys, Now, Opened, Proposal, Request, Step};
 use device::Device;
 use futures::StreamExt;
-use gpui::{App, AppContext, Context, Entity, FocusHandle, KeyDownEvent, Window, WindowOptions};
+use gpui::{
+    App, AppContext, Context, Entity, FocusHandle, KeyDownEvent, ScrollHandle, Window,
+    WindowOptions,
+};
 use mandate_core::{
-    Client, DeviceKey, Envelope, Error, Join, JoinStatus, PairLink, Record, new_token,
+    Client, DeviceKey, Envelope, Error, Join, JoinStatus, PairLink, Record, Signed, new_token,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::mem::Discriminant;
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// Why a join ended, and what to do next.
+const JOIN_ENDED: &str = "The join ended: three wrong codes, 10 minutes, or it was cancelled. Open Add a device on the other device again.";
+
+/// A page as drawn: the screen's kind, and the tab on the tabs.
+type Page = (Discriminant<Screen>, Option<Tab>);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -37,26 +47,30 @@ enum Tab {
 }
 
 enum Screen {
+    /// What mandate is, before pairing or joining.
+    Welcome,
     Pair {
         text: String,
     },
-    /// Joining as another device: the server's address, as typed.
+    /// Joining as another device: the server's address and the code that a
+    /// device already in shows, as typed; code_field says which takes typing.
     Join {
         url: String,
-    },
-    /// The code to type on a device already in, and how the join goes.
-    Joining {
         code: String,
-        status: &'static str,
+        code_field: bool,
     },
+    /// The code matched; the device already in lets this one in.
+    Joining,
     /// Picking this computer's device key.
     #[cfg(not(target_os = "android"))]
     Choose(choose::Choose),
     Tab(Tab),
     Settings,
-    Code {
-        exchange: Exchange,
-        code: String,
+    /// An exchange the owner opened: the code to give an agent or a new
+    /// device ("agent" or "device"), until its code matches.
+    Invite {
+        kind: &'static str,
+        opened: Opened,
     },
     Admit {
         exchange: Exchange,
@@ -82,11 +96,11 @@ enum Screen {
 }
 
 /// What a new device key is for: pairing as the first device, or joining
-/// the server at a URL as another.
+/// the server at a URL, by a code, as another.
 #[derive(Clone)]
 enum Next {
     Pair(PairLink),
-    Join(String),
+    Join { url: String, code: String },
 }
 
 /// The device key's PIN, asked before a signature, and the signature.
@@ -140,10 +154,14 @@ pub struct Shell {
     adjust: HashMap<String, Adjust>,
     /// The chat picker, while one is open.
     picker: Option<pick::Picker>,
-    /// Earlier days of activity, loaded by Show more, newest first.
-    older: Vec<(String, Vec<Activity>)>,
-    /// The last loaded day has more before its last activity.
-    older_more: bool,
+    /// History loaded so far, newest first; None until Activity first shows.
+    history: Option<api::History>,
+    history_loading: bool,
+    /// Where each day's header of Activity sat on the last frame, for the
+    /// one that sticks on top.
+    day_tops: std::rc::Rc<std::cell::RefCell<Vec<(String, f32)>>>,
+    /// The page's scroll, for loading more history near its end.
+    scroll: ScrollHandle,
     /// Stop all's confirmation is open.
     stopping: bool,
     /// The agent or connector whose Delete or Unlink waits for a second tap.
@@ -157,6 +175,26 @@ pub struct Shell {
     /// A waiting item to open once a refresh shows it, from a notification.
     pending: Option<String>,
     focus: FocusHandle,
+    /// The wordmark shows alone for a moment after Android's splash.
+    launching: bool,
+    /// The page last drawn, and how many pages have been, so that a new
+    /// one fades in.
+    page: (Option<Page>, usize),
+    /// The pairing link last checked before pairing, and whether its
+    /// certificate is verified: None while the check runs.
+    pair_check: Option<(PairLink, Option<bool>)>,
+    /// What agents log in to, as the server says (`GET /owner/v1/server`).
+    agent_url: String,
+    /// The device key a refused join made, for the next try.
+    join_key: Option<device::Key>,
+    /// A finger panning on a tab, while it does.
+    swipe: Option<screens::Swipe>,
+    /// How far, in px, the page a swipe brought starts off its place.
+    slide: f32,
+    /// The exchange on its way to Let in, so that it goes there once.
+    admitting: Option<String>,
+    /// A signature is in flight; no other starts until it ends.
+    signing: bool,
 }
 
 impl Shell {
@@ -164,7 +202,7 @@ impl Shell {
         let device = Device::load(&dir);
         let screen = match device {
             Some(_) => Screen::Tab(Tab::Now),
-            None => Screen::Pair { text: String::new() },
+            None => Screen::Welcome,
         };
         cx.observe_window_appearance(window, |_, _, cx| cx.notify()).detach();
         // Keeps the countdowns of open grants current.
@@ -175,6 +213,14 @@ impl Shell {
                     break;
                 }
             }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(screens::LAUNCH).await;
+            let _ = this.update(cx, |this, cx| {
+                this.launching = false;
+                cx.notify();
+            });
         })
         .detach();
         let mut shell = Shell {
@@ -192,8 +238,10 @@ impl Shell {
             search: None,
             adjust: HashMap::new(),
             picker: None,
-            older: Vec::new(),
-            older_more: false,
+            history: None,
+            history_loading: false,
+            day_tops: Default::default(),
+            scroll: ScrollHandle::new(),
             stopping: false,
             confirming: None,
             notice: None,
@@ -203,6 +251,15 @@ impl Shell {
             unlock: None,
             pending: None,
             focus: cx.focus_handle(),
+            launching: true,
+            page: (None, 0),
+            pair_check: None,
+            agent_url: String::new(),
+            join_key: None,
+            swipe: None,
+            slide: 0.,
+            admitting: None,
+            signing: false,
         };
         if let Some(device) = device {
             shell.paired(device, cx);
@@ -240,8 +297,8 @@ impl Shell {
 
     fn open_pending(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.pending.take() else { return };
-        if let Some(ex) = self.exchanges.iter().find(|e| e.id == id) {
-            self.screen = Screen::Code { exchange: ex.clone(), code: String::new() };
+        if let Some(ex) = self.exchanges.iter().find(|e| e.id == id && e.state == "confirmed") {
+            self.admit_exchange(ex.clone(), cx);
         } else if let Some(p) = self.now.proposals.iter().find(|p| p.id == id) {
             self.review(p.clone(), cx);
         } else if self.now.requests.iter().any(|r| r.id == id) {
@@ -250,18 +307,94 @@ impl Shell {
         }
     }
 
+    /// Opens a code exchange for an agent or a new device, and shows its
+    /// code. Opening another of the same kind closes the earlier one.
+    fn invite(&mut self, kind: &'static str, cx: &mut Context<Self>) {
+        let client = self.device().client;
+        self.error = None;
+        self.call(
+            cx,
+            move || client.send::<Opened>("POST", "exchanges", &json!({ "kind": kind })),
+            move |this, opened, cx| this.go(Screen::Invite { kind, opened }, cx),
+        );
+    }
+
+    /// Cancels the exchange the owner opened, back where it was opened from.
+    fn cancel_invite(&mut self, cx: &mut Context<Self>) {
+        let Screen::Invite { kind, opened } = &self.screen else { return };
+        let back = if *kind == "agent" { Screen::Tab(Tab::Agents) } else { Screen::Settings };
+        let (client, path) = (self.device().client, format!("exchanges/{}", opened.id));
+        self.call(
+            cx,
+            move || client.send::<Value>("DELETE", &path, &json!({})),
+            |this, _, cx| this.go(back, cx),
+        );
+    }
+
+    /// Once the code shown on Invite matched, goes on to letting the new
+    /// party in.
+    fn follow_invite(&mut self, cx: &mut Context<Self>) {
+        let Screen::Invite { opened, .. } = &self.screen else { return };
+        let id = &opened.id;
+        if let Some(ex) = self.exchanges.iter().find(|e| &e.id == id && e.state == "confirmed") {
+            self.admit_exchange(ex.clone(), cx);
+        }
+    }
+
+    /// Fetches the record that lets a confirmed exchange's party in, checks
+    /// it against the payload the party sent, and shows it to sign.
+    fn admit_exchange(&mut self, exchange: Exchange, cx: &mut Context<Self>) {
+        // Refreshes overlap; each exchange goes on to Let in once, until
+        // that fails or the owner leaves it.
+        if self.admitting.as_ref() == Some(&exchange.id) {
+            return;
+        }
+        self.admitting = Some(exchange.id.clone());
+        let client = self.device().client;
+        self.error = None;
+        let fetch = move || {
+            let refused = || {
+                Error::Invalid(format!(
+                    "What the server asked to sign doesn't let {} in, so nothing was signed.",
+                    exchange.name
+                ))
+            };
+            let payload = exchange.payload.clone().ok_or_else(refused)?;
+            let path = format!("exchanges/{}/challenge", exchange.id);
+            let envelope = client.challenge(&path, &json!({}))?;
+            if !payload.matches(&envelope.record()?) {
+                return Err(refused());
+            }
+            Ok((exchange, envelope))
+        };
+        self.call(
+            cx,
+            move || Ok(fetch()),
+            |this, fetched, cx| match fetched {
+                Ok((exchange, envelope)) => this.go(Screen::Admit { exchange, envelope }, cx),
+                Err(e) => (this.admitting, this.error) = (None, Some(e.to_string())),
+            },
+        );
+    }
+
     /// The paired device; only the pairing screen runs without one.
     fn device(&self) -> Device {
         self.device.clone().expect("paired")
     }
 
     fn go(&mut self, screen: Screen, cx: &mut Context<Self>) {
+        if matches!(self.screen, Screen::Admit { .. }) {
+            self.admitting = None;
+        }
         self.error = None;
         self.notice = None;
         self.stopping = false;
         self.search = None;
         self.picker = None;
-        self.confirming = None;
+        for a in self.adjust.values_mut() {
+            a.open = false;
+        }
+        (self.confirming, self.slide) = (None, 0.);
         self.screen = screen;
         keyboard(false);
         cx.notify();
@@ -333,20 +466,41 @@ impl Shell {
         self.call(
             cx,
             move || {
-                let now: Now = client.now(None, None)?;
+                let now: Now = client.get("now")?;
                 let exchanges: Vec<Exchange> = client.get("exchanges")?;
                 let identities: Vec<Identity> = client.get("identities")?;
                 let connectors: Vec<Connector> = client.get("connectors")?;
                 let keys: Keys = client.get("keys")?;
                 let hidden: Vec<Hidden> = client.get("never-share")?;
-                Ok((now, exchanges, identities, connectors, keys, hidden))
+                let server: api::Server = client.get("server")?;
+                Ok((now, exchanges, identities, connectors, keys, hidden, server))
             },
-            |this, (now, exchanges, identities, connectors, keys, hidden), cx| {
+            |this, (now, exchanges, identities, connectors, keys, hidden, server), cx| {
                 this.adjust.retain(|id, _| now.requests.iter().any(|r| &r.id == id));
                 (this.now, this.exchanges, this.identities, this.connectors) =
                     (now, exchanges, identities, connectors);
-                (this.keys, this.hidden) = (keys, hidden);
+                (this.keys, this.hidden, this.agent_url) = (keys, hidden, server.agent_url);
                 this.open_pending(cx);
+                this.follow_invite(cx);
+                if this.history.is_some() {
+                    this.load_history(cx);
+                }
+            },
+        );
+    }
+
+    /// Connects to a pairing link's server before the owner pairs, to show
+    /// either its verified hostname or the key to compare.
+    fn check_pair(&mut self, link: PairLink, cx: &mut Context<Self>) {
+        self.pair_check = Some((link.clone(), None));
+        let checked = link.clone();
+        self.call(
+            cx,
+            move || checked.check(),
+            move |this, verified, _| {
+                if this.pair_check.as_ref().is_some_and(|(l, _)| *l == link) {
+                    this.pair_check = Some((link, Some(verified)));
+                }
             },
         );
     }
@@ -374,24 +528,50 @@ impl Shell {
                     this.go(Screen::Tab(Tab::Now), cx);
                 },
             ),
-            Next::Join(url) => self.call(
-                cx,
-                move || {
+            Next::Join { url, code } => {
+                let typed = url.clone();
+                // A refusal goes back to the Join screen, the address kept,
+                // with what to do next; the key waits for the next try, as
+                // a hardware key costs a PIN and a touch to make.
+                let attempt = move || {
                     let token = new_token();
-                    let join = Join::start(&url, &key, &device::name(), &token)?;
-                    Ok((join, key, token, url))
-                },
-                |this, (join, key, token, url), cx| {
-                    let code = join.code().to_string();
-                    this.go(Screen::Joining { code, status: "" }, cx);
-                    this.poll_join(join, key, token, url, cx);
-                },
-            ),
+                    let tried = Join::start(&url, &key, &device::name(), &token)
+                        .and_then(|mut join| Ok((join.answer(&code)?, join)));
+                    let refused = match tried {
+                        Ok((JoinStatus::Confirmed, join)) => return Ok((join, key, token, url)),
+                        Ok((JoinStatus::WrongCode { attempts_left }, _)) => {
+                            Error::Invalid(format!(
+                                "That code didn't match; {attempts_left} tries left. Check it on the other device."
+                            ))
+                        }
+                        Ok(_) => Error::Invalid(JOIN_ENDED.into()),
+                        Err(e) => e,
+                    };
+                    Err(Box::new((refused, key)))
+                };
+                self.call(
+                    cx,
+                    move || Ok(attempt()),
+                    move |this, attempt, cx| match attempt {
+                        Ok((join, key, token, url)) => {
+                            this.go(Screen::Joining, cx);
+                            this.poll_join(join, key, token, url, cx);
+                        }
+                        Err(refused) => {
+                            let (e, key) = *refused;
+                            let screen =
+                                Screen::Join { url: typed, code: String::new(), code_field: true };
+                            this.go(screen, cx);
+                            (this.join_key, this.error) = (Some(key), Some(e.to_string()));
+                        }
+                    },
+                )
+            }
         }
     }
 
-    /// Follows the join on its own thread until the owner lets this device
-    /// in, or it ends.
+    /// Follows the join on its own thread, once the code matched, until the
+    /// owner lets this device in or the exchange ends.
     fn poll_join(
         &mut self,
         mut join: Join,
@@ -400,59 +580,34 @@ impl Shell {
         url: String,
         cx: &mut Context<Self>,
     ) {
-        let dir = self.dir.clone();
-        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let (dir, typed) = (self.dir.clone(), url.clone());
+        // Long polls get their own thread, off the executor's.
+        let (tx, rx) = futures::channel::oneshot::channel();
         std::thread::spawn(move || {
             let done = loop {
                 match join.poll() {
                     Ok(JoinStatus::Approved) => {
                         break Device::joined(&dir, &url, join, key, &token);
                     }
-                    Ok(JoinStatus::Ended) => {
-                        break Err(Error::Invalid(
-                            "The join ended: three wrong codes, or 10 minutes passed. Start again."
-                                .into(),
-                        ));
-                    }
-                    Ok(status) => {
-                        if tx.unbounded_send(Err(status)).is_err() {
-                            return;
-                        }
-                    }
+                    Ok(JoinStatus::Confirmed) => {}
+                    Ok(_) => break Err(Error::Invalid(JOIN_ENDED.into())),
                     Err(e) => break Err(e),
                 }
             };
-            let _ = tx.unbounded_send(Ok(done));
+            let _ = tx.send(done);
         });
         cx.spawn(async move |this, cx| {
-            while let Some(update) = rx.next().await {
-                let _ = this.update(cx, |this, cx| {
-                    match update {
-                        Ok(Ok(device)) => {
-                            this.paired(device, cx);
-                            this.go(Screen::Tab(Tab::Now), cx);
-                        }
-                        Ok(Err(e)) => {
-                            this.go(Screen::Pair { text: String::new() }, cx);
-                            this.error = Some(e.to_string());
-                        }
-                        Err(status) => {
-                            if let Screen::Joining { status: shown, .. } = &mut this.screen {
-                                *shown = match status {
-                                    JoinStatus::WrongCode => {
-                                        "That code didn't match. Type it again on the other device."
-                                    }
-                                    JoinStatus::Confirmed => {
-                                        "The code matches. Let this device in on the other one."
-                                    }
-                                    _ => "",
-                                };
-                            }
-                        }
-                    }
-                    cx.notify();
-                });
-            }
+            let Ok(done) = rx.await else { return Ok(()) };
+            this.update(cx, |this, cx| match done {
+                Ok(device) => {
+                    this.paired(device, cx);
+                    this.go(Screen::Tab(Tab::Now), cx);
+                }
+                Err(e) => {
+                    this.go(Screen::Join { url: typed, code: String::new(), code_field: true }, cx);
+                    this.error = Some(e.to_string());
+                }
+            })
         })
         .detach();
     }
@@ -493,6 +648,9 @@ impl Shell {
         check: impl FnOnce(&Record) -> bool + Clone + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        if self.signing {
+            return;
+        }
         #[cfg(not(target_os = "android"))]
         {
             let (path, body, check) = (path.clone(), body.clone(), check.clone());
@@ -502,25 +660,45 @@ impl Shell {
         }
         let device = self.device();
         let decided = path.clone();
+        self.signing_call(decided, cx, move || {
+            let mut envelope = device.client.challenge(&path, &body)?;
+            if !check(&envelope.record()?) {
+                return Err(Error::Invalid(
+                    "What the server asked to sign isn't what you were shown, so nothing was signed."
+                        .into(),
+                ));
+            }
+            envelope.sign(&*device.key)?;
+            device.client.signed(&envelope)
+        });
+    }
+
+    /// Runs a signature and what follows it. One runs at a time, app-wide,
+    /// so two prompts for the device key never race; a second is dropped.
+    fn signing_call(
+        &mut self,
+        decided: String,
+        cx: &mut Context<Self>,
+        work: impl FnOnce() -> Result<Signed, Error> + Send + 'static,
+    ) {
+        if self.signing {
+            return;
+        }
+        self.signing = true;
         self.error = None;
         self.call(
             cx,
-            move || {
-                let mut envelope = device.client.challenge(&path, &body)?;
-                if !check(&envelope.record()?) {
-                    return Err(Error::Invalid(
-                        "What the server asked to sign isn't what you were shown, so nothing was signed."
-                            .into(),
-                    ));
+            move || Ok(work()),
+            move |this, done, cx| {
+                (this.signing, this.prompt) = (false, None);
+                match done {
+                    Ok(_) => {
+                        this.decided(&decided);
+                        this.screen = Screen::Tab(Tab::Now);
+                        this.refresh(cx);
+                    }
+                    Err(e) => this.error = Some(e.to_string()),
                 }
-                envelope.sign(&*device.key)?;
-                device.client.signed(&envelope)
-            },
-            move |this, _, cx| {
-                this.prompt = None;
-                this.decided(&decided);
-                this.screen = Screen::Tab(Tab::Now);
-                this.refresh(cx);
             },
         );
     }
@@ -540,6 +718,9 @@ impl Shell {
 
     /// Signs a record already shown in full: an admit or a reviewed send.
     fn approve(&mut self, mut envelope: Envelope, cx: &mut Context<Self>) {
+        if self.signing {
+            return;
+        }
         #[cfg(not(target_os = "android"))]
         {
             let envelope = envelope.clone();
@@ -553,20 +734,10 @@ impl Shell {
             Screen::Admit { exchange, .. } => format!("exchanges/{}", exchange.id),
             _ => String::new(),
         };
-        self.error = None;
-        self.call(
-            cx,
-            move || {
-                envelope.sign(&*device.key)?;
-                device.client.signed(&envelope)
-            },
-            move |this, _, cx| {
-                this.prompt = None;
-                this.decided(&decided);
-                this.screen = Screen::Tab(Tab::Now);
-                this.refresh(cx);
-            },
-        );
+        self.signing_call(decided, cx, move || {
+            envelope.sign(&*device.key)?;
+            device.client.signed(&envelope)
+        });
     }
 
     fn approve_request(&mut self, r: &Request, cx: &mut Context<Self>) {
@@ -662,40 +833,36 @@ impl Shell {
         });
     }
 
-    fn digit(&mut self, d: char, cx: &mut Context<Self>) {
-        let Screen::Code { exchange, code } = &mut self.screen else { return };
-        if code.len() == 6 {
-            code.clear();
-        }
-        code.push(d);
-        if code.len() < 6 {
-            return;
-        }
-        let (id, code, name) = (exchange.id.clone(), code.clone(), exchange.name.clone());
-        let client = self.device().client;
-        self.error = None;
-        self.call(
-            cx,
-            move || {
-                let payload = client.exchange_code(&id, &code)?;
-                let envelope =
-                    client.challenge(&format!("exchanges/{id}/challenge"), &json!({}))?;
-                if !payload.matches(&envelope.record()?) {
-                    return Err(Error::Invalid(format!(
-                        "What the server asked to sign doesn't let {name} in, so nothing was signed."
-                    )));
+    /// Joins with the address and code typed on Join, once both look whole.
+    pub(crate) fn submit_join(&mut self, cx: &mut Context<Self>) {
+        let Screen::Join { url, code, .. } = &self.screen else { return };
+        let url = url.trim().to_string();
+        if url.starts_with("https://") && code.len() == 6 {
+            let next = Next::Join { url, code: code.clone() };
+            match self.join_key.take() {
+                Some(key) => {
+                    self.error = None;
+                    self.with_key(next, key, cx);
                 }
-                Ok(envelope)
-            },
-            |this, envelope, _| {
-                if let Screen::Code { exchange, .. } = &this.screen {
-                    this.screen = Screen::Admit { exchange: exchange.clone(), envelope };
-                }
-            },
-        );
+                None => self.new_key(next, cx),
+            }
+        }
     }
 
     fn key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // gpui-mobile hands Android's Back over as escape.
+        #[cfg(target_os = "android")]
+        if ev.keystroke.key == "escape" {
+            if !self.go_back(cx) {
+                android::leave();
+            }
+            return;
+        }
+        self.typed(ev, cx);
+    }
+
+    /// Typing into the field that takes it, from the keyboard or a paste.
+    fn typed(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
         let typed = k.key_char.as_deref().unwrap_or_default();
         if let Some(p) = &mut self.picker {
@@ -733,21 +900,19 @@ impl Shell {
                 q.pop();
             }
             (Screen::Tab(_), Some(q)) => q.push_str(typed),
-            (Screen::Join { url }, _) if k.key == "enter" => {
-                let url = url.trim().to_string();
-                self.new_key(Next::Join(url), cx);
-            }
-            (Screen::Pair { text } | Screen::Join { url: text }, _) => type_into(text, ev, cx),
-            (Screen::Code { code, .. }, _) if k.key == "backspace" => {
-                code.pop();
-            }
-            (Screen::Code { .. }, _) => {
-                if let Some(d) = typed.chars().next()
-                    && d.is_ascii_digit()
-                {
-                    self.digit(d, cx);
+            (Screen::Join { code_field, .. }, _) if k.key == "enter" => {
+                if *code_field {
+                    self.submit_join(cx);
+                } else {
+                    *code_field = true;
                 }
             }
+            (Screen::Join { code, code_field: true, .. }, _) => {
+                type_into(code, ev, cx);
+                code.retain(|c| c.is_ascii_digit());
+                code.truncate(6);
+            }
+            (Screen::Pair { text } | Screen::Join { url: text, .. }, _) => type_into(text, ev, cx),
             _ => return,
         }
         cx.notify();
@@ -756,6 +921,32 @@ impl Shell {
     /// Whether text belongs on the current page while searching.
     fn shown(&self, text: &str) -> bool {
         self.search.as_deref().is_none_or(|q| text.to_lowercase().contains(&q.to_lowercase()))
+    }
+
+    /// Puts text on the clipboard.
+    pub(crate) fn copy(&mut self, text: String, cx: &mut Context<Self>) {
+        #[cfg(target_os = "android")]
+        let _ = cx;
+        #[cfg(target_os = "android")]
+        android::copy(&text);
+        #[cfg(not(target_os = "android"))]
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    }
+
+    /// Types the clipboard's text into the field that takes typing.
+    pub(crate) fn paste(&mut self, cx: &mut Context<Self>) {
+        #[cfg(target_os = "android")]
+        let pasted = android::clipboard();
+        #[cfg(not(target_os = "android"))]
+        let pasted = cx.read_from_clipboard().and_then(|c| c.text());
+        let Some(pasted) = pasted else { return };
+        let keystroke = gpui::Keystroke {
+            key: String::new(),
+            key_char: Some(pasted.trim().to_string()),
+            modifiers: gpui::Modifiers::default(),
+        };
+        let ev = KeyDownEvent { keystroke, is_held: false, prefer_character_input: false };
+        self.typed(&ev, cx);
     }
 }
 
@@ -775,13 +966,14 @@ fn type_into(text: &mut String, ev: &KeyDownEvent, cx: &App) {
 /// What waits for the owner, for notifications: each item's ID and a line
 /// naming only its identity, connector and kind (owner-api.md).
 fn waiting(client: &Client) -> Result<Vec<(String, String)>, Error> {
-    let now: Now = client.now(None, None)?;
+    let now: Now = client.get("now")?;
     let exchanges: Vec<Exchange> = client.get("exchanges")?;
-    let exchanges = exchanges.into_iter().map(|e| {
+    // An open exchange has no name yet; it waits for the owner once confirmed.
+    let exchanges = exchanges.into_iter().filter(|e| e.state == "confirmed").map(|e| {
         let text = if e.kind == "device" {
             screens::DEVICE_JOIN.to_string()
         } else {
-            format!("{} wants to log in", e.name)
+            format!("{} wants to join as an agent", e.name)
         };
         (e.id, text)
     });

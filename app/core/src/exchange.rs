@@ -12,7 +12,8 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 
-/// Draws the code the new party shows.
+/// A code as the server draws it, for the tests.
+#[cfg(test)]
 pub(crate) fn new_code() -> String {
     loop {
         let v = u32::from_be_bytes(random());

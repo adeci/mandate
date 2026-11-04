@@ -147,6 +147,7 @@ def see(label: str, scroll: bool = False) -> tuple[int, int]:
 
 def tap(label: str, scroll: bool = False) -> None:
     x, y = see(label, scroll)
+    print(f"tap {label!r} at {x},{y}; the screen reads: {seen}")
     adb("shell", "input", "tap", str(x), str(y))
 
 
@@ -155,13 +156,27 @@ def gone(label: str) -> None:
     until(f"{label!r} to leave the screen", lambda: find(label) is None)
 
 
-# Signing asks for the fingerprint every time.
-def finger() -> None:
-    until("the fingerprint prompt", lambda: "BiometricPrompt" in focus(), timeout=30)
+# Signing asks for the fingerprint every time. The prompt's window can show
+# before its sensor listens, so a touch that comes too early is repeated.
+def touched() -> bool:
     adb("emu", "finger", "touch", "1")
     time.sleep(1)
     adb("emu", "finger", "remove", "1")
-    until("the fingerprint prompt to close", lambda: "BiometricPrompt" not in focus(), timeout=30)
+    for _ in range(5):
+        if "BiometricPrompt" not in focus():
+            return True
+        time.sleep(1)
+    return False
+
+
+def finger() -> None:
+    try:
+        until("the fingerprint prompt", lambda: "BiometricPrompt" in focus(), timeout=30)
+    except AssertionError:
+        lines()
+        log = adb("logcat", "-d", "-t", "40", "-s", "mandate:*", "AndroidRuntime:*")
+        raise AssertionError(f"no fingerprint prompt; {focus()} reads: {seen}\n{log}")
+    until("the fingerprint prompt to take the finger", touched, timeout=60)
 
 
 def agent(cmd: str) -> tuple[int, str]:
@@ -236,19 +251,40 @@ with subtest("the app pairs by the setup page's link"):
         "curl -s --unix-socket /run/mandate/connectors/test/socket http://mandate/keys | grep -q '\"length\":1'"
     )
 
-with subtest("an agent gets in by the code the owner types"):
+# The code the app shows on Add an agent: one 6-digit word, read the same
+# twice in a row.
+def shown_code() -> str:
+    last: list[str] = []
+
+    def look() -> str | None:
+        codes = [w[0] for line in lines() for w in line if re.fullmatch(r"\d{6}", w[0])]
+        code = codes[0] if len(codes) == 1 else None
+        settled = code if code and last == [code] else None
+        last[:] = [code] if code else []
+        return settled
+
+    try:
+        return until("the code on screen", look)
+    except AssertionError:
+        raise AssertionError(f"no code on screen, which reads: {seen}")
+
+
+with subtest("an agent gets in with the code the app shows"):
+    tap("Agents")
+    tap("Add an agent")
+    see("type this code")
+    code = shown_code()
     server.succeed(
-        "(mandate login https://localhost:8443 --name laptop >/tmp/login.log 2>&1; echo $? >/tmp/login.exit)"
-        " >/dev/null 2>&1 &"
+        f"(echo {code} | mandate login https://localhost:8443 --name laptop >/tmp/login.log 2>&1;"
+        " echo $? >/tmp/login.exit) >/dev/null 2>&1 &"
     )
-    server.wait_until_succeeds("grep -q 'code: ' /tmp/login.log")
-    code = grab(r"code: (\d{6})", server.succeed("cat /tmp/login.log"))
-    tap("Type the code")
-    see("6 digits")
-    adb("shell", "input", "text", code)
-    tap("Let laptop in")
+    try:
+        tap("Let laptop in")
+    except AssertionError as e:
+        raise AssertionError(f"{e}; mandate login says: {server.succeed('cat /tmp/login.log')!r}")
     finger()
-    server.wait_until_succeeds("test $(cat /tmp/login.exit) = 0")
+    server.wait_until_succeeds("test -s /tmp/login.exit")
+    assert server.succeed("cat /tmp/login.exit").strip() == "0", server.succeed("cat /tmp/login.log")
     status, out = agent("test chats")
     assert status != 0 and "mandate request test" in out, (status, out)
 

@@ -57,7 +57,7 @@ fn run(app: android_activity::AndroidApp) {
                 shell.update(cx, |shell, cx| match o {
                     Opened::Link(link) => shell.take_link(link, cx),
                     Opened::Item(id) => shell.take_item(id, cx),
-                    Opened::Insets => cx.notify(),
+                    Opened::Redraw => cx.notify(),
                 });
             }
         })
@@ -65,11 +65,12 @@ fn run(app: android_activity::AndroidApp) {
     });
 }
 
-/// What an intent opened the app with, or new insets to lay out for.
+/// What an intent opened the app with, or a change to lay out again for:
+/// new insets, or the clock switching between 12 and 24 hours.
 enum Opened {
     Link(String),
     Item(String),
-    Insets,
+    Redraw,
 }
 
 /// Intents can arrive before android_main takes the receiver.
@@ -127,7 +128,19 @@ extern "system" fn Java_dev_mandate_app_Main_insets(
     INSETS[0].store(top.to_bits(), Relaxed);
     INSETS[1].store(bottom.to_bits(), Relaxed);
     KEYBOARD.store(keyboard == jni::sys::JNI_TRUE, Relaxed);
-    let _ = OPENED.0.unbounded_send(Opened::Insets);
+    let _ = OPENED.0.unbounded_send(Opened::Redraw);
+}
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_dev_mandate_app_Main_clock(
+    _: EnvUnowned,
+    _: JClass,
+    h24: jni::sys::jboolean,
+) {
+    let h24 = h24 == jni::sys::JNI_TRUE;
+    if crate::words::H24.swap(h24, Relaxed) != h24 {
+        let _ = OPENED.0.unbounded_send(Opened::Redraw);
+    }
 }
 
 /// Shows or hides the soft keyboard. NativeActivity hands its keys to gpui
@@ -136,6 +149,61 @@ pub fn keyboard(show: bool) {
     if let Some(app) = gpui_jni::android_app() {
         if show { app.show_soft_input(true) } else { app.hide_soft_input(false) }
     }
+}
+
+/// The clipboard's text, if any.
+pub fn clipboard() -> Option<String> {
+    let text = activity_call(|env, activity| {
+        let sig = jni_sig!("()Ljava/lang/String;");
+        let text = env.call_method(activity, jni_str!("clipboard"), sig, &[])?.l()?;
+        let text = env.cast_local::<JString>(text)?;
+        if text.is_null() { Ok(None) } else { text.try_to_string(env).map(Some) }
+    });
+    text.inspect_err(|e| log::error!("clipboard: {e}")).ok().flatten()
+}
+
+/// Puts text on the clipboard.
+pub fn copy(text: &str) {
+    let copied = activity_call(|env, activity| {
+        let text = env.new_string(text)?;
+        let sig = jni_sig!("(Ljava/lang/String;)V");
+        env.call_method(activity, jni_str!("copy"), sig, &[(&text).into()])?.v()
+    });
+    if let Err(e) = copied {
+        log::error!("copy: {e}");
+    }
+}
+
+/// Back at the app's root: the app goes to the background, as other
+/// Android apps do.
+pub fn leave() {
+    let left = activity_call(|env, activity| {
+        env.call_method(activity, jni_str!("leave"), jni_sig!("()V"), &[])?.v()
+    });
+    if let Err(e) = left {
+        log::error!("leave: {e}");
+    }
+}
+
+/// Opens the camera app. Its QR reading opens the setup page's
+/// mandate://pair link, which brings the app back on the pairing screen.
+pub fn scan() {
+    let opened = activity_call(|env, activity| {
+        env.call_method(activity, jni_str!("scan"), jni_sig!("()V"), &[])?.v()
+    });
+    if let Err(e) = opened {
+        log::error!("scan: {e}");
+    }
+}
+
+/// Calls into the activity (Main.java).
+fn activity_call<T>(
+    f: impl FnOnce(&mut Env, &JObject) -> jni::errors::Result<T>,
+) -> Result<T, Error> {
+    java(|env, _| {
+        let activity = activity(env);
+        f(env, &activity)
+    })
 }
 
 /// The Java classes native code calls. They are found while the library

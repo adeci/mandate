@@ -1,7 +1,7 @@
 //! Now, as the console had it: what waits for the owner, open grants,
 //! routines, and Stop all at the bottom.
 
-use crate::api::{Activity, Exchange, Grant, Proposal, Request};
+use crate::api::{Exchange, Grant, Proposal, Request};
 use crate::pick::Pick;
 use crate::screens::{
     DEVICE_JOIN, approve, button, clickable, column, device_rows, device_warning, id_for, link,
@@ -9,18 +9,22 @@ use crate::screens::{
 };
 use crate::theme::{MEDIUM, Theme, bold, chars, lines};
 use crate::words::{self, connector, horizon, span};
-use crate::{Adjust, Screen, Shell};
-use gpui::{AnyElement, Context, Div, ElementId, Stateful, div, prelude::*};
+use crate::{Adjust, Shell};
+use gpui::{AnyElement, Context, Div, ElementId, Stateful, div, hsla, prelude::*, px, relative};
 use mandate_core::Record;
 use serde_json::json;
 
 pub(crate) const FOR: [u64; 7] = [900, 1800, 3600, 7200, 14400, 28800, 43200];
 pub(crate) const HORIZON: [u64; 4] = [86400, 604800, 2592000, 0];
+/// The windows Adjust offers besides the one asked for.
+const WINDOWS: [u64; 4] = [900, 3600, 14400, 43200];
 
 impl Shell {
     pub(crate) fn now_tab(&self, t: Theme, cx: &mut Context<Self>) -> Div {
         let mut waiting: Vec<AnyElement> = Vec::new();
-        for ex in self.exchanges.iter().filter(|e| self.shown(&e.name)) {
+        // An exchange shows here once its party's code matched.
+        let confirmed = self.exchanges.iter().filter(|e| e.state == "confirmed");
+        for ex in confirmed.filter(|e| self.shown(&e.name)) {
             waiting.push(login_card(t, ex, cx).into_any_element());
         }
         for r in &self.now.requests {
@@ -102,7 +106,12 @@ impl Shell {
             }
             (_, Some(s)) => (
                 "wants to read".into(),
-                format!("{} {} for {}", words::days(&s.days), s.start, span(s.length)),
+                format!(
+                    "{} {} for {}",
+                    words::days(&s.days),
+                    words::time_of_day(&s.start),
+                    span(s.length)
+                ),
             ),
             _ => ("wants to read".into(), span(a.for_)),
         };
@@ -113,12 +122,14 @@ impl Shell {
                 r.terms.iter().flatten().filter(|t| t.chats.as_ref().is_none_or(Vec::is_empty));
             column()
                 .children(a.names.iter().map(|(id, name)| {
+                    // An ID only tells apart chats that share a name.
+                    let twin = a.names.iter().any(|(other, n)| other != id && n == name);
                     div()
                         .flex()
                         .flex_wrap()
                         .gap_x(chars(1.))
                         .child(name.clone())
-                        .child(t.alt(words::short_id(id)))
+                        .when(twin, |d| d.child(t.alt(words::short_id(id))))
                 }))
                 .children(unmatched.map(|u| t.alt(format!("no chat matched \"{}\"", u.term))))
                 .into_any_element()
@@ -146,13 +157,24 @@ impl Shell {
         let deny = format!("requests/{id}/deny");
         let name = r.identity_name.clone();
         let (ra, rb) = (r.clone(), r.clone());
+        let adjust = (r.kind != "extend").then(|| {
+            let label = if nothing { "Pick chats" } else { "Adjust" };
+            div().flex().justify_end().child(
+                link(t, id_for("adjust", &id), label, cx, move |this, cx| {
+                    this.open_adjust(&rb, cx)
+                })
+                .font_weight(MEDIUM),
+            )
+        });
+        // Deny sits above, so that Approve's full width at the bottom is
+        // where the thumb lands, and nothing else is.
         panel(t)
             .child(
                 column()
                     .child(who(&r.identity_name, &verb))
                     .child(div().font_weight(MEDIUM).child(connector(&r.connector))),
             )
-            .child(table(t, rows))
+            .child(column().gap(lines(0.25)).child(table(t, rows)).children(adjust))
             .when(nothing, |d| {
                 d.child(format!(
                     "Nothing matched {} on {}.",
@@ -161,12 +183,14 @@ impl Shell {
                 ))
             })
             .children(reason(t, &r.reason))
-            .when(a.open, |d| {
-                let picking =
-                    self.picker.as_ref().is_some_and(|p| p.pick == Pick::Request(r.id.clone()));
-                let picker = picking.then(|| self.request_picker(t, &r.id, &a, cx));
-                d.child(adjust_panel(t, r, &a, picker, cx))
+            .when(named && !nothing && a.chats.is_empty(), |d| {
+                d.child(t.alt("tick the chats to grant"))
             })
+            .when(nothing, |d| d.child(t.alt("pick the chats to grant")))
+            .child(button(t, id_for("deny", &id), "Deny", cx, move |this, cx| {
+                let notice = format!("You denied {name}'s request.");
+                this.post("POST", deny.clone(), cx, move |_| Some(notice))
+            }))
             .when(!nothing, |d| {
                 d.child(approve(
                     t,
@@ -177,71 +201,83 @@ impl Shell {
                     move |this, cx| this.approve_request(&ra, cx),
                 ))
             })
-            .when(named && !nothing && a.chats.is_empty(), |d| {
-                d.child(t.alt("tick the chats to grant"))
-            })
-            .when(nothing && !a.open, |d| d.child(t.alt("pick the chats to grant")))
-            .child(
-                div()
-                    .flex()
-                    .gap(chars(1.))
-                    .when(r.kind != "extend", |d| {
-                        let label = if nothing { "Pick chats" } else { "Adjust" };
-                        d.child(
-                            button(t, id_for("adjust", &id), label, cx, move |this, cx| {
-                                let a = this
-                                    .adjust
-                                    .entry(rb.id.clone())
-                                    .or_insert_with(|| Adjust::of(&rb));
-                                a.open = !a.open;
-                                let (open, empty) = (a.open, a.names.is_empty());
-                                if open && empty && rb.terms.is_some() {
-                                    this.open_picker(
-                                        Pick::Request(rb.id.clone()),
-                                        rb.connector.clone(),
-                                        cx,
-                                    );
-                                } else if !open {
-                                    this.close_picker(cx);
-                                }
-                                cx.notify();
-                            })
-                            .flex_1(),
-                        )
-                    })
-                    .child(
-                        button(t, id_for("deny", &id), "Deny", cx, move |this, cx| {
-                            let notice = format!("You denied {name}'s request.");
-                            this.post("POST", deny.clone(), cx, move |_| Some(notice))
-                        })
-                        .flex_1(),
-                    ),
-            )
     }
 
-    pub(crate) fn activity(&self, a: &Activity) -> String {
-        let name = self
-            .identities
-            .iter()
-            .find(|i| i.id == a.identity)
-            .map_or("An agent", |i| i.name.as_str());
-        let conn = connector(&a.connector);
-        let chats: Vec<&str> = a
-            .chats
-            .iter()
-            .flatten()
-            .map(|c| if c.name.is_empty() { c.id.as_str() } else { c.name.as_str() })
-            .collect();
-        let chats = chats.join(", ");
-        let n = |n: u64, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
-        match a.verb.as_str() {
-            "messages" => format!("{name} read {chats} on {conn} · {}", n(a.count, "message")),
-            "chats" => format!("{name} listed {conn} chats"),
-            "search" => format!("{name} searched {conn} · {}", n(a.count, "result")),
-            "media" => format!("{name} opened a file in {chats}"),
-            "send" => format!("You sent {name}'s message to {chats} on {conn}"),
-            op => format!("You let {name} {op} on {conn}"),
+    /// Opens Adjust for one request, closing it on any other; with nothing
+    /// matched, the chat picker opens with it.
+    fn open_adjust(&mut self, r: &Request, cx: &mut Context<Self>) {
+        for a in self.adjust.values_mut() {
+            a.open = false;
         }
+        let a = self.adjust.entry(r.id.clone()).or_insert_with(|| Adjust::of(r));
+        a.open = true;
+        if a.names.is_empty() && r.terms.is_some() {
+            self.open_picker(Pick::Request(r.id.clone()), r.connector.clone(), cx);
+        } else {
+            self.close_picker(cx);
+        }
+    }
+
+    /// Closes Adjust, keeping what the owner chose; false if none was open.
+    pub(crate) fn close_adjust(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(a) = self.adjust.values_mut().find(|a| a.open) else { return false };
+        a.open = false;
+        self.close_picker(cx);
+        true
+    }
+
+    /// Adjust, as a sheet from the bottom over Now: chats, window and
+    /// history, then Done. bottom is the inset the window draws under.
+    pub(crate) fn adjust_sheet(
+        &self,
+        t: Theme,
+        bottom: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let r =
+            self.now.requests.iter().find(|r| self.adjust.get(&r.id).is_some_and(|a| a.open))?;
+        let a = &self.adjust[&r.id];
+        let picking = self.picker.as_ref().is_some_and(|p| p.pick == Pick::Request(r.id.clone()));
+        let picker = picking.then(|| self.request_picker(t, &r.id, a, cx));
+        let scrim = div().id("scrim").flex_1().bg(hsla(0., 0., 0., 0.4)).on_click(cx.listener(
+            |this, _, _, cx| {
+                this.close_adjust(cx);
+            },
+        ));
+        let sheet = div()
+            .id("sheet")
+            .occlude()
+            .max_h(relative(0.85))
+            .overflow_y_scroll()
+            .bg(t.bg)
+            .border_t_2()
+            .border_color(t.text)
+            .pt(lines(1.))
+            .pb(px(bottom) + lines(1.))
+            .px(chars(1.))
+            .child(
+                column()
+                    .w_full()
+                    .max_w(chars(80.))
+                    .mx_auto()
+                    .gap(lines(1.))
+                    .child(who(&r.identity_name, "wants to read"))
+                    .child(adjust_panel(t, r, a, picker, cx))
+                    .child(button(t, "done", "Done", cx, |this, cx| {
+                        this.close_adjust(cx);
+                    })),
+            );
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(scrim)
+                .child(sheet),
+        )
     }
 
     fn stop_all_control(&self, t: Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -304,12 +340,14 @@ fn adjust_panel(
             this.open_picker(Pick::Request(r.id.clone()), r.connector.clone(), cx)
         })
     };
-    let fors: Vec<u64> = FOR.into_iter().filter(|&f| f < r.for_).chain([r.for_]).collect();
-    let horizons: Vec<u64> = HORIZON
-        .into_iter()
-        .filter(|&h| r.horizon == 0 || (h != 0 && h < r.horizon))
-        .chain((r.horizon != 0).then_some(r.horizon))
-        .collect();
+    // Free choices, starting from what was asked.
+    let mut fors: Vec<u64> = WINDOWS.into_iter().chain([r.for_]).collect();
+    fors.sort_unstable();
+    fors.dedup();
+    let mut horizons: Vec<u64> = HORIZON.into_iter().chain([r.horizon]).collect();
+    // All history, 0, comes last.
+    horizons.sort_unstable_by_key(|&h| if h == 0 { u64::MAX } else { h });
+    horizons.dedup();
     let choices = |field: &'static str,
                    values: Vec<u64>,
                    current: u64,
@@ -330,9 +368,6 @@ fn adjust_panel(
     };
     column()
         .gap(lines(1.))
-        .border_t_2()
-        .border_color(t.alt)
-        .pt(lines(1.))
         .when(named, |d| {
             d.child(div().font_weight(MEDIUM).child("CHATS"))
                 .when(!ticks.is_empty(), |d| d.child(column().children(ticks)))
@@ -342,17 +377,18 @@ fn adjust_panel(
                 })
         })
         .when(r.kind == "once", |d| {
-            d.child(div().font_weight(MEDIUM).child("FOR"))
+            d.child(div().font_weight(MEDIUM).child("WINDOW"))
                 .child(choices("for", fors, a.for_, span, cx))
         })
-        .child(div().font_weight(MEDIUM).child("MESSAGES FROM"))
+        .child(div().font_weight(MEDIUM).child("HISTORY"))
         .child(choices("horizon", horizons, a.horizon, horizon, cx))
 }
 
+/// A party whose code matched, waiting to be let in.
 fn login_card(t: Theme, ex: &Exchange, cx: &mut Context<Shell>) -> Div {
     let ex2 = ex.clone();
-    let code = button(t, id_for("code", &ex.id), "Type the code", cx, move |this, cx| {
-        this.go(Screen::Code { exchange: ex2.clone(), code: String::new() }, cx)
+    let review = button(t, id_for("review", &ex.id), "Review", cx, move |this, cx| {
+        this.admit_exchange(ex2.clone(), cx)
     });
     let since = ("Since".to_string(), div().child(words::clock(&ex.started_at)).into_any_element());
     if ex.kind == "device" {
@@ -362,14 +398,14 @@ fn login_card(t: Theme, ex: &Exchange, cx: &mut Context<Shell>) -> Div {
             .child(bold(DEVICE_JOIN.to_string()))
             .child(table(t, rows))
             .child(device_warning(t))
-            .child(code);
+            .child(review);
     }
     let mut rows = Vec::new();
     if !ex.address.is_empty() {
         rows.push(("From".to_string(), div().child(ex.address.clone()).into_any_element()));
     }
     rows.push(since);
-    panel(t).child(who(&ex.name, "wants to log in")).child(table(t, rows)).child(code)
+    panel(t).child(who(&ex.name, "wants to join as an agent")).child(table(t, rows)).child(review)
 }
 
 fn send_card(t: Theme, p: &Proposal, cx: &mut Context<Shell>) -> Div {
@@ -460,7 +496,8 @@ fn open_grant(t: Theme, g: &Grant, cx: &mut Context<Shell>) -> Div {
 
 fn routine(t: Theme, g: &Grant, stopped: bool, cx: &mut Context<Shell>) -> Div {
     let when = g.schedule.as_ref().map_or(String::new(), |s| {
-        format!("{} at {} for {} · ", words::days(&s.days), s.start, span(s.length))
+        let start = words::time_of_day(&s.start);
+        format!("{} at {start} for {} · ", words::days(&s.days), span(s.length))
     });
     let id = g.id.clone();
     let running = g

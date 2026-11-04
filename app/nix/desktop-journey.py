@@ -1,7 +1,8 @@
 # The desktop app's journey against the demo server. The first run pairs by
-# the setup page's link with the CanoKey (FIDO2), lets an agent in, and
-# approves a read and, from its notification, a send. The second run joins
-# with a SoftHSM2 key (PKCS#11), is let in by the first, and approves a read.
+# the setup page's link with the CanoKey (FIDO2), lets an agent in with the
+# code it shows, and approves a read and, from its notification, a send. The
+# second run joins with a SoftHSM2 key (PKCS#11) and the code the first shows,
+# is let in by the first, and approves a read.
 # Each effect is checked on the server. gpui draws no accessibility nodes,
 # so the app's buttons are found by their text (OCR).
 # desktop-journey.nix defines module.
@@ -60,7 +61,7 @@ seen: list[str] = []
 def lines(n: int) -> list[list[tuple[str, int, int, int, int]]]:
     found: dict[tuple[str, ...], list[tuple[str, int, int, int, int]]] = {}
     sh(n, "import -window root -resize 200% /tmp/ocr.png")
-    for negate in ("", "-colorspace gray -negate -threshold 50%"):
+    for negate in ("", "-colorspace gray -threshold 50%", "-colorspace gray -negate -threshold 50%"):
         tsv = sh(n, f"magick /tmp/ocr.png {negate} png:- | tesseract stdin stdout tsv 2>/dev/null")
         for row in tsv.splitlines()[1:]:
             f = row.split("\t")
@@ -163,16 +164,16 @@ def keys(screen: int, n: int) -> None:
     )
 
 
-# The 6 digits the joining run shows, one per box.
+# The 6-digit code an invite shows.
 def code(n: int) -> str:
     def read() -> str | None:
         for line in lines(n):
-            digits = "".join(w[0] for w in line)
-            if re.fullmatch(r"\d{6}", digits):
-                return digits
+            for w in line:
+                if re.fullmatch(r"\d{6}", w[0]):
+                    return w[0]
         return None
 
-    return until("the join code", read)
+    return until(f"a code on screen {n}", read)
 
 
 start_all()
@@ -205,8 +206,9 @@ with subtest("the first run pairs by the setup page's link, with the FIDO2 key")
     # The link goes through the x-scheme-handler, as a browser hands it on.
     sh(1, "xdg-mime query default x-scheme-handler/mandate | grep -q dev.mandate.app.desktop")
     spawn(1, "app1", f"xdg-open {shlex.quote(link)}")
-    see(1, "Pair only if")
-    tap(1, "Pair")
+    # OCR misses the boxed PAIR, which sits centered two lines under the warning.
+    _, y = see(1, "setup printed")
+    sh(1, f"xdotool mousemove 640 {y + 42} click 1")
     see(1, "Security key")
     shot(1, "chooser-light")
     tap(1, "Security key")
@@ -225,16 +227,15 @@ def sign(n: int, pin: str | None) -> None:
         typed(n, pin, enter=True)
 
 
-with subtest("an agent gets in by the code the owner types"):
+with subtest("an agent gets in by the code the app shows"):
+    sh(1, "xdotool mousemove 562 785 click 1")  # the Agents tab; OCR misses its small label
+    tap(1, "Add an agent")
+    login = code(1)
+    shot(1, "invite-agent-light")
     server.succeed(
-        "(mandate login https://localhost:8443 --name laptop >/tmp/login.log 2>&1; echo $? >/tmp/login.exit)"
-        " >/dev/null 2>&1 &"
+        f"(echo {login} | mandate login https://localhost:8443 --name laptop >/tmp/login.log 2>&1;"
+        " echo $? >/tmp/login.exit) >/dev/null 2>&1 &"
     )
-    server.wait_until_succeeds("grep -q 'code: ' /tmp/login.log")
-    login = grab(r"code: (\d{6})", server.succeed("cat /tmp/login.log"))
-    tap(1, "Type the code")
-    see(1, "6 digits")
-    typed(1, login)
     tap(1, "Let laptop in")
     until("the PIN prompt or the agent", lambda: find(1, "to sign") or server.execute("test -s /tmp/login.exit")[0] == 0)
     sign(1, PIN)
@@ -282,11 +283,26 @@ with subtest("a click on a send's notification opens it, and the send runs once"
     assert status == 0 and "done" in out, (status, out)
     assert len(sent()) == 1 and "on my way" in sent()[0], sent()
 
-with subtest("a second run joins with a PKCS#11 key, let in by the first"):
+# The pairing screen's "Join as another device" link, which OCR misses for
+# its underline: 20 columns right of "Already set up?".
+def join_link(n: int) -> None:
+    x, y = see(n, "Already set up")
+    sh(n, f"xdotool mousemove {x + 168} {y} click 1")
+
+
+with subtest("a second run joins with a PKCS#11 key and the code the first shows"):
     scheme(2, True)
     spawn(2, "app2", "mandate-app")
-    tap(2, "Join as another device")
+    join_link(2)
+    see(2, "Server address")
     typed(2, "https://server:8443", enter=True)
+    sh(1, "xdotool mousemove 938 115 click 1")  # the settings icon
+    tap(1, "Add a device")
+    digits = code(1)
+    shot(1, "invite-device-light")
+    typed(2, digits)
+    shot(2, "join-dark")
+    sh(2, "xdotool key Return")
     see(2, "PKCS11 token")
     shot(2, "chooser-dark")
     tap(2, "PKCS11 token")
@@ -294,10 +310,6 @@ with subtest("a second run joins with a PKCS#11 key, let in by the first"):
     see(2, "desktop PIN")
     typed(2, HSM_PIN, enter=True)
     tap(2, "Make a new key")
-    digits = code(2)
-    shot(2, "joining-dark")
-    tap(1, "Type the code")
-    typed(1, digits)
     tap(1, "Let this device in")
     until("the PIN prompt or the join", lambda: find(1, "to sign") or find(2, "Stop all access"))
     sign(1, PIN)

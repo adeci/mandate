@@ -1,18 +1,21 @@
 //! Agents, Connections, Activity and Settings, as the console laid them out.
 
-use crate::api::{Activity, Grant, Now};
-use crate::device::hex;
+use crate::api::{Activity, Grant, History};
 use crate::pick::NewGrant;
 use crate::screens::{button, column, id_for, link, panel, table};
 use crate::theme::{MEDIUM, Theme, bold, chars, lines};
 use crate::words::{self, connector, horizon};
 use crate::{Screen, Shell, segment};
-use gpui::{AnyElement, Context, Div, div, prelude::*};
+use gpui::{Context, Div, canvas, div, prelude::*};
 use mandate_core::{Op, Record, Time, Trust};
 use serde_json::json;
 
 impl Shell {
     pub(crate) fn agents_tab(&self, t: Theme, cx: &mut Context<Self>) -> Div {
+        let add = button(t, "add-agent", "Add an agent", cx, |this, cx| this.invite("agent", cx));
+        let empty = self.identities.is_empty().then(|| {
+            t.alt("No agents yet. Add one: you get a code to give it, and it logs in with that.")
+        });
         let agents = self.identities.iter().filter(|a| self.shown(&a.name)).map(|a| {
             let seen = a.last_seen.as_deref().map_or("not connected yet".into(), |s| {
                 format!("last seen {} {}", words::date(s), words::clock(s))
@@ -63,12 +66,7 @@ impl Shell {
                     .font_weight(MEDIUM),
                 )
         });
-        column()
-            .gap(lines(1.))
-            .when(self.identities.is_empty(), |d| {
-                d.child(t.alt("No agents yet. An agent logs in with mandate login, and you type its code on Now."))
-            })
-            .children(agents)
+        column().gap(lines(1.)).children(empty).child(div().flex().child(add)).children(agents)
     }
 
     pub(crate) fn connections_tab(&self, t: Theme, cx: &mut Context<Self>) -> Div {
@@ -97,7 +95,7 @@ impl Shell {
                         .flex()
                         .gap(chars(2.))
                         .child(t.alt(k).w(chars(8.)).flex_none())
-                        .child(div().flex_1().child(v))
+                        .child(div().flex_1().min_w_0().child(v))
                 }))
                 .child(self.link_control(t, &c.name, c.setup, cx))
         });
@@ -145,73 +143,172 @@ impl Shell {
         )
     }
 
-    /// What agents did, newest first, under the local day it happened;
-    /// Show more pages back through the server's days.
-    pub(crate) fn activity_tab(&self, t: Theme, cx: &mut Context<Self>) -> Div {
+    /// Everything that happened, newest first, under the local day it
+    /// happened; scrolling near the end loads further back.
+    pub(crate) fn activity_tab(&self, t: Theme, _cx: &mut Context<Self>) -> Div {
+        let Some(history) = &self.history else {
+            return column().child(t.alt("Loading activity…"));
+        };
         let today = words::day(Time::now().unix());
-        let mut days: Vec<(String, Vec<&Activity>)> = vec![(today.clone(), Vec::new())];
-        let all = self.now.activity.iter().chain(self.older.iter().flat_map(|(_, a)| a));
-        for a in all.filter(|a| self.shown(&self.activity(a))) {
+        let mut days: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        for a in &history.entries {
+            let line = self.entry(a);
+            if !self.shown(&line) {
+                continue;
+            }
             let day = words::date(&a.at);
+            let row = (words::clock(&a.at), line);
             match days.last_mut() {
-                Some((d, list)) if *d == day => list.push(a),
-                _ => days.push((day, vec![a])),
+                Some((d, rows)) if *d == day => rows.push(row),
+                _ => days.push((day, vec![row])),
             }
         }
-        let sections = days.into_iter().filter(|(d, acts)| *d == today || !acts.is_empty()).map(
-            |(day, acts)| {
-                let rows: Vec<(String, AnyElement)> = acts
-                    .into_iter()
-                    .map(|a| {
-                        (words::clock(&a.at), div().child(self.activity(a)).into_any_element())
-                    })
-                    .collect();
-                let title = if day == today { "Today".to_string() } else { day };
-                column().gap(lines(1.)).child(t.heading(&title)).child(if rows.is_empty() {
-                    t.alt("Nothing happened yet today.").into_any_element()
-                } else {
-                    table(t, rows).into_any_element()
-                })
-            },
-        );
-        // The server keeps activity by UTC day; say how far back it looked.
-        let back = self.older.last().map(|(day, _)| {
-            t.alt(format!("Looked back to {}.", words::date(&format!("{day}T12:00:00Z"))))
+        self.day_tops.borrow_mut().clear();
+        let sections = days.into_iter().map(|(day, rows)| {
+            let title = if day == today { "Today".to_string() } else { day };
+            // Each header says where it is, for the one that sticks on top.
+            let tops = self.day_tops.clone();
+            let at = title.clone();
+            let mark = canvas(
+                move |bounds, _, _| tops.borrow_mut().push((at, f32::from(bounds.top()))),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full();
+            column().child(div().relative().child(day_heading(&title)).child(mark)).children(
+                rows.into_iter().map(|(time, line)| {
+                    div()
+                        .flex()
+                        .gap(chars(1.))
+                        .py(lines(0.25))
+                        .child(t.alt(time).flex_none())
+                        .child(div().flex_1().min_w_0().child(line))
+                }),
+            )
         });
-        column().gap(lines(1.)).children(sections).children(back).child(div().flex().child(button(
-            t,
-            "more",
-            "Show more",
-            cx,
-            |this, cx| this.more_activity(cx),
-        )))
+        let end = match (&history.next, history.entries.is_empty()) {
+            (Some(_), _) => t.alt("Loading more…"),
+            (None, true) => t.alt("Nothing has happened yet."),
+            (None, false) => t.alt("That is everything."),
+        };
+        column().gap(lines(1.)).children(sections).child(end)
     }
 
-    /// Loads more activity: the rest of the last shown day while it has
-    /// more, else the day before it.
-    fn more_activity(&mut self, cx: &mut Context<Self>) {
-        let today = words::utc_day(Time::now().unix());
-        let (day, last, more) = match self.older.last() {
-            Some((day, acts)) => (day.clone(), acts.last(), self.older_more),
-            None => (today, self.now.activity.last(), self.now.more),
+    /// One plain line for an entry: who did what, and how it ended.
+    fn entry(&self, a: &Activity) -> String {
+        let who = self
+            .identities
+            .iter()
+            .find(|i| i.id == a.identity)
+            .map_or("an agent", |i| i.name.as_str());
+        let on = connector(&a.connector);
+        let chats: Vec<&str> = a
+            .chats
+            .iter()
+            .map(|c| if c.name.is_empty() { c.id.as_str() } else { c.name.as_str() })
+            .collect();
+        let chats = chats.join(", ");
+        let n = |what: &str| {
+            let n = a.count.unwrap_or(0);
+            format!("{n} {what}{}", if n == 1 { "" } else { "s" })
         };
-        let (day, before) = match (more, last) {
-            (true, Some(a)) => (day, a.at.parse::<Time>().ok()),
-            _ => {
-                let noon = format!("{day}T12:00:00Z").parse::<Time>().map_or(0, Time::unix);
-                (words::utc_day(noon - 86400), None)
-            }
+        let d = &a.detail;
+        match a.kind.as_str() {
+            "read" => match d.as_str() {
+                "messages" => format!("{who} read {chats} on {on} · {}", n("message")),
+                "chats" => format!("{who} listed {on} chats"),
+                "search" => format!("{who} searched {on} · {}", n("result")),
+                "media" => format!("{who} opened a file in {chats} on {on}"),
+                op => format!("{who} used {op} on {on}"),
+            },
+            "request.asked" if d.is_empty() => format!("{who} asked to read {on}"),
+            "request.asked" => format!("{who} asked to read {on}: \"{d}\""),
+            "request.approved" => format!("you approved {who} on {on} · {d}"),
+            "request.denied" => format!("you denied {who}'s request for {on}"),
+            "request.expired" => format!("{who}'s request for {on} expired"),
+            "proposal.made" => format!("{who} asked to {d} on {on}"),
+            "proposal.approved" => format!("you approved {who}'s send on {on} · {d}"),
+            "proposal.done" => format!("sent · {who} on {on} · {d}"),
+            "proposal.failed" => format!("failed · {who} on {on} · {d}"),
+            "proposal.unknown" => format!("may have sent · {who} on {on} · {d}"),
+            "proposal.denied" => format!("you denied {who}'s send on {on}"),
+            "proposal.expired" => format!("{who}'s {d} on {on} expired"),
+            "grant.made" => format!("you granted {who} {on}"),
+            "grant.extended" => format!("you extended {who}'s grant on {on} {d}"),
+            "grant.closed" => format!("{who}'s grant on {on} closed"),
+            "routine.paused" => format!("you paused {who}'s routine on {on}"),
+            "routine.resumed" => format!("you resumed {who}'s routine on {on}"),
+            "agent.admitted" => format!("you let {d} in"),
+            "agent.deleted" => format!("you deleted {d}"),
+            "device.joined" => format!("{d} joined as a device"),
+            "key.removed" => format!("you removed {d}"),
+            "stop_all" => format!("you stopped all access · {d}"),
+            kind => format!("{kind} · {d}"),
+        }
+    }
+
+    /// The day whose header has scrolled above the page, to keep on top.
+    pub(crate) fn sticky_day(&self) -> Option<String> {
+        let top = f32::from(self.scroll.bounds().top());
+        let tops = self.day_tops.borrow();
+        tops.iter().take_while(|(_, y)| *y < top).last().map(|(day, _)| day.clone())
+    }
+
+    /// Loads the newest history, ahead of what is already loaded.
+    pub(crate) fn load_history(&mut self, cx: &mut Context<Self>) {
+        self.page_history(None, cx);
+    }
+
+    /// Loads the page before the last loaded, while there is one.
+    pub(crate) fn more_history(&mut self, cx: &mut Context<Self>) {
+        if let Some(next) = self.history.as_ref().and_then(|h| h.next.clone()) {
+            self.page_history(Some(next), cx);
+        }
+    }
+
+    fn page_history(&mut self, before: Option<String>, cx: &mut Context<Self>) {
+        if self.history_loading {
+            return;
+        }
+        self.history_loading = true;
+        let path = match &before {
+            Some(next) => format!("activity?limit=100&before={}", segment(next)),
+            None => "activity?limit=100".into(),
         };
         let client = self.device().client;
         self.call(
             cx,
-            move || {
-                let page: Now = client.now(Some(&day), before)?;
-                Ok((day, page))
-            },
-            |this, (day, page), _| {
-                this.older_more = page.more;
-                this.older.push((day, page.activity));
+            move || Ok(client.get::<History>(&path)),
+            move |this, page, _| {
+                this.history_loading = false;
+                let page = match page {
+                    Ok(page) => page,
+                    // No retry on every frame: the next refresh tries the
+                    // newest page again.
+                    Err(e) => {
+                        let h = this.history.get_or_insert_with(History::default);
+                        h.next = None;
+                        return this.error = Some(e.to_string());
+                    }
+                };
+                match (&mut this.history, before) {
+                    // Older entries go after what is loaded.
+                    (Some(h), Some(_)) => {
+                        h.entries.extend(page.entries);
+                        h.next = page.next;
+                    }
+                    // Newer ones go before it, up to the first already there.
+                    (Some(h), None) if !h.entries.is_empty() => {
+                        let first = (h.entries[0].at.clone(), h.entries[0].kind.clone());
+                        let fresh: Vec<Activity> = page
+                            .entries
+                            .into_iter()
+                            .take_while(|e| (&e.at, &e.kind) != (&first.0, &first.1))
+                            .collect();
+                        h.entries.splice(0..0, fresh);
+                    }
+                    _ => this.history = Some(page),
+                }
             },
         );
     }
@@ -237,6 +334,8 @@ impl Shell {
                 })
         });
         let devices: Vec<Div> = devices.collect();
+        let add_device =
+            button(t, "add-device", "Add a device", cx, |this, cx| this.invite("device", cx));
         let hidden = self.hidden.iter().enumerate().map(|(i, h)| {
             let path =
                 format!("never-share/{}/{}/{}", segment(&h.connector), h.kind, segment(&h.id));
@@ -252,15 +351,13 @@ impl Shell {
                     this.post("DELETE", path.clone(), cx, move |_| Some(notice))
                 }))
         });
+        // The same short key the setup page and `mandate setup` print.
         let key = match self.device.as_ref().map(|d| d.client.trust()) {
-            Some(Trust::Pin(k)) => {
-                let k = hex(&k);
-                (0..k.len()).step_by(4).map(|i| &k[i..i + 4]).collect::<Vec<_>>().join(" ")
-            }
-            _ => "checked against the usual certificate roots".into(),
+            Some(Trust::Pin(k)) => crate::screens::fingerprint(&k),
+            _ => "certificate verified".into(),
         };
         #[cfg(target_os = "android")]
-        let this_key: Option<Vec<(String, AnyElement)>> = None;
+        let this_key: Option<Vec<(String, gpui::AnyElement)>> = None;
         #[cfg(not(target_os = "android"))]
         let this_key = self.device.as_ref().map(|d| {
             let rows = d.key.rows().into_iter();
@@ -270,7 +367,8 @@ impl Shell {
             .gap(lines(1.))
             .child(t.heading("Devices"))
             .child(column().border_2().border_color(t.text).children(devices))
-            .child(t.alt("Each device can approve. Another device joins with a code you type on Now."))
+            .child(t.alt("Each device can approve. Another device joins with a code this one shows."))
+            .child(div().flex().child(add_device))
             .when_some(this_key, |d, rows| {
                 d.child(t.heading("This computer's key"))
                     .child(table(t, rows))
@@ -327,7 +425,9 @@ fn grant_line(t: Theme, g: &Grant) -> Div {
             .join(", ")
     };
     let state = match (&g.until, &g.schedule) {
-        (_, Some(s)) => format!("[{} at {}]", words::days(&s.days), s.start),
+        (_, Some(s)) => {
+            format!("[{} at {}]", words::days(&s.days), words::time_of_day(&s.start))
+        }
         (Some(u), None) => format!("[until {}]", words::clock(u)),
         _ => String::new(),
     };
@@ -335,4 +435,9 @@ fn grant_line(t: Theme, g: &Grant) -> Div {
         .child(format!("{chats} · {}", connector(&g.connector)))
         .child(div().text_color(if g.schedule.is_some() { t.routine } else { t.open }).child(state))
         .child(t.alt(horizon(g.horizon)))
+}
+
+/// A day's header in Activity, in the list and stuck on top.
+pub(crate) fn day_heading(day: &str) -> Div {
+    bold(day.to_uppercase()).py(lines(0.5))
 }
