@@ -241,6 +241,19 @@ in
         server.wait_until_succeeds("grep -q ': open' /tmp/events")
         status, out = laptop.execute("echo 123456 | mandate login https://server:8443 --name laptop 2>&1")
         assert status != 0 and "nothing is waiting for a login" in out, (status, out)
+        # Denied: the login ends at once with "Not let in."
+        denied = call("POST", "/owner/v1/exchanges", {"kind": "agent"})["body"]
+        laptop.succeed(
+            # set +e: the driver's errexit would end the subshell with mandate.
+            f"(set +e; echo {denied['code']} | mandate login https://server:8443 --name laptop >/tmp/denied.log 2>&1;"
+            " echo $? >/tmp/denied.exit) >/dev/null 2>&1 &"
+        )
+        server.wait_until_succeeds("testdevice --state /root/phone.json call GET /owner/v1/exchanges | grep -q confirmed")
+        assert call("DELETE", f"/owner/v1/exchanges/{denied['id']}")["status"] == 200
+        laptop.wait_until_succeeds("test -s /tmp/denied.exit")
+        assert laptop.succeed("cat /tmp/denied.exit").strip() == "1" and "Not let in." in laptop.succeed("cat /tmp/denied.log")
+        entry = call("GET", "/owner/v1/activity?kinds=access&limit=1")["body"]["entries"][0]
+        assert entry["kind"] == "agent.denied" and entry["detail"] == "laptop" and entry["address"], entry
         first = call("POST", "/owner/v1/exchanges", {"kind": "agent"})["body"]
         ex = call("POST", "/owner/v1/exchanges", {"kind": "agent"})["body"]
         assert [e["id"] for e in call("GET", "/owner/v1/exchanges")["body"]] == [ex["id"]]
@@ -264,7 +277,8 @@ in
         assert laptop.succeed("stat -c %a /root/.config/mandate/credentials.json").strip() == "600"
         server.wait_until_succeeds("grep -q '\"state\":\"approved\"' /tmp/events")
         events = [json.loads(e) for e in re.findall(r"event: exchange\ndata: (.*)", server.succeed("cat /tmp/events"))]
-        want = [(first["id"], "open"), (first["id"], "ended"), (ex["id"], "open"), (ex["id"], "confirmed"), (ex["id"], "approved")]
+        want = [(denied["id"], "open"), (denied["id"], "confirmed"), (denied["id"], "ended"),
+                (first["id"], "open"), (first["id"], "ended"), (ex["id"], "open"), (ex["id"], "confirmed"), (ex["id"], "approved")]
         assert [(e["id"], e["state"]) for e in events] == want, events
 
     with subtest("reads wait for a grant; one narrower than asked opens only its chats, back to its horizon"):

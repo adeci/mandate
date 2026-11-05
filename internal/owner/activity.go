@@ -35,6 +35,8 @@ type activity struct {
 	Note   string `json:"note,omitempty"`
 	// Device is the display name of the device that decided.
 	Device string `json:"device,omitempty"`
+	// Address is where a login or a joining device came from.
+	Address string `json:"address,omitempty"`
 }
 
 // gatewayRead is a read as the gateway posts it.
@@ -162,21 +164,28 @@ func (s *Server) getActivity(w http.ResponseWriter, r *http.Request) {
 	var before *cursor
 	if v := q.Get("before"); v != "" {
 		c, ok := parseCursor(v)
+		if t, err := time.Parse(time.RFC3339, v); !ok && err == nil {
+			// A time: what came strictly before it.
+			c, ok = cursor{t.UTC(), 0}, true
+		}
 		if !ok {
-			fail(w, http.StatusBadRequest, "before is a next from an earlier page")
+			fail(w, http.StatusBadRequest, "before is a next from an earlier page or an RFC 3339 time")
 			return
 		}
 		before = &c
 	}
-	match := func(activity) bool { return true }
-	if text := strings.ToLower(strings.TrimSpace(q.Get("q"))); text != "" {
+	kinds := kindFilter(q.Get("kinds"))
+	text := strings.ToLower(strings.TrimSpace(q.Get("q")))
+	names := map[string]string{}
+	if text != "" {
 		s.mu.Lock()
-		names := map[string]string{}
 		for id, i := range s.st.Identities {
 			names[id] = i.Name
 		}
 		s.mu.Unlock()
-		match = func(a activity) bool { return a.matches(text, names[a.Identity]) }
+	}
+	match := func(a activity) bool {
+		return kinds(a.Kind) && (text == "" || a.matches(text, names[a.Identity]))
 	}
 	entries, next, err := readActivity(s.dir, before, limit, match)
 	if err != nil {
@@ -196,11 +205,40 @@ type placed struct {
 	at cursor
 }
 
+// kindGroups are the kinds Activity's filters name.
+var kindGroups = map[string][]string{
+	"reads":    {"read"},
+	"sends":    {"proposal"},
+	"requests": {"request", "grant", "routine", "stop_all"},
+	"access":   {"agent", "device", "key"},
+}
+
+// kindFilter matches the kinds that list, a comma-separated list of kinds,
+// prefixes (request matches request.denied) and groups, names; all if it is
+// empty.
+func kindFilter(list string) func(kind string) bool {
+	var want []string
+	for _, k := range strings.Split(list, ",") {
+		k = strings.TrimSpace(k)
+		if g, ok := kindGroups[k]; ok {
+			want = append(want, g...)
+		} else if k != "" {
+			want = append(want, k)
+		}
+	}
+	if want == nil {
+		return func(string) bool { return true }
+	}
+	return func(kind string) bool {
+		return slices.ContainsFunc(want, func(w string) bool { return kind == w || strings.HasPrefix(kind, w+".") })
+	}
+}
+
 // matches reports whether the entry mentions text, which is lowercase:
 // in its identity (by ID or as identity names it), connector, chats, terms,
 // detail, reason, note or device.
 func (a activity) matches(text, identity string) bool {
-	fields := []string{a.Identity, identity, a.Connector, a.Detail, a.Reason, a.Note, a.Device}
+	fields := []string{a.Identity, identity, a.Connector, a.Detail, a.Reason, a.Note, a.Device, a.Address}
 	for _, c := range a.Chats {
 		fields = append(fields, c.ID, c.Name)
 	}

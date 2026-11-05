@@ -194,7 +194,7 @@ func (c *cli) login(ctx context.Context, args []string) error {
 	}
 	fmt.Fprintln(c.errOut, "Code confirmed; waiting for the owner to let this machine in.")
 	for {
-		var poll struct{ Status string }
+		var poll struct{ Status, Reason string }
 		if _, _, err := c.do(ctx, time.Minute+requestTimeout, http.MethodGet, "/agent/v1/join/"+id+"?wait=60", nil, &poll); err != nil {
 			return err
 		}
@@ -210,6 +210,9 @@ func (c *cli) login(ctx context.Context, args []string) error {
 			fmt.Fprintf(c.out, "logged in to %s as %s\n", c.url, *name)
 			return nil
 		case "ended":
+			if poll.Reason == "denied" {
+				return errors.New("Not let in.") //nolint:staticcheck // shown as is
+			}
 			return errors.New("the login ended before the owner let this machine in; run mandate login again")
 		}
 	}

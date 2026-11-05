@@ -365,7 +365,7 @@ func join(ctx context.Context, state, u, spki, code, name string) error {
 		return err
 	}
 	for {
-		var poll struct{ Status string }
+		var poll struct{ Status, Reason string }
 		if err := d.callJSON(ctx, http.MethodGet, "/owner/v1/join/"+started.ID+"?wait=30", nil, &poll); err != nil {
 			return err
 		}
@@ -374,7 +374,7 @@ func join(ctx context.Context, state, u, spki, code, name string) error {
 			d.Token = token
 			return d.save(state)
 		case "ended":
-			return errors.New("the exchange ended")
+			return fmt.Errorf("the exchange ended %s", poll.Reason)
 		}
 	}
 }

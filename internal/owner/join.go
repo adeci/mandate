@@ -47,6 +47,8 @@ type joining struct {
 	// has it in its live set and the exchange is approved.
 	admitted string
 	approved bool
+	// denied: the owner refused it after its code was confirmed.
+	denied bool
 }
 
 // attempt is one try at the code by a new party.
@@ -224,7 +226,13 @@ func (s *Server) joinPoll(kind string) http.HandlerFunc {
 			fail(w, http.StatusNotFound, "no such exchange")
 			return
 		}
-		reply(w, http.StatusOK, map[string]string{"status": state})
+		out := map[string]string{"status": state}
+		s.mu.Lock()
+		if j := s.join(r, kind); j != nil && j.denied {
+			out["reason"] = "denied"
+		}
+		s.mu.Unlock()
+		reply(w, http.StatusOK, out)
 	}
 }
 
@@ -322,9 +330,15 @@ func (s *Server) cancelJoin(w http.ResponseWriter, r *http.Request) {
 	case j == nil:
 		fail(w, http.StatusNotFound, "no such exchange")
 		return
-	case j.approved:
+	case j.approved || j.admitted != "":
 		fail(w, http.StatusConflict, "the exchange was approved already")
 		return
+	case j.state(s.now()) == "confirmed":
+		// The owner refuses who confirmed the code.
+		j.denied = true
+		s.endJoin(j)
+		by, _ := s.callerKey(r)
+		s.note(activity{Kind: j.kind + ".denied", Detail: j.name, Address: j.address}, by)
 	case !j.ended:
 		s.endJoin(j)
 	}
@@ -366,7 +380,7 @@ func (s *Server) joinChallenge(w http.ResponseWriter, r *http.Request) {
 			if err := s.commit("identities"); err != nil {
 				return err
 			}
-			s.note(activity{Kind: "agent.admitted", Identity: ident.ID, Detail: j.name}, env.Key)
+			s.note(activity{Kind: "agent.admitted", Identity: ident.ID, Detail: j.name, Address: j.address}, env.Key)
 			return nil
 		}})
 		return
@@ -379,7 +393,7 @@ func (s *Server) joinChallenge(w http.ResponseWriter, r *http.Request) {
 		if err := s.commit("keys"); err != nil {
 			return err
 		}
-		s.note(activity{Kind: "device.joined", Detail: k.Name}, env.Key)
+		s.note(activity{Kind: "device.joined", Detail: k.Name, Address: j.address}, env.Key)
 		return nil
 	})
 }

@@ -71,7 +71,7 @@ mistyped code fails and nobody can guess it offline.
    ([records.md](records.md)). The new party polls
    `GET {base}/join/{id}?wait=SECONDS` → `{"status": "<state>"}`, which
    waits while it is `open` or `confirmed`, until `approved`, and its token
-   works, or `ended`.
+   works, or `ended`; `"reason": "denied"` is added when the owner refused it.
 
 An exchange is `open`, then `confirmed`, then `approved` or `ended`. At most
 one of each kind is open or confirmed; opening another ends it. One attempt

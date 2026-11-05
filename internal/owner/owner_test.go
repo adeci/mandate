@@ -710,6 +710,46 @@ func TestActivitySearch(t *testing.T) {
 	}
 }
 
+func TestActivityFilters(t *testing.T) {
+	h := start(t, nil)
+	owner := h.pair() // device.paired, now
+	at := func(day int) time.Time { return time.Date(2026, 1, day, 12, 0, 0, 0, time.UTC) }
+	reads := []map[string]any{}
+	for day, verb := range map[int]string{1: "d1", 2: "d2", 3: "d3"} {
+		reads = append(reads, map[string]any{"at": at(day), "identity": "x", "connector": "test", "verb": verb, "chats": []chat{}, "count": 1})
+	}
+	if st := h.do("POST", "/internal/activity", "", reads, nil); st != http.StatusOK {
+		t.Fatalf("post activity = %d", st)
+	}
+	list := func(query string) (got []string) {
+		t.Helper()
+		var page activityPage
+		if st := h.do("GET", "/owner/v1/activity?"+query, owner.token, nil, &page); st != http.StatusOK {
+			t.Fatalf("activity?%s = %d", query, st)
+		}
+		for _, e := range page.Entries {
+			got = append(got, e.Kind+" "+e.Detail)
+		}
+		return got
+	}
+	for query, want := range map[string][]string{
+		"kinds=reads":                 {"read d3", "read d2", "read d1"},
+		"kinds=access":                {"device.paired Pixel 9"},
+		"kinds=device,sends":          {"device.paired Pixel 9"},
+		"kinds=read&limit=1":          {"read d3"},
+		"before=2026-01-03T00:00:00Z": {"read d2", "read d1"},
+		"before=2026-01-02T12:00:00Z": {"read d1"},
+		"kinds=requests":              nil,
+	} {
+		if got := list(query); !slices.Equal(got, want) {
+			t.Errorf("activity?%s = %v, want %v", query, got, want)
+		}
+	}
+	if st := h.do("GET", "/owner/v1/activity?before=yesterday", owner.token, nil, nil); st != http.StatusBadRequest {
+		t.Errorf("bad before = %d", st)
+	}
+}
+
 func TestActivityPaging(t *testing.T) {
 	h := start(t, nil)
 	owner := h.pair() // device.joined, now
@@ -920,6 +960,45 @@ func TestChallengeRules(t *testing.T) {
 	}
 	if st := h.do("POST", "/internal/requests", "", requestBody(agent), &limited); st != http.StatusTooManyRequests || limited.RetryAfter < 1 {
 		t.Errorf("fourth waiting request = %d, retry after %d", st, limited.RetryAfter)
+	}
+}
+
+func TestDenyLogin(t *testing.T) {
+	h := start(t, nil)
+	owner := h.pair()
+	id, code := h.open(owner, exchange.Agent)
+	p := exchange.Payload{TokenSHA256: exchange.TokenSHA256(exchange.NewToken())}
+	if st, out := h.join("/internal", exchange.Agent, code, p); st != http.StatusOK {
+		t.Fatalf("join = %d %v", st, out)
+	}
+	h.confirmed(owner, id, p)
+	// The agent is waiting on its poll when the owner denies.
+	polled := make(chan map[string]string, 1)
+	go func() {
+		var out map[string]string
+		h.do("GET", "/internal/join/"+id+"?wait=10", "", nil, &out)
+		polled <- out
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if st := h.do("DELETE", "/owner/v1/exchanges/"+id, owner.token, nil, nil); st != http.StatusOK {
+		t.Fatalf("deny = %d", st)
+	}
+	select {
+	case out := <-polled:
+		if out["status"] != "ended" || out["reason"] != "denied" {
+			t.Errorf("poll = %v", out)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the poll did not end")
+	}
+	var page activityPage
+	h.do("GET", "/owner/v1/activity?kinds=access", owner.token, nil, &page)
+	if len(page.Entries) != 2 || page.Entries[0].Kind != "agent.denied" || page.Entries[0].Detail != "laptop" ||
+		page.Entries[0].Address != "192.0.2.7" || page.Entries[0].Device != "Pixel 9" {
+		t.Errorf("activity = %+v", page.Entries)
+	}
+	if st := h.do("POST", "/owner/v1/exchanges/"+id+"/challenge", owner.token, nil, nil); st != http.StatusGone {
+		t.Errorf("admitting a denied login = %d", st)
 	}
 }
 

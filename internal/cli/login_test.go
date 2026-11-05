@@ -19,9 +19,10 @@ import (
 
 // joinServer plays the owner side of an exchange the owner opened with
 // code "123456": three wrong codes end it, and the right one is approved at
-// once.
+// once, or denied if deny is set.
 type joinServer struct {
 	spki func(sum []byte) []byte // what front reports as the TLS key
+	deny bool
 
 	mu       sync.Mutex
 	attempt  *exchange.Server
@@ -54,11 +55,14 @@ func (j *joinServer) start(t *testing.T) *httptest.Server {
 	mux.HandleFunc("GET /agent/v1/join/{id}", func(w http.ResponseWriter, _ *http.Request) {
 		j.mu.Lock()
 		defer j.mu.Unlock()
-		status := "ended"
-		if j.approved {
-			status = "approved"
+		answer := map[string]string{"status": "ended"}
+		switch {
+		case j.deny:
+			answer["reason"] = "denied"
+		case j.approved:
+			answer["status"] = "approved"
 		}
-		json.NewEncoder(w).Encode(map[string]string{"status": status})
+		json.NewEncoder(w).Encode(answer)
 	})
 	mux.HandleFunc("POST /agent/v1/join/{id}", func(w http.ResponseWriter, r *http.Request) {
 		var body struct{ Msg, Confirm, Sealed string }
@@ -101,6 +105,7 @@ func TestLogin(t *testing.T) {
 		typed  string // stdin
 		spki   func([]byte) []byte
 		rooted bool
+		deny   bool
 		says   string // on stderr
 		err    string
 	}{
@@ -111,11 +116,12 @@ func TestLogin(t *testing.T) {
 			typed: "111111\n222222\n333333\n123456\n", spki: same, says: "attempts left: 1.", err: "wrong code three times",
 		},
 		"no code":       {typed: "", spki: same, err: "no code given"},
+		"denied":        {typed: "123456\n", spki: same, deny: true, says: "Code confirmed", err: "Not let in."},
 		"other TLS key": {typed: "123456\n", spki: func([]byte) []byte { return make([]byte, 32) }, err: "intercepting"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			j := &joinServer{spki: tc.spki}
+			j := &joinServer{spki: tc.spki, deny: tc.deny}
 			srv := j.start(t)
 			roots := x509.NewCertPool()
 			if tc.rooted {

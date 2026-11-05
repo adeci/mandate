@@ -1,6 +1,7 @@
 package owner
 
 import (
+	"cmp"
 	"context"
 	"net/http"
 	"slices"
@@ -87,6 +88,10 @@ func (s *Server) connectorUnlink(w http.ResponseWriter, r *http.Request) {
 		failErr(w, connectorError(err))
 		return
 	}
+	s.mu.Lock()
+	by, _ := s.callerKey(r)
+	s.note(activity{Kind: "connector.unlinked", Connector: r.PathValue("name")}, by)
+	s.mu.Unlock()
 	s.connectorsChanged()
 	reply(w, http.StatusOK, struct{}{})
 }
@@ -151,8 +156,14 @@ func (s *Server) editNeverShare(w http.ResponseWriter, r *http.Request) {
 	n.Name = body.Name
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	had := false
 	s.st.NeverShare = slices.DeleteFunc(s.st.NeverShare, func(o neverShare) bool {
-		return o.Connector == n.Connector && o.Kind == n.Kind && o.ID == n.ID
+		match := o.Connector == n.Connector && o.Kind == n.Kind && o.ID == n.ID
+		if match && n.Name == "" {
+			n.Name = o.Name
+		}
+		had = had || match
+		return match
 	})
 	if r.Method == http.MethodPut {
 		s.st.NeverShare = append(s.st.NeverShare, n)
@@ -160,6 +171,18 @@ func (s *Server) editNeverShare(w http.ResponseWriter, r *http.Request) {
 	if err := s.commit(); err != nil {
 		failErr(w, err)
 		return
+	}
+	// What is hidden: a chat, or a person by name.
+	a := activity{Kind: "never_share.added", Connector: n.Connector, Detail: n.Kind + " " + cmp.Or(n.Name, n.ID)}
+	if n.Kind == "chat" {
+		a.Chats = []chat{{n.ID, n.Name}}
+	}
+	if r.Method == http.MethodDelete {
+		a.Kind = "never_share.removed"
+	}
+	if r.Method == http.MethodPut || had {
+		by, _ := s.callerKey(r)
+		s.note(a, by)
 	}
 	reply(w, http.StatusOK, struct{}{})
 }

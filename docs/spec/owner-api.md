@@ -93,7 +93,7 @@ Chat names that start with `~` were chosen by other people. The app shows chat I
 | route | |
 |---|---|
 | `GET /owner/v1/now` | What waits (access requests and proposals), open grants, routines and stopped routines. |
-| `GET /owner/v1/activity` | `?q=&before=<next>&limit=` (at most 500, default 100): the history, newest first, as `{entries, next}`; `next` is absent on the last page. `q` keeps the entries that mention it, in any case, in their identity (ID or name), connector, chats, terms, `detail`, `reason`, `note` or `device`. |
+| `GET /owner/v1/activity` | `?q=&kinds=&before=&limit=` (at most 500, default 100): the history, newest first, as `{entries, next}`; `next` is absent on the last page. `before` is a `next`, or an RFC 3339 time to start strictly before. `q` keeps the entries that mention it, in any case, in their identity (ID or name), connector, chats, terms, `detail`, `reason`, `note`, `device` or `address`. `kinds` is a comma list of kinds, kind prefixes (`request` for `request.*`) and groups: `reads` (`read`), `sends` (`proposal`), `requests` (`request`, `grant`, `routine`, `stop_all`), `access` (`agent`, `device`, `key`). |
 | `POST /owner/v1/requests/{id}/challenge` | `{chats?, for?, horizon?, zone?}`: a grant answering the request. `chats`: any chats of the connector, chosen by the owner; the matched ones are a suggestion, and an extend keeps its chats. `for` and `horizon`: any the owner chooses, wider or narrower than asked; a routine's window is its schedule. `zone` is the device's IANA zone, for a routine. |
 | `POST /owner/v1/requests/{id}/deny` | |
 | `GET /owner/v1/proposals/{id}` | The display fields, which of them can be edited, and the agent's note. |
@@ -106,7 +106,7 @@ Chat names that start with `~` were chosen by other people. The app shows chat I
 | `POST /owner/v1/stop-all` | Closes every grant, denies every waiting request, and cancels every challenge. Proposals stay. Returns `{grants, requests}`. |
 | `POST /owner/v1/exchanges` | `{kind}`, `agent` or `device`: opens a code exchange, ending the one of that kind open before. Returns `201 {id, code, expires_at}`. |
 | `GET /owner/v1/exchanges` | Exchanges open or confirmed: `[{id, kind, state, name?, address?, payload?, started_at, expires_at}]`, `state` being `open` or `confirmed`. Name, address and payload are set once confirmed. |
-| `DELETE /owner/v1/exchanges/{id}` | Ends the exchange. |
+| `DELETE /owner/v1/exchanges/{id}` | Ends the exchange; once confirmed, this denies the new party, whose poll answers `{"status": "ended", "reason": "denied"}`. |
 | `POST /owner/v1/exchanges/{id}/challenge` | Once confirmed: the `identity` record (kind `agent`) or the key `add` entry (kind `device`) for the payload. |
 | `GET /owner/v1/identities` | Names, first and last seen, and grants. |
 | `PATCH /owner/v1/identities/{id}` | `{name}` |
@@ -175,14 +175,15 @@ A proposal, as `GET /owner/v1/proposals/{id}` and `now` show it; `editable` list
  "next": "1793697300.4180"}
 ```
 
-An entry has `at` and `kind`, and `identity`, `connector`, `chats`, `count` and `detail` where they apply; request entries add the request's `reason` and `terms`, proposal entries the agent's `note`, and what a device decided its display name as `device`. Never message text, except a write's signed display, which the owner approved. The kinds:
+An entry has `at` and `kind`, and `identity`, `connector`, `chats`, `count` and `detail` where they apply; request entries add the request's `reason` and `terms`, proposal entries the agent's `note`, what a device decided its display name as `device`, and logins and joins the new party's `address`. Never message text, except a write's signed display, which the owner approved. The kinds:
 
 - `read`: an agent read; `detail` is the read (`chats`, `messages`, `search`, `media` or a read op), `count` the messages.
 - `request.asked`, `request.approved` (`detail`: window and history), `request.denied`, `request.expired`.
 - `proposal.made` (`detail`: the op), `proposal.approved`, then its outcome `proposal.done`, `proposal.failed` or `proposal.unknown` (`detail`: the signed display's text); `proposal.denied`, `proposal.expired`.
 - `grant.made` (by the owner), `grant.extended`, `grant.closed`, `routine.paused`, `routine.resumed`.
-- `agent.admitted`, `agent.deleted` (`detail`: its name); `device.paired` (the first device), `device.joined`, `key.added`, `key.retired`, `key.removed` (`detail`: the device's name).
+- `agent.admitted`, `agent.denied`, `agent.deleted` (`detail`: its name); `device.paired` (the first device), `device.joined`, `device.denied`, `key.added`, `key.retired`, `key.removed` (`detail`: the device's name).
 - `stop_all`: `count` is the grants closed.
+- `never_share.added`, `never_share.removed` (`detail`: `chat` or `person` and its name); `connector.unlinked`.
 
 `GET /owner/v1/identities`:
 
