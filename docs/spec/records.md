@@ -77,12 +77,12 @@ challenge = H("mandate-record-v1", kind, record, nonce, issued_at)
 
 1. `kind` is `key`, `identity`, `grant` or `write`.
 2. `record` decodes for its kind, as under Encoding.
-3. `key` is trusted by the key log. For a key entry, use the log as it stood before that entry.
+3. `key` is trusted by the key log, and for a key entry or a write not retired. For a key entry, use the log as it stood before that entry.
 4. `nonce` is at least 16 bytes.
 5. `sig` verifies over the challenge.
 6. The kind's rules below hold.
 
-Removing a key invalidates the identities and grants it signed.
+Removing a key invalidates the identities and grants it signed; retiring it does not.
 
 ## Kinds
 
@@ -91,13 +91,17 @@ Removing a key invalidates the identities and grants it signed.
 | field | |
 |---|---|
 | `seq` | 0, 1, 2, … |
-| `op` | `add` or `remove` |
+| `op` | `add`, `retire` or `remove` |
 | `key` | the key |
 | `prev` | SHA-256 of the previous entry's record bytes; `""` at seq 0 |
 | `at` | for display |
 
 - **Seq 0** adds the first device's key and is signed by that key. Every later entry is signed by a key trusted after the entry before it.
-- **`add`** names a key not yet trusted. **`remove`** names a trusted key exactly as it was added, and never the last one.
+- **`add`** names a key not yet trusted.
+- **`retire`** names a trusted key exactly as it was added, not yet retired, and is signed by another key. A retired key signs no key entries or writes, but the identities and grants it signed stay valid. A device rotates its key by adding the new key with the old, then retiring the old with the new.
+- **`remove`** names a trusted key exactly as it was added, for a key that may be compromised.
+- Neither `retire` nor `remove` may leave no key that is not retired.
+- **Name:** a device's display name is unsigned metadata, like an identity's; the key's `name` is its default.
 - **Order:** a log is valid only as a whole, in order.
 - **First log:** a connector trusts the first log the owner side pushes to it (trust on first use). Only the owner side's uid can push, and root starts both. `mandate reset` empties every log, so a fresh seq 0 is accepted again.
 
@@ -261,7 +265,19 @@ challenge 85a66d819ef8d18b0cfaf7cd1b6fce2cc50ea99769be2c684a2681fde2a13016
 sig       c0bd3f0afc7c0a080b4f85fe6afe1f9737966049ce3a87d4273b9b41e2f185cefec064417a326cd8b62a5f430b836c1e48c98998995774ca745ef844b3f8ba32
 ```
 
+**key, seq 3: the laptop retires the phone**
+
+```
+{"at":"2026-11-03T09:50:00Z","key":{"id":"b9035233be144c52017fbb52541aab66faa7f6c93eef6e76968ba564c477d31e","name":"Pixel 9","public_key":"BN4CBo-cv2UYsv7S22CmwboOxAVnQh_vAIceeHGJ_wTKxefX7CfLCPv9U9pGtDjRzs6ZPn39ROrW67Fcq2ilkcE","type":"p256"},"op":"retire","prev":"0af42c2f10d3d8193f43273ef3c8b5b79f798fd7edf8542e9c0e99de385f9116","seq":3}
+nonce 808182838485868788898a8b8c8d8e8f  issued_at 2026-11-03T09:50:00Z  key laptop
+challenge 44f6d7cc661f0fb4aeb0e1ccc4d6d632f3e40ec954a774e908396a01a292438c
+sig       ae221c4433b7f68a3b27446c75fd9a0ac38e51ff7abcab46d0ea49e876dc514e480107f1798eeff1245bce5d5c47b6274bcd12e6a21e7040f820f08f21c1c8dd
+```
+
+After it, the identity and the one-off grant, which the phone signed, still verify.
+
 **Must fail**
 
+- The write, verified after the phone is retired: a retired key signs no writes.
 - The one-off grant's envelope with `kind` set to `identity`. The bytes do not decode as an identity, and the challenge becomes `fa68aefd9d143f4937810198130e07ad1816c529dd278258c0c776bd4f552ef8`, so `sig` fails too.
 - The one-off grant with a space before `"horizon"`. It is not canonical, so it is rejected before the signature is checked.

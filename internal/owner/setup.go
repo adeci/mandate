@@ -334,7 +334,7 @@ func (s *Server) pair(w http.ResponseWriter, r *http.Request) {
 	if err := os.Remove(setupFile(s.dir)); err != nil {
 		s.log.Error("spend setup password", "err", err)
 	}
-	s.note(activity{Kind: "device.joined", Detail: key.Name})
+	s.note(activity{Kind: "device.paired", Detail: key.Name}, "")
 	reply(w, http.StatusOK, map[string]string{"kind": "key", "id": key.ID})
 }
 

@@ -282,7 +282,7 @@ connector with a fresh state directory and checks what needs no account:
 - health has a valid shape;
 - the empty store's schema and `user_version`;
 - setup steps have a valid shape;
-- `execute` refuses a bad signature, an untrusted or removed key, an expired
+- `execute` refuses a bad signature, an untrusted, retired or removed key, an expired
   record, another connector's record and a changed display, and `PUT /keys`
   refuses a rewritten log.
 

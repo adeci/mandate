@@ -7,11 +7,14 @@
 //	testdevice [--state FILE] join URL SPKI CODE [NAME]
 //	testdevice [--state FILE] call METHOD PATH [BODY]
 //	testdevice [--state FILE] sign PATH [BODY]
+//	testdevice [--state FILE] rotate [NAME]
 //
 // call prints {"status", "body"}; sign posts BODY to the challenge route
 // PATH, signs the envelope it answers and posts it to /owner/v1/signed,
 // printing the answer with the record and the envelope it signed. pair
 // keeps the key of an earlier pairing, as an app would after mandate reset.
+// rotate swaps the device's key as the app's "How you approve" does: the
+// current key adds a new one, which then retires it.
 package main
 
 import (
@@ -57,7 +60,7 @@ func main() {
 
 func run(ctx context.Context, state string, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: testdevice [--state FILE] pair|join|call|sign ARGS")
+		return errors.New("usage: testdevice [--state FILE] pair|join|call|sign|rotate ARGS")
 	}
 	name := func(i int) string {
 		if len(args) > i {
@@ -86,6 +89,12 @@ func run(ctx context.Context, state string, args []string) error {
 			return err
 		}
 		return d.sign(ctx, args[1], arg(args, 2))
+	case args[0] == "rotate" && len(args) <= 2:
+		d, err := load(state)
+		if err != nil {
+			return err
+		}
+		return d.rotate(ctx, state, name(1))
 	}
 	return fmt.Errorf("unknown command %q", args)
 }
@@ -364,4 +373,49 @@ func (d *device) sign(ctx context.Context, path, body string) error {
 		"status": status, "body": out,
 		"record": json.RawMessage(env.Record), "envelope": json.RawMessage(signed),
 	})
+}
+
+// signed signs env with priv and posts it to /owner/v1/signed.
+func (d *device) signed(ctx context.Context, env record.Envelope, priv *ecdsa.PrivateKey) error {
+	if err := record.Sign(&env, priv); err != nil {
+		return err
+	}
+	var out map[string]string
+	return d.callJSON(ctx, http.MethodPost, "/owner/v1/signed", env, &out)
+}
+
+func (d *device) rotate(ctx context.Context, state, name string) error {
+	oldPriv, err := d.key()
+	if err != nil {
+		return err
+	}
+	oldKey, err := record.P256Key(&oldPriv.PublicKey, name)
+	if err != nil {
+		return err
+	}
+	_, newPriv, newKey, err := newDevice(d.URL, d.SPKI, name, nil)
+	if err != nil {
+		return err
+	}
+	var env record.Envelope
+	if err := d.callJSON(ctx, http.MethodPost, "/owner/v1/keys/add/challenge", map[string]any{"key": newKey}, &env); err != nil {
+		return err
+	}
+	if err := d.signed(ctx, env, oldPriv); err != nil {
+		return err
+	}
+	// The token belongs to the new key now.
+	if d.Key, err = x509.MarshalPKCS8PrivateKey(newPriv); err != nil {
+		return err
+	}
+	if err := d.save(state); err != nil {
+		return err
+	}
+	if err := d.callJSON(ctx, http.MethodPost, "/owner/v1/keys/"+oldKey.ID+"/retire/challenge", struct{}{}, &env); err != nil {
+		return err
+	}
+	if err := d.signed(ctx, env, newPriv); err != nil {
+		return err
+	}
+	return emit(map[string]string{"old": oldKey.ID, "new": newKey.ID})
 }

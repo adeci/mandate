@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -145,6 +146,26 @@ func start(t *testing.T, conns map[string]*connector.Client, opts ...func(*Serve
 	}
 	t.Cleanup(stop)
 	return &harness{t, s, unixClient(filepath.Join(socks, "owner")), c, lives, stop}
+}
+
+// stalled is a connector that takes connections and never answers.
+func stalled(t *testing.T) map[string]*connector.Client {
+	sock := filepath.Join(sockDir(t), "stalled")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { c.Close() })
+		}
+	}()
+	return map[string]*connector.Client{"test": connector.Dial("test", sock)}
 }
 
 // nowhere is a connector that never answers.
@@ -369,8 +390,9 @@ func (h *harness) agent(owner device) string {
 	if st != http.StatusOK {
 		h.t.Fatalf("sign identity = %d", st)
 	}
+	// Approved once the gateway has the identity.
 	var poll struct{ Status string }
-	h.do("GET", "/internal/join/"+id, "", nil, &poll)
+	h.do("GET", "/internal/join/"+id+"?wait=5", "", nil, &poll)
 	if poll.Status != "approved" {
 		h.t.Fatalf("agent's poll = %q", poll.Status)
 	}
@@ -421,6 +443,91 @@ func (h *harness) waitLive(what string, ok func(live) bool) {
 
 func hasGrant(l live, id string) bool {
 	return slices.ContainsFunc(l.Grants, func(e record.Envelope) bool { return bytes.Contains(e.Record, []byte(`"id":"`+id+`"`)) })
+}
+
+func TestKeyRotation(t *testing.T) {
+	h := start(t, nowhere())
+	old := h.pair()
+	agent := h.agent(old)
+	grant := h.grant(old, agent)
+	type keys struct {
+		Trusted []record.Key
+		Retired []string
+		Names   map[string]string
+	}
+
+	// The device's current key adds its new key; the token moves with it.
+	fresh := newDevice(t, "Pixel 9")
+	add := h.challenge(old, "/owner/v1/keys/add/challenge", map[string]any{"key": fresh.key})
+	if st, _ := h.sign(device{fresh.priv, old.token, fresh.key}, add); st != http.StatusForbidden {
+		t.Errorf("add signed by the new key itself = %d", st)
+	}
+	if st, id := h.sign(old, add); st != http.StatusOK || id != fresh.key.ID {
+		t.Fatalf("add = %d %s", st, id)
+	}
+	rotated := device{fresh.priv, old.token, fresh.key}
+
+	// The new key retires the old one; the old one can't retire itself.
+	retire := h.challenge(rotated, "/owner/v1/keys/"+old.key.ID+"/retire/challenge", nil)
+	if st, _ := h.sign(old, retire); st != http.StatusForbidden {
+		t.Errorf("a key retiring itself = %d", st)
+	}
+	retire = h.challenge(rotated, "/owner/v1/keys/"+old.key.ID+"/retire/challenge", nil)
+	if st, _ := h.sign(rotated, retire); st != http.StatusOK {
+		t.Fatalf("retire = %d", st)
+	}
+	var k keys
+	h.do("GET", "/owner/v1/keys", rotated.token, nil, &k)
+	if len(k.Trusted) != 2 || !slices.Equal(k.Retired, []string{old.key.ID}) {
+		t.Errorf("keys = %+v", k)
+	}
+
+	// What the old key signed stays; it signs nothing new.
+	h.waitLive("with the old key's grant", func(l live) bool { return hasGrant(l, grant) && len(l.Identities) == 1 })
+	env := h.challenge(rotated, "/owner/v1/grants/challenge", map[string]any{"identity": agent, "connector": "test", "for": 600, "horizon": 0})
+	if st, _ := h.sign(device{old.priv, rotated.token, old.key}, env); st != http.StatusForbidden {
+		t.Errorf("a grant signed by the retired key = %d", st)
+	}
+	if st, _ := h.sign(rotated, env); st != http.StatusOK {
+		t.Errorf("a grant signed by the new key = %d", st)
+	}
+	if st := h.do("POST", "/owner/v1/keys/"+fresh.key.ID+"/remove/challenge", rotated.token, nil, nil); st != http.StatusConflict {
+		t.Errorf("removing the last key that signs = %d", st)
+	}
+}
+
+func TestRenameDevice(t *testing.T) {
+	h := start(t, nil)
+	d := h.pair()
+	if st := h.do("PATCH", "/owner/v1/keys/"+d.key.ID, d.token, map[string]string{"name": " Fold "}, nil); st != http.StatusOK {
+		t.Fatalf("rename = %d", st)
+	}
+	var k struct {
+		Trusted []record.Key
+		Names   map[string]string
+	}
+	h.do("GET", "/owner/v1/keys", d.token, nil, &k)
+	if k.Names[d.key.ID] != "Fold" || k.Trusted[0].Name != "Pixel 9" {
+		t.Errorf("keys = %+v", k)
+	}
+	if st := h.do("PATCH", "/owner/v1/keys/nope", d.token, map[string]string{"name": "x"}, nil); st != http.StatusNotFound {
+		t.Errorf("renaming an unknown key = %d", st)
+	}
+}
+
+func TestStalledConnector(t *testing.T) {
+	h := start(t, stalled(t))
+	owner := h.pair() // a key log the connector never takes
+	began := time.Now()
+	agent := h.agent(owner)
+	if d := time.Since(began); d > 3*time.Second {
+		t.Errorf("admitting an agent took %v with a connector stalled", d)
+	}
+	h.waitLive("with the agent", func(l live) bool {
+		return slices.ContainsFunc(l.Identities, func(e record.Envelope) bool { return bytes.Contains(e.Record, []byte(agent)) })
+	})
+	grant := h.grant(owner, agent)
+	h.waitLive("with the grant", func(l live) bool { return hasGrant(l, grant) })
 }
 
 func TestHome(t *testing.T) {
@@ -542,12 +649,64 @@ func TestDecisionInActivity(t *testing.T) {
 	for _, e := range page.Entries {
 		kinds = append(kinds, e.Kind)
 	}
-	if want := []string{"request.denied", "request.asked", "agent.admitted", "device.joined"}; !slices.Equal(kinds, want) || page.Next != "" {
+	if want := []string{"request.denied", "request.asked", "agent.admitted", "device.paired"}; !slices.Equal(kinds, want) || page.Next != "" {
 		t.Fatalf("kinds = %v, next %q, want %v", kinds, page.Next, want)
 	}
 	denied := page.Entries[0]
 	if denied.Identity != agent || denied.Connector != "test" || len(denied.Chats) != 2 || denied.Chats[0] != (chat{"c1", "Family"}) {
 		t.Errorf("denied = %+v", denied)
+	}
+}
+
+func TestActivitySearch(t *testing.T) {
+	h := start(t, nowhere())
+	owner := h.pair()
+	agent := h.agent(owner)
+	req := h.request(agent) // reason "summary", term "fam": Family, ~Fam
+	if st := h.do("POST", "/owner/v1/requests/"+req+"/deny", owner.token, nil, nil); st != http.StatusOK {
+		t.Fatalf("deny = %d", st)
+	}
+	read := map[string]any{"at": time.Now().UTC(), "identity": agent, "connector": "test", "verb": "messages", "chats": []chat{{"c9", "Book club"}}, "count": 3}
+	if st := h.do("POST", "/internal/activity", "", []any{read}, nil); st != http.StatusOK {
+		t.Fatalf("post activity = %d", st)
+	}
+	search := func(q string, limit int, before string) activityPage {
+		t.Helper()
+		var page activityPage
+		path := fmt.Sprintf("/owner/v1/activity?q=%s&limit=%d", url.QueryEscape(q), limit)
+		if before != "" {
+			path += "&before=" + url.QueryEscape(before)
+		}
+		if st := h.do("GET", path, owner.token, nil, &page); st != http.StatusOK {
+			t.Fatalf("activity = %d", st)
+		}
+		return page
+	}
+	kinds := func(p activityPage) (k []string) {
+		for _, e := range p.Entries {
+			k = append(k, e.Kind)
+		}
+		return k
+	}
+	// The request's terms and reason, in any case; the decision names who decided.
+	page := search("FAMILY", 100, "")
+	if got := kinds(page); !slices.Equal(got, []string{"request.denied", "request.asked"}) {
+		t.Fatalf("q=FAMILY: %v", got)
+	}
+	if d := page.Entries[0]; d.Reason != "summary" || d.Device != "Pixel 9" || len(d.Terms) != 1 || d.Terms[0].Term != "fam" {
+		t.Errorf("denied = %+v", d)
+	}
+	if got := kinds(search("book CLUB", 100, "")); !slices.Equal(got, []string{"read"}) {
+		t.Errorf("q=book CLUB: %v", got)
+	}
+	if got := kinds(search("nowhere", 100, "")); got != nil {
+		t.Errorf("q=nowhere: %v", got)
+	}
+	// Paging keeps the search.
+	first := search("summary", 1, "")
+	second := search("summary", 1, first.Next)
+	if kinds(first)[0] != "request.denied" || first.Next == "" || !slices.Equal(kinds(second), []string{"request.asked"}) || second.Next != "" {
+		t.Errorf("paged: %v %q, %v %q", kinds(first), first.Next, kinds(second), second.Next)
 	}
 }
 
@@ -585,7 +744,7 @@ func TestActivityPaging(t *testing.T) {
 		}
 	}
 	// Same second: the later line is newer.
-	want := []string{"device.joined Pixel 9", "read d3b", "read d3a", "read d2", "read d1b", "read d1a"}
+	want := []string{"device.paired Pixel 9", "read d3b", "read d3a", "read d2", "read d1b", "read d1a"}
 	if !slices.Equal(got, want) || pages != 3 {
 		t.Errorf("pages = %d, entries = %v, want %v", pages, got, want)
 	}

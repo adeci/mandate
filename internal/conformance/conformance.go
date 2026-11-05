@@ -537,21 +537,25 @@ func (k *kit) keys(p *proc) (connector.KeysHead, error) {
 	return h, err
 }
 
-// checkKeysAndExecute trusts key a through a log that adds and removes b,
-// then offers execute approvals that each break one rule.
+// checkKeysAndExecute trusts key a through a log that adds and removes b
+// and adds and retires d, then offers execute approvals that each break one
+// rule.
 func (k *kit) checkKeysAndExecute(p *proc, spec connector.Spec, data string) {
-	a, b, c := newKey(), newKey(), newKey()
+	a, b, c, d := newKey(), newKey(), newKey(), newKey()
 	e0 := keyEntry(0, "add", a, nil, a)
 	e1 := keyEntry(1, "add", b, &e0, a)
 	e2 := keyEntry(2, "remove", b, &e1, a)
-	log, err := record.NewLog([]record.Envelope{e0, e1, e2})
+	e3 := keyEntry(3, "add", d, &e2, a)
+	e4 := keyEntry(4, "retire", d, &e3, a)
+	entries := []record.Envelope{e0, e1, e2, e3, e4}
+	log, err := record.NewLog(entries)
 	if err != nil {
 		panic(err)
 	}
 	n, head := log.Head()
 	want := connector.KeysHead{Length: n, Head: head}
 
-	_, err = k.get(p, "PUT", "/keys", []record.Envelope{e0, e1, e2})
+	_, err = k.get(p, "PUT", "/keys", entries)
 	if err == nil {
 		var got connector.KeysHead
 		if got, err = k.keys(p); err == nil && got != want {
@@ -593,6 +597,7 @@ func (k *kit) checkKeysAndExecute(p *proc, spec connector.Spec, data string) {
 	k.check("execute refuses a bad signature", execute(bad))
 	k.check("execute refuses an untrusted key", execute(sign(write(nil), now, c)))
 	k.check("execute refuses a removed key", execute(sign(write(nil), now, b)))
+	k.check("execute refuses a retired key", execute(sign(write(nil), now, d)))
 	k.check("execute refuses an expired record", execute(sign(write(func(w *record.Write) {
 		w.CreatedAt = record.Time{Time: now.Add(-2 * time.Hour)}
 		w.ExpiresAt = record.Time{Time: now.Add(-time.Hour)}

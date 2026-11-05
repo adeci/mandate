@@ -111,7 +111,7 @@ func readSpec(t testing.TB) spec {
 			t.Fatalf("unparsed vector line %q", line)
 		}
 	}
-	if len(s.vectors) != 8 || len(s.keys) != 3 || s.envJSON == "" {
+	if len(s.vectors) != 9 || len(s.keys) != 3 || s.envJSON == "" {
 		t.Fatalf("parsed %d vectors and %d keys from records.md", len(s.vectors), len(s.keys))
 	}
 	return s
@@ -141,12 +141,13 @@ func (s spec) envelope(v vector) Envelope {
 	return e
 }
 
-// log returns the spec's key log: phone, laptop and YubiKey.
+// log returns the spec's key log before the phone is retired: phone,
+// laptop and YubiKey.
 func (s spec) log(t testing.TB) *Log {
 	t.Helper()
 	var entries []Envelope
 	for _, v := range s.vectors {
-		if v.kind == "key" {
+		if v.kind == "key" && !strings.Contains(v.record, `"op":"retire"`) {
 			entries = append(entries, s.envelope(v))
 		}
 	}
@@ -231,7 +232,19 @@ func TestVectors(t *testing.T) {
 		t.Errorf("seq 0 envelope: %v", err)
 	}
 
+	// The phone, retired, signed these before.
+	for _, title := range []string{"identity", "grant, one-off"} {
+		e := s.vector(t, title)
+		if _, err := l.Verify(e, e.IssuedAt.Add(time.Minute)); err != nil {
+			t.Errorf("%s after the retire: %v", title, err)
+		}
+	}
+
 	// Must fail.
+	w := s.vector(t, "write")
+	if _, err := l.Verify(w, w.IssuedAt.Add(time.Minute)); !errors.Is(err, ErrRetired) {
+		t.Errorf("write by a retired key: %v", err)
+	}
 	g := s.vector(t, "grant, one-off")
 	g.Kind = "identity"
 	if got := hex.EncodeToString(g.Challenge()); got != "fa68aefd9d143f4937810198130e07ad1816c529dd278258c0c776bd4f552ef8" {
@@ -307,6 +320,9 @@ func TestLog(t *testing.T) {
 		"seq 0 removing":              {&Log{}, sign(t, entry(&Log{}, "remove", keys[0]), at, phone)},
 		"adding a trusted key":        {full, sign(t, entry(full, "add", keys[1]), at, phone)},
 		"removing the last key":       {phoneOnly, sign(t, entry(phoneOnly, "remove", keys[0]), at, phone)},
+		"retiring the last key":       {phoneOnly, sign(t, entry(phoneOnly, "retire", keys[0]), at, phone)},
+		"a key retiring itself":       {full, sign(t, entry(full, "retire", keys[1]), at, laptop)},
+		"retiring an untrusted key":   {phoneOnly, sign(t, entry(phoneOnly, "retire", keys[1]), at, phone)},
 		"removing a renamed key": {full, func() Envelope {
 			k := keys[1]
 			k.Name = "Old MacBook"
@@ -367,6 +383,50 @@ func TestLog(t *testing.T) {
 	}
 	if n, h := held.Head(); n != 4 || slices.ContainsFunc(held.Trusted(), func(k Key) bool { return k.ID == keys[1].ID }) {
 		t.Errorf("after Extend: Head() = %d, %s; Trusted() = %v", n, h, held.Trusted())
+	}
+}
+
+func TestRetire(t *testing.T) {
+	s := readSpec(t)
+	at := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
+	phone, laptop := s.priv(t, "phone"), s.priv(t, "laptop")
+	full := s.log(t)
+	keys := full.Trusted()
+	entry := func(l *Log, op string, k Key) KeyEntry {
+		n, head := l.Head()
+		return KeyEntry{Seq: n, Op: op, Key: k, Prev: head, At: Time{at}}
+	}
+	// Phone and laptop only; the laptop retires the phone.
+	l, err := NewLog(full.Entries()[:2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Append(sign(t, entry(l, "retire", keys[0]), at, laptop)); err != nil {
+		t.Fatal(err)
+	}
+	if !l.Retired(keys[0].ID) || l.Retired(keys[1].ID) || len(l.Trusted()) != 2 {
+		t.Fatalf("after the retire: retired %v, %v; trusted %v", l.Retired(keys[0].ID), l.Retired(keys[1].ID), l.Trusted())
+	}
+	for name, e := range map[string]Envelope{
+		"the retired key signing a key entry": sign(t, entry(l, "add", keys[2]), at, phone),
+		"retiring it again":                   sign(t, entry(l, "retire", keys[0]), at, laptop),
+		"retiring the last key that signs":    sign(t, entry(l, "retire", keys[1]), at, laptop),
+		"removing the last key that signs":    sign(t, entry(l, "remove", keys[1]), at, laptop),
+	} {
+		if err := l.Append(e); err == nil {
+			t.Errorf("%s: appended", name)
+		}
+	}
+	// A retired key may still be removed, which ends what it signed.
+	id := s.vector(t, "identity")
+	if _, err := l.Verify(id, at); err != nil {
+		t.Fatalf("identity by the retired key: %v", err)
+	}
+	if err := l.Append(sign(t, entry(l, "remove", keys[0]), at, laptop)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Verify(id, at); !errors.Is(err, ErrUntrusted) {
+		t.Errorf("identity by a removed key: %v", err)
 	}
 }
 

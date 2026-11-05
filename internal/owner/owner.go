@@ -73,7 +73,10 @@ type Server struct {
 	wake chan struct{}
 	subs map[chan event]struct{}
 
+	// push and keysDue schedule pushing the live set to the gateway and the
+	// key log to the connectors, each on its own loop.
 	push      chan struct{}
+	keysDue   chan struct{}
 	executing sync.WaitGroup
 	// stopping is done once shutdown begins; streams and long polls, which
 	// never go idle, end on it.
@@ -119,6 +122,7 @@ func newServer(dir string, conns map[string]*connector.Client, gatewaySock strin
 		wake:       make(chan struct{}),
 		subs:       map[chan event]struct{}{},
 		push:       make(chan struct{}, 1),
+		keysDue:    make(chan struct{}, 1),
 	}
 	s.stopping, s.stop = context.WithCancel(context.Background())
 	// A write that was running when mandate stopped may have reached the
@@ -218,6 +222,9 @@ func (s *Server) handler(front, gateway uint32) http.Handler {
 	authed("PUT /owner/v1/never-share/{connector}/{kind}/{id}", s.editNeverShare)
 	authed("DELETE /owner/v1/never-share/{connector}/{kind}/{id}", s.editNeverShare)
 	authed("GET /owner/v1/keys", s.getKeys)
+	authed("PATCH /owner/v1/keys/{id}", s.renameKey)
+	authed("POST /owner/v1/keys/add/challenge", s.addKeyChallenge)
+	authed("POST /owner/v1/keys/{id}/retire/challenge", s.retireKeyChallenge)
 	authed("POST /owner/v1/keys/{id}/remove/challenge", s.removeKeyChallenge)
 
 	internal := http.NewServeMux()
@@ -272,17 +279,19 @@ func (s *Server) commit(what ...string) error {
 	return nil
 }
 
-// changed wakes long polls, sends the app's changed events and schedules a
-// push of the live set. The caller holds s.mu.
+// changed wakes long polls, sends the app's changed events and schedules
+// pushes of the live set and the key log. The caller holds s.mu.
 func (s *Server) changed(what ...string) {
 	close(s.wake)
 	s.wake = make(chan struct{})
 	for _, w := range what {
 		s.publish("changed", map[string]string{"what": w})
 	}
-	select {
-	case s.push <- struct{}{}:
-	default:
+	for _, c := range []chan struct{}{s.push, s.keysDue} {
+		select {
+		case c <- struct{}{}:
+		default:
+		}
 	}
 }
 

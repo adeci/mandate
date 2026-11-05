@@ -25,6 +25,9 @@ type state struct {
 	Requests   map[string]*request  `json:"requests"`
 	Proposals  map[string]*proposal `json:"proposals"`
 	NeverShare []neverShare         `json:"never_share"`
+	// KeyNames are devices' display names by key ID, unsigned like an
+	// identity's; a key without one shows the name it was added with.
+	KeyNames map[string]string `json:"key_names,omitempty"`
 }
 
 type identity struct {
@@ -217,7 +220,7 @@ func (st *state) expire(now time.Time) (bool, []activity) {
 		case r.Status == "pending" && !now.Before(r.CreatedAt.Add(requestTTL)):
 			r.Status, r.DecidedAt = "expired", now
 			changed = true
-			expired = append(expired, requestActivity("request.expired", r, ""))
+			expired = append(expired, requestActivity("request.expired", r))
 		case r.Status != "pending" && now.Sub(r.DecidedAt) > keepDecided:
 			delete(st.Requests, id)
 			changed = true

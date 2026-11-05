@@ -43,7 +43,10 @@ type joining struct {
 	// Set once a new party confirmed the code.
 	name, address string
 	payload       *exchange.Payload
-	approved      bool
+	// admitted is the agent identity the owner signed, until the gateway
+	// has it in its live set and the exchange is approved.
+	admitted string
+	approved bool
 }
 
 // attempt is one try at the code by a new party.
@@ -59,6 +62,8 @@ func (j *joining) state(now time.Time) string {
 	switch {
 	case j.approved:
 		return "approved"
+	case j.admitted != "":
+		return "confirmed" // until the gateway has the identity
 	case j.ended || !now.Before(j.expiresAt()):
 		return "ended"
 	case j.payload != nil:
@@ -97,7 +102,7 @@ func (s *Server) expireJoins(now time.Time) {
 		switch {
 		case now.Sub(j.startedAt) > 2*joinTTL:
 			delete(s.joins, id)
-		case !j.ended && !j.approved && !now.Before(j.expiresAt()):
+		case !j.ended && !j.approved && j.admitted == "" && !now.Before(j.expiresAt()):
 			s.endJoin(j)
 		}
 	}
@@ -355,25 +360,26 @@ func (s *Server) joinChallenge(w http.ResponseWriter, r *http.Request) {
 		ident := record.Identity{ID: record.NewID(), TokenSHA256: token, CreatedAt: rtime(s.now())}
 		s.issue(w, ident, &challenge{holds: holds, apply: func(env record.Envelope, _ record.Record) error {
 			s.st.Identities[ident.ID] = &identity{Envelope: env, Record: ident, Name: j.name}
-			j.approved = true
-			s.joinEvent(j)
+			// Approved once the gateway took it, so the agent's first
+			// call works (syncLive).
+			j.admitted = ident.ID
 			if err := s.commit("identities"); err != nil {
 				return err
 			}
-			s.note(activity{Kind: "agent.admitted", Identity: ident.ID, Detail: j.name})
+			s.note(activity{Kind: "agent.admitted", Identity: ident.ID, Detail: j.name}, env.Key)
 			return nil
 		}})
 		return
 	}
 	k := *j.payload.Key
-	s.keyChallenge(w, "add", k, holds, func() error {
+	s.keyChallenge(w, "add", k, "", holds, func(env record.Envelope) error {
 		s.st.Devices[k.ID] = token
 		j.approved = true
 		s.joinEvent(j)
 		if err := s.commit("keys"); err != nil {
 			return err
 		}
-		s.note(activity{Kind: "device.joined", Detail: k.Name})
+		s.note(activity{Kind: "device.joined", Detail: k.Name}, env.Key)
 		return nil
 	})
 }

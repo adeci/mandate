@@ -90,7 +90,7 @@ func (s *Server) postRequest(w http.ResponseWriter, r *http.Request) {
 		failErr(w, err)
 		return
 	}
-	s.note(requestActivity("request.asked", req, req.Reason))
+	s.note(requestActivity("request.asked", req), "")
 	s.publish("waiting", map[string]string{"kind": "request", "id": req.ID, "identity": req.Identity, "connector": req.Connector})
 	reply(w, http.StatusCreated, map[string]string{"id": req.ID})
 }
@@ -191,7 +191,9 @@ func (s *Server) requestChallenge(w http.ResponseWriter, r *http.Request) {
 		if err := s.commit("now"); err != nil {
 			return err
 		}
-		s.note(grantActivity("request.approved", g, names, grantDetail(g)))
+		a := grantActivity("request.approved", g, names, grantDetail(g))
+		a.Reason, a.Terms = req.Reason, req.Terms
+		s.note(a, env.Key)
 		return nil
 	}
 	s.issue(w, g, c)
@@ -290,9 +292,10 @@ func (s *Server) extendable(identity, conn string) *grant {
 	return best
 }
 
-// requestActivity is an entry about req, with the chats its terms matched.
-func requestActivity(kind string, req *request, detail string) activity {
-	a := activity{Kind: kind, Identity: req.Identity, Connector: req.Connector, Detail: detail}
+// requestActivity is an entry about req, with its reason and terms and the
+// chats they matched.
+func requestActivity(kind string, req *request) activity {
+	a := activity{Kind: kind, Identity: req.Identity, Connector: req.Connector, Reason: req.Reason, Terms: req.Terms}
 	for _, t := range req.Terms {
 		for _, c := range t.Chats {
 			if !slices.ContainsFunc(a.Chats, func(d chat) bool { return d.ID == c.ID }) {
@@ -318,7 +321,8 @@ func (s *Server) denyRequest(w http.ResponseWriter, r *http.Request) {
 			failErr(w, err)
 			return
 		}
-		s.note(requestActivity("request.denied", req, ""))
+		by, _ := s.callerKey(r)
+		s.note(requestActivity("request.denied", req), by)
 		reply(w, http.StatusOK, struct{}{})
 	}
 }
@@ -364,7 +368,7 @@ func (s *Server) grantChallenge(w http.ResponseWriter, r *http.Request) {
 			if err := s.commit("now"); err != nil {
 				return err
 			}
-			s.note(grantActivity("grant.made", g, nil, grantDetail(g)))
+			s.note(grantActivity("grant.made", g, nil, grantDetail(g)), env.Key)
 			return nil
 		},
 	})
@@ -431,7 +435,7 @@ func (s *Server) replaceGrant(w http.ResponseWriter, old *grant, g record.Grant,
 			if err := s.commit("now"); err != nil {
 				return err
 			}
-			s.note(grantActivity(kind, g, old.ChatNames, detail))
+			s.note(grantActivity(kind, g, old.ChatNames, detail), env.Key)
 			return nil
 		},
 	})
@@ -460,11 +464,12 @@ func (s *Server) closeGrant(w http.ResponseWriter, r *http.Request) {
 	if g.Record.Schedule != nil {
 		kind = "routine.paused"
 	}
-	s.note(grantActivity(kind, g.Record, g.ChatNames, ""))
+	by, _ := s.callerKey(r)
+	s.note(grantActivity(kind, g.Record, g.ChatNames, ""), by)
 	reply(w, http.StatusOK, struct{}{})
 }
 
-func (s *Server) stopAll(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) stopAll(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
@@ -486,7 +491,8 @@ func (s *Server) stopAll(w http.ResponseWriter, _ *http.Request) {
 		failErr(w, err)
 		return
 	}
-	s.note(activity{Kind: "stop_all", Count: grants, Detail: fmt.Sprintf("%d grants closed, %d requests denied", grants, requests)})
+	by, _ := s.callerKey(r)
+	s.note(activity{Kind: "stop_all", Count: grants, Detail: fmt.Sprintf("%d grants closed, %d requests denied", grants, requests)}, by)
 	reply(w, http.StatusOK, map[string]int{"grants": grants, "requests": requests})
 }
 
@@ -618,6 +624,7 @@ func (s *Server) deleteIdentity(w http.ResponseWriter, r *http.Request) {
 		failErr(w, err)
 		return
 	}
-	s.note(activity{Kind: "agent.deleted", Identity: id, Detail: i.Name})
+	by, _ := s.callerKey(r)
+	s.note(activity{Kind: "agent.deleted", Identity: id, Detail: i.Name}, by)
 	reply(w, http.StatusOK, struct{}{})
 }

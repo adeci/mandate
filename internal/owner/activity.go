@@ -2,6 +2,7 @@ package owner
 
 import (
 	"bufio"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,12 @@ type activity struct {
 	Chats     []chat    `json:"chats,omitempty"`
 	Count     int       `json:"count,omitempty"`
 	Detail    string    `json:"detail,omitempty"`
+	// Reason and Terms are a request's; Note is a proposal's.
+	Reason string `json:"reason,omitempty"`
+	Terms  []term `json:"terms,omitempty"`
+	Note   string `json:"note,omitempty"`
+	// Device is the display name of the device that decided.
+	Device string `json:"device,omitempty"`
 }
 
 // gatewayRead is a read as the gateway posts it.
@@ -77,11 +84,15 @@ func appendActivity(dir string, entries []activity) error {
 	return nil
 }
 
-// note appends what the owner side just did to the history. A failure is
-// only logged: the step itself took effect. The caller holds s.mu.
-func (s *Server) note(a activity) {
+// note appends what the owner side just did to the history, decided by the
+// device of key by, if any. A failure is only logged: the step itself took
+// effect. The caller holds s.mu.
+func (s *Server) note(a activity, by string) {
 	if a.At.IsZero() {
 		a.At = s.now()
+	}
+	if k := s.trusted(by); k != nil {
+		a.Device = cmp.Or(s.st.KeyNames[by], k.Name)
 	}
 	if err := appendActivity(s.dir, []activity{a}); err != nil {
 		s.log.Error("note activity", "kind", a.Kind, "err", err)
@@ -157,7 +168,17 @@ func (s *Server) getActivity(w http.ResponseWriter, r *http.Request) {
 		}
 		before = &c
 	}
-	entries, next, err := readActivity(s.dir, before, limit)
+	match := func(activity) bool { return true }
+	if text := strings.ToLower(strings.TrimSpace(q.Get("q"))); text != "" {
+		s.mu.Lock()
+		names := map[string]string{}
+		for id, i := range s.st.Identities {
+			names[id] = i.Name
+		}
+		s.mu.Unlock()
+		match = func(a activity) bool { return a.matches(text, names[a.Identity]) }
+	}
+	entries, next, err := readActivity(s.dir, before, limit, match)
 	if err != nil {
 		s.log.Error("read activity", "err", err)
 		failErr(w, err)
@@ -175,9 +196,26 @@ type placed struct {
 	at cursor
 }
 
-// readActivity is up to limit entries before before (if set), newest
-// first, and the cursor of the page after them if there is one.
-func readActivity(dir string, before *cursor, limit int) ([]activity, string, error) {
+// matches reports whether the entry mentions text, which is lowercase:
+// in its identity (by ID or as identity names it), connector, chats, terms,
+// detail, reason, note or device.
+func (a activity) matches(text, identity string) bool {
+	fields := []string{a.Identity, identity, a.Connector, a.Detail, a.Reason, a.Note, a.Device}
+	for _, c := range a.Chats {
+		fields = append(fields, c.ID, c.Name)
+	}
+	for _, t := range a.Terms {
+		fields = append(fields, t.Term)
+		for _, c := range t.Chats {
+			fields = append(fields, c.ID, c.Name)
+		}
+	}
+	return slices.ContainsFunc(fields, func(f string) bool { return strings.Contains(strings.ToLower(f), text) })
+}
+
+// readActivity is up to limit entries before before (if set) that match,
+// newest first, and the cursor of the page after them if there is one.
+func readActivity(dir string, before *cursor, limit int, match func(activity) bool) ([]activity, string, error) {
 	des, err := os.ReadDir(activityDir(dir))
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, "", err
@@ -199,7 +237,7 @@ func readActivity(dir string, before *cursor, limit int) ([]activity, string, er
 		if err != nil {
 			return nil, "", err
 		}
-		es = slices.DeleteFunc(es, func(e placed) bool { return before != nil && !e.at.before(*before) })
+		es = slices.DeleteFunc(es, func(e placed) bool { return before != nil && !e.at.before(*before) || !match(e.activity) })
 		slices.SortFunc(es, func(a, b placed) int {
 			if a.at.before(b.at) {
 				return 1

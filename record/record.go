@@ -36,7 +36,7 @@ type Key struct {
 // KeyEntry is an entry of the key log.
 type KeyEntry struct {
 	Seq  int    `json:"seq"`
-	Op   string `json:"op"` // "add" or "remove"
+	Op   string `json:"op"` // "add", "retire" or "remove"
 	Key  Key    `json:"key"`
 	Prev string `json:"prev"`
 	At   Time   `json:"at"`
@@ -247,7 +247,7 @@ func (k Key) parse() (*ecdsa.PublicKey, error) {
 }
 
 func (e KeyEntry) check() error {
-	if e.Op != "add" && e.Op != "remove" {
+	if e.Op != "add" && e.Op != "retire" && e.Op != "remove" {
 		return fmt.Errorf("unknown op %q", e.Op)
 	}
 	_, err := e.Key.parse()

@@ -28,6 +28,7 @@ type Envelope struct {
 
 var (
 	ErrUntrusted    = errors.New("key is not trusted")
+	ErrRetired      = errors.New("key is retired and signs nothing new")
 	ErrBadSignature = errors.New("signature does not verify")
 	ErrExpired      = errors.New("expired")
 )

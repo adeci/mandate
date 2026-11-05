@@ -93,7 +93,7 @@ Chat names that start with `~` were chosen by other people. The app shows chat I
 | route | |
 |---|---|
 | `GET /owner/v1/now` | What waits (access requests and proposals), open grants, routines and stopped routines. |
-| `GET /owner/v1/activity` | `?before=<next>&limit=` (at most 500, default 100): the history, newest first, as `{entries, next}`; `next` is absent on the last page. |
+| `GET /owner/v1/activity` | `?q=&before=<next>&limit=` (at most 500, default 100): the history, newest first, as `{entries, next}`; `next` is absent on the last page. `q` keeps the entries that mention it, in any case, in their identity (ID or name), connector, chats, terms, `detail`, `reason`, `note` or `device`. |
 | `POST /owner/v1/requests/{id}/challenge` | `{chats?, for?, horizon?, zone?}`: a grant answering the request. `chats`: any chats of the connector, chosen by the owner; the matched ones are a suggestion, and an extend keeps its chats. `for` and `horizon`: any the owner chooses, wider or narrower than asked; a routine's window is its schedule. `zone` is the device's IANA zone, for a routine. |
 | `POST /owner/v1/requests/{id}/deny` | |
 | `GET /owner/v1/proposals/{id}` | The display fields, which of them can be edited, and the agent's note. |
@@ -120,8 +120,11 @@ Chat names that start with `~` were chosen by other people. The app shows chat I
 | `GET /owner/v1/never-share` | `[{connector, kind, id, name}]`, `kind` being `chat` or `person` |
 | `PUT /owner/v1/never-share/{connector}/{kind}/{id}` | `{name?}`. Hides the chat, or the person's messages and DMs, from every read and chat list, whatever the grants say. |
 | `DELETE /owner/v1/never-share/{connector}/{kind}/{id}` | |
-| `GET /owner/v1/keys` | The key log as envelopes, and the trusted keys with their device names. |
-| `POST /owner/v1/keys/{id}/remove/challenge` | The `remove` entry. |
+| `GET /owner/v1/keys` | The key log as envelopes, the trusted keys, which of them are retired, and each one's display name. |
+| `PATCH /owner/v1/keys/{id}` | `{name}`: the device's display name, which signs nothing. |
+| `POST /owner/v1/keys/add/challenge` | `{key}`: the `add` entry for a new key of the calling device, to be signed by its current key. Once signed, the device token belongs to the new key. |
+| `POST /owner/v1/keys/{id}/retire/challenge` | The `retire` entry, signed by another key; in a rotation, the device's new key. What the retired key signed stays valid. |
+| `POST /owner/v1/keys/{id}/remove/challenge` | The `remove` entry, for a key that may be compromised: what it signed ends too. |
 
 Calls that return nothing above answer `{}`.
 
@@ -166,17 +169,19 @@ A proposal, as `GET /owner/v1/proposals/{id}` and `now` show it; `editable` list
 {"entries": [{"at": "2026-11-03T09:20:00Z", "kind": "read", "identity": "QX3M…", "connector": "signal",
               "chats": [{"id": "group.6f1b2c", "name": "~Family"}], "count": 20, "detail": "messages"},
              {"at": "2026-11-03T09:15:00Z", "kind": "request.approved", "identity": "QX3M…", "connector": "signal",
-              "chats": [{"id": "group.6f1b2c", "name": "~Family"}], "detail": "30m window, 7d of history"}],
+              "chats": [{"id": "group.6f1b2c", "name": "~Family"}], "detail": "30m window, 7d of history",
+              "reason": "summarize the weekend plans", "terms": [{"term": "fam", "chats": [{"id": "group.6f1b2c", "name": "~Family"}]}],
+              "device": "Pixel 9"}],
  "next": "1793697300.4180"}
 ```
 
-An entry has `at` and `kind`, and `identity`, `connector`, `chats`, `count` and `detail` where they apply. Never message text, except a write's signed display, which the owner approved. The kinds:
+An entry has `at` and `kind`, and `identity`, `connector`, `chats`, `count` and `detail` where they apply; request entries add the request's `reason` and `terms`, proposal entries the agent's `note`, and what a device decided its display name as `device`. Never message text, except a write's signed display, which the owner approved. The kinds:
 
 - `read`: an agent read; `detail` is the read (`chats`, `messages`, `search`, `media` or a read op), `count` the messages.
-- `request.asked` (`detail`: the reason), `request.approved` (`detail`: window and history), `request.denied`, `request.expired`.
+- `request.asked`, `request.approved` (`detail`: window and history), `request.denied`, `request.expired`.
 - `proposal.made` (`detail`: the op), `proposal.approved`, then its outcome `proposal.done`, `proposal.failed` or `proposal.unknown` (`detail`: the signed display's text); `proposal.denied`, `proposal.expired`.
 - `grant.made` (by the owner), `grant.extended`, `grant.closed`, `routine.paused`, `routine.resumed`.
-- `agent.admitted`, `agent.deleted` (`detail`: its name); `device.joined`, `key.removed` (`detail`: the device's name).
+- `agent.admitted`, `agent.deleted` (`detail`: its name); `device.paired` (the first device), `device.joined`, `key.added`, `key.retired`, `key.removed` (`detail`: the device's name).
 - `stop_all`: `count` is the grants closed.
 
 `GET /owner/v1/identities`:
@@ -195,7 +200,8 @@ An entry has `at` and `kind`, and `identity`, `connector`, `chats`, `count` and 
 `GET /owner/v1/keys`:
 
 ```json
-{"log": [<key envelope>, …], "trusted": [{"id": "b903…", "name": "Pixel 9", "public_key": "BN4C…", "type": "p256"}]}
+{"log": [<key envelope>, …], "trusted": [{"id": "b903…", "name": "Pixel 9", "public_key": "BN4C…", "type": "p256"}],
+ "retired": [], "names": {"b903…": "Pixel 9"}}
 ```
 
 An exchange's `payload` is `{"token_sha256": "…"}` for an agent, with `key` added for a device. `GET /owner/v1/connectors/{name}/chats` answers as `GET /containers` in `connector.md`.
