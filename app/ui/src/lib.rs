@@ -99,7 +99,7 @@ enum Screen {
     #[cfg(target_os = "android")]
     Method(Next),
     /// One entry of Activity, in full.
-    Entry(Box<api::Activity>),
+    Entry(std::rc::Rc<api::Activity>),
 }
 
 /// What a new device key is for: pairing as the first device, joining the
@@ -176,10 +176,15 @@ pub struct Shell {
     /// The chat picker, while one is open.
     picker: Option<pick::Picker>,
     /// History loaded so far, newest first; None until Activity first shows.
-    history: Option<api::History>,
+    history: Option<tabs::Loaded>,
     history_loading: bool,
-    /// The search the loaded history answers, "" for all of it.
-    history_q: String,
+    /// What Activity asks for: search, kinds and the day it starts at. The
+    /// loaded history shows until a page for this arrives.
+    wanted: tabs::HistoryQuery,
+    /// The search text as last typed, applied once typing pauses.
+    typed: String,
+    /// The month the day picker shows, while it is open.
+    calendar: Option<(i32, i32)>,
     /// Where each day's header of Activity sat on the last frame, for the
     /// one that sticks on top.
     day_tops: std::rc::Rc<std::cell::RefCell<Vec<(String, f32)>>>,
@@ -270,7 +275,9 @@ impl Shell {
             picker: None,
             history: None,
             history_loading: false,
-            history_q: String::new(),
+            wanted: tabs::HistoryQuery::default(),
+            typed: String::new(),
+            calendar: None,
             day_tops: Default::default(),
             scroll: ScrollHandle::new(),
             sheet: None,
@@ -745,6 +752,7 @@ impl Shell {
                         break Device::joined(&dir, &url, join, key, &token);
                     }
                     Ok(JoinStatus::Confirmed) => {}
+                    Ok(JoinStatus::Denied) => break Err(Error::Invalid("Not let in.".into())),
                     Ok(_) => break Err(Error::Invalid(JOIN_ENDED.into())),
                     Err(e) => break Err(e),
                 }

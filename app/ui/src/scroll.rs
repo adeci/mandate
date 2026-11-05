@@ -391,17 +391,23 @@ impl Spring {
     }
 }
 
-/// A row of a long list. Once it has been laid out it keeps its size, and
-/// off screen it is only that size: its content is laid out and painted
-/// only while it shows. Rows keep their sizes by id, so ids should follow
-/// the content rather than its place in the list.
-pub fn lazy(id: impl Into<ElementId>, row: impl IntoElement) -> Lazy {
-    Lazy { id: id.into(), row: Some(row.into_any_element()) }
+/// A row of a long list, built only when it is laid out: while its size is
+/// still unknown, and while it shows. Once laid out it keeps its size, and
+/// off screen it is only that size. Rows keep their sizes by id, so ids
+/// should follow the content rather than its place in the list.
+pub fn lazy_with(
+    id: impl Into<ElementId>,
+    build: impl FnOnce(&mut Window, &mut App) -> AnyElement + 'static,
+) -> Lazy {
+    Lazy { id: id.into(), row: Some(Box::new(build)) }
 }
+
+/// What builds a lazy row's content.
+type Build = Box<dyn FnOnce(&mut Window, &mut App) -> AnyElement>;
 
 pub struct Lazy {
     id: ElementId,
-    row: Option<AnyElement>,
+    row: Option<Build>,
 }
 
 impl IntoElement for Lazy {
@@ -450,7 +456,7 @@ impl Element for Lazy {
                 (window.request_layout(style, None, cx), None)
             }
             None => {
-                let mut row = self.row.take().expect("laid out once");
+                let mut row = (self.row.take().expect("laid out once"))(window, cx);
                 (row.request_layout(window, cx), Some(row))
             }
         }
@@ -473,7 +479,7 @@ impl Element for Lazy {
             });
             return None;
         }
-        let row = self.row.take().expect("laid out once");
+        let build = self.row.take().expect("laid out once");
         window.with_element_state(id, |known: Option<Option<Size<Pixels>>>, window| {
             let known = known.flatten();
             if !bounds.intersects(&window.content_mask().bounds) {
@@ -481,6 +487,7 @@ impl Element for Lazy {
                 // is laid out in place next frame.
                 return (None, known.filter(|k| k.width == bounds.size.width));
             }
+            let row = build(window, cx);
             let mut row = div().w(bounds.size.width).child(row).into_any_element();
             let laid = row.layout_as_root(
                 size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::MinContent),

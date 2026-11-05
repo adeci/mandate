@@ -119,6 +119,8 @@ pub struct Activity {
     pub note: String,
     /// The device the owner decided on.
     pub device: String,
+    /// Where a login or join came from.
+    pub address: String,
 }
 
 /// A page of history, newest first; next pages back from its last entry.

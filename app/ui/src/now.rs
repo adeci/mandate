@@ -3,8 +3,8 @@
 use crate::api::{Exchange, Grant, Proposal, Request};
 use crate::pick::Pick;
 use crate::screens::{
-    DEVICE_JOIN, approve, button, clickable, column, device_rows, device_warning, id_for, link,
-    panel, reason, slider, table, who,
+    DEVICE_JOIN, approve, button, clickable, column, deny_exchange, device_rows, device_warning,
+    id_for, link, panel, reason, slider, table, who,
 };
 use crate::theme::{MEDIUM, Theme, bold, chars, lines};
 use crate::words::{self, connector, horizon, span};
@@ -343,6 +343,7 @@ fn login_card(t: Theme, ex: &Exchange, cx: &mut Context<Shell>) -> Div {
         this.admit_exchange(ex2.clone(), cx)
     });
     let since = ("Since".to_string(), div().child(words::clock(&ex.started_at)).into_any_element());
+    let deny = deny_exchange(t, ex, cx);
     if ex.kind == "device" {
         let mut rows = device_rows(ex);
         rows.push(since);
@@ -350,6 +351,7 @@ fn login_card(t: Theme, ex: &Exchange, cx: &mut Context<Shell>) -> Div {
             .child(bold(DEVICE_JOIN.to_string()))
             .child(table(t, rows))
             .child(device_warning(t))
+            .child(deny)
             .child(review);
     }
     let mut rows = Vec::new();
@@ -357,7 +359,11 @@ fn login_card(t: Theme, ex: &Exchange, cx: &mut Context<Shell>) -> Div {
         rows.push(("From".to_string(), div().child(ex.address.clone()).into_any_element()));
     }
     rows.push(since);
-    panel(t).child(who(&ex.name, "wants to join as an agent")).child(table(t, rows)).child(review)
+    panel(t)
+        .child(who(&ex.name, "wants to join as an agent"))
+        .child(table(t, rows))
+        .child(deny)
+        .child(review)
 }
 
 fn send_card(t: Theme, p: &Proposal, cx: &mut Context<Shell>) -> Div {

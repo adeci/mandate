@@ -10,6 +10,8 @@ import android.app.Service;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.IBinder;
+import android.service.notification.StatusBarNotification;
+import java.util.Arrays;
 
 /**
  * Holds the owner stream in a process of its own, so that it outlives the
@@ -82,5 +84,13 @@ public final class Stream extends Service {
 
     void hide(String id) {
         getSystemService(NotificationManager.class).cancel(id, 0);
+    }
+
+    /** The items with a notification up, also those posted before this process started. */
+    String[] shown() {
+        return Arrays.stream(getSystemService(NotificationManager.class).getActiveNotifications())
+                .filter(n -> n.getTag() != null)
+                .map(StatusBarNotification::getTag)
+                .toArray(String[]::new);
     }
 }

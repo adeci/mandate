@@ -1,14 +1,18 @@
 //! Agents, Connections, Activity and Settings, as the console laid them out.
 
 use crate::api::{Activity, Grant, History};
+use crate::now::chip;
 use crate::pick::NewGrant;
-use crate::screens::{button, clickable, column, id_for, link, panel, table};
+use crate::screens::{button, clickable, column, id_for, link, panel, shade, table};
 use crate::theme::{MEDIUM, Theme, bold, chars, lines};
 use crate::words::{self, connector, horizon};
 use crate::{Confirm, Next, Screen, Shell, segment};
-use gpui::{Context, Div, SharedString, canvas, div, prelude::*};
+use gpui::{Context, Div, ElementId, SharedString, canvas, div, prelude::*};
 use mandate_core::{Time, Trust};
 use serde_json::json;
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::time::Duration;
 
 impl Shell {
     pub(crate) fn agents_tab(&self, t: Theme, cx: &mut Context<Self>) -> Div {
@@ -110,13 +114,22 @@ impl Shell {
     }
 
     /// Everything that happened, newest first, under the local day it
-    /// happened; scrolling near the end loads further back.
+    /// happened: kinds to narrow it, a day to start at, and scrolling near
+    /// the end loads further back.
     pub(crate) fn activity_tab(&self, t: Theme, cx: &mut Context<Self>) -> Div {
+        let changing = self.history.as_ref().is_some_and(|h| h.query != self.wanted);
+        let top = column()
+            .gap(lines(0.5))
+            .child(self.history_filters(t, cx))
+            .children(self.calendar.map(|(y, m)| self.day_picker(t, y, m, cx)))
+            // A quiet mark while a new search, kind or day loads; the list
+            // it replaces stays until then.
+            .when(changing, |d| d.child(t.alt("Loading…")));
         let Some(history) = &self.history else {
-            return column().child(t.alt("Loading…"));
+            return column().gap(lines(1.)).child(top).child(t.alt("Loading…"));
         };
         let today = words::day(Time::now().unix());
-        let mut days: Vec<(String, Vec<&Activity>)> = Vec::new();
+        let mut days: Vec<(String, Vec<&Rc<Activity>>)> = Vec::new();
         for a in &history.entries {
             let day = words::date(&a.at);
             match days.last_mut() {
@@ -124,8 +137,10 @@ impl Shell {
                 _ => days.push((day, vec![a])),
             }
         }
+        let names: Rc<HashMap<String, String>> =
+            Rc::new(self.identities.iter().map(|i| (i.id.clone(), i.name.clone())).collect());
+        let shell = cx.entity().downgrade();
         self.day_tops.borrow_mut().clear();
-        let mut n = 0usize;
         let sections: Vec<Div> = days
             .into_iter()
             .map(|(day, rows)| {
@@ -139,27 +154,38 @@ impl Shell {
                 )
                 .absolute()
                 .size_full();
-                // A row keeps its laid-out height by when it happened (and
-                // its place among entries of the same moment), so newer
-                // entries arriving on top don't disturb it.
+                // A row keeps its laid-out size by when it happened (and its
+                // place among entries of the same moment), so newer entries
+                // arriving on top don't disturb it; it is built only while
+                // it shows.
                 let mut same = (None, 0usize);
                 let rows: Vec<_> = rows
                     .into_iter()
                     .map(|a| {
-                        n += 1;
                         same = (Some(&a.at), if same.0 == Some(&a.at) { same.1 + 1 } else { 0 });
-                        let shown = a.clone();
-                        let row = clickable(("entry", n), cx, move |this, cx| {
-                            this.go(Screen::Entry(Box::new(shown.clone())), cx)
+                        let id: ElementId = (SharedString::from(a.at.clone()), same.1).into();
+                        let (a, names, shell) = (a.clone(), names.clone(), shell.clone());
+                        crate::scroll::lazy_with(id.clone(), move |_, _| {
+                            let who = names.get(&a.identity).map_or("an agent", String::as_str);
+                            let (time, text) = (words::clock(&a.at), Shell::line(&a, who));
+                            div()
+                                .id(id)
+                                .cursor_pointer()
+                                .on_click(move |_, _, cx| {
+                                    let a = a.clone();
+                                    let _ =
+                                        shell.update(cx, |this, cx| this.go(Screen::Entry(a), cx));
+                                })
+                                .flex()
+                                .gap(chars(2.))
+                                .py(lines(0.5))
+                                .border_t_1()
+                                .border_color(t.bg_alt)
+                                .child(shade())
+                                .child(t.alt(time).w(chars(9.)).flex_none())
+                                .child(div().flex_1().min_w_0().child(text))
+                                .into_any_element()
                         })
-                        .flex()
-                        .gap(chars(2.))
-                        .py(lines(0.5))
-                        .border_t_1()
-                        .border_color(t.bg_alt)
-                        .child(t.alt(words::clock(&a.at)).flex_none())
-                        .child(div().flex_1().min_w_0().child(self.entry(a)));
-                        crate::scroll::lazy((SharedString::from(a.at.clone()), same.1), row)
                     })
                     .collect();
                 column()
@@ -167,13 +193,109 @@ impl Shell {
                     .children(rows)
             })
             .collect();
-        let end = match (&history.next, history.entries.is_empty(), &self.search) {
-            (Some(_), _, _) => Some(t.alt("Loading more…")),
-            (None, true, Some(q)) => Some(t.alt(format!("Nothing matches \"{q}\"."))),
-            (None, true, None) => Some(t.alt("Nothing yet.")),
-            (None, false, _) => None,
+        let query = &history.query;
+        let narrowed = !query.q.is_empty() || query.kinds.is_some() || query.before.is_some();
+        let end = match (&history.next, history.entries.is_empty()) {
+            (Some(_), _) => Some(t.alt("Loading more…")),
+            (None, true) if narrowed => Some(t.alt("Nothing matches.")),
+            (None, true) => Some(t.alt("Nothing yet.")),
+            (None, false) => None,
         };
-        column().gap(lines(1.)).children(sections).children(end)
+        column().gap(lines(1.)).child(top).children(sections).children(end)
+    }
+
+    /// The kinds to show, and the day the list starts at.
+    fn history_filters(&self, t: Theme, cx: &mut Context<Self>) -> Div {
+        let kinds = KINDS.iter().enumerate().map(|(i, (label, kinds))| {
+            let on = self.wanted.kinds == *kinds;
+            chip(t, ("kind", i), label, on, cx, move |this, cx| {
+                this.wanted.kinds = *kinds;
+                cx.notify();
+            })
+        });
+        let kinds: Vec<_> = kinds.collect();
+        let day = match self.wanted.before {
+            Some(before) => {
+                let picked = words::day(before - 1);
+                chip(t, "from-day", &format!("From {picked} ×"), true, cx, |this, cx| {
+                    (this.wanted.before, this.calendar) = (None, None);
+                    cx.notify();
+                })
+            }
+            None => {
+                chip(t, "pick-day", "Jump to a day", self.calendar.is_some(), cx, |this, cx| {
+                    let (y, m, _) = words::ymd(Time::now().unix());
+                    this.calendar = match this.calendar {
+                        Some(_) => None,
+                        None => Some((y, m as i32)),
+                    };
+                    cx.notify();
+                })
+            }
+        };
+        div().flex().flex_wrap().gap(chars(1.)).children(kinds).child(day)
+    }
+
+    /// A month of days to start the list at; days still to come can't be
+    /// picked.
+    fn day_picker(&self, t: Theme, year: i32, month: i32, cx: &mut Context<Self>) -> Div {
+        let first = words::midnight(year, month, 1);
+        let (_, _, days) = words::ymd(words::midnight(year, month + 1, 0));
+        let lead = words::weekday(first);
+        let now = Time::now().unix();
+        let step = |by: i32| {
+            move |this: &mut Shell, cx: &mut Context<Shell>| {
+                if let Some((y, m)) = this.calendar {
+                    let (y2, m2, _) = words::ymd(words::midnight(y, m + by, 1));
+                    this.calendar = Some((y2, m2 as i32));
+                }
+                cx.notify();
+            }
+        };
+        let head = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(link(t, "month-back", "‹", cx, step(-1)).px(chars(1.)))
+            .child(div().font_weight(MEDIUM).child(words::month(first)))
+            .child(link(t, "month-on", "›", cx, step(1)).px(chars(1.)));
+        let cells = (0..lead).map(|_| div().into_any_element()).chain((1..=days).map(|d| {
+            let start = words::midnight(year, month, d as i32);
+            let label = d.to_string();
+            if start > now {
+                return t.alt(label).text_center().py(lines(0.25)).into_any_element();
+            }
+            clickable(("day", d as usize), cx, move |this, cx| {
+                this.wanted.before = Some(words::midnight(year, month, d as i32 + 1));
+                this.calendar = None;
+                cx.notify();
+            })
+            .text_center()
+            .py(lines(0.25))
+            .child(label)
+            .into_any_element()
+        }));
+        let cells: Vec<_> = cells.collect();
+        let weeks = cells.chunks(7).count();
+        let mut cells = cells.into_iter();
+        let rows = (0..weeks).map(|_| {
+            let mut row = div().flex();
+            for _ in 0..7 {
+                row = row.child(div().flex_1().children(cells.next()));
+            }
+            row
+        });
+        let letters = div()
+            .flex()
+            .children(["M", "T", "W", "T", "F", "S", "S"].map(|l| t.alt(l).flex_1().text_center()));
+        column()
+            .border_2()
+            .border_color(t.text)
+            .p(chars(1.))
+            .gap(lines(0.25))
+            .child(head)
+            .child(letters)
+            .children(rows)
     }
 
     /// An entry in full: who, what, the agent's words, the chats and the
@@ -214,6 +336,7 @@ impl Shell {
         if let Some(n) = a.count.filter(|_| a.kind == "read") {
             add("Count", n.to_string());
         }
+        add("From", a.address.clone());
         add("Device", a.device.clone());
         let rows = rows.into_iter().map(|(l, v)| (l, div().child(v).into_any_element())).collect();
         column().gap(lines(1.)).child(bold(self.entry(a))).child(table(t, rows))
@@ -221,11 +344,12 @@ impl Shell {
 
     /// One plain line for an entry: who did what, and how it ended.
     fn entry(&self, a: &Activity) -> String {
-        let who = self
-            .identities
-            .iter()
-            .find(|i| i.id == a.identity)
-            .map_or("an agent", |i| i.name.as_str());
+        let who = self.identities.iter().find(|i| i.id == a.identity);
+        Shell::line(a, who.map_or("an agent", |i| i.name.as_str()))
+    }
+
+    /// An entry's line, given its agent's name.
+    fn line(a: &Activity, who: &str) -> String {
         let on = connector(&a.connector);
         let chats: Vec<&str> = a
             .chats
@@ -265,11 +389,16 @@ impl Shell {
             "routine.resumed" => format!("you resumed {who}'s routine on {on}"),
             "agent.admitted" => format!("you let {d} in"),
             "agent.deleted" => format!("you deleted {d}"),
+            "agent.denied" => format!("you didn't let {d} in"),
+            "device.denied" => format!("you didn't let {d} join"),
             "device.paired" => format!("{d} paired"),
             "device.joined" => format!("{d} joined"),
             "key.added" => format!("{d} changed how it approves"),
             "key.retired" => format!("{d}'s old key retired"),
             "key.removed" => format!("you removed {d}"),
+            "never_share.added" => format!("you hid {d}"),
+            "never_share.removed" => format!("you shared {d} again"),
+            "connector.unlinked" => format!("you unlinked {on}"),
             "stop_all" => format!("you stopped all access · {d}"),
             kind => format!("{kind} · {d}"),
         }
@@ -282,7 +411,27 @@ impl Shell {
         tops.iter().take_while(|(_, y)| *y < top).last().map(|(day, _)| day.clone())
     }
 
-    /// Loads the newest history, ahead of what is already loaded.
+    /// Takes the search text as typed, and applies it once typing has
+    /// paused for a moment; the list shown meanwhile stays.
+    pub(crate) fn searched(&mut self, text: String, cx: &mut Context<Self>) {
+        if text == self.typed {
+            return;
+        }
+        self.typed = text.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SEARCH_PAUSE).await;
+            this.update(cx, |this, cx| {
+                if this.typed == text && this.wanted.q != text {
+                    this.wanted.q = text;
+                    cx.notify();
+                }
+            })
+        })
+        .detach();
+    }
+
+    /// Loads the newest page of what Activity asks for: ahead of what is
+    /// loaded if it answers the same, else in its place.
     pub(crate) fn load_history(&mut self, cx: &mut Context<Self>) {
         self.page_history(None, cx);
     }
@@ -294,57 +443,67 @@ impl Shell {
         }
     }
 
-    fn page_history(&mut self, before: Option<String>, cx: &mut Context<Self>) {
+    fn page_history(&mut self, cursor: Option<String>, cx: &mut Context<Self>) {
         if self.history_loading {
             return;
         }
         self.history_loading = true;
-        let q = self.history_q.clone();
+        let query = self.wanted.clone();
         let mut path = "activity?limit=100".to_string();
-        if let Some(next) = &before {
-            path += &format!("&before={}", segment(next));
+        let before =
+            cursor.clone().or_else(|| query.before.map(|t| Time::from_unix(t).to_string()));
+        if let Some(before) = &before {
+            path += &format!("&before={}", segment(before));
         }
-        if !q.is_empty() {
-            path += &format!("&q={}", segment(&q));
+        if let Some(kinds) = query.kinds {
+            path += &format!("&kinds={kinds}");
+        }
+        if !query.q.is_empty() {
+            path += &format!("&q={}", segment(&query.q));
         }
         let client = self.device().client;
         self.call(
             cx,
             move || Ok(client.get::<History>(&path)),
-            move |this, page, _| {
+            move |this, page, cx| {
                 this.history_loading = false;
-                // The search changed meanwhile; this page is for the old one.
-                if this.history_q != q {
-                    return;
+                // Asked for something else meanwhile; the next frame asks again.
+                if this.wanted != query {
+                    return cx.notify();
                 }
                 let page = match page {
                     Ok(page) => page,
                     // No retry on every frame: the next refresh tries the
                     // newest page again.
                     Err(e) => {
-                        let h = this.history.get_or_insert_with(History::default);
-                        h.next = None;
+                        let h = this.history.get_or_insert_with(Loaded::default);
+                        (h.query, h.next) = (query, None);
                         return this.error = Some(e.to_string());
                     }
                 };
-                match (&mut this.history, before) {
+                let entries = page.entries.into_iter().map(Rc::new);
+                match (&mut this.history, cursor) {
                     // Older entries go after what is loaded.
-                    (Some(h), Some(_)) => {
-                        h.entries.extend(page.entries);
+                    (Some(h), Some(_)) if h.query == query => {
+                        h.entries.extend(entries);
                         h.next = page.next;
                     }
                     // Newer ones go before it, up to the first already there.
-                    (Some(h), None) if !h.entries.is_empty() => {
-                        let first = (h.entries[0].at.clone(), h.entries[0].kind.clone());
-                        let fresh: Vec<Activity> = page
-                            .entries
-                            .into_iter()
-                            .take_while(|e| (&e.at, &e.kind) != (&first.0, &first.1))
+                    (Some(h), None) if h.query == query && !h.entries.is_empty() => {
+                        let first = h.entries[0].clone();
+                        let fresh: Vec<_> = entries
+                            .take_while(|e| (&e.at, &e.kind) != (&first.at, &first.kind))
                             .collect();
                         h.entries.splice(0..0, fresh);
                     }
-                    _ => this.history = Some(page),
+                    // A new search, kind or day: the list starts over at its top.
+                    _ => {
+                        this.history =
+                            Some(Loaded { entries: entries.collect(), next: page.next, query });
+                        this.scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
+                    }
                 }
+                cx.notify();
             },
         );
     }
@@ -539,3 +698,34 @@ fn grant_line(t: Theme, g: &Grant) -> Div {
 pub(crate) fn day_heading(day: &str) -> Div {
     bold(day.to_uppercase()).py(lines(0.5))
 }
+
+/// What Activity asks the server for.
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct HistoryQuery {
+    /// Search text, "" for everything.
+    pub q: String,
+    /// A named group of kinds, None for all.
+    pub kinds: Option<&'static str>,
+    /// Only before this Unix time: the start of the day after the one jumped to.
+    pub before: Option<i64>,
+}
+
+/// History loaded so far for a query, newest first.
+#[derive(Default)]
+pub(crate) struct Loaded {
+    pub entries: Vec<Rc<Activity>>,
+    pub next: Option<String>,
+    pub query: HistoryQuery,
+}
+
+/// The filter chips, and the group of kinds each asks for.
+const KINDS: [(&str, Option<&str>); 5] = [
+    ("All", None),
+    ("Reads", Some("reads")),
+    ("Sends", Some("sends")),
+    ("Requests", Some("requests")),
+    ("Logins & devices", Some("access")),
+];
+
+/// How long typing pauses before a search goes to the server.
+const SEARCH_PAUSE: Duration = Duration::from_millis(250);

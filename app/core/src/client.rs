@@ -295,6 +295,8 @@ pub enum JoinStatus {
     Approved,
     /// Three wrong codes, 10 minutes, or the owner cancelled.
     Ended,
+    /// The owner saw the code match and did not let the device in.
+    Denied,
 }
 
 impl Join {
@@ -372,6 +374,8 @@ impl Join {
         #[derive(Deserialize)]
         struct Poll {
             status: String,
+            #[serde(default)]
+            reason: String,
         }
         let (Some(id), Some(_)) = (self.id, self.peer) else {
             return Err(invalid("the code has not matched yet"));
@@ -382,6 +386,7 @@ impl Join {
         Ok(match p.status.as_str() {
             "open" | "confirmed" => JoinStatus::Confirmed,
             "approved" => JoinStatus::Approved,
+            "ended" if p.reason == "denied" => JoinStatus::Denied,
             "ended" => JoinStatus::Ended,
             status => return Err(invalid(format!("unexpected join status {status:?}"))),
         })

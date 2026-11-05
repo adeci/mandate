@@ -20,7 +20,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 #[unsafe(no_mangle)]
@@ -517,51 +517,79 @@ extern "system" fn Java_dev_mandate_app_Stream_run<'a>(
         })
         .resolve::<ThrowRuntimeExAndDefault>();
     if let Some((service, dir)) = args {
-        serve(&service, &PathBuf::from(dir));
+        serve(Arc::new(service), &PathBuf::from(dir));
     }
 }
 
+/// The service, and the items it has a notification up for.
+type Notices = (Arc<Global<JObject<'static>>>, Arc<Mutex<HashSet<String>>>);
+
 /// Holds the owner stream for the service, with a notification up for each
-/// waiting item.
-fn serve(service: &Global<JObject<'static>>, dir: &Path) -> ! {
-    let mut shown = HashSet::new();
+/// waiting item. It refetches on each event, and each minute too, since an
+/// item can run out of time without one.
+fn serve(service: Arc<Global<JObject<'static>>>, dir: &Path) -> ! {
+    // Notifications outlive the process, so a new one starts from them.
+    let notices: Notices = (service.clone(), Arc::new(Mutex::new(posted(&service))));
+    let (tick, tick_dir) = (notices.clone(), dir.to_path_buf());
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+            notify(&tick, Device::load(&tick_dir).as_ref().map(|d| &d.client));
+        }
+    });
     loop {
         // Loaded on each connect, in case the app has paired anew.
-        if let Some(device) = Device::load(dir) {
-            match device.client.events() {
-                Ok(events) => {
-                    notify(service, &device.client, &mut shown);
-                    for event in events {
-                        if event.is_err() {
-                            break;
-                        }
-                        notify(service, &device.client, &mut shown);
+        let device = Device::load(dir);
+        match device.as_ref().map(|d| d.client.events()) {
+            Some(Ok(events)) => {
+                notify(&notices, device.as_ref().map(|d| &d.client));
+                for event in events {
+                    if event.is_err() {
+                        break;
                     }
+                    notify(&notices, device.as_ref().map(|d| &d.client));
                 }
-                Err(e) => log::warn!("stream: {e}"),
             }
+            Some(Err(e)) => log::warn!("stream: {e}"),
+            None => notify(&notices, None),
         }
         std::thread::sleep(Duration::from_secs(5));
     }
 }
 
-/// Shows what newly waits and hides what no longer does. A notification
-/// names the identity, the connector and the kind of thing, nothing else.
-fn notify(service: &Global<JObject<'static>>, client: &Client, shown: &mut HashSet<String>) {
-    let waiting = match crate::waiting(client) {
-        Ok(w) => w,
-        Err(e) => return log::warn!("stream: {e}"),
+/// The items with a notification up.
+fn posted(service: &Global<JObject<'static>>) -> HashSet<String> {
+    let tags = java(|env, _| {
+        let sig = jni_sig!("()[Ljava/lang/String;");
+        let tags = env.call_method(service, jni_str!("shown"), sig, &[])?.l()?;
+        let tags = env.cast_local::<jni::objects::JObjectArray<JString>>(tags)?;
+        (0..tags.len(env)?)
+            .map(|i| tags.get_element(env, i)?.try_to_string(env))
+            .collect::<jni::errors::Result<HashSet<_>>>()
+    });
+    tags.inspect_err(|e| log::error!("notifications: {e}")).unwrap_or_default()
+}
+
+/// Shows what newly waits and hides what no longer does: decided, ended or
+/// out of time. Unpaired (no client), nothing waits. A notification names
+/// the identity, the connector and the kind of thing, nothing else.
+fn notify((service, shown): &Notices, client: Option<&Client>) {
+    let waiting = match client.map(crate::waiting) {
+        Some(Ok(w)) => w,
+        Some(Err(e)) => return log::warn!("stream: {e}"),
+        None => Vec::new(),
     };
+    let mut shown = shown.lock().unwrap();
     let posted = java(|env, _| {
         for (id, text) in waiting.iter().filter(|(id, _)| !shown.contains(id)) {
             let (id, text) = (env.new_string(id)?, env.new_string(text)?);
             let sig = jni_sig!("(Ljava/lang/String;Ljava/lang/String;)V");
-            env.call_method(service, jni_str!("show"), sig, &[(&id).into(), (&text).into()])?;
+            env.call_method(&**service, jni_str!("show"), sig, &[(&id).into(), (&text).into()])?;
         }
         for id in shown.iter().filter(|id| !waiting.iter().any(|(w, _)| w == *id)) {
             let id = env.new_string(id)?;
             let sig = jni_sig!("(Ljava/lang/String;)V");
-            env.call_method(service, jni_str!("hide"), sig, &[(&id).into()])?;
+            env.call_method(&**service, jni_str!("hide"), sig, &[(&id).into()])?;
         }
         Ok(())
     });

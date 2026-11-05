@@ -127,6 +127,40 @@ pub fn day(unix: i64) -> String {
     strftime(unix, c"%e %b").trim_start().to_string()
 }
 
+/// The local calendar date of a Unix time: year, month 1–12, day.
+pub fn ymd(unix: i64) -> (i32, u32, u32) {
+    let t = unix as libc::time_t;
+    // SAFETY: tm is plain data that localtime_r fills.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        tm
+    };
+    (tm.tm_year + 1900, tm.tm_mon as u32 + 1, tm.tm_mday as u32)
+}
+
+/// The start of a local day, as a Unix time. Months and days out of range
+/// roll over, so day 0 is the last day of the month before.
+pub fn midnight(year: i32, month: i32, day: i32) -> i64 {
+    // SAFETY: mktime reads and normalises a tm it is given; -1 for isdst
+    // lets it find whether summer time applies.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        (tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_isdst) = (year - 1900, month - 1, day, -1);
+        libc::mktime(&mut tm) as i64
+    }
+}
+
+/// "November 2026", in local time.
+pub fn month(unix: i64) -> String {
+    strftime(unix, c"%B %Y")
+}
+
+/// The weekday of a Unix time in local time, Monday 0 to Sunday 6.
+pub fn weekday(unix: i64) -> u32 {
+    (strftime(unix, c"%u").parse::<u32>().unwrap_or(1) + 6) % 7
+}
+
 /// When a routine runs right now in local time, the clock time it ends.
 pub fn running(s: &crate::api::Schedule) -> Option<String> {
     let now = Time::now().unix();

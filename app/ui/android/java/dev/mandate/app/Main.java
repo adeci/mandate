@@ -10,6 +10,9 @@ import android.os.Bundle;
 import android.os.Build;
 import android.provider.Settings;
 import android.text.format.DateFormat;
+import android.view.Display;
+import android.view.Surface;
+import android.view.SurfaceHolder;
 import android.view.View;
 import android.view.ViewTreeObserver;
 import android.view.WindowInsets;
@@ -115,6 +118,26 @@ public final class Main extends NativeActivity {
     public void onConfigurationChanged(Configuration config) {
         super.onConfigurationChanged(config);
         bars(config);
+    }
+
+    /**
+     * Asks for the display's top refresh rate while gpui draws. Without a
+     * vote the system leaves an unknown surface at 60 Hz on a 120 Hz screen.
+     * The vote counts only while frames come, so an idle app lets the
+     * display slow down. Again on each new size: a fold switches displays.
+     */
+    @Override
+    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+        super.surfaceChanged(holder, format, width, height);
+        Display.Mode now = getDisplay().getMode();
+        float top = now.getRefreshRate();
+        for (Display.Mode m : getDisplay().getSupportedModes()) {
+            if (m.getPhysicalWidth() == now.getPhysicalWidth()
+                    && m.getPhysicalHeight() == now.getPhysicalHeight()) {
+                top = Math.max(top, m.getRefreshRate());
+            }
+        }
+        holder.getSurface().setFrameRate(top, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
     }
 
     /** Again on return from a prompt or another app, which may have set the bars their way. */

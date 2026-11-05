@@ -112,18 +112,16 @@ impl Render for Shell {
         {
             self.check_pair(link, cx);
         }
-        // Activity loads when it first shows, and further back as its end
-        // nears; the day scrolled past keeps its header on top.
+        // Activity loads when it first shows, again when what it asks for
+        // changes, and further back as its end nears; the day scrolled past
+        // keeps its header on top.
         let sticky = if tab == Some(Tab::Activity) {
             let (at, end) =
                 (f32::from(self.scroll.offset().y), f32::from(self.scroll.max_offset().y));
             let near = -at >= end - 2. * f32::from(window.viewport_size().height);
-            // A new search starts the history over, from the server.
-            let q = self.search.clone().unwrap_or_default();
-            if self.history_q != q {
-                (self.history_q, self.history) = (q, None);
-            }
+            self.searched(self.search.clone().unwrap_or_default(), cx);
             match &self.history {
+                Some(h) if h.query != self.wanted => self.load_history(cx),
                 None => self.load_history(cx),
                 Some(h) if h.next.is_some() && near => self.more_history(cx),
                 Some(_) => {}
@@ -450,7 +448,7 @@ fn touches() -> impl IntoElement {
 
 /// A grey veil over a clickable while a finger is down on it, readable on
 /// white, black and emerald alike.
-fn shade() -> impl IntoElement {
+pub(crate) fn shade() -> impl IntoElement {
     canvas(
         |_, _, _| (),
         |bounds, _, window, _| {
@@ -948,7 +946,8 @@ impl Shell {
 
 fn admit(t: Theme, ex: &Exchange, envelope: &Envelope, cx: &mut Context<Shell>) -> Div {
     let envelope = envelope.clone();
-    let later = button(t, "later", "Not now", cx, |this, cx| this.up(cx));
+    // Deny sits above, as on every card, so Let in's place is the thumb's.
+    let deny = deny_exchange(t, ex, cx);
     if ex.kind == "device" {
         // A device can approve anything, so the warning sits on the button.
         let admit = approve(t, "admit", "Let this device in".into(), true, cx, move |this, cx| {
@@ -957,25 +956,28 @@ fn admit(t: Theme, ex: &Exchange, envelope: &Envelope, cx: &mut Context<Shell>) 
         return column()
             .child(bold(DEVICE_JOIN.to_string()))
             .child(table(t, device_rows(ex)))
-            .child(column().child(device_warning(t)).child(admit))
-            .child(later);
+            .child(deny)
+            .child(column().child(device_warning(t)).child(admit));
     }
     let mut rows = vec![("Kind".to_string(), div().child("agent").into_any_element())];
     if !ex.address.is_empty() {
         rows.push(("From".into(), div().child(ex.address.clone()).into_any_element()));
     }
-    column()
-        .child(bold(format!("Let {} in?", ex.name)))
-        .child(table(t, rows))
-        .child(approve(
-            t,
-            "admit",
-            format!("Let {} in", ex.name).into(),
-            true,
-            cx,
-            move |this, cx| this.approve(envelope.clone(), cx),
-        ))
-        .child(later)
+    column().child(bold(format!("Let {} in?", ex.name))).child(table(t, rows)).child(deny).child(
+        approve(t, "admit", format!("Let {} in", ex.name).into(), true, cx, move |this, cx| {
+            this.approve(envelope.clone(), cx)
+        }),
+    )
+}
+
+/// Deny for a party whose code matched: the exchange ends, and the party is
+/// told it was not let in.
+pub fn deny_exchange(t: Theme, ex: &Exchange, cx: &mut Context<Shell>) -> Stateful<Div> {
+    let (id, name) = (ex.id.clone(), ex.name.clone());
+    button(t, id_for("deny-exchange", &ex.id), "Deny", cx, move |this, cx| {
+        let notice = format!("You didn't let {name} in.");
+        this.post("DELETE", format!("exchanges/{id}"), cx, move |_| Some(notice))
+    })
 }
 
 /// The title of every device join, never the name the device gave itself.
