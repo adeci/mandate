@@ -48,6 +48,8 @@ pub struct Theme {
     pub routine: Hsla,
     /// Green-tinted slate: counts and quiet notices.
     pub info: Hsla,
+    /// Red, once only: Stop all, the break-glass button.
+    pub danger: Hsla,
 }
 
 impl Theme {
@@ -66,6 +68,7 @@ impl Theme {
             open: c(0x0f766e, 0x2a9d8f),
             routine: c(0x4d7c5f, 0x8fb39a),
             info: c(0x3f5a52, 0x9db5ad),
+            danger: c(0xb91c1c, 0xef4444),
         }
     }
 

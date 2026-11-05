@@ -174,20 +174,22 @@ impl Shell {
         );
     }
 
-    /// The PIN the device key asks for before it signs, if it does.
+    /// The PIN the device key asks for before it signs or confirms, if it
+    /// does.
     pub(crate) fn pin_prompt(&self, t: Theme, cx: &mut Context<Self>) -> Option<Div> {
         let unlock = self.unlock.as_ref()?;
         let fido = self.device.as_ref().is_some_and(|d| d.key.touch());
         let what = if fido { "your security key's PIN" } else { "your token's PIN" };
+        let (to, act) = if unlock.gate { ("confirm", "Confirm") } else { ("sign", "Sign") };
         Some(
             panel(t)
-                .child(bold(format!("Type {what} to sign.")))
+                .child(bold(format!("Type {what} to {to}.")))
                 .child(field(t, "unlock-pin", "PIN", &unlock.pin, true, true, cx, |_, _| {}))
                 .child(
                     div()
                         .flex()
                         .gap(chars(1.))
-                        .child(button(t, "unlock", "Sign", cx, |this, cx| this.submit_pin(cx)))
+                        .child(button(t, "unlock", act, cx, |this, cx| this.submit_pin(cx)))
                         .child(button(t, "cancel-unlock", "Cancel", cx, |this, cx| {
                             this.unlock = None;
                             cx.notify();

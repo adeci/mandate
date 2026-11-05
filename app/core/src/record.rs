@@ -58,6 +58,9 @@ pub struct KeyEntry {
 #[serde(rename_all = "lowercase")]
 pub enum Op {
     Add,
+    /// A device's old key, after rotation: it signs nothing new, but what it
+    /// signed stays valid.
+    Retire,
     Remove,
 }
 

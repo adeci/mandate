@@ -10,6 +10,7 @@ mod link;
 mod now;
 mod pick;
 mod screens;
+mod scroll;
 mod tabs;
 mod theme;
 mod words;
@@ -24,7 +25,7 @@ use gpui::{
 use mandate_core::{
     Client, DeviceKey, Envelope, Error, Join, JoinStatus, PairLink, Record, Signed, new_token,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -93,21 +94,41 @@ enum Screen {
     },
     /// The owner's own grant for an agent.
     Grant(pick::NewGrant),
+    /// How this device approves: picked before its key is made, when it
+    /// pairs, joins or changes its key.
+    #[cfg(target_os = "android")]
+    Method(Next),
+    /// One entry of Activity, in full.
+    Entry(Box<api::Activity>),
 }
 
-/// What a new device key is for: pairing as the first device, or joining
-/// the server at a URL, by a code, as another.
+/// What a new device key is for: pairing as the first device, joining the
+/// server at a URL by a code as another, or taking this device's place.
 #[derive(Clone)]
 enum Next {
     Pair(PairLink),
     Join { url: String, code: String },
+    Rotate,
 }
 
-/// The device key's PIN, asked before a signature, and the signature.
+/// An action asked once more in a sheet before it runs; the ones that take
+/// access away also want the owner to prove it is them.
+#[derive(Clone)]
+enum Confirm {
+    DeleteAgent { id: String, name: String },
+    RemoveDevice { id: String, name: String },
+    Unlink { name: String },
+    Close { id: String, what: String },
+    StopAll,
+}
+
+/// The device key's PIN, asked before a signature or, for a gate, before
+/// the key proves the owner is here; then what follows.
 #[cfg(not(target_os = "android"))]
 struct Unlock {
     pin: String,
     then: Then,
+    gate: bool,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -157,15 +178,15 @@ pub struct Shell {
     /// History loaded so far, newest first; None until Activity first shows.
     history: Option<api::History>,
     history_loading: bool,
+    /// The search the loaded history answers, "" for all of it.
+    history_q: String,
     /// Where each day's header of Activity sat on the last frame, for the
     /// one that sticks on top.
     day_tops: std::rc::Rc<std::cell::RefCell<Vec<(String, f32)>>>,
     /// The page's scroll, for loading more history near its end.
     scroll: ScrollHandle,
-    /// Stop all's confirmation is open.
-    stopping: bool,
-    /// The agent or connector whose Delete or Unlink waits for a second tap.
-    confirming: Option<String>,
+    /// The action whose sheet asks for a second tap.
+    sheet: Option<Confirm>,
     notice: Option<String>,
     error: Option<String>,
     /// What the device key waits for while it signs, e.g. a touch.
@@ -187,19 +208,28 @@ pub struct Shell {
     agent_url: String,
     /// The device key a refused join made, for the next try.
     join_key: Option<device::Key>,
-    /// A finger panning on a tab, while it does.
-    swipe: Option<screens::Swipe>,
-    /// How far, in px, the page a swipe brought starts off its place.
-    slide: f32,
+    /// The screens Back returns to, the latest last; empty at a tab's root.
+    back: Vec<Screen>,
     /// The exchange on its way to Let in, so that it goes there once.
     admitting: Option<String>,
     /// A signature is in flight; no other starts until it ends.
     signing: bool,
+    /// An exchange is being opened; a second tap waits for it.
+    opening: bool,
+    /// This device's new name, while it is typed in Settings.
+    renaming: Option<String>,
+    /// The owner's choice to lock mandate when it leaves the screen.
+    lock: bool,
+    /// Locked until the owner proves it is them.
+    locked: bool,
+    /// Asking the owner to unlock, so the lock screen asks only once.
+    unlocking: bool,
 }
 
 impl Shell {
     fn new(dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let device = Device::load(&dir);
+        let lock = Prefs::load(&dir).lock && device.is_some();
         let screen = match device {
             Some(_) => Screen::Tab(Tab::Now),
             None => Screen::Welcome,
@@ -240,10 +270,10 @@ impl Shell {
             picker: None,
             history: None,
             history_loading: false,
+            history_q: String::new(),
             day_tops: Default::default(),
             scroll: ScrollHandle::new(),
-            stopping: false,
-            confirming: None,
+            sheet: None,
             notice: None,
             error: None,
             prompt: None,
@@ -256,10 +286,14 @@ impl Shell {
             pair_check: None,
             agent_url: String::new(),
             join_key: None,
-            swipe: None,
-            slide: 0.,
+            back: Vec::new(),
             admitting: None,
             signing: false,
+            opening: false,
+            renaming: None,
+            lock,
+            locked: lock,
+            unlocking: false,
         };
         if let Some(device) = device {
             shell.paired(device, cx);
@@ -277,12 +311,46 @@ impl Shell {
         self.listen(cx);
     }
 
+    /// The app is back on screen after being away: locked again if the owner
+    /// chose so.
+    pub fn foreground(&mut self, cx: &mut Context<Self>) {
+        if self.lock && self.device.is_some() {
+            (self.locked, self.unlocking) = (true, false);
+            cx.notify();
+        }
+    }
+
+    /// Asks the owner to prove it is them, and unlocks the app.
+    pub(crate) fn unlock_app(&mut self, cx: &mut Context<Self>) {
+        self.unlocking = true;
+        self.gate(
+            |this, cx| {
+                (this.locked, this.unlocking) = (false, false);
+                cx.notify();
+            },
+            cx,
+        );
+    }
+
+    /// Turns the app lock on or off, kept on this device.
+    pub(crate) fn set_lock(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.lock = on;
+        if let Err(e) = (Prefs { lock: on }).save(&self.dir) {
+            self.error = Some(e.to_string());
+        }
+        cx.notify();
+    }
+
     /// A pairing link opened from outside the app: shown on the pairing
     /// screen for the owner to check, ignored once paired.
     pub fn take_link(&mut self, link: String, cx: &mut Context<Self>) {
         if self.device.is_none() {
-            self.screen = Screen::Pair { text: link };
-            cx.notify();
+            let screen = Screen::Pair { text: link };
+            if matches!(self.screen, Screen::Pair { .. }) {
+                self.swap(screen, cx);
+            } else {
+                self.go(screen, cx);
+            }
         }
     }
 
@@ -303,31 +371,42 @@ impl Shell {
             self.review(p.clone(), cx);
         } else if self.now.requests.iter().any(|r| r.id == id) {
             // Requests are decided on their card in Now.
-            self.screen = Screen::Tab(Tab::Now);
+            self.root(Tab::Now, cx);
         }
     }
 
     /// Opens a code exchange for an agent or a new device, and shows its
     /// code. Opening another of the same kind closes the earlier one.
     fn invite(&mut self, kind: &'static str, cx: &mut Context<Self>) {
+        // A second tap would open a second exchange, closing the first
+        // while its code shows.
+        if self.opening {
+            return;
+        }
+        self.opening = true;
         let client = self.device().client;
         self.error = None;
         self.call(
             cx,
-            move || client.send::<Opened>("POST", "exchanges", &json!({ "kind": kind })),
-            move |this, opened, cx| this.go(Screen::Invite { kind, opened }, cx),
+            move || Ok(client.send::<Opened>("POST", "exchanges", &json!({ "kind": kind }))),
+            move |this, opened, cx| {
+                this.opening = false;
+                match opened {
+                    Ok(opened) => this.go(Screen::Invite { kind, opened }, cx),
+                    Err(e) => this.error = Some(e.to_string()),
+                }
+            },
         );
     }
 
     /// Cancels the exchange the owner opened, back where it was opened from.
     fn cancel_invite(&mut self, cx: &mut Context<Self>) {
-        let Screen::Invite { kind, opened } = &self.screen else { return };
-        let back = if *kind == "agent" { Screen::Tab(Tab::Agents) } else { Screen::Settings };
+        let Screen::Invite { opened, .. } = &self.screen else { return };
         let (client, path) = (self.device().client, format!("exchanges/{}", opened.id));
         self.call(
             cx,
             move || client.send::<Value>("DELETE", &path, &json!({})),
-            |this, _, cx| this.go(back, cx),
+            |this, _, cx| this.up(cx),
         );
     }
 
@@ -371,7 +450,15 @@ impl Shell {
             cx,
             move || Ok(fetch()),
             |this, fetched, cx| match fetched {
-                Ok((exchange, envelope)) => this.go(Screen::Admit { exchange, envelope }, cx),
+                // Let in takes Add an agent's place: Back leads past it.
+                Ok((exchange, envelope)) => {
+                    let admit = Screen::Admit { exchange, envelope };
+                    if matches!(this.screen, Screen::Invite { .. }) {
+                        this.swap(admit, cx)
+                    } else {
+                        this.go(admit, cx)
+                    }
+                }
                 Err(e) => (this.admitting, this.error) = (None, Some(e.to_string())),
             },
         );
@@ -382,20 +469,73 @@ impl Shell {
         self.device.clone().expect("paired")
     }
 
+    /// Goes on to screen; Back returns here.
     fn go(&mut self, screen: Screen, cx: &mut Context<Self>) {
-        if matches!(self.screen, Screen::Admit { .. }) {
+        let here = std::mem::replace(&mut self.screen, screen);
+        self.back.push(here);
+        self.entered(cx);
+    }
+
+    /// Shows screen in this one's place; Back skips this one.
+    fn swap(&mut self, screen: Screen, cx: &mut Context<Self>) {
+        self.screen = screen;
+        self.entered(cx);
+    }
+
+    /// A tab's first page, the way here forgotten.
+    fn root(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        self.back.clear();
+        self.swap(Screen::Tab(tab), cx);
+    }
+
+    /// Back one screen; false at the root, where Android's Back leaves.
+    pub(crate) fn pop(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(screen) = self.back.pop() else { return false };
+        self.swap(screen, cx);
+        true
+    }
+
+    /// Leaves a screen that is done: back where it was opened from, or a
+    /// root if it was opened from nowhere.
+    fn up(&mut self, cx: &mut Context<Self>) {
+        if !self.pop(cx) {
+            match self.device {
+                Some(_) => self.root(Tab::Now, cx),
+                None => self.swap(Screen::Welcome, cx),
+            }
+        }
+    }
+
+    /// After a decision: a screen made for it (Review, Let in, a new grant)
+    /// is left; a tab or Settings stays.
+    fn decided_here(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.screen, Screen::Review { .. } | Screen::Admit { .. } | Screen::Grant(_)) {
+            self.up(cx);
+        }
+    }
+
+    /// Back on Join, past any screen the try went through (a key chooser,
+    /// Joining), showing screen in its place.
+    fn at_join(&mut self, screen: Screen, cx: &mut Context<Self>) {
+        if let Some(i) = self.back.iter().rposition(|s| matches!(s, Screen::Join { .. })) {
+            self.back.truncate(i);
+        }
+        self.swap(screen, cx);
+    }
+
+    /// What every change of screen resets.
+    fn entered(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.screen, Screen::Admit { .. }) {
             self.admitting = None;
         }
         self.error = None;
         self.notice = None;
-        self.stopping = false;
         self.search = None;
         self.picker = None;
         for a in self.adjust.values_mut() {
             a.open = false;
         }
-        (self.confirming, self.slide) = (None, 0.);
-        self.screen = screen;
+        (self.sheet, self.renaming) = (None, None);
         keyboard(false);
         cx.notify();
     }
@@ -505,27 +645,44 @@ impl Shell {
         );
     }
 
-    /// Makes the device key for next: on Android at once, on desktop with
+    /// Makes the device key for next: on Android with the way of approving
+    /// the owner picks (none to pick without biometrics), on desktop with
     /// the authenticator or token the owner picks.
     fn new_key(&mut self, next: Next, cx: &mut Context<Self>) {
         self.error = None;
         #[cfg(target_os = "android")]
-        self.call(cx, android::Keystore::generate, move |this, key, cx| {
-            this.with_key(next, key, cx)
-        });
+        if android::biometrics_enrolled() {
+            self.go(Screen::Method(next), cx);
+        } else if android::screen_lock_set() {
+            self.make_key(next, android::Method::ScreenLock, cx);
+        } else {
+            self.error = Some("Set a screen lock in Android's Settings, then try again.".into());
+        }
         #[cfg(not(target_os = "android"))]
         self.go(Screen::Choose(choose::Choose::new(next)), cx);
+    }
+
+    /// Makes a Keystore key that unlocks by method, then goes on with it.
+    #[cfg(target_os = "android")]
+    pub(crate) fn make_key(&mut self, next: Next, method: android::Method, cx: &mut Context<Self>) {
+        self.error = None;
+        self.call(
+            cx,
+            move || android::Keystore::generate(method),
+            move |this, key, cx| this.with_key(next, key, cx),
+        );
     }
 
     fn with_key(&mut self, next: Next, key: device::Key, cx: &mut Context<Self>) {
         let dir = self.dir.clone();
         match next {
+            Next::Rotate => self.rotate(key, cx),
             Next::Pair(link) => self.call(
                 cx,
                 move || Device::pair(&dir, &link, key),
                 |this, device, cx| {
                     this.paired(device, cx);
-                    this.go(Screen::Tab(Tab::Now), cx);
+                    this.root(Tab::Now, cx);
                 },
             ),
             Next::Join { url, code } => {
@@ -552,14 +709,14 @@ impl Shell {
                     move || Ok(attempt()),
                     move |this, attempt, cx| match attempt {
                         Ok((join, key, token, url)) => {
-                            this.go(Screen::Joining, cx);
+                            this.at_join(Screen::Joining, cx);
                             this.poll_join(join, key, token, url, cx);
                         }
                         Err(refused) => {
                             let (e, key) = *refused;
                             let screen =
                                 Screen::Join { url: typed, code: String::new(), code_field: true };
-                            this.go(screen, cx);
+                            this.at_join(screen, cx);
                             (this.join_key, this.error) = (Some(key), Some(e.to_string()));
                         }
                     },
@@ -599,10 +756,11 @@ impl Shell {
             this.update(cx, |this, cx| match done {
                 Ok(device) => {
                     this.paired(device, cx);
-                    this.go(Screen::Tab(Tab::Now), cx);
+                    this.root(Tab::Now, cx);
                 }
                 Err(e) => {
-                    this.go(Screen::Join { url: typed, code: String::new(), code_field: true }, cx);
+                    let screen = Screen::Join { url: typed, code: String::new(), code_field: true };
+                    this.at_join(screen, cx);
                     this.error = Some(e.to_string());
                 }
             })
@@ -620,7 +778,7 @@ impl Shell {
     ) -> bool {
         let key = self.device().key;
         if key.locked() {
-            self.unlock = Some(Unlock { pin: String::new(), then: Box::new(then) });
+            self.unlock = Some(Unlock { pin: String::new(), then: Box::new(then), gate: false });
             cx.notify();
             return false;
         }
@@ -632,9 +790,41 @@ impl Shell {
     fn submit_pin(&mut self, cx: &mut Context<Self>) {
         let Some(unlock) = self.unlock.take() else { return };
         let key = self.device().key;
-        let pin = unlock.pin;
+        let (pin, gate) = (unlock.pin, unlock.gate);
         self.error = None;
-        self.call(cx, move || key.unlock(&pin), move |this, (), cx| (unlock.then)(this, cx));
+        self.call(
+            cx,
+            move || if gate { key.confirm(Some(&pin)) } else { key.unlock(&pin) },
+            move |this, (), cx| (unlock.then)(this, cx),
+        );
+    }
+
+    /// Proves the owner is here the way this device approves, then runs
+    /// then. Nothing is signed: a fingerprint or the screen lock on Android,
+    /// a touch or the PIN on desktop.
+    fn gate(
+        &mut self,
+        then: impl FnOnce(&mut Shell, &mut Context<Shell>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let key = self.device().key;
+        self.error = None;
+        #[cfg(not(target_os = "android"))]
+        {
+            if key.confirm_needs_pin() {
+                self.unlock = Some(Unlock { pin: String::new(), then: Box::new(then), gate: true });
+                return cx.notify();
+            }
+            self.prompt = Some("Touch your security key.");
+        }
+        #[cfg(target_os = "android")]
+        let work = move || key.authenticate();
+        #[cfg(not(target_os = "android"))]
+        let work = move || key.confirm(None);
+        self.call(cx, work, move |this, (), cx| {
+            this.prompt = None;
+            then(this, cx)
+        });
     }
 
     /// Fetches a challenge, checks that its record says what the owner was
@@ -692,7 +882,7 @@ impl Shell {
                 match done {
                     Ok(_) => {
                         this.decided(&decided);
-                        this.screen = Screen::Tab(Tab::Now);
+                        this.decided_here(cx);
                         this.refresh(cx);
                     }
                     Err(e) => this.error = Some(e.to_string()),
@@ -783,7 +973,7 @@ impl Shell {
         self.call(
             cx,
             move || client.challenge(&path, &json!({"edits": {}})),
-            |this, envelope, _| this.screen = Screen::Review { proposal, envelope },
+            |this, envelope, cx| this.go(Screen::Review { proposal, envelope }, cx),
         );
     }
 
@@ -804,11 +994,8 @@ impl Shell {
             move || client.send::<Value>(method, &path, &json!({})),
             move |this, answer, cx| {
                 this.decided(&decided);
-                this.screen = Screen::Tab(match this.screen {
-                    Screen::Tab(tab) => tab,
-                    _ => Tab::Now,
-                });
-                (this.stopping, this.confirming, this.notice) = (false, None, notice(answer));
+                this.decided_here(cx);
+                (this.sheet, this.notice) = (None, notice(answer));
                 this.refresh(cx);
             },
         );
@@ -829,6 +1016,112 @@ impl Shell {
                 n(s.requests, "request")
             ))
         });
+    }
+
+    /// Asks once more, in a sheet, before c runs.
+    pub(crate) fn ask(&mut self, c: Confirm, cx: &mut Context<Self>) {
+        self.sheet = Some(c);
+        cx.notify();
+    }
+
+    /// Runs what the sheet asked about. Taking access away also wants the
+    /// owner to prove it is them; removing a device signs, which does that.
+    pub(crate) fn confirmed(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.sheet.take() else { return };
+        match c {
+            Confirm::DeleteAgent { id, name } => self.gate(
+                move |this, cx| {
+                    let notice = format!("You deleted {name}.");
+                    this.post("DELETE", format!("identities/{id}"), cx, move |_| Some(notice))
+                },
+                cx,
+            ),
+            Confirm::RemoveDevice { id, .. } => {
+                let path = format!("keys/{id}/remove/challenge");
+                let check = move |r: &Record| matches!(r, Record::Key(e) if e.op == mandate_core::Op::Remove && e.key.id == id);
+                self.sign(path, json!({}), check, cx);
+            }
+            Confirm::Unlink { name } => self.gate(move |this, cx| this.unlink(name, cx), cx),
+            Confirm::Close { id, .. } => {
+                self.post("POST", format!("grants/{id}/close"), cx, |_| Some("Closed.".into()))
+            }
+            Confirm::StopAll => self.stop_all(cx),
+        }
+        cx.notify();
+    }
+
+    /// Moves this device to key: the current key adds it, it retires the
+    /// current key, and the device token goes with it. Nothing else changes.
+    fn rotate(&mut self, key: device::Key, cx: &mut Context<Self>) {
+        if self.signing {
+            return;
+        }
+        // The current key signs first; a locked security key wants its PIN.
+        #[cfg(not(target_os = "android"))]
+        if self.device().key.locked() {
+            let then: Then = Box::new(move |this, cx| this.rotate(key, cx));
+            self.unlock = Some(Unlock { pin: String::new(), then, gate: false });
+            return cx.notify();
+        }
+        let (device, dir, old) = (self.device(), self.dir.clone(), self.key_id.clone());
+        let name = self.keys.trusted.iter().find(|k| k.id == old).map(|k| k.name.clone());
+        let refused = || {
+            Error::Invalid(
+                "Nothing was signed: the server asked for something other than the new key.".into(),
+            )
+        };
+        self.signing = true;
+        self.error = None;
+        let work = move || {
+            let new = key.key(&name.unwrap_or_else(device::name));
+            let mut add = device.client.challenge("keys/add/challenge", &json!({ "key": new }))?;
+            if !matches!(add.record()?, Record::Key(e) if e.op == mandate_core::Op::Add && e.key == new)
+            {
+                return Err(refused());
+            }
+            add.sign(&*device.key)?;
+            device.client.signed(&add)?;
+            // The token is the new key's from here, so the device moves to it
+            // before anything else can fail.
+            let rotated = device.rotate(&dir, key)?;
+            let retire = || {
+                let path = format!("keys/{old}/retire/challenge");
+                let mut retire = rotated.client.challenge(&path, &json!({}))?;
+                if !matches!(retire.record()?, Record::Key(e) if e.op == mandate_core::Op::Retire && e.key.id == old)
+                {
+                    return Err(refused());
+                }
+                retire.sign(&*rotated.key)?;
+                rotated.client.signed(&retire)
+            };
+            let retired = retire().err();
+            Ok((rotated, retired))
+        };
+        self.call(
+            cx,
+            move || Ok(work()),
+            |this, rotated, cx| {
+                (this.signing, this.prompt) = (false, None);
+                match rotated {
+                    Ok((device, retired)) => {
+                        this.key_id = device.key.key("").id;
+                        this.device = Some(device);
+                        this.root(Tab::Now, cx);
+                        this.go(Screen::Settings, cx);
+                        match retired {
+                            None => this.notice = Some("Changed.".into()),
+                            Some(e) => {
+                                this.error = Some(format!(
+                                    "Changed, but the old key is still listed: {e}. Remove it under Devices."
+                                ))
+                            }
+                        }
+                        this.refresh(cx);
+                    }
+                    Err(e) => this.error = Some(e.to_string()),
+                }
+            },
+        );
     }
 
     /// Joins with the address and code typed on Join, once both look whole.
@@ -870,6 +1163,13 @@ impl Shell {
                 p.q.push_str(typed);
             }
             self.find_chats(cx);
+            return cx.notify();
+        }
+        if let Some(name) = &mut self.renaming {
+            if k.key == "enter" {
+                return self.rename(cx);
+            }
+            type_into(name, ev, cx);
             return cx.notify();
         }
         #[cfg(not(target_os = "android"))]
@@ -984,6 +1284,29 @@ fn waiting(client: &Client) -> Result<Vec<(String, String)>, Error> {
         .into_iter()
         .map(|p| (p.id, format!("{} wants to {} on {}", p.identity_name, p.op, p.connector)));
     Ok(exchanges.chain(requests).chain(proposals).collect())
+}
+
+/// The owner's choices kept on this device, beside the device file.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Prefs {
+    /// Lock mandate when it leaves the screen.
+    lock: bool,
+}
+
+impl Prefs {
+    const FILE: &str = "prefs.json";
+
+    fn load(dir: &std::path::Path) -> Prefs {
+        std::fs::read(dir.join(Prefs::FILE))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(dir.join(Prefs::FILE), serde_json::to_vec(self)?)
+    }
 }
 
 /// Shows or hides the phone's keyboard as a text field opens or closes.

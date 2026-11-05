@@ -5,7 +5,7 @@ use crate::api::{SetupField, Step};
 use crate::screens::{button, clickable, column, id_for};
 use crate::theme::{BOLD, MEDIUM, SIZE, Theme, bold, chars, lines};
 use crate::words::connector;
-use crate::{Screen, Shell, Tab, keyboard, segment};
+use crate::{Screen, Shell, keyboard, segment};
 use gpui::{Context, Div, div, prelude::*, px, rgb};
 use qrcode::{Color, QrCode};
 use serde_json::json;
@@ -47,7 +47,7 @@ impl Shell {
         let Screen::Link { name, step, values, focus } = &mut self.screen else { return };
         if next.done {
             let notice = format!("{} is linked.", connector(name));
-            self.go(Screen::Tab(Tab::Connections), cx);
+            self.up(cx);
             self.notice = Some(notice);
             return self.refresh(cx);
         }

@@ -112,8 +112,8 @@ def lines() -> list[list[tuple[str, int, int, int, int]]]:
     return list(found.values())
 
 
-# The centre of the label's last appearance: "Let laptop in" is also the
-# heading above its button.
+# The centre of the label's lowest appearance: "Let laptop in" is also the
+# heading above its button, and a sheet's buttons sit below what it covers.
 def find(label: str) -> tuple[int, int] | None:
     want = label.lower().split()
     at = None
@@ -122,7 +122,8 @@ def find(label: str) -> tuple[int, int] | None:
             box = line[i : i + len(want)]
             if [w[0] for w in box] == want:
                 top, bottom = min(w[2] for w in box), max(w[4] for w in box)
-                at = ((box[0][1] + box[-1][3]) // 2, (top + bottom) // 2)
+                if at is None or (top + bottom) // 2 > at[1]:
+                    at = ((box[0][1] + box[-1][3]) // 2, (top + bottom) // 2)
     return at
 
 
@@ -241,6 +242,8 @@ with subtest("the app pairs by the setup page's link"):
     adb("shell", f"am start -a android.intent.action.VIEW -d {shlex.quote(link)}")
     # Pair shows once the app has checked the server.
     tap("Pair")
+    # The emulator has a fingerprint, so the app asks how to approve.
+    tap("Fingerprint or face")
     finger()
     server.wait_until_succeeds("test $(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/setup) = 404")
     server.wait_until_succeeds(
@@ -282,12 +285,23 @@ with subtest("an agent gets in with the code the app shows"):
     finger()
     server.wait_until_succeeds("test -s /tmp/login.exit")
     assert server.succeed("cat /tmp/login.exit").strip() == "0", server.succeed("cat /tmp/login.log")
-    status, out = agent("test chats")
-    assert status != 0 and "mandate request test" in out, (status, out)
+    # The gateway learns of the identity a moment after login returns.
+    answers: list[tuple[int, str]] = []
+
+    def let_in() -> bool:
+        answers.append(agent("test chats"))
+        return "mandate request test" in answers[-1][1]
+
+    try:
+        until("the agent to be let in", let_in, timeout=60)
+    except AssertionError:
+        login = server.succeed("cat /tmp/login.log")
+        raise AssertionError(f"mandate test chats answers {answers[-2:]}; mandate login said {login!r}")
 
 with subtest("an approved read reads"):
     status, out = agent("request test --chat Family --for 30m --reason 'plan dinner' --wait 0")
     assert status == 75, (status, out)
+    tap("Now")
     tap("Approve 30 min")
     finger()
     server.wait_until_succeeds("mandate test chats")
@@ -300,6 +314,7 @@ with subtest("an approved send runs once"):
     assert status == 75, (status, out)
     proposal = out.split()[0]
     assert sent() == []
+    tap("Now")
     tap("Approve and send")
     finger()
     status, out = agent(f"status {proposal} --wait 60s")
@@ -308,8 +323,10 @@ with subtest("an approved send runs once"):
     gone("Approve and send")
 
 with subtest("Stop all closes the grant"):
-    tap("stop all access", scroll=True)
-    see("Cancel")
+    # Settings is the gear at the top bar's right end, which has no text.
+    adb("shell", "input", "tap", "1002", "130")
+    tap("Stop all access", scroll=True)
+    see("Every grant closes")
     tap("Stop all")
     server.wait_until_fails("mandate test chats")
     status, out = agent("test chats")

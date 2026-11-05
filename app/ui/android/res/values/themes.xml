@@ -2,11 +2,12 @@
 <resources>
     <color name="paper">#FFFFFF</color>
     <color name="ink">#000000</color>
-    <!-- The system splash: the icon on the app's own background. -->
+    <!-- The system splash: the app's own background and no icon, so the app's
+         wordmark is the first thing shown. -->
     <style name="Main" parent="android:Theme.DeviceDefault.Light.NoActionBar">
         <item name="android:windowBackground">@color/paper</item>
         <item name="android:windowSplashScreenBackground">@color/paper</item>
-        <item name="android:windowSplashScreenIconBackgroundColor">@color/paper</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/blank</item>
         <!-- Bar icons dark on the light app; Main.bars keeps them so as the mode changes. -->
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowLightNavigationBar">true</item>

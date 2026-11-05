@@ -106,11 +106,16 @@ def see(n: int, label: str) -> tuple[int, int]:
     try:
         return until(f"{label!r} on screen {n}", look)
     except AssertionError:
-        desktop.execute(f"journalctl -u app{n} -u background --no-pager | tail -n 30 >&2")
-        png = sh(n, "import -window root png:- | base64 -w0")
-        for i in range(0, len(png), 1000):
-            print(f"SCREEN{n} {png[i : i + 1000]}")
+        dump(n)
         raise AssertionError(f"no {label!r} on screen {n}, which reads: {seen}")
+
+
+# The app's log and screen n into the test's log, as SCREENn lines of base64.
+def dump(n: int) -> None:
+    desktop.execute(f"journalctl -u app{n} -u background --no-pager | tail -n 30 >&2")
+    png = sh(n, "import -window root png:- | base64 -w0")
+    for i in range(0, len(png), 1000):
+        print(f"SCREEN{n} {png[i : i + 1000]}")
 
 
 def tap(n: int, label: str) -> None:
@@ -241,6 +246,8 @@ with subtest("an agent gets in by the code the app shows"):
     until("the PIN prompt or the agent", lambda: find(1, "to sign") or server.execute("test -s /tmp/login.exit")[0] == 0)
     sign(1, PIN)
     server_after(1, "test $(cat /tmp/login.exit) = 0")
+    status, out = agent("test chats")
+    assert status != 0 and "mandate request test" in out, (status, out)
 
 with subtest("the background run notifies of a waiting read, by identity, connector and kind"):
     status, out = agent("request test --chat Family --for 30m --reason 'plan dinner' --wait 0")
@@ -249,7 +256,17 @@ with subtest("the background run notifies of a waiting read, by identity, connec
     desktop.fail("grep -E 'Family|dinner' /tmp/notify.log")
     see(1, "laptop wants to read test")
 
+# The Now tab, from a tab or from a screen pushed over one (Settings has a
+# back arrow, no tabs). Neither is OCR-readable; on a tab, the back arrow's
+# spot is the title, where a click does nothing.
+def now(n: int) -> None:
+    sh(n, "xdotool mousemove 343 115 click 1")
+    time.sleep(1)
+    sh(n, "xdotool mousemove 402 785 click 1")
+
+
 with subtest("an approved read reads"):
+    now(1)  # letting an agent in returns to Agents
     see(1, "Approve 30 min")
     shot(1, "now-light")
     scheme(1, True)
@@ -320,17 +337,30 @@ with subtest("a second run joins with a PKCS#11 key and the code the first shows
     desktop.succeed("test $(stat -c %a /tmp/data2/mandate/device.json) = 600 && grep -q '\"token\"' /tmp/data2/mandate/device.json")
     desktop.fail("grep -q '\"token\"' /tmp/data1/mandate/device.json")
 
-# Closes the open grant: OCR misses its small CLOSE button, which sits two
-# lines under the grant's "last 7 days".
-def close(n: int) -> None:
+# Closes the open grant on Now, and waits until reads stop. OCR misses the
+# small CLOSE button, two lines under the grant's "last 7 days", and the
+# sheet's CLOSE, two lines under its question; a gate may want the PIN.
+def close(n: int, pin: str) -> None:
+    now(n)
     x, y = see(n, "last 7 days")
     sh(n, f"xdotool mousemove {x + 47} {y + 42} click 1")
+    _, y = see(n, "grant on test")
+    sh(n, f"xdotool mousemove 640 {y + 42} click 1")
+    try:
+        until(
+            "the grant to close",
+            lambda: server.execute("mandate test chats")[0] != 0
+            or (find(n, "to confirm") is not None and typed(n, pin, enter=True)),
+            60,
+        )
+    except AssertionError:
+        dump(n)
+        raise
 
 
 with subtest("the joined run approves a read with its PKCS#11 key"):
     server.succeed("mandate test chats")
-    close(1)
-    server.wait_until_fails("mandate test chats")
+    close(1, PIN)
     status, out = agent("request test --chat Family --for 30m --reason 'later' --wait 0")
     assert status == 75, (status, out)
     tap(2, "Approve")  # OCR reads its "30" as "38" in dark mode
@@ -338,7 +368,7 @@ with subtest("the joined run approves a read with its PKCS#11 key"):
     assert len(sent()) == 1, sent()
 
 with subtest("Settings names each run's key"):
-    close(2)
+    close(2, HSM_PIN)
     # The settings icon, top right of the page's 80 columns.
     sh(2, "xdotool mousemove 938 115 click 1")
     see(2, "PKCS11 token")

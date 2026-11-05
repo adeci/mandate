@@ -3,8 +3,8 @@
 //! chats of the owner's own grant.
 
 use crate::api::Container;
-use crate::now::{FOR, HORIZON, checkbox, chip};
-use crate::screens::{approve, button, clickable, column, id_for, link};
+use crate::now::{FOR, HORIZON, checkbox, chip, stops};
+use crate::screens::{approve, button, clickable, column, id_for, link, slider};
 use crate::theme::{MEDIUM, Theme, chars, lines};
 use crate::words::{self, connector, horizon, span};
 use crate::{Adjust, Screen, Shell, keyboard, segment};
@@ -103,41 +103,56 @@ impl Shell {
         );
     }
 
-    /// The picker's search and results; row draws each chat's control.
+    /// One bordered element: the search over a scrollable list of the
+    /// connector's chats, which the server searches. pinned (the chats
+    /// already picked) come first; row draws each chat's control.
     pub(crate) fn picker(
         &self,
         t: Theme,
+        pinned: Vec<Container>,
         cx: &mut Context<Self>,
         row: impl Fn(&Container, &mut Context<Self>) -> AnyElement,
     ) -> Div {
         let Some(p) = &self.picker else { return column() };
-        let results: Vec<AnyElement> = match &p.found {
-            None => vec![t.alt("Loading chats…").into_any_element()],
-            Some(f) if f.is_empty() => vec![t.alt("No chat matches.").into_any_element()],
-            Some(f) => f.iter().map(|c| row(c, cx)).collect(),
-        };
+        let mut rows: Vec<AnyElement> = pinned.iter().map(|c| row(c, cx)).collect();
+        match &p.found {
+            None => rows.push(t.alt("Loading chats…").into_any_element()),
+            Some(f) => {
+                let fresh = f.iter().filter(|c| !pinned.iter().any(|p| p.id == c.id));
+                rows.extend(fresh.map(|c| row(c, cx)));
+                if rows.is_empty() {
+                    rows.push(t.alt("No chat matches.").into_any_element());
+                }
+            }
+        }
         // The list stops at 50; a search reaches the rest.
         let more = p.found.as_ref().is_some_and(|f| f.len() >= 50);
         column()
-            .gap(lines(0.5))
+            .border_2()
+            .border_color(t.text)
             .child(
                 clickable("chat-search", cx, |_, _| keyboard(true))
                     .flex()
                     .items_center()
                     .gap(chars(1.))
-                    .border_2()
+                    .border_b_2()
                     .border_color(t.text)
                     .px(chars(1.))
                     .py(lines(0.5))
                     .child(crate::screens::icon("search", t.alt))
                     .child(if p.q.is_empty() {
-                        t.alt(format!("search {} chats", connector(&p.connector))).flex_1()
+                        t.alt(format!("Search {} chats", connector(&p.connector))).flex_1()
                     } else {
                         div().flex_1().child(format!("{}▏", p.q))
                     }),
             )
-            .children(results)
-            .when(more, |d| d.child(t.alt("Search for more")))
+            .child(crate::scroll::view(
+                "chat-list",
+                div().max_h(lines(12.)).px(chars(1.)).py(lines(0.25)),
+                column()
+                    .children(rows)
+                    .when(more, |d| d.child(t.alt("Search for more").py(lines(0.25)))),
+            ))
     }
 
     pub(crate) fn hide_screen(&self, t: Theme, cx: &mut Context<Self>) -> Div {
@@ -163,7 +178,7 @@ impl Shell {
             .child(div().font_weight(MEDIUM).child("CONNECTOR"))
             .child(div().flex().flex_wrap().gap(chars(1.)).children(conns))
             .when(self.picker.is_some(), |d| {
-                d.child(self.picker(t, cx, |c, cx| {
+                d.child(self.picker(t, Vec::new(), cx, |c, cx| {
                     let conn =
                         self.picker.as_ref().map(|p| p.connector.clone()).unwrap_or_default();
                     let is = |kind: &str, id: &str| {
@@ -260,17 +275,11 @@ impl Shell {
                 )
             })
             .collect::<Vec<_>>();
-        let fors = FOR
-            .into_iter()
-            .map(|v| {
-                chip(t, ("for", v as usize), &span(v), g.for_ == v, cx, move |this, cx| {
-                    if let Screen::Grant(g) = &mut this.screen {
-                        g.for_ = v;
-                    }
-                    cx.notify();
-                })
-            })
-            .collect::<Vec<_>>();
+        let fors = slider(t, "for", stops(&FOR, g.for_, span), g.for_, cx, |this, v| {
+            if let Screen::Grant(g) = &mut this.screen {
+                g.for_ = v;
+            }
+        });
         let lengths = LENGTHS
             .into_iter()
             .map(|v| {
@@ -282,24 +291,12 @@ impl Shell {
                 })
             })
             .collect::<Vec<_>>();
-        let horizons = HORIZON
-            .into_iter()
-            .map(|v| {
-                chip(
-                    t,
-                    ("horizon", v as usize),
-                    &horizon(v),
-                    g.horizon == v,
-                    cx,
-                    move |this, cx| {
-                        if let Screen::Grant(g) = &mut this.screen {
-                            g.horizon = v;
-                        }
-                        cx.notify();
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
+        let horizons =
+            slider(t, "horizon", stops(&HORIZON, g.horizon, horizon), g.horizon, cx, |this, v| {
+                if let Screen::Grant(g) = &mut this.screen {
+                    g.horizon = v;
+                }
+            });
         let days: [(&str, &[u8]); 3] =
             [("every day", &[]), ("weekdays", &[1, 2, 3, 4, 5]), ("weekends", &[0, 6])];
         let days = days
@@ -398,8 +395,18 @@ impl Shell {
                             )),
                     )
                     .when(g.chats.is_some(), |d| {
-                        d.children(picked).when(picking, |d| {
-                            d.child(self.picker(t, cx, |c, cx| {
+                        let pinned: Vec<Container> = ng
+                            .chats
+                            .iter()
+                            .flatten()
+                            .map(|(id, name)| Container {
+                                id: id.clone(),
+                                name: name.clone(),
+                                ..Container::default()
+                            })
+                            .collect();
+                        d.when(!picking, |d| d.children(picked)).when(picking, |d| {
+                            d.child(self.picker(t, pinned, cx, |c, cx| {
                                 let on = matches!(&ng.chats, Some(m) if m.contains_key(&c.id));
                                 let (id, name) = (c.id.clone(), display(c));
                                 clickable(id_for("pick", &c.id), cx, move |this, cx| {
@@ -434,7 +441,7 @@ impl Shell {
                         set(|g| g.routine = true),
                     )),
             )
-            .when(!g.routine, |d| d.child(chips(div()).children(fors)))
+            .when(!g.routine, |d| d.child(fors))
             .when(g.routine, |d| {
                 d.child(chips(div()).children(days))
                     .child(
@@ -462,8 +469,8 @@ impl Shell {
                     .child(chips(div()).children(lengths))
                     .child(t.alt(format!("in {}", words::zone())))
             })
-            .child(heading("MESSAGES FROM"))
-            .child(chips(div()).children(horizons))
+            .child(heading("HISTORY"))
+            .child(horizons)
             .child(approve(t, "grant", label.into(), ready, cx, move |this, cx| {
                 this.grant(&ng, cx)
             }))
@@ -518,7 +525,16 @@ impl Shell {
     ) -> Div {
         let id = id.to_string();
         let ticked = a.chats.clone();
-        self.picker(t, cx, move |c, cx| {
+        let pinned = a
+            .names
+            .iter()
+            .map(|(id, name)| Container {
+                id: id.clone(),
+                name: name.clone(),
+                ..Container::default()
+            })
+            .collect();
+        self.picker(t, pinned, cx, move |c, cx| {
             let (rid, cid, name) = (id.clone(), c.id.clone(), display(c));
             clickable(id_for("pick", &c.id), cx, move |this, cx| {
                 if let Some(a) = this.adjust.get_mut(&rid) {

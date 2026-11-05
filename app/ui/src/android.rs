@@ -58,6 +58,11 @@ fn run(app: android_activity::AndroidApp) {
                     Opened::Link(link) => shell.take_link(link, cx),
                     Opened::Item(id) => shell.take_item(id, cx),
                     Opened::Redraw => cx.notify(),
+                    Opened::Error(e) => {
+                        shell.error = Some(e);
+                        cx.notify();
+                    }
+                    Opened::Foreground => shell.foreground(cx),
                 });
             }
         })
@@ -65,12 +70,20 @@ fn run(app: android_activity::AndroidApp) {
     });
 }
 
-/// What an intent opened the app with, or a change to lay out again for:
-/// new insets, or the clock switching between 12 and 24 hours.
+/// What an intent or the scanner opened the app with, a change to lay out
+/// again for (new insets, the clock switching between 12 and 24 hours), an
+/// error to show, or the app coming back from the background.
 enum Opened {
     Link(String),
     Item(String),
     Redraw,
+    Error(String),
+    Foreground,
+}
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_dev_mandate_app_Main_foreground(_: EnvUnowned, _: JClass) {
+    let _ = OPENED.0.unbounded_send(Opened::Foreground);
 }
 
 /// Intents can arrive before android_main takes the receiver.
@@ -131,6 +144,15 @@ extern "system" fn Java_dev_mandate_app_Main_insets(
     let _ = OPENED.0.unbounded_send(Opened::Redraw);
 }
 
+/// Whether gpui has opened the window and asked for its first frame.
+#[unsafe(no_mangle)]
+extern "system" fn Java_dev_mandate_app_Main_started(
+    _: EnvUnowned,
+    _: JClass,
+) -> jni::sys::jboolean {
+    gpui_jni::NATIVE_INITIALIZED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 #[unsafe(no_mangle)]
 extern "system" fn Java_dev_mandate_app_Main_clock(
     _: EnvUnowned,
@@ -153,13 +175,23 @@ pub fn keyboard(show: bool) {
 
 /// The clipboard's text, if any.
 pub fn clipboard() -> Option<String> {
+    text(jni_str!("clipboard"))
+}
+
+/// The phone's name in its settings, else its model.
+pub fn device_name() -> Option<String> {
+    text(jni_str!("deviceName"))
+}
+
+/// Calls an activity method that answers a String or null.
+fn text(method: &JNIStr) -> Option<String> {
     let text = activity_call(|env, activity| {
         let sig = jni_sig!("()Ljava/lang/String;");
-        let text = env.call_method(activity, jni_str!("clipboard"), sig, &[])?.l()?;
+        let text = env.call_method(activity, method, sig, &[])?.l()?;
         let text = env.cast_local::<JString>(text)?;
         if text.is_null() { Ok(None) } else { text.try_to_string(env).map(Some) }
     });
-    text.inspect_err(|e| log::error!("clipboard: {e}")).ok().flatten()
+    text.inspect_err(|e| log::error!("{method}: {e}")).ok().flatten()
 }
 
 /// Puts text on the clipboard.
@@ -194,6 +226,46 @@ pub fn scan() {
     if let Err(e) = opened {
         log::error!("scan: {e}");
     }
+}
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_dev_mandate_app_Scan_frame<'a>(
+    mut env: EnvUnowned<'a>,
+    _: JClass<'a>,
+    luma: JByteArray<'a>,
+    width: jni::sys::jint,
+    height: jni::sys::jint,
+    stride: jni::sys::jint,
+) -> jni::sys::jint {
+    env.with_env(|env| -> jni::errors::Result<jni::sys::jint> {
+        let luma = env.convert_byte_array(&luma)?;
+        let (w, h, stride) = (width as usize, height as usize, stride as usize);
+        Ok(match read_qr(&luma, w, h, stride) {
+            None => 0,
+            Some(link) if link.starts_with("mandate://pair?") => {
+                let _ = OPENED.0.unbounded_send(Opened::Link(link));
+                1
+            }
+            Some(_) => 2,
+        })
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// The text of a QR code in a greyscale frame, if it holds one.
+fn read_qr(luma: &[u8], w: usize, h: usize, stride: usize) -> Option<String> {
+    if w == 0 || h == 0 || luma.len() < (h - 1) * stride + w {
+        return None;
+    }
+    let mut image = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| luma[y * stride + x]);
+    image.detect_grids().into_iter().find_map(|g| g.decode().ok()).map(|(_, text)| text)
+}
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_dev_mandate_app_Scan_denied(_: EnvUnowned, _: JClass) {
+    let no =
+        "mandate may not use the camera. Paste the link instead, or allow the camera in Settings.";
+    let _ = OPENED.0.unbounded_send(Opened::Error(no.into()));
 }
 
 /// Calls into the activity (Main.java).
@@ -275,49 +347,134 @@ fn activity<'a>(env: &Env<'a>) -> JObject<'a> {
     unsafe { JObject::from_raw(env, gpui_jni::activity_as_ptr() as jni::sys::jobject) }
 }
 
+/// How a device key lets the owner sign: a strong biometric or the screen
+/// lock, or the screen lock alone. Fixed when the key is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Method {
+    Biometric = 1,
+    ScreenLock = 2,
+}
+
 /// The device key in the Android Keystore (Keys.java): P-256, signing only
 /// through a BiometricPrompt for each signature.
-pub struct Keystore([u8; 65]);
+pub struct Keystore {
+    point: [u8; 65],
+    alias: String,
+}
+
+/// The alias of keys made before each key had its own.
+pub const FIRST_ALIAS: &str = "device";
 
 impl Keystore {
-    /// A new device key, replacing any before.
-    pub fn generate() -> Result<Keystore, Error> {
-        let spki = java(|env, c| keys(env, c, jni_str!("generate"), jni_sig!("()[B"), &[]))?;
-        Keystore::from_spki(&spki)
+    /// A new device key under a fresh alias; any other stays.
+    pub fn generate(method: Method) -> Result<Keystore, Error> {
+        let alias = format!("device-{}", &mandate_core::new_token()[..16]);
+        let spki = java(|env, c| {
+            let name = env.new_string(&alias)?;
+            let sig = jni_sig!("(Ljava/lang/String;I)[B");
+            keys(env, c, jni_str!("generate"), sig, &[(&name).into(), JValue::Int(method as i32)])
+        })?;
+        Keystore::from_spki(&spki, alias)
     }
 
-    pub fn load() -> Option<Keystore> {
-        let spki = java(|env, c| keys(env, c, jni_str!("publicKey"), jni_sig!("()[B"), &[]));
-        spki.and_then(|spki| Keystore::from_spki(&spki)).inspect_err(|e| log::error!("{e}")).ok()
+    pub fn load(alias: &str) -> Option<Keystore> {
+        let spki = java(|env, c| {
+            let name = env.new_string(alias)?;
+            let sig = jni_sig!("(Ljava/lang/String;)[B");
+            keys(env, c, jni_str!("publicKey"), sig, &[(&name).into()])
+        });
+        spki.and_then(|spki| Keystore::from_spki(&spki, alias.into()))
+            .inspect_err(|e| log::error!("{e}"))
+            .ok()
+    }
+
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// Removes the key from the Keystore; it signs nothing after.
+    pub fn delete(&self) -> Result<(), Error> {
+        java(|env, c| {
+            let name = env.new_string(&self.alias)?;
+            let sig = jni_sig!("(Ljava/lang/String;)V");
+            env.call_static_method(&c.keys, jni_str!("delete"), sig, &[(&name).into()])?.v()
+        })
+    }
+
+    pub fn method(&self) -> Method {
+        let method = java(|env, c| {
+            let name = env.new_string(&self.alias)?;
+            let sig = jni_sig!("(Ljava/lang/String;)I");
+            env.call_static_method(&c.keys, jni_str!("method"), sig, &[(&name).into()])?.i()
+        });
+        if method.is_ok_and(|m| m == Method::ScreenLock as i32) {
+            Method::ScreenLock
+        } else {
+            Method::Biometric
+        }
+    }
+
+    /// Asks the owner to authenticate as this key would, signing nothing.
+    /// Blocks; a cancel is an error with Android's message.
+    pub fn authenticate(&self) -> Result<(), Error> {
+        java(|env, c| {
+            let activity = activity(env);
+            let alias = env.new_string(&self.alias)?;
+            let sig = jni_sig!("(Landroid/app/Activity;Ljava/lang/String;)V");
+            let args = [(&activity).into(), (&alias).into()];
+            env.call_static_method(&c.keys, jni_str!("authenticate"), sig, &args)?.v()
+        })
     }
 
     /// The point in an X.509 public key, which for P-256 is a fixed header
     /// and then the uncompressed point.
-    fn from_spki(spki: &[u8]) -> Result<Keystore, Error> {
+    fn from_spki(spki: &[u8], alias: String) -> Result<Keystore, Error> {
         const HEADER: [u8; 26] = [
             0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
             0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
         ];
         let point = spki.strip_prefix(&HEADER).and_then(|p| p.try_into().ok());
-        point.map(Keystore).ok_or_else(|| Error::Key("the Keystore key is not P-256".into()))
+        let point = point.ok_or_else(|| Error::Key("the Keystore key is not P-256".into()))?;
+        Ok(Keystore { point, alias })
     }
 }
 
 impl DeviceKey for Keystore {
     fn key(&self, name: &str) -> Key {
-        Key::p256(&self.0, name)
+        Key::p256(&self.point, name)
     }
 
     /// Blocks on the owner's answer to the prompt; a cancel signs nothing.
     fn sign(&self, challenge: &[u8; 32]) -> Result<DeviceSignature, Error> {
         let der = java(|env, c| {
             let activity = activity(env);
+            let alias = env.new_string(&self.alias)?;
             let msg = env.byte_array_from_slice(challenge)?;
-            let sig = jni_sig!("(Landroid/app/Activity;[B)[B");
-            keys(env, c, jni_str!("sign"), sig, &[(&activity).into(), (&msg).into()])
+            let sig = jni_sig!("(Landroid/app/Activity;Ljava/lang/String;[B)[B");
+            let args = [(&activity).into(), (&alias).into(), (&msg).into()];
+            keys(env, c, jni_str!("sign"), sig, &args)
         })?;
         Ok(DeviceSignature { sig: der_signature(&der)?, authenticator_data: Vec::new() })
     }
+}
+
+/// Whether a strong biometric is enrolled.
+pub fn biometrics_enrolled() -> bool {
+    available() & 1 != 0
+}
+
+/// Whether a secure screen lock (PIN, pattern or password) is set.
+pub fn screen_lock_set() -> bool {
+    available() & 2 != 0
+}
+
+fn available() -> i32 {
+    let bits = java(|env, c| {
+        let activity = activity(env);
+        let sig = jni_sig!("(Landroid/app/Activity;)I");
+        env.call_static_method(&c.keys, jni_str!("available"), sig, &[(&activity).into()])?.i()
+    });
+    bits.inspect_err(|e| log::error!("available: {e}")).unwrap_or(0)
 }
 
 /// The token sealed by a Keystore key.

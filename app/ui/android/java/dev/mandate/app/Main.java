@@ -1,15 +1,17 @@
 package dev.mandate.app;
 
 import android.app.NativeActivity;
-import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.res.Configuration;
 import android.graphics.Insets;
 import android.os.Bundle;
-import android.provider.MediaStore;
+import android.os.Build;
+import android.provider.Settings;
 import android.text.format.DateFormat;
+import android.view.View;
+import android.view.ViewTreeObserver;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 
@@ -32,6 +34,15 @@ public final class Main extends NativeActivity {
     /** Whether the phone's clock reads 24-hour. */
     private static native void clock(boolean h24);
 
+    /** Whether gpui has started drawing. */
+    private static native boolean started();
+
+    /** The app is back after being in the background, for the app lock. */
+    private static native void foreground();
+
+    /** Whether the owner left the app, as opposed to mandate's own scanner covering it. */
+    private boolean away, scanning;
+
     @Override
     protected void onCreate(Bundle saved) {
         open(getIntent());
@@ -48,6 +59,26 @@ public final class Main extends NativeActivity {
                             insets(i.top / density, i.bottom / density, all.isVisible(WindowInsets.Type.ime()));
                             return view.onApplyWindowInsets(all);
                         });
+        // The window counts as drawn, and the splash goes, at its first
+        // traversal, but the native surface stays empty until gpui draws, which
+        // shows as a dark flash. Cancelling the traversals until gpui has
+        // started, plus one frame for that frame to land, keeps the splash.
+        View content = findViewById(android.R.id.content);
+        content.getViewTreeObserver()
+                .addOnPreDrawListener(
+                        new ViewTreeObserver.OnPreDrawListener() {
+                            private boolean seen;
+
+                            @Override
+                            public boolean onPreDraw() {
+                                if (!seen) {
+                                    seen = started();
+                                    return false;
+                                }
+                                content.getViewTreeObserver().removeOnPreDrawListener(this);
+                                return true;
+                            }
+                        });
     }
 
     @Override
@@ -62,6 +93,22 @@ public final class Main extends NativeActivity {
     protected void onResume() {
         super.onResume();
         clock(DateFormat.is24HourFormat(this));
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        if (away) {
+            foreground();
+        }
+        away = false;
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        away = !scanning;
+        scanning = false;
     }
 
     @Override
@@ -95,6 +142,12 @@ public final class Main extends NativeActivity {
         return clip == null || clip.getItemCount() == 0 ? null : clip.getItemAt(0).coerceToText(this).toString();
     }
 
+    /** What the owner named the phone in Settings, else its model. */
+    String deviceName() {
+        String name = Settings.Global.getString(getContentResolver(), Settings.Global.DEVICE_NAME);
+        return name == null || name.isEmpty() ? Build.MODEL : name;
+    }
+
     void copy(String text) {
         getSystemService(ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("mandate", text));
     }
@@ -104,13 +157,10 @@ public final class Main extends NativeActivity {
         runOnUiThread(() -> moveTaskToBack(true));
     }
 
-    /** Opens the camera app, whose QR reading opens the setup page's mandate://pair link. */
+    /** Opens the in-app QR scanner (Scan.java). */
     void scan() {
-        try {
-            startActivity(new Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA));
-        } catch (ActivityNotFoundException e) {
-            // No camera app: pasting the link stays.
-        }
+        scanning = true;
+        startActivity(new Intent(this, Scan.class));
     }
 
     /** System bar icons dark in light mode and light in dark mode, as the app is. */

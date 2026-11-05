@@ -6,19 +6,20 @@ use crate::device::hex;
 use crate::theme::{BOLD, FONT, MEDIUM, NORMAL, SIZE, Theme, bold, chars, lines};
 use crate::{Screen, Shell, Tab, words};
 use gpui::{
-    Animation, AnimationExt, AnyElement, ClickEvent, Context, DispatchPhase, Div, ElementId, Hsla,
-    LongPressEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString,
-    Stateful, Svg, TouchDragEvent, TouchPhase, WeakEntity, Window, canvas, div, ease_out_quint,
-    fill, hsla, prelude::*, px, relative, svg,
+    Animation, AnimationExt, AnyElement, BoxShadow, ClickEvent, Context, DispatchPhase, Div,
+    ElementId, Hsla, LongPressEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollWheelEvent, SharedString, Stateful, Svg, TouchDragEvent, TouchPhase, Window, canvas, div,
+    ease_out_quint, fill, hsla, point, prelude::*, px, relative, rgb, svg,
 };
 use mandate_core::{Envelope, PairLink, Record};
 use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
-/// How long the wordmark shows alone at launch, and how long it takes to
-/// fade in.
-pub const LAUNCH: Duration = Duration::from_millis(400);
-const WORDMARK_IN: Duration = Duration::from_millis(250);
+/// How long the wordmark shows alone at launch, and how long its glow
+/// takes to bloom and settle.
+pub const LAUNCH: Duration = Duration::from_millis(340);
+const WORDMARK_IN: Duration = Duration::from_millis(300);
 /// A new page fades in this fast: enough to see the change, never enough
 /// to wait for it.
 const PAGE_IN: Duration = Duration::from_millis(90);
@@ -26,6 +27,11 @@ const PAGE_IN: Duration = Duration::from_millis(90);
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = Theme::of(window);
+        // Back and typing reach the shell through its focus, which a system
+        // prompt (fingerprint, screen lock) can take away.
+        if window.focused(cx).is_none() {
+            window.focus(&self.focus, cx);
+        }
         #[cfg(target_os = "android")]
         let ((top, bottom), typing, pin) =
             (crate::android::insets(), crate::android::keyboard_up(), None::<Div>);
@@ -47,16 +53,46 @@ impl Render for Shell {
             .pb(px(bottom))
             .child(touches());
         if self.launching {
-            let mark = wordmark().with_animation(
+            // A quick emerald bloom behind the wordmark, which starts in
+            // emerald too and settles to the text color.
+            let (glow, text) = (t.grant_hi, t.text);
+            let mark = wordmark().px(chars(1.)).rounded_full().with_animation(
                 "launch",
-                Animation::new(WORDMARK_IN).with_easing(ease_out_quint()),
-                |d, v| d.opacity(v),
+                Animation::new(WORDMARK_IN),
+                move |d, v| {
+                    let bloom = (v * std::f32::consts::PI).sin();
+                    d.opacity((v * 4.).min(1.)).text_color(mix(glow, text, v)).shadow(vec![
+                        BoxShadow {
+                            color: glow.opacity(0.5 * bloom),
+                            offset: point(px(0.), px(0.)),
+                            blur_radius: px(32. * bloom),
+                            spread_radius: px(8. * bloom),
+                            inset: false,
+                        },
+                    ])
+                },
             );
             return root
                 .items_center()
                 .justify_center()
                 .pb(lines(4.))
                 .child(mark)
+                .into_any_element();
+        }
+        if self.locked {
+            if !self.unlocking {
+                self.unlock_app(cx);
+            }
+            return root
+                .items_center()
+                .justify_center()
+                .gap(lines(1.))
+                .px(chars(2.))
+                .pb(lines(4.))
+                .child(wordmark())
+                .children(pin)
+                .when_some(self.error.clone(), |d, e| d.child(flash(t, e)))
+                .child(button(t, "unlock-app", "Unlock", cx, |this, cx| this.unlock_app(cx)))
                 .into_any_element();
         }
         let pad = if window.viewport_size().width < px(480.) { 1. } else { 2. };
@@ -82,6 +118,11 @@ impl Render for Shell {
             let (at, end) =
                 (f32::from(self.scroll.offset().y), f32::from(self.scroll.max_offset().y));
             let near = -at >= end - 2. * f32::from(window.viewport_size().height);
+            // A new search starts the history over, from the server.
+            let q = self.search.clone().unwrap_or_default();
+            if self.history_q != q {
+                (self.history_q, self.history) = (q, None);
+            }
             match &self.history {
                 None => self.load_history(cx),
                 Some(h) if h.next.is_some() && near => self.more_history(cx),
@@ -109,6 +150,9 @@ impl Render for Shell {
             Screen::Link { .. } => "Link",
             Screen::Hide { .. } => "Never share",
             Screen::Grant(_) => "New grant",
+            #[cfg(target_os = "android")]
+            Screen::Method(_) => "How you approve",
+            Screen::Entry(_) => "Activity",
         };
         let screen = match &self.screen {
             Screen::Welcome => welcome(t, cx),
@@ -127,7 +171,10 @@ impl Render for Shell {
             Screen::Link { .. } => self.link_screen(t, cx),
             Screen::Hide { .. } => self.hide_screen(t, cx),
             Screen::Grant(_) => self.grant_screen(t, cx),
+            #[cfg(target_os = "android")]
+            Screen::Method(next) => self.method_screen(t, next, cx),
             Screen::Settings => self.settings(t, cx),
+            Screen::Entry(a) => self.entry_screen(t, a),
             Screen::Admit { exchange, envelope } => admit(t, exchange, envelope, cx),
             Screen::Review { proposal, envelope } => {
                 let fields: Vec<(String, AnyElement)> = match envelope.record() {
@@ -182,22 +229,17 @@ impl Render for Shell {
         } else {
             notes(page(pad).pt(lines(1.)).pb(lines(2.)).gap(lines(1.)))
         };
-        // A page swiped to slides in from where the finger came from.
-        let slide = self.slide;
-        let body = body.with_animation(
-            ("page", self.page.1),
-            Animation::new(PAGE_IN).with_easing(ease_out_quint()),
-            move |d, v| d.opacity(v).relative().left(px(slide * (1. - v))),
-        );
-        // A tab follows the finger while it swipes across.
-        let body = match tab {
-            Some(tab) => div()
-                .relative()
-                .left(px(self.swipe_shift(tab)))
-                .child(body)
-                .child(swipes(cx.entity().downgrade()))
-                .into_any_element(),
-            None => body.into_any_element(),
+        // The page after the launch shows at once, as the wordmark already
+        // led into it; later pages fade in.
+        let body = if self.page.1 <= 1 {
+            body.into_any_element()
+        } else {
+            body.with_animation(
+                ("page", self.page.1),
+                Animation::new(PAGE_IN).with_easing(ease_out_quint()),
+                |d, v| d.opacity(v),
+            )
+            .into_any_element()
         };
         root.when(!matches!(self.screen, Screen::Welcome), |d| {
             d.child(self.top_bar(t, title, tab.is_some(), pad, cx))
@@ -210,13 +252,7 @@ impl Render for Shell {
                 .flex()
                 .flex_col()
                 .child(
-                    div()
-                        .id("page")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll)
-                        .child(body),
+                    crate::scroll::view("page", div().flex_1().min_h_0(), body).track(&self.scroll),
                 )
                 .children(sticky.map(|day| {
                     div()
@@ -231,6 +267,7 @@ impl Render for Shell {
         // The soft keyboard sits where the tab bar would; it returns as the keyboard goes.
         .when_some(tab.filter(|_| !typing), |d, tab| d.child(self.tab_bar(t, tab, pad, cx)))
         .when(tab == Some(Tab::Now), |d| d.children(self.adjust_sheet(t, bottom, cx)))
+        .children(self.confirm_sheet(t, bottom, cx))
         .into_any_element()
     }
 }
@@ -240,84 +277,130 @@ fn wordmark() -> Div {
     div().font_weight(BOLD).text_size(px(SIZE * 2.5)).line_height(px(SIZE * 3.)).child("mandate")
 }
 
-/// The tabs in the bar's order, for swiping between them.
-const TABS: [Tab; 4] = [Tab::Now, Tab::Agents, Tab::Connections, Tab::Activity];
-
-/// The tab beside this one: towards the end for a finger moving left.
-fn beside(tab: Tab, leftwards: bool) -> Option<Tab> {
-    let i = TABS.iter().position(|&t| t == tab)?;
-    if leftwards { TABS.get(i + 1).copied() } else { i.checked_sub(1).map(|i| TABS[i]) }
+/// The color v of the way from a to b.
+fn mix(a: Hsla, b: Hsla, v: f32) -> Hsla {
+    let at = |x: f32, y: f32| x + (y - x) * v;
+    Hsla { h: at(a.h, b.h), s: at(a.s, b.s), l: at(a.l, b.l), a: at(a.a, b.a) }
 }
 
-/// A finger panning on a tab: how far, and once it is clear, whether across.
-#[derive(Default)]
-pub(crate) struct Swipe {
-    dx: f32,
-    dy: f32,
-    across: Option<bool>,
-    /// The tab already changed; the rest of the pan is ignored.
-    done: bool,
+thread_local! {
+    /// The slider a finger or the mouse is dragging, by ID.
+    static SLIDING: Cell<Option<&'static str>> = const { Cell::new(None) };
 }
 
-/// Hands touch pans to the shell while a tab shows.
-fn swipes(shell: WeakEntity<Shell>) -> impl IntoElement {
-    canvas(
+/// A slider that snaps to stops, its value shown above it. A tap picks the
+/// nearest stop; a drag follows the finger, stop by stop.
+pub(crate) fn slider(
+    t: Theme,
+    id: &'static str,
+    stops: Vec<(u64, String)>,
+    current: u64,
+    cx: &mut Context<Shell>,
+    pick: impl Fn(&mut Shell, u64) + 'static,
+) -> Div {
+    let n = stops.len().max(1);
+    let at = stops.iter().position(|(v, _)| *v == current).unwrap_or(0);
+    let label = stops.get(at).map(|(_, l)| l.clone()).unwrap_or_default();
+    let frac = |i: usize| if n > 1 { i as f32 / (n - 1) as f32 } else { 0. };
+    let values: Rc<Vec<u64>> = Rc::new(stops.iter().map(|(v, _)| *v).collect());
+    let (shell, pick) = (cx.entity().downgrade(), Rc::new(pick));
+    let input = canvas(
         |_, _, _| (),
-        move |_, _, window, _| {
-            window.on_mouse_event(move |e: &ScrollWheelEvent, phase, window, cx| {
-                if phase == DispatchPhase::Capture {
-                    let width = f32::from(window.viewport_size().width);
-                    let _ = shell.update(cx, |this, cx| this.swiped(e, width, cx));
+        move |bounds, _, window, _| {
+            // The stop under x, and the shell moved to it.
+            let set = move |x: Pixels, cx: &mut gpui::App| {
+                let f = ((x - bounds.left()) / bounds.size.width).clamp(0., 1.);
+                let i = (f * (values.len().max(1) - 1) as f32).round() as usize;
+                let (v, pick) = (values[i], pick.clone());
+                let _ = shell.update(cx, |this, cx| {
+                    pick(this, v);
+                    cx.notify();
+                });
+            };
+            let set = Rc::new(set);
+            let s = set.clone();
+            window.on_mouse_event(move |e: &MouseDownEvent, phase, _, cx| {
+                if phase == DispatchPhase::Bubble && bounds.contains(&e.position) {
+                    SLIDING.set(Some(id));
+                    s(e.position.x, cx);
+                }
+            });
+            let s = set.clone();
+            window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                if phase == DispatchPhase::Bubble
+                    && e.pressed_button.is_some()
+                    && SLIDING.get() == Some(id)
+                {
+                    s(e.position.x, cx);
+                }
+            });
+            window.on_mouse_event(move |_: &MouseUpEvent, phase, _, _| {
+                if phase == DispatchPhase::Capture && SLIDING.get() == Some(id) {
+                    SLIDING.set(None);
+                }
+            });
+            // On touch, claiming the drag keeps the page from scrolling.
+            window.on_mouse_event(move |e: &TouchDragEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                match e.phase {
+                    TouchPhase::Started if bounds.contains(&e.start_position) => {
+                        window.prevent_default();
+                        SLIDING.set(Some(id));
+                        set(e.position.x, cx);
+                    }
+                    TouchPhase::Moved if SLIDING.get() == Some(id) => set(e.position.x, cx),
+                    TouchPhase::Ended | TouchPhase::Cancelled if SLIDING.get() == Some(id) => {
+                        SLIDING.set(None)
+                    }
+                    _ => {}
                 }
             });
         },
     )
     .absolute()
-    .size_0()
-}
-
-impl Shell {
-    /// Follows a pan across a tab: past a third of the width the next tab
-    /// takes over at once; short of it, or past the first or last tab, the
-    /// page springs back as the finger lifts.
-    fn swiped(&mut self, e: &ScrollWheelEvent, width: f32, cx: &mut Context<Self>) {
-        let Screen::Tab(tab) = self.screen else { return };
-        let ScrollDelta::Pixels(d) = e.delta else { return };
-        if self.picker.is_some() || self.adjust.values().any(|a| a.open) {
-            return;
-        }
-        if e.touch_phase == TouchPhase::Started {
-            self.swipe = None;
-        }
-        let s = self.swipe.get_or_insert_with(Swipe::default);
-        (s.dx, s.dy) = (s.dx + f32::from(d.x), s.dy + f32::from(d.y));
-        if s.across.is_none() && s.dx.abs() + s.dy.abs() > 12. {
-            s.across = Some(s.dx.abs() > s.dy.abs() * 1.5);
-        }
-        let next = beside(tab, s.dx < 0.).filter(|_| s.across == Some(true) && !s.done);
-        if let Some(next) = next.filter(|_| s.dx.abs() > width / 3.) {
-            s.done = true;
-            let enter = if s.dx < 0. { 40. } else { -40. };
-            self.go(Screen::Tab(next), cx);
-            self.slide = enter;
-        }
-        if matches!(e.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled) {
-            self.swipe = None;
-        }
-        cx.notify();
-    }
-
-    /// How far the page sits off its place while a finger swipes it: as far
-    /// as the finger went, or a short stretch past the first or last tab.
-    fn swipe_shift(&self, tab: Tab) -> f32 {
-        match &self.swipe {
-            Some(s) if s.across == Some(true) && !s.done => match beside(tab, s.dx < 0.) {
-                Some(_) => s.dx,
-                None => (s.dx * 0.3).clamp(-48., 48.),
-            },
-            _ => 0.,
-        }
-    }
+    .top_0()
+    .left_0()
+    .size_full();
+    let knob = px(18.);
+    let track = div()
+        .relative()
+        .h(lines(2.))
+        .mx(knob / 2.)
+        .child(div().absolute().left_0().w_full().top(lines(1.) - px(1.)).h(px(2.)).bg(t.alt))
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .w(relative(frac(at)))
+                .top(lines(1.) - px(1.))
+                .h(px(2.))
+                .bg(t.text),
+        )
+        .children((0..n).map(|i| {
+            div()
+                .absolute()
+                .left(relative(frac(i)))
+                .ml(px(-1.))
+                .top(lines(1.) - px(5.))
+                .w(px(2.))
+                .h(px(10.))
+                .bg(if i <= at { t.text } else { t.alt })
+        }))
+        .child(
+            div()
+                .absolute()
+                .left(relative(frac(at)))
+                .ml(-knob / 2.)
+                .top(lines(1.) - knob / 2.)
+                .size(knob)
+                .border_2()
+                .border_color(t.text)
+                .bg(t.text),
+        )
+        .child(input);
+    column().child(div().font_weight(MEDIUM).child(label)).child(track)
 }
 
 thread_local! {
@@ -410,9 +493,9 @@ fn icon_button(
 }
 
 impl Shell {
-    /// One step back: closes what is open on the page, else leaves it for
-    /// the page it came from. False at the root (Welcome, or Now once
-    /// paired), where Android's Back leaves the app.
+    /// One step back: closes what is open on the page, else returns to the
+    /// screen it came from. False at a root, where Android's Back leaves the
+    /// app.
     pub(crate) fn go_back(&mut self, cx: &mut Context<Self>) -> bool {
         if self.picker.is_some() {
             self.close_picker(cx);
@@ -421,22 +504,116 @@ impl Shell {
         if self.close_adjust(cx) {
             return true;
         }
-        if self.search.is_some() || self.stopping || self.confirming.is_some() {
-            (self.search, self.stopping, self.confirming) = (None, false, None);
+        if self.search.is_some() || self.sheet.is_some() || self.renaming.is_some() {
+            (self.search, self.sheet, self.renaming) = (None, None, None);
             crate::keyboard(false);
             cx.notify();
             return true;
         }
-        let back = match self.screen {
-            Screen::Welcome | Screen::Tab(Tab::Now) => return false,
-            _ if self.device.is_none() => Screen::Welcome,
-            Screen::Link { .. } => Screen::Tab(Tab::Connections),
-            Screen::Hide { .. } => Screen::Settings,
-            Screen::Grant(_) => Screen::Tab(Tab::Agents),
-            _ => Screen::Tab(Tab::Now),
+        self.pop(cx)
+    }
+
+    /// The sheet asking once more before a destructive or braking action:
+    /// what happens, the action, and Cancel.
+    fn confirm_sheet(&self, t: Theme, bottom: f32, cx: &mut Context<Self>) -> Option<Div> {
+        use crate::Confirm::*;
+        let (question, then, action) = match self.sheet.as_ref()? {
+            DeleteAgent { name, .. } => {
+                (format!("Delete {name}?"), "It loses all access.", "Delete")
+            }
+            RemoveDevice { name, .. } => {
+                (format!("Remove {name}?"), "It can no longer approve.", "Remove")
+            }
+            Unlink { name } => (
+                format!("Unlink {}?", words::connector(name)),
+                "Its session is forgotten.",
+                "Unlink",
+            ),
+            Close { what, .. } => (format!("Close {what}?"), "", "Close"),
+            StopAll => (
+                "Stop all access?".into(),
+                "Every grant closes, routines pause and waiting requests are denied.",
+                "Stop all",
+            ),
         };
-        self.go(back, cx);
-        true
+        let stop = matches!(self.sheet, Some(StopAll));
+        let act = button(t, "sheet-act", action, cx, |this, cx| this.confirmed(cx))
+            .when(stop, |b| b.bg(t.danger).border_color(t.danger).text_color(rgb(0xffffff)));
+        let scrim = div().id("sheet-scrim").flex_1().bg(hsla(0., 0., 0., 0.4)).on_click(
+            cx.listener(|this, _, _, cx| {
+                this.sheet = None;
+                cx.notify();
+            }),
+        );
+        let sheet = div()
+            .id("sheet")
+            .occlude()
+            .bg(t.bg)
+            .border_t_2()
+            .border_color(t.text)
+            .pt(lines(1.))
+            .pb(px(bottom) + lines(1.))
+            .px(chars(1.))
+            .child(
+                column()
+                    .w_full()
+                    .max_w(chars(60.))
+                    .mx_auto()
+                    .gap(lines(1.))
+                    .child(bold(question))
+                    .when(!then.is_empty(), |d| d.child(then))
+                    .child(act)
+                    .child(button(t, "sheet-cancel", "Cancel", cx, |this, cx| {
+                        this.sheet = None;
+                        cx.notify();
+                    })),
+            );
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(scrim)
+                .child(sheet),
+        )
+    }
+
+    /// How this device approves: fingerprint or face (the screen lock as
+    /// backup), or the screen lock alone. When changing, the current way
+    /// is marked.
+    #[cfg(target_os = "android")]
+    fn method_screen(&self, t: Theme, next: &crate::Next, cx: &mut Context<Self>) -> Div {
+        use crate::android::Method;
+        let current = matches!(next, crate::Next::Rotate)
+            .then(|| self.device.as_ref().map(|d| d.key.method()))
+            .flatten();
+        let choice = |id: &'static str, method: Method, label: &str, cx: &mut Context<Self>| {
+            let next = next.clone();
+            let on = current == Some(method);
+            clickable(id, cx, move |this, cx| {
+                if !on {
+                    this.make_key(next.clone(), method, cx)
+                }
+            })
+            .flex()
+            .items_center()
+            .gap(chars(1.))
+            .border_2()
+            .border_color(t.text)
+            .px(chars(1.))
+            .py(lines(1.))
+            .font_weight(MEDIUM)
+            .child(crate::now::checkbox(t, on))
+            .child(label.to_string())
+        };
+        column()
+            .gap(lines(1.))
+            .child(bold("How do you want to approve?"))
+            .child(choice("biometric", Method::Biometric, "Fingerprint or face", cx))
+            .child(choice("screen-lock", Method::ScreenLock, "Screen lock", cx))
     }
 
     /// The page's name, a way back off the tabs, and search and settings on
@@ -451,7 +628,9 @@ impl Shell {
             .gap(chars(1.))
             .when(back, |d| {
                 d.child(icon_button(t, "back", "arrow-left", cx, |this, cx| {
-                    this.go_back(cx);
+                    if !this.go_back(cx) {
+                        this.up(cx);
+                    }
                 }))
             })
             .child(
@@ -511,7 +690,7 @@ impl Shell {
         let cells = items.into_iter().enumerate().map(|(i, (tab, name, label, count))| {
             let on = tab == current;
             let color = if on { t.text } else { t.alt };
-            clickable(("tab", i), cx, move |this, cx| this.go(Screen::Tab(tab), cx))
+            clickable(("tab", i), cx, move |this, cx| this.root(tab, cx))
                 .flex_1()
                 .flex()
                 .flex_col()
@@ -558,7 +737,7 @@ fn welcome(t: Theme, cx: &mut Context<Shell>) -> Div {
 
 /// A box the owner types or pastes into: a tap gives it the typing and
 /// opens the keyboard, and Paste beside it takes the clipboard.
-fn field(
+pub(crate) fn field(
     t: Theme,
     id: &'static str,
     text: &str,
@@ -702,60 +881,74 @@ impl Shell {
     /// the code matches.
     fn invite_screen(&self, t: Theme, kind: &str, opened: &Opened, cx: &mut Context<Self>) -> Div {
         let code = opened.code.clone();
-        let big = div()
-            .text_size(px(SIZE * 2.5))
-            .line_height(px(SIZE * 3.))
-            .font_weight(BOLD)
-            .child(code.clone());
-        let copy = |id: &'static str, text: String, cx: &mut Context<Self>| {
-            button(t, id, "Copy", cx, move |this, cx| this.copy(text.clone(), cx)).flex_none()
-        };
-        let line = |text: String, copied: Stateful<Div>| {
+        // What to run or enter there, in a ruled block with Copy at its end.
+        let block = |text: String, id: &'static str, cx: &mut Context<Self>| {
+            let copied = text.clone();
             div()
+                .w_full()
                 .flex()
-                .items_center()
-                .gap(chars(1.))
+                .items_stretch()
+                .border_2()
+                .border_color(t.text)
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .bg(t.bg_alt)
                         .px(chars(1.))
                         .py(lines(0.5))
                         .font_weight(MEDIUM)
                         .child(text),
                 )
-                .child(copied)
+                .child(
+                    clickable(id, cx, move |this, cx| this.copy(copied.clone(), cx))
+                        .flex()
+                        .items_center()
+                        .px(chars(1.))
+                        .border_l_2()
+                        .border_color(t.text)
+                        .font_weight(MEDIUM)
+                        .child("COPY"),
+                )
         };
         let (first, there) = if kind == "agent" {
             let command = format!("mandate login {}", self.agent_url);
-            (
-                "On the agent's machine, run:",
-                line(command.clone(), copy("copy-command", command, cx)),
-            )
+            ("On the agent's machine, run:", block(command, "copy-command", cx))
         } else {
             (
                 "On the new device, tap Already set up? and enter:",
-                line(self.server.clone(), copy("copy-url", self.server.clone(), cx)),
+                block(self.server.clone(), "copy-url", cx),
             )
         };
+        let copy_code = code.clone();
         column()
+            .items_center()
+            .text_center()
+            .gap(lines(1.))
+            .mt(lines(2.))
             .child(first)
             .child(there)
-            .child("Then type this code:")
-            .child(div().flex().items_center().gap(chars(2.)).child(big).child(copy(
-                "copy-code",
-                code,
-                cx,
-            )))
-            .child(t.alt(format!("Expires {}.", words::clock(&opened.expires_at))))
+            .child(div().mt(lines(1.)).child("Then type this code:"))
+            .child(
+                div()
+                    .text_size(px(SIZE * 3.5))
+                    .line_height(px(SIZE * 4.))
+                    .font_weight(BOLD)
+                    .child(code),
+            )
+            .child(
+                link(t, "copy-code", "Copy code", cx, move |this, cx| {
+                    this.copy(copy_code.clone(), cx)
+                })
+                .font_weight(MEDIUM),
+            )
+            .child(t.alt(format!("Expires {}", words::clock(&opened.expires_at))))
             .child(link(t, "cancel-invite", "Cancel", cx, |this, cx| this.cancel_invite(cx)))
     }
 }
 
 fn admit(t: Theme, ex: &Exchange, envelope: &Envelope, cx: &mut Context<Shell>) -> Div {
     let envelope = envelope.clone();
-    let later = button(t, "later", "Not now", cx, |this, cx| this.go(Screen::Tab(Tab::Now), cx));
+    let later = button(t, "later", "Not now", cx, |this, cx| this.up(cx));
     if ex.kind == "device" {
         // A device can approve anything, so the warning sits on the button.
         let admit = approve(t, "admit", "Let this device in".into(), true, cx, move |this, cx| {
@@ -878,7 +1071,23 @@ pub fn clickable(
         .child(shade())
 }
 
-/// A 2px block that inverts while pressed.
+/// Every button's shape: a 2px block at least two lines high, its label
+/// in capitals, centered.
+fn block(d: Stateful<Div>, t: Theme, label: &str) -> Stateful<Div> {
+    d.min_h(lines(2.))
+        .px(chars(1.))
+        .py(lines(0.25))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_center()
+        .border_2()
+        .border_color(t.text)
+        .font_weight(MEDIUM)
+        .child(label.to_uppercase())
+}
+
+/// A button that inverts while pressed.
 pub fn button(
     t: Theme,
     id: impl Into<ElementId>,
@@ -886,21 +1095,13 @@ pub fn button(
     cx: &mut Context<Shell>,
     f: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
 ) -> Stateful<Div> {
-    clickable(id, cx, f)
-        .h(lines(2.))
-        .px(chars(1.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .border_2()
-        .border_color(t.text)
-        .font_weight(MEDIUM)
+    block(clickable(id, cx, f), t, label)
         .active(|s| s.bg(t.text).text_color(t.bg))
         .hover(|s| s.bg(t.bg_alt))
-        .child(label.to_uppercase())
 }
 
-/// The emerald action that grants access, saying what it grants.
+/// The button that grants access, saying what it grants: the same shape,
+/// filled with the deep emerald.
 pub fn approve(
     t: Theme,
     id: impl Into<ElementId>,
@@ -909,18 +1110,14 @@ pub fn approve(
     cx: &mut Context<Shell>,
     f: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
 ) -> Stateful<Div> {
-    let block = |d: Stateful<Div>| {
-        d.min_h(lines(2.)).px(chars(1.)).py(lines(0.5)).text_center().border_2().font_weight(MEDIUM)
-    };
     if !enabled {
-        return block(div().id(id.into())).border_color(t.alt).text_color(t.alt).child(label);
+        return block(div().id(id.into()), t, &label).border_color(t.alt).text_color(t.alt);
     }
-    block(clickable(id, cx, f))
-        .border_color(t.grant)
+    block(clickable(id, cx, f), t, &label)
         .bg(t.grant)
         .text_color(t.on_grant)
-        .active(|s| s.bg(t.grant_hi).border_color(t.grant_hi))
-        .child(label)
+        .active(|s| s.bg(t.grant_hi))
+        .hover(|s| s.bg(t.grant_hi))
 }
 
 pub fn link(

@@ -1,12 +1,16 @@
 package dev.mandate.app;
 
 import android.app.Activity;
+import android.app.KeyguardManager;
+import android.hardware.biometrics.BiometricManager;
 import android.hardware.biometrics.BiometricManager.Authenticators;
 import android.hardware.biometrics.BiometricPrompt;
 import android.os.CancellationSignal;
+import android.security.keystore.KeyInfo;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.security.keystore.StrongBoxUnavailableException;
+import java.security.KeyFactory;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
 import java.security.PrivateKey;
@@ -20,28 +24,32 @@ import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
 /**
- * The device key, which signs only through a BiometricPrompt for that one
- * signature, and the key that seals the device token. Both live in the
- * Android Keystore.
+ * Device keys, which sign only through a BiometricPrompt for that one
+ * signature, and the key that seals the device token. All live in the
+ * Android Keystore. Each device key has its own alias, so a new one can be
+ * made while the old one still signs.
  */
 final class Keys {
-    private static final String DEVICE = "device", TOKEN = "token";
+    private static final String TOKEN = "token";
     private static final int IV = 12;
+    /** Methods: a strong biometric or the screen lock, or the screen lock alone. */
+    static final int BIOMETRIC = 1, SCREEN_LOCK = 2;
 
-    /** A new device key, in StrongBox if the phone has one; answers its public key as X.509. */
-    static byte[] generate() throws Exception {
+    /** A new device key under alias, in StrongBox if the phone has one; answers its public key as X.509. */
+    static byte[] generate(String alias, int method) throws Exception {
         // A 0-second validity: each signature needs its own authentication,
         // and unlocking the phone authorizes none. The screen lock signs as
         // well, so a newly enrolled finger is no reason to drop the key.
+        int auth =
+                method == SCREEN_LOCK
+                        ? KeyProperties.AUTH_DEVICE_CREDENTIAL
+                        : KeyProperties.AUTH_BIOMETRIC_STRONG | KeyProperties.AUTH_DEVICE_CREDENTIAL;
         KeyGenParameterSpec.Builder spec =
-                new KeyGenParameterSpec.Builder(DEVICE, KeyProperties.PURPOSE_SIGN)
+                new KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
                         .setAlgorithmParameterSpec(new ECGenParameterSpec("secp256r1"))
                         .setDigests(KeyProperties.DIGEST_SHA256)
                         .setUserAuthenticationRequired(true)
-                        .setUserAuthenticationParameters(
-                                0,
-                                KeyProperties.AUTH_BIOMETRIC_STRONG
-                                        | KeyProperties.AUTH_DEVICE_CREDENTIAL)
+                        .setUserAuthenticationParameters(0, auth)
                         .setInvalidatedByBiometricEnrollment(false);
         KeyPairGenerator gen = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore");
         try {
@@ -54,17 +62,52 @@ final class Keys {
     }
 
     /** The device key's public key as X.509. */
-    static byte[] publicKey() throws Exception {
-        return store().getCertificate(DEVICE).getPublicKey().getEncoded();
+    static byte[] publicKey(String alias) throws Exception {
+        return store().getCertificate(alias).getPublicKey().getEncoded();
+    }
+
+    static void delete(String alias) throws Exception {
+        store().deleteEntry(alias);
+    }
+
+    /** The method the key at alias was made with. */
+    static int method(String alias) throws Exception {
+        PrivateKey key = (PrivateKey) store().getKey(alias, null);
+        KeyInfo info = KeyFactory.getInstance(key.getAlgorithm(), "AndroidKeyStore").getKeySpec(key, KeyInfo.class);
+        return (info.getUserAuthenticationType() & KeyProperties.AUTH_BIOMETRIC_STRONG) != 0 ? BIOMETRIC : SCREEN_LOCK;
+    }
+
+    /** Bit 1: a strong biometric is enrolled; bit 2: a secure screen lock is set. */
+    static int available(Activity activity) {
+        int biometric =
+                activity.getSystemService(BiometricManager.class).canAuthenticate(Authenticators.BIOMETRIC_STRONG)
+                                == BiometricManager.BIOMETRIC_SUCCESS
+                        ? 1
+                        : 0;
+        int lock = activity.getSystemService(KeyguardManager.class).isDeviceSecure() ? 2 : 0;
+        return biometric | lock;
     }
 
     /**
      * SHA256withECDSA over msg, as DER, once the owner authenticates for it in
-     * BiometricPrompt with a strong biometric or the screen lock.
+     * BiometricPrompt with the key's method.
      */
-    static byte[] sign(Activity activity, byte[] msg) throws Exception {
+    static byte[] sign(Activity activity, String alias, byte[] msg) throws Exception {
         Signature s = Signature.getInstance("SHA256withECDSA");
-        s.initSign((PrivateKey) store().getKey(DEVICE, null));
+        s.initSign((PrivateKey) store().getKey(alias, null));
+        prompt(activity, "Sign with mandate", method(alias), new BiometricPrompt.CryptoObject(s));
+        s.update(msg);
+        return s.sign();
+    }
+
+    /** Asks the owner to authenticate as the key at alias would, signing nothing. */
+    static void authenticate(Activity activity, String alias) throws Exception {
+        prompt(activity, "Unlock mandate", method(alias), null);
+    }
+
+    /** Shows BiometricPrompt and waits for the owner; a cancel or failure throws its message. */
+    private static void prompt(Activity activity, String title, int method, BiometricPrompt.CryptoObject crypto)
+            throws Exception {
         CountDownLatch done = new CountDownLatch(1);
         String[] error = {null};
         BiometricPrompt.AuthenticationCallback callback =
@@ -80,25 +123,28 @@ final class Keys {
                         done.countDown();
                     }
                 };
+        int allowed =
+                method == SCREEN_LOCK
+                        ? Authenticators.DEVICE_CREDENTIAL
+                        : Authenticators.BIOMETRIC_STRONG | Authenticators.DEVICE_CREDENTIAL;
         activity.runOnUiThread(
-                () ->
-                        new BiometricPrompt.Builder(activity)
-                                .setTitle("Sign with mandate")
-                                .setAllowedAuthenticators(
-                                        Authenticators.BIOMETRIC_STRONG
-                                                | Authenticators.DEVICE_CREDENTIAL)
-                                .build()
-                                .authenticate(
-                                        new BiometricPrompt.CryptoObject(s),
-                                        new CancellationSignal(),
-                                        activity.getMainExecutor(),
-                                        callback));
+                () -> {
+                    BiometricPrompt p =
+                            new BiometricPrompt.Builder(activity)
+                                    .setTitle(title)
+                                    .setAllowedAuthenticators(allowed)
+                                    .build();
+                    CancellationSignal cancel = new CancellationSignal();
+                    if (crypto == null) {
+                        p.authenticate(cancel, activity.getMainExecutor(), callback);
+                    } else {
+                        p.authenticate(crypto, cancel, activity.getMainExecutor(), callback);
+                    }
+                });
         done.await();
         if (error[0] != null) {
             throw new Exception(error[0]);
         }
-        s.update(msg);
-        return s.sign();
     }
 
     /** The token sealed under a new AES-GCM key: IV then ciphertext. */

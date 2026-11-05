@@ -10,6 +10,8 @@ use p256::ecdsa::VerifyingKey;
 pub struct Log {
     entries: Vec<Envelope>,
     trusted: Vec<(Key, VerifyingKey)>,
+    /// The IDs of trusted keys retired by rotation.
+    retired: Vec<String>,
 }
 
 impl Log {
@@ -35,7 +37,11 @@ impl Log {
                 let vk = entry.key.verifying_key()?;
                 self.trusted.push((entry.key, vk));
             }
-            Op::Remove => self.trusted.retain(|(k, _)| k.id != entry.key.id),
+            Op::Retire => self.retired.push(entry.key.id),
+            Op::Remove => {
+                self.trusted.retain(|(k, _)| k.id != entry.key.id);
+                self.retired.retain(|id| *id != entry.key.id);
+            }
         }
         self.entries.push(e);
         Ok(())
@@ -54,9 +60,14 @@ impl Log {
         &self.entries
     }
 
-    /// The keys trusted now, in the order they were added.
+    /// The keys trusted now, in the order they were added, retired ones too.
     pub fn trusted(&self) -> impl Iterator<Item = &Key> {
         self.trusted.iter().map(|(k, _)| k)
+    }
+
+    /// Whether a trusted key was retired: it signs no key entries or writes.
+    pub fn retired(&self, id: &str) -> bool {
+        self.retired.iter().any(|r| r == id)
     }
 
     /// Verifies e with the keys trusted now and returns its record. A key
@@ -69,8 +80,13 @@ impl Log {
             return Err(invalid("nonce is shorter than 16 bytes"));
         }
         e.verify_sig(k, &vk)?;
+        // A retired key's identities and grants stay valid; it signs nothing
+        // new that the log or a connector acts on.
+        if matches!(r, Record::Key(_) | Record::Write(_)) && self.retired(&k.id) {
+            return Err(Error::Untrusted);
+        }
         if let Record::Key(entry) = &r {
-            self.follows(entry)?;
+            self.follows(entry, &k.id)?;
         }
         Ok(r)
     }
@@ -89,7 +105,7 @@ impl Log {
         Ok((k, *vk))
     }
 
-    fn follows(&self, e: &KeyEntry) -> Result<(), Error> {
+    fn follows(&self, e: &KeyEntry, signer: &str) -> Result<(), Error> {
         let (n, head) = self.head();
         if e.seq != n {
             return Err(invalid(format!("seq {} where {n} is next", e.seq)));
@@ -98,14 +114,20 @@ impl Log {
             return Err(invalid("prev does not name the previous entry"));
         }
         let held = self.trusted.iter().find(|(k, _)| k.id == e.key.id).map(|(k, _)| k);
+        let named = held.is_some_and(|k| *k == e.key);
+        // Keys that sign new entries after this one.
+        let active = self.trusted.iter().filter(|(k, _)| !self.retired(&k.id)).count();
+        let leaves_one = active > usize::from(!self.retired(&e.key.id));
         match (e.op, held) {
             (Op::Add, None) => Ok(()),
             (Op::Add, Some(_)) => Err(invalid(format!("key {} is already trusted", e.key.id))),
-            (Op::Remove, Some(k)) if *k == e.key && self.trusted.len() == 1 => {
-                Err(invalid("removing the last key"))
+            (_, _) if !named => Err(invalid(format!("key {} is not trusted as named", e.key.id))),
+            (_, _) if !leaves_one => Err(invalid("no key would be left to sign")),
+            (Op::Retire, _) if self.retired(&e.key.id) => {
+                Err(invalid(format!("key {} is already retired", e.key.id)))
             }
-            (Op::Remove, Some(k)) if *k == e.key => Ok(()),
-            (Op::Remove, _) => Err(invalid(format!("key {} is not trusted as named", e.key.id))),
+            (Op::Retire, _) if signer == e.key.id => Err(invalid("a key retiring itself")),
+            (Op::Retire | Op::Remove, _) => Ok(()),
         }
     }
 }
@@ -212,7 +234,7 @@ mod tests {
             }
         }
         assert!(
-            s.vectors.len() == 8 && s.keys.len() == 3 && !s.envelope.is_empty(),
+            s.vectors.len() == 9 && s.keys.len() == 3 && !s.envelope.is_empty(),
             "parsed {} vectors and {} keys from records.md",
             s.vectors.len(),
             s.keys.len()
@@ -241,10 +263,12 @@ mod tests {
             self.envelope(self.vectors.iter().find(|v| v.title == title).unwrap())
         }
 
-        /// The spec's key log: phone, laptop and YubiKey.
+        /// The spec's key log before the retirement: phone, laptop and
+        /// YubiKey, each adding the next.
         fn log(&self) -> Log {
-            let key_entries = self.vectors.iter().filter(|v| v.kind == "key");
-            Log::new(key_entries.map(|v| self.envelope(v))).unwrap()
+            let adds =
+                self.vectors.iter().filter(|v| v.kind == "key" && !v.title.contains("retire"));
+            Log::new(adds.map(|v| self.envelope(v))).unwrap()
         }
     }
 
@@ -281,6 +305,13 @@ mod tests {
         let e0: Envelope = serde_json::from_str(&s.envelope).unwrap();
         assert_eq!(serde_json::to_string_pretty(&e0).unwrap() + "\n", s.envelope);
         Log::new([e0]).unwrap();
+
+        // After the phone is retired, what it signed before still verifies,
+        // but it signs no writes.
+        assert!(l.retired(&s.keys["phone"].id));
+        l.verify(&s.vector("identity")).unwrap();
+        l.verify(&s.vector("grant, one-off")).unwrap();
+        assert!(matches!(l.verify(&s.vector("write")), Err(Error::Untrusted)), "retired write");
 
         // Must fail.
         let mut g = s.vector("grant, one-off");
@@ -344,6 +375,40 @@ mod tests {
         assert!(matches!(l.verify(&routine), Err(Error::Untrusted)));
         let ids: Vec<&str> = l.trusted().map(|k| k.id.as_str()).collect();
         assert_eq!(ids, [keys[0].id.as_str(), keys[2].id.as_str()]);
+    }
+
+    /// Rotation: a device adds its new key with the old, then retires the
+    /// old with the new; a retired key signs no more entries.
+    #[test]
+    fn retire() {
+        let s = read_spec();
+        let (phone, laptop) = (s.key("phone"), s.key("laptop"));
+        let full = s.log();
+        let keys: Vec<Key> = full.trusted().cloned().collect();
+        let next = |l: &Log, op, key: &Key| {
+            let (seq, prev) = l.head();
+            KeyEntry { seq, op, key: key.clone(), prev, at: Time::from_unix(1_793_000_000) }
+        };
+        let one = Log::new(full.entries()[..1].to_vec()).unwrap();
+        let refused = [
+            ("retiring itself", &full, next(&full, Op::Retire, &keys[0]), &phone),
+            ("retiring the last key", &one, next(&one, Op::Retire, &keys[0]), &phone),
+        ];
+        for (name, l, e, key) in refused {
+            assert!(l.clone().append(signed(e, key)).is_err(), "{name}: appended");
+        }
+        let mut l = full.clone();
+        l.append(signed(next(&l, Op::Retire, &keys[0]), &laptop)).unwrap();
+        assert!(l.retired(&keys[0].id));
+        let again = next(&l, Op::Retire, &keys[0]);
+        assert!(l.clone().append(signed(again, &laptop)).is_err(), "retired twice");
+        let by_retired = next(&l, Op::Remove, &keys[2]);
+        assert!(l.clone().append(signed(by_retired, &phone)).is_err(), "signed by a retired key");
+        // Removing the laptop would leave only the YubiKey; the phone, retired,
+        // does not count, so removing the YubiKey after that is refused.
+        l.append(signed(next(&l, Op::Remove, &keys[1]), &laptop)).unwrap();
+        let last = next(&l, Op::Remove, &keys[2]);
+        assert!(l.clone().append(signed(last, &laptop)).is_err(), "removing the last signer");
     }
 
     #[test]

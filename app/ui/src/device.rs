@@ -1,5 +1,7 @@
 //! The paired device as saved in the app's data dir.
 
+#[cfg(not(target_os = "android"))]
+use mandate_core::DeviceKey;
 use mandate_core::{Client, Error, Join, PairLink, Trust};
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
@@ -10,14 +12,16 @@ use std::sync::Arc;
 
 pub const FILE: &str = "device.json";
 
-/// What the device calls itself in the key log: "phone", or the computer's
-/// hostname.
+/// What the device calls itself in the key log: the phone's name from its
+/// settings, or the computer's hostname.
 pub fn name() -> String {
-    if cfg!(target_os = "android") {
-        return "phone".into();
+    #[cfg(target_os = "android")]
+    return crate::android::device_name().unwrap_or_else(|| "phone".into());
+    #[cfg(not(target_os = "android"))]
+    {
+        let host = fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+        if host.trim().is_empty() { "computer".into() } else { host.trim().into() }
     }
-    let host = fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
-    if host.trim().is_empty() { "computer".into() } else { host.trim().into() }
 }
 
 /// The device key: in the Android Keystore, or on desktop on the FIDO2
@@ -70,28 +74,52 @@ impl Device {
             saved["pin"] = hex(&p).into();
         }
         save_secrets(&mut saved, &key, token)?;
-        fs::create_dir_all(dir)?;
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(dir.join(FILE))?;
-        f.write_all(saved.to_string().as_bytes())?;
+        write(dir, &saved)?;
         #[cfg(target_os = "android")]
         crate::android::listen();
         Ok(Device { client, key: Arc::new(key) })
     }
+
+    /// Moves the device to key once the server has accepted it in the key
+    /// log: the file keeps the address and token under the new key, and the
+    /// old key is removed.
+    pub fn rotate(&self, dir: &Path, key: Key) -> Result<Device, Error> {
+        let invalid = || Error::Invalid(format!("{FILE} is not as saved"));
+        let mut saved: Value =
+            serde_json::from_slice(&fs::read(dir.join(FILE))?).map_err(|_| invalid())?;
+        let (_, token) = secrets(&saved).ok_or_else(invalid)?;
+        save_secrets(&mut saved, &key, &token)?;
+        write(dir, &saved)?;
+        #[cfg(target_os = "android")]
+        self.key.delete()?;
+        #[cfg(not(target_os = "android"))]
+        crate::desktop::forget_token(&self.key.key("").id);
+        Ok(Device { client: self.client.clone(), key: Arc::new(key) })
+    }
+}
+
+fn write(dir: &Path, saved: &Value) -> Result<(), Error> {
+    fs::create_dir_all(dir)?;
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(dir.join(FILE))?;
+    f.write_all(saved.to_string().as_bytes())?;
+    Ok(())
 }
 
 /// The key and the token from the file: the token sealed by the Keystore.
 #[cfg(target_os = "android")]
 fn secrets(v: &Value) -> Option<(Key, String)> {
-    Some((Key::load()?, crate::android::unseal(&unhex(v["sealed"].as_str()?)?)?))
+    let alias = v["alias"].as_str().unwrap_or(crate::android::FIRST_ALIAS);
+    Some((Key::load(alias)?, crate::android::unseal(&unhex(v["sealed"].as_str()?)?)?))
 }
 
 #[cfg(target_os = "android")]
-fn save_secrets(saved: &mut Value, _: &Key, token: &str) -> Result<(), Error> {
+fn save_secrets(saved: &mut Value, key: &Key, token: &str) -> Result<(), Error> {
+    saved["alias"] = key.alias().into();
     saved["sealed"] = hex(&crate::android::seal(token)?).into();
     Ok(())
 }

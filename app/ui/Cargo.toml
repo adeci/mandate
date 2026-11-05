@@ -37,3 +37,4 @@ android_logger = "0.15"
 gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/longbridge/gpui-mobile", rev = "9075e3aa3eea812127f2c60ed66f0cd5798ff245", default-features = false }
 jni = "0.22"
 log = "0.4"
+rqrr = "0.11"

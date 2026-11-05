@@ -154,6 +154,16 @@ impl Fido {
         Err(miss.map_or_else(|| key_error(PLUG_IN), Error::from))
     }
 
+    /// Proves the owner is here, signing nothing the server sees: an
+    /// assertion over random bytes, with a touch and the PIN token, which pin
+    /// gets first when none is held.
+    pub fn confirm(&self, pin: Option<&str>) -> Result<(), Error> {
+        if let Some(pin) = pin {
+            self.unlock(pin)?;
+        }
+        self.sign(&random::<32>()).map(drop)
+    }
+
     /// Opens the authenticator at path if it holds the credential: an
     /// assertion without touch or PIN fails on any other.
     fn probe(&self, path: &Path) -> Result<Device, Ctap> {

@@ -5,7 +5,7 @@
     <style name="Main" parent="android:Theme.DeviceDefault.NoActionBar">
         <item name="android:windowBackground">@color/paper</item>
         <item name="android:windowSplashScreenBackground">@color/paper</item>
-        <item name="android:windowSplashScreenIconBackgroundColor">@color/paper</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/blank</item>
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowLightNavigationBar">false</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>

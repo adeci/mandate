@@ -111,6 +111,14 @@ pub struct Activity {
     pub chats: Vec<Chat>,
     pub count: Option<u64>,
     pub detail: String,
+    /// A request's reason, in the agent's words.
+    pub reason: String,
+    /// A request's search terms and the chats they matched.
+    pub terms: Vec<Term>,
+    /// A proposal's note, in the agent's words.
+    pub note: String,
+    /// The device the owner decided on.
+    pub device: String,
 }
 
 /// A page of history, newest first; next pages back from its last entry.
@@ -183,6 +191,18 @@ pub struct Server {
 #[serde(default)]
 pub struct Keys {
     pub trusted: Vec<Trusted>,
+    /// Names given in the app, over the names keys were added with.
+    pub names: BTreeMap<String, String>,
+    /// Keys rotated out: still in the log, no device of their own.
+    pub retired: Vec<String>,
+}
+
+impl Keys {
+    /// What the owner calls a device: a name given in the app, else the
+    /// one it joined with.
+    pub fn name<'a>(&'a self, k: &'a Trusted) -> &'a str {
+        self.names.get(&k.id).map_or(k.name.as_str(), String::as_str)
+    }
 }
 
 #[derive(Clone, Default, Deserialize)]

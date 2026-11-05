@@ -98,6 +98,25 @@ impl Key {
         }
     }
 
+    /// Whether `confirm` needs the PIN: a token's session stays logged in,
+    /// so only its PIN proves the owner is here.
+    pub fn confirm_needs_pin(&self) -> bool {
+        match &self.kind {
+            Kind::Fido(k) => k.locked(),
+            Kind::Pkcs11(_) => true,
+        }
+    }
+
+    /// Proves the owner is here without signing anything the server sees:
+    /// a touch on a security key, the PIN on a token. Blocks.
+    pub fn confirm(&self, pin: Option<&str>) -> Result<(), Error> {
+        match (&self.kind, pin) {
+            (Kind::Fido(k), pin) => k.confirm(pin),
+            (Kind::Pkcs11(k), Some(pin)) => k.check_pin(pin),
+            (Kind::Pkcs11(_), None) => Err(Error::Key("Type your token's PIN.".into())),
+        }
+    }
+
     /// Whether every signature waits on a touch.
     pub fn touch(&self) -> bool {
         matches!(self.kind, Kind::Fido(_))
@@ -166,6 +185,16 @@ pub fn load_secrets(saved: &Value) -> Option<(Key, String)> {
         String::from_utf8(item.secret().await.ok()?.to_vec()).ok()
     })?;
     Some((key, token))
+}
+
+/// Deletes the device token kept for a device key no longer in use, after a
+/// rotation saved it under the new key.
+pub fn forget_token(old_key_id: &str) {
+    let _ = futures::executor::block_on(async {
+        let keyring = oo7::Keyring::new().await?;
+        keyring.unlock().await?;
+        keyring.delete(&vec![(TOKEN_ATTRIBUTE, old_key_id)]).await
+    });
 }
 
 const TOKEN_LABEL: &str = "mandate device token";

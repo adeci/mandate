@@ -244,6 +244,18 @@ impl Pkcs11 {
         *self.login.lock().unwrap() = Some(login);
         Ok(())
     }
+
+    /// Checks pin on the token. The session stays logged in, so it logs out
+    /// first: logged in, the token would take any PIN without checking it.
+    /// A wrong PIN leaves the key locked.
+    pub fn check_pin(&self, pin: &str) -> Result<(), Error> {
+        let mut held = self.login.lock().unwrap();
+        if let Some(login) = held.take() {
+            let _ = login.session.logout();
+        }
+        *held = Some(Login::open(&self.module, &self.serial, pin)?);
+        Ok(())
+    }
 }
 
 impl DeviceKey for Pkcs11 {

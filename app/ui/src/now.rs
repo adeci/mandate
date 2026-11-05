@@ -1,11 +1,10 @@
-//! Now, as the console had it: what waits for the owner, open grants,
-//! routines, and Stop all at the bottom.
+//! Now: what waits for the owner, open grants and routines.
 
 use crate::api::{Exchange, Grant, Proposal, Request};
 use crate::pick::Pick;
 use crate::screens::{
     DEVICE_JOIN, approve, button, clickable, column, device_rows, device_warning, id_for, link,
-    panel, reason, table, who,
+    panel, reason, slider, table, who,
 };
 use crate::theme::{MEDIUM, Theme, bold, chars, lines};
 use crate::words::{self, connector, horizon, span};
@@ -14,10 +13,9 @@ use gpui::{AnyElement, Context, Div, ElementId, Stateful, div, hsla, prelude::*,
 use mandate_core::Record;
 use serde_json::json;
 
+/// The windows and the history a grant can give, as slider stops.
 pub(crate) const FOR: [u64; 7] = [900, 1800, 3600, 7200, 14400, 28800, 43200];
-pub(crate) const HORIZON: [u64; 4] = [86400, 604800, 2592000, 0];
-/// The windows Adjust offers besides the one asked for.
-const WINDOWS: [u64; 4] = [900, 3600, 14400, 43200];
+pub(crate) const HORIZON: [u64; 6] = [86400, 259200, 604800, 2592000, 7776000, 0];
 
 impl Shell {
     pub(crate) fn now_tab(&self, t: Theme, cx: &mut Context<Self>) -> Div {
@@ -86,7 +84,6 @@ impl Shell {
                     .children(routines.into_iter().map(|g| routine(t, g, false, cx)))
                     .children(stopped.into_iter().map(|g| routine(t, g, true, cx)))
             })
-            .child(self.stop_all_control(t, cx))
     }
 
     fn request_card(&self, t: Theme, r: &Request, cx: &mut Context<Self>) -> Div {
@@ -201,7 +198,8 @@ impl Shell {
         }
         let a = self.adjust.entry(r.id.clone()).or_insert_with(|| Adjust::of(r));
         a.open = true;
-        if a.names.is_empty() && r.terms.is_some() {
+        // Named chats are picked in the one list that searches them all.
+        if r.terms.is_some() {
             self.open_picker(Pick::Request(r.id.clone()), r.connector.clone(), cx);
         } else {
             self.close_picker(cx);
@@ -234,29 +232,28 @@ impl Shell {
                 this.close_adjust(cx);
             },
         ));
-        let sheet = div()
-            .id("sheet")
-            .occlude()
-            .max_h(relative(0.85))
-            .overflow_y_scroll()
-            .bg(t.bg)
-            .border_t_2()
-            .border_color(t.text)
-            .pt(lines(1.))
-            .pb(px(bottom) + lines(1.))
-            .px(chars(1.))
-            .child(
-                column()
-                    .w_full()
-                    .max_w(chars(80.))
-                    .mx_auto()
-                    .gap(lines(1.))
-                    .child(who(&r.identity_name, "wants to read"))
-                    .child(adjust_panel(t, r, a, picker, cx))
-                    .child(button(t, "done", "Done", cx, |this, cx| {
-                        this.close_adjust(cx);
-                    })),
-            );
+        let sheet = crate::scroll::view(
+            "sheet",
+            div()
+                .occlude()
+                .max_h(relative(0.85))
+                .bg(t.bg)
+                .border_t_2()
+                .border_color(t.text)
+                .pt(lines(1.))
+                .pb(px(bottom) + lines(1.))
+                .px(chars(1.)),
+            column()
+                .w_full()
+                .max_w(chars(80.))
+                .mx_auto()
+                .gap(lines(1.))
+                .child(who(&r.identity_name, "wants to read"))
+                .child(adjust_panel(t, r, a, picker, cx))
+                .child(button(t, "done", "Done", cx, |this, cx| {
+                    this.close_adjust(cx);
+                })),
+        );
         Some(
             div()
                 .absolute()
@@ -268,39 +265,6 @@ impl Shell {
                 .child(scrim)
                 .child(sheet),
         )
-    }
-
-    fn stop_all_control(&self, t: Theme, cx: &mut Context<Self>) -> AnyElement {
-        if !self.stopping {
-            return link(t, "stop", "stop all access…", cx, |this, cx| {
-                this.stopping = true;
-                cx.notify();
-            })
-            .mt(lines(2.))
-            .into_any_element();
-        }
-        panel(t)
-            .mt(lines(2.))
-            .child("Close all grants, pause routines and deny waiting requests?")
-            .child(
-                div()
-                    .flex()
-                    .gap(chars(1.))
-                    .child(
-                        button(t, "stop-all", "Stop all", cx, |this, cx| this.stop_all(cx))
-                            .flex_1()
-                            .bg(t.text)
-                            .text_color(t.bg),
-                    )
-                    .child(
-                        button(t, "cancel", "Cancel", cx, |this, cx| {
-                            this.stopping = false;
-                            cx.notify();
-                        })
-                        .flex_1(),
-                    ),
-            )
-            .into_any_element()
     }
 }
 
@@ -329,54 +293,47 @@ fn adjust_panel(
         .child(name.clone())
     });
     let ticks: Vec<_> = ticks.collect();
-    let other = {
-        let r = r.clone();
-        link(t, id_for("other", &r.id), "Pick other chats", cx, move |this, cx| {
-            this.open_picker(Pick::Request(r.id.clone()), r.connector.clone(), cx)
-        })
-    };
-    // Free choices, starting from what was asked.
-    let mut fors: Vec<u64> = WINDOWS.into_iter().chain([r.for_]).collect();
-    fors.sort_unstable();
-    fors.dedup();
-    let mut horizons: Vec<u64> = HORIZON.into_iter().chain([r.horizon]).collect();
-    // All history, 0, comes last.
-    horizons.sort_unstable_by_key(|&h| if h == 0 { u64::MAX } else { h });
-    horizons.dedup();
-    let choices = |field: &'static str,
-                   values: Vec<u64>,
-                   current: u64,
-                   word: fn(u64) -> String,
-                   cx: &mut Context<Shell>| {
-        div().flex().flex_wrap().gap(chars(1.)).children(values.into_iter().map(|v| {
-            let r = r.clone();
-            chip(t, (field, v as usize), &word(v), v == current, cx, move |this, cx| {
-                let a = this.adjust.entry(r.id.clone()).or_insert_with(|| Adjust::of(&r));
-                if field == "for" {
-                    a.for_ = v;
-                } else {
-                    a.horizon = v;
-                }
-                cx.notify();
-            })
-        }))
-    };
+    let (rf, rh) = (r.clone(), r.clone());
     column()
         .gap(lines(1.))
         .when(named, |d| {
-            d.child(div().font_weight(MEDIUM).child("CHATS"))
-                .when(!ticks.is_empty(), |d| d.child(column().children(ticks)))
-                .child(match picker {
-                    Some(p) => p.into_any_element(),
-                    None => other.into_any_element(),
-                })
+            d.child(div().font_weight(MEDIUM).child("CHATS")).child(match picker {
+                Some(p) => p.into_any_element(),
+                None => column().children(ticks).into_any_element(),
+            })
         })
         .when(r.kind == "once", |d| {
-            d.child(div().font_weight(MEDIUM).child("WINDOW"))
-                .child(choices("for", fors, a.for_, span, cx))
+            d.child(div().font_weight(MEDIUM).child("WINDOW")).child(slider(
+                t,
+                "window",
+                stops(&FOR, r.for_, span),
+                a.for_,
+                cx,
+                move |this, v| {
+                    this.adjust.entry(rf.id.clone()).or_insert_with(|| Adjust::of(&rf)).for_ = v
+                },
+            ))
         })
         .child(div().font_weight(MEDIUM).child("HISTORY"))
-        .child(choices("horizon", horizons, a.horizon, horizon, cx))
+        .child(slider(
+            t,
+            "history",
+            stops(&HORIZON, r.horizon, horizon),
+            a.horizon,
+            cx,
+            move |this, v| {
+                this.adjust.entry(rh.id.clone()).or_insert_with(|| Adjust::of(&rh)).horizon = v
+            },
+        ))
+}
+
+/// A slider's stops: the usual ones and the one asked for, in order, all
+/// history (0) last, each with its words.
+pub(crate) fn stops(usual: &[u64], asked: u64, word: fn(u64) -> String) -> Vec<(u64, String)> {
+    let mut v: Vec<u64> = usual.iter().copied().chain([asked]).collect();
+    v.sort_unstable_by_key(|&s| if s == 0 { u64::MAX } else { s });
+    v.dedup();
+    v.into_iter().map(|s| (s, word(s))).collect()
 }
 
 /// A party whose code matched, waiting to be let in.
@@ -457,8 +414,8 @@ fn chat_list(g: &Grant) -> String {
 fn open_grant(t: Theme, g: &Grant, cx: &mut Context<Shell>) -> Div {
     let until =
         g.until.as_deref().map(|u| format!("[until {} · {}]", words::clock(u), words::left(u)));
-    let (id, conn) = (g.id.clone(), g.connector.clone());
-    let close = format!("grants/{id}/close");
+    let (id, id2, conn) = (g.id.clone(), g.id.clone(), g.connector.clone());
+    let what = format!("{}'s grant on {}", g.identity_name, connector(&g.connector));
     panel(t)
         .border_color(t.open)
         .child(
@@ -484,7 +441,8 @@ fn open_grant(t: Theme, g: &Grant, cx: &mut Context<Shell>) -> Div {
                     )
                 }))
                 .child(button(t, id_for("close", &g.id), "Close", cx, move |this, cx| {
-                    this.post("POST", close.clone(), cx, |_| Some("Closed.".into()))
+                    let (id, what) = (id2.clone(), what.clone());
+                    this.ask(crate::Confirm::Close { id, what }, cx)
                 })),
         )
 }
