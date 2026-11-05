@@ -2,7 +2,7 @@
 # code, approve a read and a send, then Stop all. Each effect is checked on
 # the server. gpui draws no accessibility nodes, so the app's buttons are
 # found by their text (OCR), and Android's own screens through uiautomator.
-# journey.nix defines sdk, apk and tesseract.
+# journey.nix defines sdk, apk, tesseract and magick.
 import html
 import os
 import re
@@ -98,9 +98,12 @@ def press(*labels: str) -> bool:
 seen: list[str] = []
 
 
-def lines() -> list[list[tuple[str, int, int, int, int]]]:
-    png = run(f"{sdk}/platform-tools/adb", "-s", "emulator-5554", "exec-out", "screencap", "-p")
-    tsv = run(tesseract, "stdin", "stdout", "tsv", input=png).decode()
+def screenshot() -> bytes:
+    return run(f"{sdk}/platform-tools/adb", "-s", "emulator-5554", "exec-out", "screencap", "-p")
+
+
+def lines(png: bytes | None = None) -> list[list[tuple[str, int, int, int, int]]]:
+    tsv = run(tesseract, "stdin", "stdout", "tsv", input=png or screenshot()).decode()
     found: dict[tuple[str, ...], list[tuple[str, int, int, int, int]]] = {}
     for row in tsv.splitlines()[1:]:
         f = row.split("\t")
@@ -251,14 +254,35 @@ with subtest("the app pairs by the setup page's link"):
         "curl -s --unix-socket /run/mandate/connectors/test/socket http://mandate/keys | grep -q '\"length\":1'"
     )
 
-# The code the app shows on Add an agent: one 6-digit word, read the same
-# twice in a row.
+# The code the app shows on Add an agent, between "Then type this code:" and
+# "Copy code". Read with the rest of the page, a leading 5 in its large type
+# comes out as 2 or 9, so the code alone is read again at half and quarter
+# size, as digits only; both readings must agree, on two screenshots in a row.
 def shown_code() -> str:
     last: list[str] = []
 
+    def read(png: bytes) -> str | None:
+        top = bottom = None
+        for line in lines(png):
+            text = " ".join(w[0] for w in line)
+            if "type this code" in text:
+                top = max(w[4] for w in line)
+            elif text.startswith("copy code"):
+                bottom = min(w[2] for w in line)
+        if top is None or bottom is None or bottom <= top:
+            return None
+        readings = set()
+        for size in (50, 25):
+            crop = run(magick, "png:-", "-crop", f"1080x{bottom - top}+0+{top}", "+repage", "-resize", f"{size}%",
+                       "-bordercolor", "white", "-border", "20", "png:-", input=png)
+            digits = run(tesseract, "stdin", "stdout", "--psm", "7", "-c", "tessedit_char_whitelist=0123456789",
+                         input=crop).decode()
+            readings.add(re.sub(r"\s", "", digits))
+        code = readings.pop() if len(readings) == 1 else ""
+        return code if re.fullmatch(r"\d{6}", code) else None
+
     def look() -> str | None:
-        codes = [w[0] for line in lines() for w in line if re.fullmatch(r"\d{6}", w[0])]
-        code = codes[0] if len(codes) == 1 else None
+        code = read(screenshot())
         settled = code if code and last == [code] else None
         last[:] = [code] if code else []
         return settled

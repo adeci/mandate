@@ -14,6 +14,7 @@ mandate.inputs.nixpkgs.legacyPackages.x86_64-linux.testers.runNixOSTest {
     sdk = "${android.androidsdk}/libexec/android-sdk"
     apk = "${apk}"
     tesseract = "${pkgs.tesseract.override { enableLanguages = [ "eng" ]; }}/bin/tesseract"
+    magick = "${pkgs.imagemagick}/bin/magick"
   ''
   + builtins.readFile ./journey.py;
 }
