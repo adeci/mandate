@@ -17,17 +17,18 @@ import (
 // rewritten whole on every change. Activity is appended to a file per day
 // instead, since it only grows.
 type state struct {
-	Keys []record.Envelope `json:"keys"`
-	// Devices maps a trusted key's ID to its device token's SHA-256.
-	Devices    map[string]string    `json:"devices"`
+	Keys       []record.Envelope    `json:"keys"`
 	Identities map[string]*identity `json:"identities"`
 	Grants     map[string]*grant    `json:"grants"`
 	Requests   map[string]*request  `json:"requests"`
 	Proposals  map[string]*proposal `json:"proposals"`
 	NeverShare []neverShare         `json:"never_share"`
-	// KeyNames are devices' display names by key ID, unsigned like an
-	// identity's; a key without one shows the name it was added with.
-	KeyNames map[string]string `json:"key_names,omitempty"`
+	// Devices are the paired devices by ID (devices.go).
+	Devices map[string]*pairedDevice `json:"paired_devices"`
+	// Before a device could have several keys: a token per key ID, and
+	// display names by key ID. Read once, into Devices.
+	OldDevices  map[string]string `json:"devices,omitempty"`
+	OldKeyNames map[string]string `json:"key_names,omitempty"`
 }
 
 type identity struct {
@@ -118,7 +119,7 @@ const (
 
 func newState() state {
 	return state{
-		Devices:    map[string]string{},
+		Devices:    map[string]*pairedDevice{},
 		Identities: map[string]*identity{},
 		Grants:     map[string]*grant{},
 		Requests:   map[string]*request{},
@@ -140,6 +141,16 @@ func loadState(dir string) (state, error) {
 	if err := json.Unmarshal(b, &st); err != nil {
 		return st, fmt.Errorf("decode owner state: %w", err)
 	}
+	if st.Devices == nil {
+		st.Devices = map[string]*pairedDevice{}
+	}
+	// Each device of before is a device of one key.
+	for id, token := range st.OldDevices {
+		d := newPaired(token, id)
+		d.Name = st.OldKeyNames[id]
+		st.Devices[id] = d
+	}
+	st.OldDevices, st.OldKeyNames = nil, nil
 	return st, nil
 }
 

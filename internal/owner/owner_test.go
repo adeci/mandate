@@ -445,73 +445,118 @@ func hasGrant(l live, id string) bool {
 	return slices.ContainsFunc(l.Grants, func(e record.Envelope) bool { return bytes.Contains(e.Record, []byte(`"id":"`+id+`"`)) })
 }
 
-func TestKeyRotation(t *testing.T) {
-	h := start(t, nowhere())
-	old := h.pair()
-	agent := h.agent(old)
-	grant := h.grant(old, agent)
-	type keys struct {
-		Trusted []record.Key
-		Retired []string
-		Names   map[string]string
-	}
-
-	// The device's current key adds its new key; the token moves with it.
-	fresh := newDevice(t, "Pixel 9")
-	add := h.challenge(old, "/owner/v1/keys/add/challenge", map[string]any{"key": fresh.key})
-	if st, _ := h.sign(device{fresh.priv, old.token, fresh.key}, add); st != http.StatusForbidden {
-		t.Errorf("add signed by the new key itself = %d", st)
-	}
-	if st, id := h.sign(old, add); st != http.StatusOK || id != fresh.key.ID {
-		t.Fatalf("add = %d %s", st, id)
-	}
-	rotated := device{fresh.priv, old.token, fresh.key}
-
-	// The new key retires the old one; the old one can't retire itself.
-	retire := h.challenge(rotated, "/owner/v1/keys/"+old.key.ID+"/retire/challenge", nil)
-	if st, _ := h.sign(old, retire); st != http.StatusForbidden {
-		t.Errorf("a key retiring itself = %d", st)
-	}
-	retire = h.challenge(rotated, "/owner/v1/keys/"+old.key.ID+"/retire/challenge", nil)
-	if st, _ := h.sign(rotated, retire); st != http.StatusOK {
-		t.Fatalf("retire = %d", st)
-	}
-	var k keys
-	h.do("GET", "/owner/v1/keys", rotated.token, nil, &k)
-	if len(k.Trusted) != 2 || !slices.Equal(k.Retired, []string{old.key.ID}) {
-		t.Errorf("keys = %+v", k)
-	}
-
-	// What the old key signed stays; it signs nothing new.
-	h.waitLive("with the old key's grant", func(l live) bool { return hasGrant(l, grant) && len(l.Identities) == 1 })
-	env := h.challenge(rotated, "/owner/v1/grants/challenge", map[string]any{"identity": agent, "connector": "test", "for": 600, "horizon": 0})
-	if st, _ := h.sign(device{old.priv, rotated.token, old.key}, env); st != http.StatusForbidden {
-		t.Errorf("a grant signed by the retired key = %d", st)
-	}
-	if st, _ := h.sign(rotated, env); st != http.StatusOK {
-		t.Errorf("a grant signed by the new key = %d", st)
-	}
-	if st := h.do("POST", "/owner/v1/keys/"+fresh.key.ID+"/remove/challenge", rotated.token, nil, nil); st != http.StatusConflict {
-		t.Errorf("removing the last key that signs = %d", st)
+// keysView is GET /owner/v1/keys.
+type keysView struct {
+	Trusted []record.Key
+	Retired []string
+	Devices []struct {
+		ID, Name string
+		Current  bool
+		Keys     []struct{ ID, Method string }
 	}
 }
 
-func TestRenameDevice(t *testing.T) {
+func (h *harness) keys(d device) keysView {
+	h.t.Helper()
+	var k keysView
+	if st := h.do("GET", "/owner/v1/keys", d.token, nil, &k); st != http.StatusOK {
+		h.t.Fatalf("keys = %d", st)
+	}
+	return k
+}
+
+func TestDeviceMethods(t *testing.T) {
+	h := start(t, nowhere())
+	phone := h.pair()
+	agent := h.agent(phone)
+	grant := h.grant(phone, agent)
+
+	// The device adds a second way to approve; its token works with both.
+	fresh := newDevice(t, "Pixel 9")
+	if st := h.do("POST", "/owner/v1/keys/add/challenge", phone.token, map[string]any{"key": fresh.key, "method": "face"}, nil); st != http.StatusBadRequest {
+		t.Errorf("an unknown method = %d", st)
+	}
+	add := h.challenge(phone, "/owner/v1/keys/add/challenge", map[string]any{"key": fresh.key, "method": "security key"})
+	if st, _ := h.sign(device{fresh.priv, phone.token, fresh.key}, add); st != http.StatusForbidden {
+		t.Errorf("add signed by the new key itself = %d", st)
+	}
+	if st, id := h.sign(phone, add); st != http.StatusOK || id != fresh.key.ID {
+		t.Fatalf("add = %d %s", st, id)
+	}
+	second := device{fresh.priv, phone.token, fresh.key}
+	k := h.keys(second)
+	if len(k.Devices) != 1 || k.Devices[0].ID != phone.key.ID || !k.Devices[0].Current || len(k.Devices[0].Keys) != 2 ||
+		k.Devices[0].Keys[1].ID != fresh.key.ID || k.Devices[0].Keys[1].Method != "security key" {
+		t.Fatalf("keys = %+v", k)
+	}
+	// Either key signs for the device.
+	env := h.challenge(second, "/owner/v1/grants/challenge", map[string]any{"identity": agent, "connector": "test", "for": 600, "horizon": 0})
+	if st, _ := h.sign(second, env); st != http.StatusOK {
+		t.Errorf("a grant signed by the second key = %d", st)
+	}
+
+	// Removing a way retires its key, signed by another of the device's;
+	// the last one stays.
+	retire := h.challenge(second, "/owner/v1/keys/"+phone.key.ID+"/retire/challenge", nil)
+	if st, _ := h.sign(phone, retire); st != http.StatusForbidden {
+		t.Errorf("a key retiring itself = %d", st)
+	}
+	retire = h.challenge(second, "/owner/v1/keys/"+phone.key.ID+"/retire/challenge", nil)
+	if st, _ := h.sign(second, retire); st != http.StatusOK {
+		t.Fatalf("retire = %d", st)
+	}
+	k = h.keys(second)
+	if len(k.Trusted) != 2 || !slices.Equal(k.Retired, []string{phone.key.ID}) || len(k.Devices) != 1 ||
+		k.Devices[0].ID != phone.key.ID || len(k.Devices[0].Keys) != 1 || k.Devices[0].Keys[0].ID != fresh.key.ID {
+		t.Errorf("keys after the retire = %+v", k)
+	}
+	if st := h.do("POST", "/owner/v1/keys/"+fresh.key.ID+"/retire/challenge", second.token, nil, nil); st != http.StatusConflict {
+		t.Errorf("retiring a device's last key = %d", st)
+	}
+
+	// What the retired key signed stays; it signs nothing new.
+	h.waitLive("with the retired key's grant", func(l live) bool { return hasGrant(l, grant) && len(l.Identities) == 1 })
+	env = h.challenge(second, "/owner/v1/grants/challenge", map[string]any{"identity": agent, "connector": "test", "for": 600, "horizon": 0})
+	if st, _ := h.sign(phone, env); st != http.StatusForbidden {
+		t.Errorf("a grant signed by the retired key = %d", st)
+	}
+	var page activityPage
+	h.do("GET", "/owner/v1/activity?kinds=key", second.token, nil, &page)
+	if len(page.Entries) != 2 || page.Entries[0].Detail != "Pixel 9 removed a key" || page.Entries[1].Detail != "Pixel 9 added security key" {
+		t.Errorf("activity = %+v", page.Entries)
+	}
+}
+
+func TestDeviceNameAndMethod(t *testing.T) {
 	h := start(t, nil)
 	d := h.pair()
-	if st := h.do("PATCH", "/owner/v1/keys/"+d.key.ID, d.token, map[string]string{"name": " Fold "}, nil); st != http.StatusOK {
-		t.Fatalf("rename = %d", st)
+	if st := h.do("PATCH", "/owner/v1/keys/"+d.key.ID, d.token, map[string]string{"name": " Fold ", "method": "fingerprint"}, nil); st != http.StatusOK {
+		t.Fatalf("patch = %d", st)
 	}
-	var k struct {
-		Trusted []record.Key
-		Names   map[string]string
-	}
-	h.do("GET", "/owner/v1/keys", d.token, nil, &k)
-	if k.Names[d.key.ID] != "Fold" || k.Trusted[0].Name != "Pixel 9" {
+	if k := h.keys(d); k.Devices[0].Name != "Fold" || k.Devices[0].Keys[0].Method != "fingerprint" || k.Trusted[0].Name != "Pixel 9" {
 		t.Errorf("keys = %+v", k)
 	}
 	if st := h.do("PATCH", "/owner/v1/keys/nope", d.token, map[string]string{"name": "x"}, nil); st != http.StatusNotFound {
 		t.Errorf("renaming an unknown key = %d", st)
+	}
+	if st := h.do("PATCH", "/owner/v1/keys/"+d.key.ID, d.token, map[string]string{"method": "face"}, nil); st != http.StatusBadRequest {
+		t.Errorf("an unknown method = %d", st)
+	}
+}
+
+func TestDevicesMigrated(t *testing.T) {
+	dir := t.TempDir()
+	old := `{"keys":[],"devices":{"k1":"t1","k2":"t2"},"key_names":{"k2":"Fold"}}`
+	if err := os.WriteFile(stateFile(dir), []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := loadState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Devices) != 2 || st.Devices["k1"].TokenSHA256 != "t1" || !slices.Equal(st.Devices["k1"].Keys, []string{"k1"}) ||
+		st.Devices["k2"].Name != "Fold" || st.OldDevices != nil || st.OldKeyNames != nil {
+		t.Errorf("migrated = %+v", st.Devices)
 	}
 }
 
@@ -747,6 +792,49 @@ func TestActivityFilters(t *testing.T) {
 	}
 	if st := h.do("GET", "/owner/v1/activity?before=yesterday", owner.token, nil, nil); st != http.StatusBadRequest {
 		t.Errorf("bad before = %d", st)
+	}
+}
+
+func TestActivityDays(t *testing.T) {
+	h := start(t, nil)
+	owner := h.pair()
+	var reads []map[string]any
+	// UTC times; Berlin is UTC+1 in January.
+	for i, at := range []string{"2026-01-01T22:30:00Z", "2026-01-01T23:30:00Z", "2026-01-02T10:00:00Z", "2026-01-31T23:10:00Z", "2026-02-01T23:10:00Z"} {
+		t0, _ := time.Parse(time.RFC3339, at)
+		reads = append(reads, map[string]any{"at": t0, "identity": "x", "connector": "test", "verb": fmt.Sprint("v", i), "chats": []chat{}, "count": 1})
+	}
+	if st := h.do("POST", "/internal/activity", "", reads, nil); st != http.StatusOK {
+		t.Fatalf("post activity = %d", st)
+	}
+	type days struct {
+		Days []struct {
+			Day   string
+			Count int
+		}
+	}
+	got := func(query string) string {
+		t.Helper()
+		var d days
+		if st := h.do("GET", "/owner/v1/activity/days?"+query, owner.token, nil, &d); st != http.StatusOK {
+			t.Fatalf("days?%s = %d", query, st)
+		}
+		return fmt.Sprint(d.Days)
+	}
+	for query, want := range map[string]string{
+		"from=2026-01-01&to=2026-01-31&tz=Europe/Berlin":           "[{2026-01-01 1} {2026-01-02 2}]",
+		"from=2026-01-01&to=2026-01-31&tz=UTC":                     "[{2026-01-01 2} {2026-01-02 1} {2026-01-31 1}]",
+		"from=2026-01-01&to=2026-02-28&tz=Europe/Berlin&q=v4":      "[{2026-02-02 1}]",
+		"from=2026-01-01&to=2026-12-31&tz=Europe/Berlin&kinds=key": "[]",
+	} {
+		if g := got(query); g != want {
+			t.Errorf("days?%s = %s, want %s", query, g, want)
+		}
+	}
+	for _, query := range []string{"from=2026-01-02&to=2026-01-01", "from=2026-01-01&to=2027-01-02", "from=2026-1-1&to=2026-01-02"} {
+		if st := h.do("GET", "/owner/v1/activity/days?"+query, owner.token, nil, nil); st != http.StatusBadRequest {
+			t.Errorf("days?%s = %d", query, st)
+		}
 	}
 }
 

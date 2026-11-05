@@ -386,8 +386,8 @@ func (s *Server) joinChallenge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	k := *j.payload.Key
-	s.keyChallenge(w, "add", k, "", holds, func(env record.Envelope) error {
-		s.st.Devices[k.ID] = token
+	s.keyChallenge(w, "add", k, nil, holds, func(env record.Envelope) error {
+		s.st.Devices[k.ID] = newPaired(token, k.ID)
 		j.approved = true
 		s.joinEvent(j)
 		if err := s.commit("keys"); err != nil {
@@ -400,8 +400,8 @@ func (s *Server) joinChallenge(w http.ResponseWriter, r *http.Request) {
 
 // The caller holds s.mu.
 func (s *Server) tokenTaken(sum string) bool {
-	for _, t := range s.st.Devices {
-		if t == sum {
+	for _, d := range s.st.Devices {
+		if d.TokenSHA256 == sum {
 			return true
 		}
 	}

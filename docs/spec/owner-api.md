@@ -62,7 +62,7 @@ It keeps never-share, activity and every connector's spent approvals, so nothing
 
 - The app makes 32 random bytes, in lowercase hex as an agent's token is, and keeps them in the platform keystore. Only the `token_sha256` of that text reaches the server ([agent-api.md, Derivations](agent-api.md#derivations)).
 - It is the bearer token (`Authorization: Bearer …`) for every call below. Signing still needs the device key.
-- Removing the device's key revokes its token.
+- A device approves with one key per method (fingerprint, screen lock, security key, token). Its token works with every key it has, and ends with its last key removed.
 
 ## Signing
 
@@ -94,6 +94,7 @@ Chat names that start with `~` were chosen by other people. The app shows chat I
 |---|---|
 | `GET /owner/v1/now` | What waits (access requests and proposals), open grants, routines and stopped routines. |
 | `GET /owner/v1/activity` | `?q=&kinds=&before=&limit=` (at most 500, default 100): the history, newest first, as `{entries, next}`; `next` is absent on the last page. `before` is a `next`, or an RFC 3339 time to start strictly before. `q` keeps the entries that mention it, in any case, in their identity (ID or name), connector, chats, terms, `detail`, `reason`, `note`, `device` or `address`. `kinds` is a comma list of kinds, kind prefixes (`request` for `request.*`) and groups: `reads` (`read`), `sends` (`proposal`), `requests` (`request`, `grant`, `routine`, `stop_all`), `access` (`agent`, `device`, `key`). |
+| `GET /owner/v1/activity/days` | `?from=YYYY-MM-DD&to=YYYY-MM-DD&tz=<IANA zone>&kinds=&q=`, at most 366 days: `{"days": [{"day", "count"}]}`, the days in `tz` (the server's if unset or unknown) with entries that `kinds` and `q` keep, ascending. |
 | `POST /owner/v1/requests/{id}/challenge` | `{chats?, for?, horizon?, zone?}`: a grant answering the request. `chats`: any chats of the connector, chosen by the owner; the matched ones are a suggestion, and an extend keeps its chats. `for` and `horizon`: any the owner chooses, wider or narrower than asked; a routine's window is its schedule. `zone` is the device's IANA zone, for a routine. |
 | `POST /owner/v1/requests/{id}/deny` | |
 | `GET /owner/v1/proposals/{id}` | The display fields, which of them can be edited, and the agent's note. |
@@ -120,10 +121,10 @@ Chat names that start with `~` were chosen by other people. The app shows chat I
 | `GET /owner/v1/never-share` | `[{connector, kind, id, name}]`, `kind` being `chat` or `person` |
 | `PUT /owner/v1/never-share/{connector}/{kind}/{id}` | `{name?}`. Hides the chat, or the person's messages and DMs, from every read and chat list, whatever the grants say. |
 | `DELETE /owner/v1/never-share/{connector}/{kind}/{id}` | |
-| `GET /owner/v1/keys` | The key log as envelopes, the trusted keys, which of them are retired, and each one's display name. |
-| `PATCH /owner/v1/keys/{id}` | `{name}`: the device's display name, which signs nothing. |
-| `POST /owner/v1/keys/add/challenge` | `{key}`: the `add` entry for a new key of the calling device, to be signed by its current key. Once signed, the device token belongs to the new key. |
-| `POST /owner/v1/keys/{id}/retire/challenge` | The `retire` entry, signed by another key; in a rotation, the device's new key. What the retired key signed stays valid. |
+| `GET /owner/v1/keys` | The key log as envelopes, the trusted keys, which of them are retired, and the devices with their keys that are not. |
+| `PATCH /owner/v1/keys/{id}` | `{name?, method?}`: the display name of the key's device, and the key's method (`fingerprint`, `screen lock`, `security key` or `token`); neither signs anything. |
+| `POST /owner/v1/keys/add/challenge` | `{key, method}`: the `add` entry for another key of the calling device, to be signed by one of its keys that is not retired. |
+| `POST /owner/v1/keys/{id}/retire/challenge` | The `retire` entry, signed by another key. What the retired key signed stays valid; it leaves its device, which must keep a key (`409` otherwise: remove the device instead). |
 | `POST /owner/v1/keys/{id}/remove/challenge` | The `remove` entry, for a key that may be compromised: what it signed ends too. |
 
 Calls that return nothing above answer `{}`.
@@ -181,7 +182,7 @@ An entry has `at` and `kind`, and `identity`, `connector`, `chats`, `count` and 
 - `request.asked`, `request.approved` (`detail`: window and history), `request.denied`, `request.expired`.
 - `proposal.made` (`detail`: the op), `proposal.approved`, then its outcome `proposal.done`, `proposal.failed` or `proposal.unknown` (`detail`: the signed display's text); `proposal.denied`, `proposal.expired`.
 - `grant.made` (by the owner), `grant.extended`, `grant.closed`, `routine.paused`, `routine.resumed`.
-- `agent.admitted`, `agent.denied`, `agent.deleted` (`detail`: its name); `device.paired` (the first device), `device.joined`, `device.denied`, `key.added`, `key.retired`, `key.removed` (`detail`: the device's name).
+- `agent.admitted`, `agent.denied`, `agent.deleted` (`detail`: its name); `device.paired` (the first device), `device.joined`, `device.denied`, `key.removed` (`detail`: the device's name); `key.added`, `key.retired` (`detail`: "Pixel 9 added security key", "Pixel 9 removed fingerprint").
 - `stop_all`: `count` is the grants closed.
 - `never_share.added`, `never_share.removed` (`detail`: `chat` or `person` and its name); `connector.unlinked`.
 
@@ -201,8 +202,9 @@ An entry has `at` and `kind`, and `identity`, `connector`, `chats`, `count` and 
 `GET /owner/v1/keys`:
 
 ```json
-{"log": [<key envelope>, …], "trusted": [{"id": "b903…", "name": "Pixel 9", "public_key": "BN4C…", "type": "p256"}],
- "retired": [], "names": {"b903…": "Pixel 9"}}
+{"log": [<key envelope>, …], "trusted": [{"id": "b903…", "name": "Pixel 9", "public_key": "BN4C…", "type": "p256"}, …],
+ "retired": [], "devices": [{"id": "b903…", "name": "Pixel 9", "current": true,
+                             "keys": [{"id": "b903…", "method": "fingerprint"}, {"id": "77c1…", "method": "security key"}]}]}
 ```
 
 An exchange's `payload` is `{"token_sha256": "…"}` for an agent, with `key` added for a device. `GET /owner/v1/connectors/{name}/chats` answers as `GET /containers` in `connector.md`.

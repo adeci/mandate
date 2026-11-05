@@ -2,12 +2,12 @@ package owner
 
 import (
 	"bufio"
-	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -93,8 +93,8 @@ func (s *Server) note(a activity, by string) {
 	if a.At.IsZero() {
 		a.At = s.now()
 	}
-	if k := s.trusted(by); k != nil {
-		a.Device = cmp.Or(s.st.KeyNames[by], k.Name)
+	if _, d := s.st.deviceOf(by); d != nil {
+		a.Device = s.deviceName(d)
 	}
 	if err := appendActivity(s.dir, []activity{a}); err != nil {
 		s.log.Error("note activity", "kind", a.Kind, "err", err)
@@ -174,20 +174,7 @@ func (s *Server) getActivity(w http.ResponseWriter, r *http.Request) {
 		}
 		before = &c
 	}
-	kinds := kindFilter(q.Get("kinds"))
-	text := strings.ToLower(strings.TrimSpace(q.Get("q")))
-	names := map[string]string{}
-	if text != "" {
-		s.mu.Lock()
-		for id, i := range s.st.Identities {
-			names[id] = i.Name
-		}
-		s.mu.Unlock()
-	}
-	match := func(a activity) bool {
-		return kinds(a.Kind) && (text == "" || a.matches(text, names[a.Identity]))
-	}
-	entries, next, err := readActivity(s.dir, before, limit, match)
+	entries, next, err := readActivity(s.dir, before, limit, s.activityFilter(q))
 	if err != nil {
 		s.log.Error("read activity", "err", err)
 		failErr(w, err)
@@ -203,6 +190,70 @@ func (s *Server) getActivity(w http.ResponseWriter, r *http.Request) {
 type placed struct {
 	activity
 	at cursor
+}
+
+// activityFilter matches the entries q's kinds and q keep.
+func (s *Server) activityFilter(q url.Values) func(activity) bool {
+	kinds := kindFilter(q.Get("kinds"))
+	text := strings.ToLower(strings.TrimSpace(q.Get("q")))
+	names := map[string]string{}
+	if text != "" {
+		s.mu.Lock()
+		for id, i := range s.st.Identities {
+			names[id] = i.Name
+		}
+		s.mu.Unlock()
+	}
+	return func(a activity) bool {
+		return kinds(a.Kind) && (text == "" || a.matches(text, names[a.Identity]))
+	}
+}
+
+// getActivityDays counts the entries kinds and q keep on each day from
+// from to to, inclusive, as days in the zone tz (the server's if unset or
+// unknown), for a calendar.
+func (s *Server) getActivityDays(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	loc, err := time.LoadLocation(q.Get("tz"))
+	if q.Get("tz") == "" || err != nil {
+		loc = time.Local
+	}
+	from, err1 := time.ParseInLocation(time.DateOnly, q.Get("from"), loc)
+	to, err2 := time.ParseInLocation(time.DateOnly, q.Get("to"), loc)
+	end := to.AddDate(0, 0, 1)
+	if err1 != nil || err2 != nil || !end.After(from) || end.After(from.AddDate(0, 0, 366)) {
+		fail(w, http.StatusBadRequest, "from and to are dates YYYY-MM-DD, at most 366 days apart")
+		return
+	}
+	match := s.activityFilter(q)
+	counts := map[string]int{}
+	// The files are by UTC day.
+	for day := from.UTC().Truncate(24 * time.Hour); day.Before(end); day = day.AddDate(0, 0, 1) {
+		es, err := readDay(activityFile(s.dir, day))
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			s.log.Error("read activity", "err", err)
+			failErr(w, err)
+			return
+		}
+		for _, e := range es {
+			if !e.At.Before(from) && e.At.Before(end) && match(e.activity) {
+				counts[e.At.In(loc).Format(time.DateOnly)]++
+			}
+		}
+	}
+	type dayCount struct {
+		Day   string `json:"day"`
+		Count int    `json:"count"`
+	}
+	days := []dayCount{}
+	for d, n := range counts {
+		days = append(days, dayCount{d, n})
+	}
+	slices.SortFunc(days, func(a, b dayCount) int { return strings.Compare(a.Day, b.Day) })
+	reply(w, http.StatusOK, map[string][]dayCount{"days": days})
 }
 
 // kindGroups are the kinds Activity's filters name.

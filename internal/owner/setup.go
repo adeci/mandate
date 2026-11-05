@@ -322,7 +322,7 @@ func (s *Server) pair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := s.keys.Trusted()[0]
-	s.st.Devices[key.ID] = body.TokenSHA256
+	s.st.Devices[key.ID] = newPaired(body.TokenSHA256, key.ID)
 	if err := s.commit("keys"); err != nil {
 		s.keys, s.st.Keys = new(record.Log), nil
 		delete(s.st.Devices, key.ID)

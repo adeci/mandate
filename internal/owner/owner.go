@@ -194,6 +194,7 @@ func (s *Server) handler(front, gateway uint32) http.Handler {
 	authed("GET /owner/v1/server", s.serverInfo)
 	authed("GET /owner/v1/now", s.getNow)
 	authed("GET /owner/v1/activity", s.getActivity)
+	authed("GET /owner/v1/activity/days", s.getActivityDays)
 	authed("GET /owner/v1/stream", s.stream)
 	authed("POST /owner/v1/signed", s.signed)
 	authed("POST /owner/v1/requests/{id}/challenge", s.requestChallenge)
@@ -222,7 +223,7 @@ func (s *Server) handler(front, gateway uint32) http.Handler {
 	authed("PUT /owner/v1/never-share/{connector}/{kind}/{id}", s.editNeverShare)
 	authed("DELETE /owner/v1/never-share/{connector}/{kind}/{id}", s.editNeverShare)
 	authed("GET /owner/v1/keys", s.getKeys)
-	authed("PATCH /owner/v1/keys/{id}", s.renameKey)
+	authed("PATCH /owner/v1/keys/{id}", s.patchKey)
 	authed("POST /owner/v1/keys/add/challenge", s.addKeyChallenge)
 	authed("POST /owner/v1/keys/{id}/retire/challenge", s.retireKeyChallenge)
 	authed("POST /owner/v1/keys/{id}/remove/challenge", s.removeKeyChallenge)
@@ -252,13 +253,8 @@ func (s *Server) device(h http.HandlerFunc) http.HandlerFunc {
 		if ok {
 			sum := tokenSHA256(string(token))
 			s.mu.Lock()
-			ok = false
-			for _, k := range s.keys.Trusted() {
-				if s.st.Devices[k.ID] == sum {
-					ok = true
-					break
-				}
-			}
+			_, d := s.deviceByToken(sum)
+			ok = d != nil
 			s.mu.Unlock()
 		}
 		if !ok {

@@ -98,7 +98,7 @@ Removing a key invalidates the identities and grants it signed; retiring it does
 
 - **Seq 0** adds the first device's key and is signed by that key. Every later entry is signed by a key trusted after the entry before it.
 - **`add`** names a key not yet trusted.
-- **`retire`** names a trusted key exactly as it was added, not yet retired, and is signed by another key. A retired key signs no key entries or writes, but the identities and grants it signed stay valid. A device rotates its key by adding the new key with the old, then retiring the old with the new.
+- **`retire`** names a trusted key exactly as it was added, not yet retired, and is signed by another key. A retired key signs no key entries or writes, but the identities and grants it signed stay valid. A device that approves in several ways holds a key for each; it adds a new one with a key it already has, and retires one with another.
 - **`remove`** names a trusted key exactly as it was added, for a key that may be compromised.
 - Neither `retire` nor `remove` may leave no key that is not retired.
 - **Name:** a device's display name is unsigned metadata, like an identity's; the key's `name` is its default.

@@ -345,12 +345,14 @@ in
 
     # Before the write, so that the approval kept across mandate reset is
     # signed by the key the phone pairs with again.
-    with subtest("the phone rotates its key: what the old key signed stays valid"):
+    with subtest("the phone swaps how it approves: one device, what the old key signed stays valid"):
         before = connector_keys()
         out = device("rotate", "phone")
         keys = call("GET", "/owner/v1/keys")["body"]
         assert keys["retired"] == [out["old"]] and len(keys["trusted"]) == 3, (out, keys)
-        assert out["new"] in [k["id"] for k in keys["trusted"]], (out, keys)
+        [phone] = [d for d in keys["devices"] if d.get("current")]
+        assert phone["id"] == out["old"] and phone["keys"] == [{"id": out["new"], "method": "screen lock"}], keys
+        assert len(keys["devices"]) == 2, keys
         # The connectors take the log with the retire entry.
         retry(lambda _: connector_keys() == before + 2)
         laptop.succeed("mandate test chats")

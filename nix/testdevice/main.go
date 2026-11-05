@@ -16,7 +16,8 @@
 // --fido2 makes the new device's key a fido2 one, signed in software with
 // the flags a security key sets (UP and UV).
 // rotate swaps the device's key as the app's "How you approve" does: the
-// current key adds a new one, which then retires it.
+// current key adds a new one (screen lock) to the device, which then
+// retires it.
 package main
 
 import (
@@ -443,7 +444,7 @@ func (d *device) rotate(ctx context.Context, state, name string) error {
 		return err
 	}
 	var env record.Envelope
-	if err := d.callJSON(ctx, http.MethodPost, "/owner/v1/keys/add/challenge", map[string]any{"key": newKey}, &env); err != nil {
+	if err := d.callJSON(ctx, http.MethodPost, "/owner/v1/keys/add/challenge", map[string]any{"key": newKey, "method": "screen lock"}, &env); err != nil {
 		return err
 	}
 	if err := d.signed(ctx, env, oldPriv); err != nil {
