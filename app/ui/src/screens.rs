@@ -34,10 +34,10 @@ impl Render for Shell {
             window.focus(&self.focus, cx);
         }
         #[cfg(target_os = "android")]
-        let ((top, bottom), typing, pin) =
-            (crate::android::insets(), crate::android::keyboard_up(), None::<Div>);
+        let ((top, bottom), typing) = (crate::android::insets(), crate::android::keyboard_up());
         #[cfg(not(target_os = "android"))]
-        let ((top, bottom), typing, pin) = ((0., 0.), false, self.pin_prompt(t, cx));
+        let ((top, bottom), typing) = ((0., 0.), false);
+        let pin = self.pin_prompt(t, cx);
         let root = div()
             .size_full()
             .flex()
@@ -161,7 +161,7 @@ impl Render for Shell {
             Screen::Hide { .. } => "Never share",
             Screen::Grant(_) => "New grant",
             #[cfg(target_os = "android")]
-            Screen::Method(_) => "How you approve",
+            Screen::Method { .. } => "How you approve",
             Screen::Entry(_) => "Activity",
         };
         let screen = match &self.screen {
@@ -182,7 +182,7 @@ impl Render for Shell {
             Screen::Hide { .. } => self.hide_screen(t, cx),
             Screen::Grant(_) => self.grant_screen(t, cx),
             #[cfg(target_os = "android")]
-            Screen::Method(next) => self.method_screen(t, next, cx),
+            Screen::Method { next, pin } => self.method_screen(t, next, pin.as_deref(), cx),
             Screen::Settings => self.settings(t, cx),
             Screen::Entry(a) => self.entry_screen(t, a),
             Screen::Admit { exchange, envelope } => admit(t, exchange, envelope, cx),
@@ -559,6 +559,18 @@ impl Shell {
             cx.notify();
             return true;
         }
+        if self.unlock.take().is_some() {
+            crate::keyboard(false);
+            cx.notify();
+            return true;
+        }
+        #[cfg(target_os = "android")]
+        if let Screen::Method { pin: pin @ Some(_), .. } = &mut self.screen {
+            *pin = None;
+            crate::keyboard(false);
+            cx.notify();
+            return true;
+        }
         self.pop(cx)
     }
 
@@ -630,18 +642,49 @@ impl Shell {
         )
     }
 
+    /// The device key's PIN, asked before it signs or proves the owner is
+    /// here.
+    pub(crate) fn pin_prompt(&self, t: Theme, cx: &mut Context<Self>) -> Option<Div> {
+        let unlock = self.unlock.as_ref()?;
+        let fido = self.device.as_ref().is_some_and(|d| d.key.touch());
+        let what = if fido { "your security key's PIN" } else { "your token's PIN" };
+        let (to, act) = if unlock.gate { ("confirm", "Confirm") } else { ("sign", "Sign") };
+        Some(
+            panel(t)
+                .child(bold(format!("Type {what} to {to}.")))
+                .child(pin_field(t, "unlock-pin", &unlock.pin, cx))
+                .child(
+                    div()
+                        .flex()
+                        .gap(chars(1.))
+                        .child(button(t, "unlock", act, cx, |this, cx| this.submit_pin(cx)))
+                        .child(button(t, "cancel-unlock", "Cancel", cx, |this, cx| {
+                            this.unlock = None;
+                            crate::keyboard(false);
+                            cx.notify();
+                        })),
+                ),
+        )
+    }
+
     /// How this device approves: fingerprint or face (the screen lock as
-    /// backup), or the screen lock alone. When changing, the current way
-    /// is marked.
+    /// backup), the screen lock alone, or a security key, whichever the
+    /// phone has. When changing, the current way is marked.
     #[cfg(target_os = "android")]
-    fn method_screen(&self, t: Theme, next: &crate::Next, cx: &mut Context<Self>) -> Div {
+    fn method_screen(
+        &self,
+        t: Theme,
+        next: &crate::Next,
+        pin: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Div {
         use crate::android::Method;
         let current = matches!(next, crate::Next::Rotate)
             .then(|| self.device.as_ref().map(|d| d.key.method()))
             .flatten();
         let choice = |id: &'static str, method: Method, label: &str, cx: &mut Context<Self>| {
             let next = next.clone();
-            let on = current == Some(method);
+            let on = current == Some(method) || (method == Method::SecurityKey && pin.is_some());
             clickable(id, cx, move |this, cx| {
                 if !on {
                     this.make_key(next.clone(), method, cx)
@@ -658,11 +701,25 @@ impl Shell {
             .child(crate::now::checkbox(t, on))
             .child(label.to_string())
         };
+        let biometric = crate::android::biometrics_enrolled()
+            .then(|| choice("biometric", Method::Biometric, "Fingerprint or face", cx));
+        let screen_lock = crate::android::screen_lock_set()
+            .then(|| choice("screen-lock", Method::ScreenLock, "Screen lock", cx));
+        let security_key = choice("security-key", Method::SecurityKey, "Security key", cx);
+        let key_pin = pin.map(|pin| {
+            column()
+                .gap(lines(0.5))
+                .child(t.alt("SECURITY KEY PIN"))
+                .child(pin_field(t, "fido-pin", pin, cx))
+                .child(button(t, "make-fido", "Continue", cx, |this, cx| this.make_fido(cx)))
+        });
         column()
             .gap(lines(1.))
             .child(bold("How do you want to approve?"))
-            .child(choice("biometric", Method::Biometric, "Fingerprint or face", cx))
-            .child(choice("screen-lock", Method::ScreenLock, "Screen lock", cx))
+            .children(biometric)
+            .children(screen_lock)
+            .child(security_key)
+            .children(key_pin)
     }
 
     /// The page's name, a way back off the tabs, and search and settings on
@@ -828,6 +885,11 @@ pub(crate) fn field(
             })
             .flex_none(),
         )
+}
+
+/// A PIN's field: dots for what was typed.
+fn pin_field(t: Theme, id: &'static str, pin: &str, cx: &mut Context<Shell>) -> Div {
+    field(t, id, &"•".repeat(pin.chars().count()), "PIN", true, |_| {}, cx)
 }
 
 /// The Pair screen: a way to bring in the setup page's link, then, once the

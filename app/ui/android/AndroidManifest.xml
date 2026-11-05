@@ -9,6 +9,9 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <uses-permission android:name="android.permission.NFC" />
+    <uses-feature android:name="android.hardware.nfc" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <application android:label="mandate" android:icon="@mipmap/icon" android:theme="@style/Main">
         <!-- singleTask: a second instance would be a second android_main in this process.
              stateNotNeeded: android_main leaves the process when the activity ends, also

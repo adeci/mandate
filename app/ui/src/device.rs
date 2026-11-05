@@ -24,10 +24,10 @@ pub fn name() -> String {
     }
 }
 
-/// The device key: in the Android Keystore, or on desktop on the FIDO2
-/// authenticator or PKCS#11 token the owner chose.
+/// The device key: on Android in the Keystore or on a FIDO2 security key, on
+/// desktop on the FIDO2 authenticator or PKCS#11 token the owner chose.
 #[cfg(target_os = "android")]
-pub type Key = crate::android::Keystore;
+pub type Key = crate::android::Key;
 #[cfg(not(target_os = "android"))]
 pub type Key = crate::desktop::Key;
 
@@ -113,13 +113,34 @@ fn write(dir: &Path, saved: &Value) -> Result<(), Error> {
 /// The key and the token from the file: the token sealed by the Keystore.
 #[cfg(target_os = "android")]
 fn secrets(v: &Value) -> Option<(Key, String)> {
-    let alias = v["alias"].as_str().unwrap_or(crate::android::FIRST_ALIAS);
-    Some((Key::load(alias)?, crate::android::unseal(&unhex(v["sealed"].as_str()?)?)?))
+    let key = match v.get("fido2") {
+        Some(f) => {
+            let point = unhex(f["public_key"].as_str()?)?.try_into().ok()?;
+            let id = unhex(f["credential_id"].as_str()?)?;
+            Key::Fido(crate::fido::android::Fido::new(point, id))
+        }
+        None => {
+            let alias = v["alias"].as_str().unwrap_or(crate::android::FIRST_ALIAS);
+            Key::Keystore(crate::android::Keystore::load(alias)?)
+        }
+    };
+    Some((key, crate::android::unseal(&unhex(v["sealed"].as_str()?)?)?))
 }
 
 #[cfg(target_os = "android")]
 fn save_secrets(saved: &mut Value, key: &Key, token: &str) -> Result<(), Error> {
-    saved["alias"] = key.alias().into();
+    let obj = saved.as_object_mut().expect("device.json is an object");
+    obj.remove("alias");
+    obj.remove("fido2");
+    match key {
+        Key::Keystore(k) => saved["alias"] = k.alias().into(),
+        Key::Fido(k) => {
+            saved["fido2"] = json!({
+                "public_key": hex(&k.public_key()),
+                "credential_id": hex(k.credential_id()),
+            })
+        }
+    }
     saved["sealed"] = hex(&crate::android::seal(token)?).into();
     Ok(())
 }

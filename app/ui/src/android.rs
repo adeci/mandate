@@ -3,6 +3,7 @@
 //! service. The Java half is in android/java.
 
 use crate::device::{Device, FILE};
+use crate::fido::android::Fido;
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use gpui::WindowOptions;
@@ -13,7 +14,7 @@ use jni::refs::Global;
 use jni::signature::MethodSignature;
 use jni::strings::JNIStr;
 use jni::{Env, EnvUnowned, JavaVM, jni_sig, jni_str};
-use mandate_core::{Client, DeviceKey, DeviceSignature, Error, Key, der_signature};
+use mandate_core::{Client, DeviceKey, DeviceSignature, Error, der_signature};
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
@@ -280,9 +281,10 @@ fn activity_call<T>(
 
 /// The Java classes native code calls. They are found while the library
 /// loads, as only then does JNI search the app's own classes.
-struct Classes {
+pub(crate) struct Classes {
     keys: Global<JClass<'static>>,
     stream: Global<JClass<'static>>,
+    pub(crate) fido: Global<JClass<'static>>,
 }
 
 static CLASSES: OnceLock<Classes> = OnceLock::new();
@@ -298,7 +300,12 @@ extern "system" fn JNI_OnLoad(vm: *mut jni::sys::JavaVM, _: *mut c_void) -> jni:
     let found = vm.attach_current_thread(|env| -> jni::errors::Result<Classes> {
         let keys = env.find_class(jni_str!("dev/mandate/app/Keys"))?;
         let stream = env.find_class(jni_str!("dev/mandate/app/Stream"))?;
-        Ok(Classes { keys: env.new_global_ref(keys)?, stream: env.new_global_ref(stream)? })
+        let fido = env.find_class(jni_str!("dev/mandate/app/Fido"))?;
+        Ok(Classes {
+            keys: env.new_global_ref(keys)?,
+            stream: env.new_global_ref(stream)?,
+            fido: env.new_global_ref(fido)?,
+        })
     });
     match found {
         Ok(classes) => _ = CLASSES.set(classes),
@@ -309,7 +316,9 @@ extern "system" fn JNI_OnLoad(vm: *mut jni::sys::JavaVM, _: *mut c_void) -> jni:
 
 /// Runs f with this thread's JNI env; a Java exception becomes an Error
 /// with its message.
-fn java<T>(f: impl FnOnce(&mut Env, &Classes) -> jni::errors::Result<T>) -> Result<T, Error> {
+pub(crate) fn java<T>(
+    f: impl FnOnce(&mut Env, &Classes) -> jni::errors::Result<T>,
+) -> Result<T, Error> {
     let classes = CLASSES.get().ok_or_else(|| Error::Key("the Java side is missing".into()))?;
     JavaVM::singleton()
         .and_then(|vm| {
@@ -343,16 +352,96 @@ fn keys(
 }
 
 /// The activity, from android-activity, for what needs one.
-fn activity<'a>(env: &Env<'a>) -> JObject<'a> {
+pub(crate) fn activity<'a>(env: &Env<'a>) -> JObject<'a> {
     unsafe { JObject::from_raw(env, gpui_jni::activity_as_ptr() as jni::sys::jobject) }
 }
 
-/// How a device key lets the owner sign: a strong biometric or the screen
-/// lock, or the screen lock alone. Fixed when the key is made.
+/// How the owner approves: a strong biometric or the screen lock, or the
+/// screen lock alone, both with a Keystore key; or a FIDO2 security key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
     Biometric = 1,
     ScreenLock = 2,
+    SecurityKey = 3,
+}
+
+/// The phone's device key: in the Keystore, or on a security key.
+pub enum Key {
+    Keystore(Keystore),
+    Fido(Fido),
+}
+
+impl Key {
+    pub fn method(&self) -> Method {
+        match self {
+            Key::Keystore(k) => k.method(),
+            Key::Fido(_) => Method::SecurityKey,
+        }
+    }
+
+    /// Whether signing needs the PIN first: a security key's, once per
+    /// signature. The Keystore asks on its own.
+    pub fn locked(&self) -> bool {
+        matches!(self, Key::Fido(k) if k.locked())
+    }
+
+    /// Keeps the security key's PIN for the next signature.
+    pub fn unlock(&self, pin: &str) -> Result<(), Error> {
+        if let Key::Fido(k) = self {
+            k.unlock(pin);
+        }
+        Ok(())
+    }
+
+    /// Whether every signature waits on a touch.
+    pub fn touch(&self) -> bool {
+        matches!(self, Key::Fido(_))
+    }
+
+    /// Whether `confirm` needs the PIN first: a security key's.
+    pub fn confirm_needs_pin(&self) -> bool {
+        self.locked()
+    }
+
+    /// Proves the owner is here, signing nothing the server sees: the
+    /// Keystore's prompt, or the security key's PIN and a touch. Blocks.
+    pub fn confirm(&self, pin: Option<&str>) -> Result<(), Error> {
+        match (self, pin) {
+            (Key::Keystore(k), _) => k.authenticate(),
+            (Key::Fido(k), Some(pin)) => k.confirm(pin),
+            (Key::Fido(k), None) => k.sign(&crate::fido::random::<32>()).map(drop),
+        }
+    }
+
+    /// Removes a Keystore key; a security key's credential stays on it.
+    pub fn delete(&self) -> Result<(), Error> {
+        match self {
+            Key::Keystore(k) => k.delete(),
+            Key::Fido(_) => Ok(()),
+        }
+    }
+}
+
+impl From<Keystore> for Key {
+    fn from(k: Keystore) -> Key {
+        Key::Keystore(k)
+    }
+}
+
+impl DeviceKey for Key {
+    fn key(&self, name: &str) -> mandate_core::Key {
+        match self {
+            Key::Keystore(k) => k.key(name),
+            Key::Fido(k) => k.key(name),
+        }
+    }
+
+    fn sign(&self, challenge: &[u8; 32]) -> Result<DeviceSignature, Error> {
+        match self {
+            Key::Keystore(k) => k.sign(challenge),
+            Key::Fido(k) => k.sign(challenge),
+        }
+    }
 }
 
 /// The device key in the Android Keystore (Keys.java): P-256, signing only
@@ -368,6 +457,9 @@ pub const FIRST_ALIAS: &str = "device";
 impl Keystore {
     /// A new device key under a fresh alias; any other stays.
     pub fn generate(method: Method) -> Result<Keystore, Error> {
+        if method == Method::SecurityKey {
+            return Err(Error::Key("A security key is not a Keystore key.".into()));
+        }
         let alias = format!("device-{}", &mandate_core::new_token()[..16]);
         let spki = java(|env, c| {
             let name = env.new_string(&alias)?;
@@ -440,8 +532,8 @@ impl Keystore {
 }
 
 impl DeviceKey for Keystore {
-    fn key(&self, name: &str) -> Key {
-        Key::p256(&self.point, name)
+    fn key(&self, name: &str) -> mandate_core::Key {
+        mandate_core::Key::p256(&self.point, name)
     }
 
     /// Blocks on the owner's answer to the prompt; a cancel signs nothing.

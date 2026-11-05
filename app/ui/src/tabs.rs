@@ -591,26 +591,24 @@ impl Shell {
         // How this device approves, and a way to change it: a new key under
         // the new way takes this one's place.
         #[cfg(target_os = "android")]
-        let (approve_rows, changeable) = {
+        let approve_rows = {
             let way = match self.device.as_ref().map(|d| d.key.method()) {
                 Some(crate::android::Method::ScreenLock) => "Screen lock",
+                Some(crate::android::Method::SecurityKey) => "Security key",
                 _ => "Fingerprint or face",
             };
-            let rows = vec![("Way".to_string(), div().child(way).into_any_element())];
-            (rows, crate::android::biometrics_enrolled())
+            vec![("Way".to_string(), div().child(way).into_any_element())]
         };
         #[cfg(not(target_os = "android"))]
-        let (approve_rows, changeable) = {
+        let approve_rows = {
             let rows = self.device.as_ref().map(|d| d.key.rows()).unwrap_or_default();
             let rows =
                 rows.into_iter().map(|(k, v)| (k.to_string(), div().child(v).into_any_element()));
-            (rows.collect::<Vec<_>>(), true)
+            rows.collect::<Vec<_>>()
         };
-        let change = changeable.then(|| {
-            div().flex().child(button(t, "change-way", "Change", cx, |this, cx| {
-                this.new_key(Next::Rotate, cx)
-            }))
-        });
+        let change = div().flex().child(button(t, "change-way", "Change", cx, |this, cx| {
+            this.new_key(Next::Rotate, cx)
+        }));
         let lock = clickable("lock", cx, |this, cx| this.set_lock(!this.lock, cx))
             .flex()
             .items_center()
@@ -629,7 +627,7 @@ impl Shell {
             .child(div().flex().child(add_device))
             .child(t.heading("How you approve"))
             .child(table(t, approve_rows))
-            .children(change)
+            .child(change)
             .child(lock)
             .child(t.heading("Never share"))
             .child(if self.hidden.is_empty() {

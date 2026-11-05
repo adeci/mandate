@@ -6,6 +6,7 @@ mod choose;
 #[cfg(not(target_os = "android"))]
 pub mod desktop;
 mod device;
+mod fido;
 mod link;
 mod now;
 mod pick;
@@ -35,6 +36,12 @@ use std::time::Duration;
 
 /// Why a join ended, and what to do next.
 const JOIN_ENDED: &str = "That code no longer works. Get a new one from Add a device.";
+
+/// What a security key waits for while it signs.
+#[cfg(target_os = "android")]
+const TOUCH: &str = "Plug in your security key or hold it to the back of the phone, then touch it.";
+#[cfg(not(target_os = "android"))]
+const TOUCH: &str = "Touch your security key.";
 
 /// A page as drawn: the screen's kind, and the tab on the tabs.
 type Page = (Discriminant<Screen>, Option<Tab>);
@@ -97,7 +104,11 @@ enum Screen {
     /// How this device approves: picked before its key is made, when it
     /// pairs, joins or changes its key.
     #[cfg(target_os = "android")]
-    Method(Next),
+    Method {
+        next: Next,
+        /// The new security key's PIN, while it is typed.
+        pin: Option<String>,
+    },
     /// One entry of Activity, in full.
     Entry(std::rc::Rc<api::Activity>),
 }
@@ -124,14 +135,12 @@ enum Confirm {
 
 /// The device key's PIN, asked before a signature or, for a gate, before
 /// the key proves the owner is here; then what follows.
-#[cfg(not(target_os = "android"))]
 struct Unlock {
     pin: String,
     then: Then,
     gate: bool,
 }
 
-#[cfg(not(target_os = "android"))]
 type Then = Box<dyn FnOnce(&mut Shell, &mut Context<Shell>)>;
 
 /// How the owner narrowed a request before approving it.
@@ -196,7 +205,6 @@ pub struct Shell {
     error: Option<String>,
     /// What the device key waits for while it signs, e.g. a touch.
     prompt: Option<&'static str>,
-    #[cfg(not(target_os = "android"))]
     unlock: Option<Unlock>,
     /// A waiting item to open once a refresh shows it, from a notification.
     pending: Option<String>,
@@ -278,7 +286,6 @@ impl Shell {
             notice: None,
             error: None,
             prompt: None,
-            #[cfg(not(target_os = "android"))]
             unlock: None,
             pending: None,
             focus: cx.focus_handle(),
@@ -537,7 +544,7 @@ impl Shell {
         for a in self.adjust.values_mut() {
             a.open = false;
         }
-        (self.sheet, self.renaming) = (None, None);
+        (self.sheet, self.renaming, self.unlock) = (None, None, None);
         keyboard(false);
         cx.notify();
     }
@@ -647,31 +654,54 @@ impl Shell {
         );
     }
 
-    /// Makes the device key for next: on Android with the way of approving
-    /// the owner picks (none to pick without biometrics), on desktop with
-    /// the authenticator or token the owner picks.
+    /// Makes the device key for next, the way the owner picks: on Android
+    /// a fingerprint, the screen lock or a security key, on desktop an
+    /// authenticator or a token.
     fn new_key(&mut self, next: Next, cx: &mut Context<Self>) {
         self.error = None;
         #[cfg(target_os = "android")]
-        if android::biometrics_enrolled() {
-            self.go(Screen::Method(next), cx);
-        } else if android::screen_lock_set() {
-            self.make_key(next, android::Method::ScreenLock, cx);
-        } else {
-            self.error = Some("Set a screen lock in Android's Settings, then try again.".into());
-        }
+        self.go(Screen::Method { next, pin: None }, cx);
         #[cfg(not(target_os = "android"))]
         self.go(Screen::Choose(choose::Choose::new(next)), cx);
     }
 
-    /// Makes a Keystore key that unlocks by method, then goes on with it.
+    /// Makes a Keystore key that unlocks by method, or asks for a security
+    /// key's PIN first, then goes on with the key.
     #[cfg(target_os = "android")]
     pub(crate) fn make_key(&mut self, next: Next, method: android::Method, cx: &mut Context<Self>) {
         self.error = None;
+        if method == android::Method::SecurityKey {
+            if let Screen::Method { pin, .. } = &mut self.screen {
+                *pin = Some(String::new());
+            }
+            keyboard(true);
+            return cx.notify();
+        }
         self.call(
             cx,
             move || android::Keystore::generate(method),
-            move |this, key, cx| this.with_key(next, key, cx),
+            move |this, key, cx| this.with_key(next, key.into(), cx),
+        );
+    }
+
+    /// Makes a credential on the security key the owner plugs in or holds
+    /// to the phone, with the PIN typed on How you approve.
+    #[cfg(target_os = "android")]
+    pub(crate) fn make_fido(&mut self, cx: &mut Context<Self>) {
+        let Screen::Method { next, pin: Some(pin) } = &self.screen else { return };
+        if pin.is_empty() || self.prompt.is_some() {
+            return;
+        }
+        let (next, pin) = (next.clone(), pin.clone());
+        keyboard(false);
+        (self.error, self.prompt) = (None, Some(TOUCH));
+        self.call(
+            cx,
+            move || crate::fido::android::Fido::create(&pin, &device::name()),
+            move |this, key, cx| {
+                this.prompt = None;
+                this.with_key(next, android::Key::Fido(key), cx)
+            },
         );
     }
 
@@ -773,7 +803,6 @@ impl Shell {
 
     /// Asks for the device key's PIN when signing needs it, then runs then;
     /// shows what the key waits for while it signs. False if it asked.
-    #[cfg(not(target_os = "android"))]
     fn ready(
         &mut self,
         then: impl FnOnce(&mut Shell, &mut Context<Shell>) + 'static,
@@ -782,29 +811,33 @@ impl Shell {
         let key = self.device().key;
         if key.locked() {
             self.unlock = Some(Unlock { pin: String::new(), then: Box::new(then), gate: false });
+            keyboard(true);
             cx.notify();
             return false;
         }
-        self.prompt = key.touch().then_some("Touch your security key.");
+        self.prompt = key.touch().then_some(TOUCH);
         true
     }
 
-    #[cfg(not(target_os = "android"))]
     fn submit_pin(&mut self, cx: &mut Context<Self>) {
         let Some(unlock) = self.unlock.take() else { return };
         let key = self.device().key;
         let (pin, gate) = (unlock.pin, unlock.gate);
-        self.error = None;
+        (self.error, self.prompt) = (None, (gate && key.touch()).then_some(TOUCH));
+        keyboard(false);
         self.call(
             cx,
             move || if gate { key.confirm(Some(&pin)) } else { key.unlock(&pin) },
-            move |this, (), cx| (unlock.then)(this, cx),
+            move |this, (), cx| {
+                this.prompt = None;
+                (unlock.then)(this, cx)
+            },
         );
     }
 
     /// Proves the owner is here the way this device approves, then runs
-    /// then. Nothing is signed: a fingerprint or the screen lock on Android,
-    /// a touch or the PIN on desktop.
+    /// then. Nothing is signed: a fingerprint or the screen lock, or a
+    /// security key's PIN and a touch, or a token's PIN.
     fn gate(
         &mut self,
         then: impl FnOnce(&mut Shell, &mut Context<Shell>) + 'static,
@@ -812,22 +845,20 @@ impl Shell {
     ) {
         let key = self.device().key;
         self.error = None;
-        #[cfg(not(target_os = "android"))]
-        {
-            if key.confirm_needs_pin() {
-                self.unlock = Some(Unlock { pin: String::new(), then: Box::new(then), gate: true });
-                return cx.notify();
-            }
-            self.prompt = Some("Touch your security key.");
+        if key.confirm_needs_pin() {
+            self.unlock = Some(Unlock { pin: String::new(), then: Box::new(then), gate: true });
+            keyboard(true);
+            return cx.notify();
         }
-        #[cfg(target_os = "android")]
-        let work = move || key.authenticate();
-        #[cfg(not(target_os = "android"))]
-        let work = move || key.confirm(None);
-        self.call(cx, work, move |this, (), cx| {
-            this.prompt = None;
-            then(this, cx)
-        });
+        self.prompt = key.touch().then_some(TOUCH);
+        self.call(
+            cx,
+            move || key.confirm(None),
+            move |this, (), cx| {
+                this.prompt = None;
+                then(this, cx)
+            },
+        );
     }
 
     /// Fetches a challenge, checks that its record says what the owner was
@@ -842,12 +873,9 @@ impl Shell {
         if self.signing {
             return;
         }
-        #[cfg(not(target_os = "android"))]
-        {
-            let (path, body, check) = (path.clone(), body.clone(), check.clone());
-            if !self.ready(move |this, cx| this.sign(path, body, check, cx), cx) {
-                return;
-            }
+        let (p, b, c) = (path.clone(), body.clone(), check.clone());
+        if !self.ready(move |this, cx| this.sign(p, b, c, cx), cx) {
+            return;
         }
         let device = self.device();
         let decided = path.clone();
@@ -912,12 +940,9 @@ impl Shell {
         if self.signing {
             return;
         }
-        #[cfg(not(target_os = "android"))]
-        {
-            let envelope = envelope.clone();
-            if !self.ready(move |this, cx| this.approve(envelope, cx), cx) {
-                return;
-            }
+        let pending = envelope.clone();
+        if !self.ready(move |this, cx| this.approve(pending, cx), cx) {
+            return;
         }
         let device = self.device();
         let decided = match &self.screen {
@@ -1060,10 +1085,10 @@ impl Shell {
             return;
         }
         // The current key signs first; a locked security key wants its PIN.
-        #[cfg(not(target_os = "android"))]
         if self.device().key.locked() {
             let then: Then = Box::new(move |this, cx| this.rotate(key, cx));
             self.unlock = Some(Unlock { pin: String::new(), then, gate: false });
+            keyboard(true);
             return cx.notify();
         }
         let (device, dir, old) = (self.device(), self.dir.clone(), self.key_id.clone());
@@ -1175,11 +1200,13 @@ impl Shell {
             type_into(name, ev, cx);
             return cx.notify();
         }
-        #[cfg(not(target_os = "android"))]
         if let Some(unlock) = &mut self.unlock {
             match k.key.as_str() {
                 "enter" => self.submit_pin(cx),
-                "escape" => self.unlock = None,
+                "escape" => {
+                    self.unlock = None;
+                    keyboard(false);
+                }
                 _ => type_into(&mut unlock.pin, ev, cx),
             }
             return cx.notify();
@@ -1187,6 +1214,10 @@ impl Shell {
         match (&mut self.screen, &mut self.search) {
             #[cfg(not(target_os = "android"))]
             (Screen::Choose(_), _) => return self.choose_key(ev, cx),
+            #[cfg(target_os = "android")]
+            (Screen::Method { pin: Some(_), .. }, _) if k.key == "enter" => self.make_fido(cx),
+            #[cfg(target_os = "android")]
+            (Screen::Method { pin: Some(pin), .. }, _) => type_into(pin, ev, cx),
             (Screen::Link { focus: Some(_), .. }, _) if k.key == "enter" => self.submit_step(cx),
             (Screen::Link { values, focus: Some(f), step: Some(step), .. }, _) => {
                 let number = step.fields.iter().any(|x| &x.name == f && x.kind == "number");

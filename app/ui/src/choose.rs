@@ -5,8 +5,8 @@
 use crate::desktop::Key;
 use crate::desktop::fido::{self, Authenticator, Fido};
 use crate::desktop::pkcs11::{self, Found, Login, Pkcs11, Token};
-use crate::screens::{button, clickable, column, id_for, panel};
-use crate::theme::{BOLD, Theme, bold, chars, lines};
+use crate::screens::{button, clickable, column, id_for};
+use crate::theme::{BOLD, Theme, chars, lines};
 use crate::{Next, Screen, Shell, device, type_into};
 use gpui::{Context, Div, KeyDownEvent, div, prelude::*};
 
@@ -172,30 +172,6 @@ impl Shell {
             },
             move |this, key, cx| this.with_key(then, key, cx),
         );
-    }
-
-    /// The PIN the device key asks for before it signs or confirms, if it
-    /// does.
-    pub(crate) fn pin_prompt(&self, t: Theme, cx: &mut Context<Self>) -> Option<Div> {
-        let unlock = self.unlock.as_ref()?;
-        let fido = self.device.as_ref().is_some_and(|d| d.key.touch());
-        let what = if fido { "your security key's PIN" } else { "your token's PIN" };
-        let (to, act) = if unlock.gate { ("confirm", "Confirm") } else { ("sign", "Sign") };
-        Some(
-            panel(t)
-                .child(bold(format!("Type {what} to {to}.")))
-                .child(field(t, "unlock-pin", "PIN", &unlock.pin, true, true, cx, |_, _| {}))
-                .child(
-                    div()
-                        .flex()
-                        .gap(chars(1.))
-                        .child(button(t, "unlock", act, cx, |this, cx| this.submit_pin(cx)))
-                        .child(button(t, "cancel-unlock", "Cancel", cx, |this, cx| {
-                            this.unlock = None;
-                            cx.notify();
-                        })),
-                ),
-        )
     }
 }
 
