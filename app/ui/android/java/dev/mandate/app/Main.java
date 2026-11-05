@@ -17,6 +17,7 @@ import android.view.View;
 import android.view.ViewTreeObserver;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.WindowManager;
 
 /**
  * The app's one activity: NativeActivity, plus the intents it was opened with,
@@ -49,6 +50,15 @@ public final class Main extends NativeActivity {
     @Override
     protected void onCreate(Bundle saved) {
         open(getIntent());
+        if (Build.VERSION.SDK_INT >= 35) {
+            // gpui draws the surface, not the view tree, so the view tree's
+            // own frame-rate votes (Android 15+) would only ever say "no
+            // preference" and clear the vote in surfaceChanged. This leaves
+            // the surface's frame rate to that vote.
+            WindowManager.LayoutParams attrs = getWindow().getAttributes();
+            attrs.setFrameRatePowerSavingsBalanced(false);
+            getWindow().setAttributes(attrs);
+        }
         super.onCreate(saved);
         bars(getResources().getConfiguration());
         getWindow()
@@ -123,8 +133,9 @@ public final class Main extends NativeActivity {
     /**
      * Asks for the display's top refresh rate while gpui draws. Without a
      * vote the system leaves an unknown surface at 60 Hz on a 120 Hz screen.
-     * The vote counts only while frames come, so an idle app lets the
-     * display slow down. Again on each new size: a fold switches displays.
+     * The vote counts only while frames come (SurfaceFlinger drops an idle
+     * layer's vote), so an idle app lets the display slow down. Again on
+     * each new size: a fold switches displays.
      */
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {

@@ -2,7 +2,7 @@
 //! notifications that open the app, and the native half of the stream
 //! service. The Java half is in android/java.
 
-use crate::device::{Device, FILE};
+use crate::device::{Device, FILE, hex, unhex};
 use crate::fido::android::Fido;
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -15,6 +15,7 @@ use jni::signature::MethodSignature;
 use jni::strings::JNIStr;
 use jni::{Env, EnvUnowned, JavaVM, jni_sig, jni_str};
 use mandate_core::{Client, DeviceKey, DeviceSignature, Error, der_signature};
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
@@ -365,6 +366,26 @@ pub enum Method {
     SecurityKey = 3,
 }
 
+impl Method {
+    /// What Settings calls it.
+    pub fn title(self) -> &'static str {
+        match self {
+            Method::Biometric => "Fingerprint or face",
+            Method::ScreenLock => "Screen lock",
+            Method::SecurityKey => "Security key",
+        }
+    }
+
+    /// The server's unsigned label for a key of this method.
+    pub fn label(self) -> &'static str {
+        match self {
+            Method::Biometric => "fingerprint",
+            Method::ScreenLock => "screen lock",
+            Method::SecurityKey => "security key",
+        }
+    }
+}
+
 /// The phone's device key: in the Keystore, or on a security key.
 pub enum Key {
     Keystore(Keystore),
@@ -377,6 +398,36 @@ impl Key {
             Key::Keystore(k) => k.method(),
             Key::Fido(_) => Method::SecurityKey,
         }
+    }
+
+    /// The key as device.json keeps it: a Keystore alias, or the security
+    /// key's credential.
+    pub fn load(v: &Value) -> Option<Key> {
+        Some(match v.get("fido2") {
+            Some(f) => {
+                let point = unhex(f["public_key"].as_str()?)?.try_into().ok()?;
+                Key::Fido(Fido::new(point, unhex(f["credential_id"].as_str()?)?))
+            }
+            None => Key::Keystore(Keystore::load(v["alias"].as_str().unwrap_or(FIRST_ALIAS))?),
+        })
+    }
+
+    pub fn saved(&self) -> Value {
+        match self {
+            Key::Keystore(k) => json!({ "alias": k.alias() }),
+            Key::Fido(k) => json!({ "fido2": {
+                "public_key": hex(&k.public_key()),
+                "credential_id": hex(k.credential_id()),
+            } }),
+        }
+    }
+
+    pub fn title(&self) -> String {
+        self.method().title().into()
+    }
+
+    pub fn label(&self) -> &'static str {
+        self.method().label()
     }
 
     /// Whether signing needs the PIN first: a security key's, once per

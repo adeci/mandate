@@ -40,7 +40,7 @@ impl Key {
     }
 
     /// The key as device.json keeps it.
-    fn load(v: &Value) -> Option<Key> {
+    pub fn load(v: &Value) -> Option<Key> {
         let point = unhex(v["public_key"].as_str()?)?.try_into().ok()?;
         let name = v["name"].as_str()?;
         match v["type"].as_str()? {
@@ -64,7 +64,7 @@ impl Key {
         }
     }
 
-    fn saved(&self) -> Value {
+    pub fn saved(&self) -> Value {
         match &self.kind {
             Kind::Fido(k) => json!({
                 "type": "fido2",
@@ -122,17 +122,19 @@ impl Key {
         matches!(self.kind, Kind::Fido(_))
     }
 
-    /// What Settings shows of it.
-    pub fn rows(&self) -> Vec<(&'static str, String)> {
+    /// What Settings calls it.
+    pub fn title(&self) -> String {
         match &self.kind {
-            Kind::Fido(_) => {
-                vec![("Type", "FIDO2 security key".into()), ("Name", self.name.clone())]
-            }
-            Kind::Pkcs11(k) => vec![
-                ("Type", "PKCS#11 token".into()),
-                ("Token", self.name.clone()),
-                ("Module", k.module().display().to_string()),
-            ],
+            Kind::Fido(_) => format!("Security key: {}", self.name),
+            Kind::Pkcs11(_) => format!("PKCS#11 token: {}", self.name),
+        }
+    }
+
+    /// The server's unsigned label for it.
+    pub fn label(&self) -> &'static str {
+        match &self.kind {
+            Kind::Fido(_) => "security key",
+            Kind::Pkcs11(_) => "token",
         }
     }
 }
@@ -153,52 +155,37 @@ impl DeviceKey for Key {
     }
 }
 
-/// Keeps the key in saved and the device token in the Secret Service, or
-/// in saved, which is written 0600, where no Secret Service runs.
-pub fn save_secrets(saved: &mut Value, key: &Key, token: &str) -> Result<(), Error> {
-    saved["key"] = key.saved();
-    let id = key.key("").id;
+/// Keeps the device token in the Secret Service under id, or in saved,
+/// which is written 0600, where no Secret Service runs.
+pub fn save_token(saved: &mut Value, id: &str, token: &str) {
     let stored = futures::executor::block_on(async {
         let keyring = oo7::Keyring::new().await?;
         keyring.unlock().await?;
-        keyring.create_item(TOKEN_LABEL, &vec![(TOKEN_ATTRIBUTE, id.as_str())], token, true).await
+        keyring.create_item(TOKEN_LABEL, &vec![(TOKEN_ATTRIBUTE, id)], token, true).await
     });
     if stored.is_err() {
         saved["token"] = token.into();
     }
-    Ok(())
 }
 
-/// The key and the device token that save_secrets kept.
-pub fn load_secrets(saved: &Value) -> Option<(Key, String)> {
-    let key = Key::load(&saved["key"])?;
+/// The device token that save_token kept under id.
+pub fn load_token(saved: &Value, id: &str) -> Option<String> {
     if let Some(token) = saved["token"].as_str() {
-        return Some((key, token.into()));
+        return Some(token.into());
     }
-    let id = key.key("").id;
-    let token = futures::executor::block_on(async {
+    futures::executor::block_on(async {
         let keyring = oo7::Keyring::new().await.ok()?;
         keyring.unlock().await.ok()?;
-        let items = keyring.search_items(&vec![(TOKEN_ATTRIBUTE, id.as_str())]).await.ok()?;
+        let items = keyring.search_items(&vec![(TOKEN_ATTRIBUTE, id)]).await.ok()?;
         let item = items.first()?;
         item.unlock().await.ok()?;
         String::from_utf8(item.secret().await.ok()?.to_vec()).ok()
-    })?;
-    Some((key, token))
-}
-
-/// Deletes the device token kept for a device key no longer in use, after a
-/// rotation saved it under the new key.
-pub fn forget_token(old_key_id: &str) {
-    let _ = futures::executor::block_on(async {
-        let keyring = oo7::Keyring::new().await?;
-        keyring.unlock().await?;
-        keyring.delete(&vec![(TOKEN_ATTRIBUTE, old_key_id)]).await
-    });
+    })
 }
 
 const TOKEN_LABEL: &str = "mandate device token";
-/// The device key's ID, so that each data dir finds its own token.
+/// The ID of the device's first key, so that each data dir finds its own
+/// token.
 const TOKEN_ATTRIBUTE: &str = "mandate-device-key";
 
 /// What a launch asks of the app: a pairing link, a waiting item, or just

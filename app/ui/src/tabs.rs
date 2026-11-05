@@ -1,13 +1,17 @@
 //! Agents, Connections, Activity and Settings, as the console laid them out.
 
-use crate::api::{Activity, Grant, History};
-use crate::now::chip;
+use crate::api::{Activity, Days, Grant, History};
+use crate::now::checkbox;
 use crate::pick::NewGrant;
-use crate::screens::{button, clickable, column, id_for, link, panel, shade, table};
-use crate::theme::{MEDIUM, Theme, bold, chars, lines};
+use crate::screens::{
+    bottom_sheet, button, clickable, column, icon, icon_button, id_for, link, panel, shade, table,
+};
+use crate::theme::{BOLD, MEDIUM, Theme, bold, chars, lines};
 use crate::words::{self, connector, horizon};
 use crate::{Confirm, Next, Screen, Shell, segment};
-use gpui::{Context, Div, ElementId, SharedString, canvas, div, prelude::*};
+use gpui::{
+    AnyElement, Context, Div, ElementId, Pixels, SharedString, canvas, div, prelude::*, px,
+};
 use mandate_core::{Time, Trust};
 use serde_json::json;
 use std::collections::HashMap;
@@ -118,13 +122,7 @@ impl Shell {
     /// the end loads further back.
     pub(crate) fn activity_tab(&self, t: Theme, cx: &mut Context<Self>) -> Div {
         let changing = self.history.as_ref().is_some_and(|h| h.query != self.wanted);
-        let top = column()
-            .gap(lines(0.5))
-            .child(self.history_filters(t, cx))
-            .children(self.calendar.map(|(y, m)| self.day_picker(t, y, m, cx)))
-            // A quiet mark while a new search, kind or day loads; the list
-            // it replaces stays until then.
-            .when(changing, |d| d.child(t.alt("Loading…")));
+        let top = self.history_filters(t, changing, cx);
         let Some(history) = &self.history else {
             return column().gap(lines(1.)).child(top).child(t.alt("Loading…"));
         };
@@ -204,98 +202,213 @@ impl Shell {
         column().gap(lines(1.)).child(top).children(sections).children(end)
     }
 
-    /// The kinds to show, and the day the list starts at.
-    fn history_filters(&self, t: Theme, cx: &mut Context<Self>) -> Div {
-        let kinds = KINDS.iter().enumerate().map(|(i, (label, kinds))| {
-            let on = self.wanted.kinds == *kinds;
-            chip(t, ("kind", i), label, on, cx, move |this, cx| {
-                this.wanted.kinds = *kinds;
-                cx.notify();
-            })
-        });
-        let kinds: Vec<_> = kinds.collect();
+    /// Two equal controls, the kinds shown and the day the list starts at;
+    /// under them a rule that turns emerald while a change loads, in place
+    /// of the list it replaces.
+    fn history_filters(&self, t: Theme, changing: bool, cx: &mut Context<Self>) -> Div {
+        let kind = KINDS.iter().find(|(_, k)| *k == self.wanted.kinds).map_or("", |(l, _)| *l);
         let day = match self.wanted.before {
-            Some(before) => {
-                let picked = words::day(before - 1);
-                chip(t, "from-day", &format!("From {picked} ×"), true, cx, |this, cx| {
-                    (this.wanted.before, this.calendar) = (None, None);
-                    cx.notify();
-                })
-            }
-            None => {
-                chip(t, "pick-day", "Jump to a day", self.calendar.is_some(), cx, |this, cx| {
-                    let (y, m, _) = words::ymd(Time::now().unix());
-                    this.calendar = match this.calendar {
-                        Some(_) => None,
-                        None => Some((y, m as i32)),
-                    };
-                    cx.notify();
-                })
-            }
+            Some(before) => format!("Up to {}", words::day(before - 1)),
+            None => "Any day".into(),
         };
-        div().flex().flex_wrap().gap(chars(1.)).children(kinds).child(day)
+        let (year, month, _) = words::ymd(self.wanted.before.map_or(Time::now().unix(), |b| b - 1));
+        let days = HistorySheet::Days { year, month: month as i32, months: false };
+        let control =
+            |id: &'static str, label: String, sheet: HistorySheet, cx: &mut Context<Self>| {
+                clickable(id, cx, move |this, cx| {
+                    this.history_sheet = Some(sheet);
+                    cx.notify();
+                })
+                .flex_1()
+                .min_w_0()
+                .h(TARGET)
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(chars(1.))
+                .px(chars(1.))
+                .border_2()
+                .border_color(t.text)
+                .child(div().min_w_0().truncate().child(label))
+                .child(icon("chevron-down", t.text))
+            };
+        column()
+            .gap(lines(0.5))
+            .child(
+                div()
+                    .flex()
+                    .gap(chars(1.))
+                    .child(control("kind-filter", kind.into(), HistorySheet::Kinds, cx))
+                    .child(control("day-filter", day, days, cx)),
+            )
+            .child(div().h(px(2.)).when(changing, |d| d.bg(t.grant_hi)))
     }
 
-    /// A month of days to start the list at; days still to come can't be
-    /// picked.
-    fn day_picker(&self, t: Theme, year: i32, month: i32, cx: &mut Context<Self>) -> Div {
-        let first = words::midnight(year, month, 1);
-        let (_, _, days) = words::ymd(words::midnight(year, month + 1, 0));
-        let lead = words::weekday(first);
-        let now = Time::now().unix();
-        let step = |by: i32| {
-            move |this: &mut Shell, cx: &mut Context<Shell>| {
-                if let Some((y, m)) = this.calendar {
-                    let (y2, m2, _) = words::ymd(words::midnight(y, m + by, 1));
-                    this.calendar = Some((y2, m2 as i32));
-                }
-                cx.notify();
+    /// Activity's open sheet: the kinds to show, or a day to start at.
+    pub(crate) fn history_sheet(
+        &self,
+        t: Theme,
+        bottom: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let content = match self.history_sheet? {
+            HistorySheet::Kinds => {
+                let rows = KINDS.iter().enumerate().map(|(i, (label, kinds))| {
+                    clickable(("kind", i), cx, move |this, cx| {
+                        (this.wanted.kinds, this.history_sheet) = (*kinds, None);
+                        cx.notify();
+                    })
+                    .h(TARGET)
+                    .flex()
+                    .items_center()
+                    .gap(chars(1.))
+                    .child(checkbox(t, self.wanted.kinds == *kinds))
+                    .child(label.to_string())
+                });
+                column().child(bold("Show").pb(lines(0.5))).children(rows)
             }
+            HistorySheet::Days { year, month, months: false } => self.days(t, year, month, cx),
+            HistorySheet::Days { year, month, months: true } => self.months(t, year, month, cx),
         };
-        let head = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .child(link(t, "month-back", "‹", cx, step(-1)).px(chars(1.)))
-            .child(div().font_weight(MEDIUM).child(words::month(first)))
-            .child(link(t, "month-on", "›", cx, step(1)).px(chars(1.)));
-        let cells = (0..lead).map(|_| div().into_any_element()).chain((1..=days).map(|d| {
-            let start = words::midnight(year, month, d as i32);
-            let label = d.to_string();
-            if start > now {
-                return t.alt(label).text_center().py(lines(0.25)).into_any_element();
-            }
-            clickable(("day", d as usize), cx, move |this, cx| {
-                this.wanted.before = Some(words::midnight(year, month, d as i32 + 1));
-                this.calendar = None;
+        let latest = self.wanted.before.is_some().then(|| {
+            button(t, "latest", "Latest", cx, |this, cx| {
+                (this.wanted.before, this.history_sheet) = (None, None);
                 cx.notify();
             })
-            .text_center()
-            .py(lines(0.25))
-            .child(label)
-            .into_any_element()
-        }));
-        let cells: Vec<_> = cells.collect();
-        let weeks = cells.chunks(7).count();
-        let mut cells = cells.into_iter();
-        let rows = (0..weeks).map(|_| {
-            let mut row = div().flex();
-            for _ in 0..7 {
-                row = row.child(div().flex_1().children(cells.next()));
-            }
-            row
         });
-        let letters = div()
-            .flex()
-            .children(["M", "T", "W", "T", "F", "S", "S"].map(|l| t.alt(l).flex_1().text_center()));
-        column()
-            .border_2()
-            .border_color(t.text)
-            .p(chars(1.))
-            .gap(lines(0.25))
-            .child(head)
-            .child(letters)
-            .children(rows)
+        let content = column().gap(lines(1.)).child(content).children(latest);
+        Some(bottom_sheet(t, bottom, cx, |this| this.history_sheet = None, content))
+    }
+
+    /// A month of days to start the list at, those with entries marked and
+    /// the rest dim; the title opens the year's months.
+    fn days(&self, t: Theme, year: i32, month: i32, cx: &mut Context<Self>) -> Div {
+        let first = words::midnight(year, month, 1);
+        let (_, _, days) = words::ymd(words::midnight(year, month + 1, 0));
+        let now = Time::now().unix();
+        let today = words::iso_day(now);
+        let marks = self.marks.as_ref().and_then(|m| m.days.as_ref());
+        let later = words::midnight(year, month + 1, 1) <= now;
+        let head = sheet_head(
+            t,
+            words::month(first),
+            days_of(year, month - 1),
+            later.then(|| days_of(year, month + 1)),
+            HistorySheet::Days { year, month, months: true },
+            cx,
+        );
+        let lead = (0..words::weekday(first)).map(|_| div().into_any_element());
+        let cells = lead.chain((1..=days as i32).map(|d| {
+            let start = words::midnight(year, month, d);
+            let day = words::iso_day(start);
+            let count = marks.map(|m| m.get(&day).copied().unwrap_or(0));
+            let (has, future) = (count.is_some_and(|n| n > 0), start > now);
+            let picked = self.wanted.before == Some(words::midnight(year, month, d + 1));
+            let number = div()
+                .size(lines(1.6))
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(day == today, |d| d.border_2().border_color(t.text))
+                .when(has, |d| d.font_weight(BOLD))
+                .when((future || count == Some(0)) && !picked, |d| d.text_color(t.alt))
+                .when(picked, |d| d.bg(t.text).text_color(t.bg))
+                .child(d.to_string());
+            mark_cell(t, ("day", d as usize), number, has, future, TARGET, cx, move |this, cx| {
+                this.wanted.before = Some(words::midnight(year, month, d + 1));
+                this.history_sheet = None;
+                cx.notify();
+            })
+        }));
+        let letters =
+            ["M", "T", "W", "T", "F", "S", "S"].map(|l| t.alt(l).text_center().into_any_element());
+        let grid = grid(7, letters.into_iter().chain(cells));
+        column().child(head).child(grid.h(picker_height()))
+    }
+
+    /// A year's months, those with entries marked and the rest dim; the
+    /// title goes back to the month it came from.
+    fn months(&self, t: Theme, year: i32, month: i32, cx: &mut Context<Self>) -> Div {
+        let now = Time::now().unix();
+        let (this_year, this_month, _) = words::ymd(now);
+        let marks = self.marks.as_ref().and_then(|m| m.days.as_ref());
+        let year_of = |year| HistorySheet::Days { year, month, months: true };
+        let head = sheet_head(
+            t,
+            year.to_string(),
+            year_of(year - 1),
+            (year < this_year).then(|| year_of(year + 1)),
+            HistorySheet::Days { year, month, months: false },
+            cx,
+        );
+        let cells = (1..=12).map(|m| {
+            let start = words::midnight(year, m, 1);
+            let prefix = format!("{}-", &words::iso_day(start)[..7]);
+            let has = marks.map(|d| d.iter().any(|(day, n)| *n > 0 && day.starts_with(&prefix)));
+            let future = (year, m as u32) > (this_year, this_month);
+            let label = div()
+                .when(has == Some(true), |d| d.font_weight(BOLD))
+                .when(future || has == Some(false), |d| d.text_color(t.alt))
+                .child(words::month_short(start));
+            mark_cell(
+                t,
+                ("month", m as usize),
+                label,
+                has == Some(true),
+                future,
+                picker_height() / 4.,
+                cx,
+                move |this, cx| {
+                    this.history_sheet = Some(days_of(year, m));
+                    cx.notify();
+                },
+            )
+        });
+        column().child(head).child(grid(3, cells).h(picker_height()))
+    }
+
+    /// The span of days the day picker shows, and asks marks for.
+    fn marks_span(&self) -> Option<(String, String)> {
+        let HistorySheet::Days { year, month, months } = self.history_sheet? else { return None };
+        let (from, to) = match months {
+            false => (words::midnight(year, month, 1), words::midnight(year, month + 1, 0)),
+            true => (words::midnight(year, 1, 1), words::midnight(year, 13, 0)),
+        };
+        Some((words::iso_day(from), words::iso_day(to)))
+    }
+
+    /// Asks which days have entries, for the span the day picker shows and
+    /// what the list is filtered by, unless asked already.
+    pub(crate) fn load_marks(&mut self, cx: &mut Context<Self>) {
+        let Some(span) = self.marks_span() else { return };
+        let key = (span, self.wanted.kinds, self.wanted.q.clone());
+        if self.marks.as_ref().is_some_and(|m| m.key == key) {
+            return;
+        }
+        let ((from, to), kinds, q) = key.clone();
+        let zone = segment(&words::zone());
+        let mut path = format!("activity/days?from={from}&to={to}&tz={zone}");
+        if let Some(kinds) = kinds {
+            path += &format!("&kinds={kinds}");
+        }
+        if !q.is_empty() {
+            path += &format!("&q={}", segment(&q));
+        }
+        self.marks = Some(Marks { key: key.clone(), days: None });
+        let client = self.device().client;
+        self.call(
+            cx,
+            move || Ok(client.get::<Days>(&path)),
+            move |this, days, cx| {
+                // A failure leaves the days unmarked, all plain.
+                if let (Some(m), Ok(days)) = (&mut this.marks, days)
+                    && m.key == key
+                {
+                    m.days = Some(days.days.into_iter().map(|d| (d.day, d.count)).collect());
+                }
+                cx.notify();
+            },
+        );
     }
 
     /// An entry in full: who, what, the agent's words, the chats and the
@@ -393,8 +506,7 @@ impl Shell {
             "device.denied" => format!("you didn't let {d} join"),
             "device.paired" => format!("{d} paired"),
             "device.joined" => format!("{d} joined"),
-            "key.added" => format!("{d} changed how it approves"),
-            "key.retired" => format!("{d}'s old key retired"),
+            "key.added" | "key.retired" => d.to_string(),
             "key.removed" => format!("you removed {d}"),
             "never_share.added" => format!("you hid {d}"),
             "never_share.removed" => format!("you shared {d} again"),
@@ -516,7 +628,11 @@ impl Shell {
         if name.is_empty() {
             return cx.notify();
         }
-        let (client, path) = (self.device().client, format!("keys/{}", segment(&self.key_id)));
+        let Some(key) = self.keys.devices.iter().find(|d| d.current).and_then(|d| d.keys.first())
+        else {
+            return cx.notify();
+        };
+        let (client, path) = (self.device().client, format!("keys/{}", segment(&key.id)));
         self.call(
             cx,
             move || client.send::<serde_json::Value>("PATCH", &path, &json!({ "name": name })),
@@ -526,44 +642,46 @@ impl Shell {
 
     /// This device and the others, what is never shared, and the server.
     pub(crate) fn settings(&self, t: Theme, cx: &mut Context<Self>) -> Div {
-        // A key retired by rotation is no device of its own any more.
-        let active: Vec<_> =
-            self.keys.trusted.iter().filter(|k| !self.keys.retired.contains(&k.id)).collect();
-        let removable = active.len() > 1;
-        let devices =
-            active.into_iter().enumerate().map(|(i, k)| {
-                let id = k.id.clone();
-                let name = self.keys.name(k).to_string();
-                let name2 = name.clone();
-                let this_one = k.id == self.key_id;
-                if let Some(typed) = self.renaming.as_ref().filter(|_| this_one) {
-                    let field = crate::screens::field(t, "rename", typed, "Name", true, |_| {}, cx);
-                    return row(t, i).child(div().flex_1().min_w_0().child(field)).child(button(
-                        t,
-                        "save-name",
-                        "Save",
-                        cx,
-                        |this, cx| this.rename(cx),
-                    ));
-                }
-                row(t, i)
-                    .child(div().flex_1().child(name.clone()).when(this_one, |d| {
-                        d.child(div().text_color(t.info).child("[this device]"))
+        let removable = self.keys.devices.len() > 1;
+        let devices = self.keys.devices.iter().enumerate().map(|(i, d)| {
+            let keys: Vec<String> = d.keys.iter().map(|k| k.id.clone()).collect();
+            let (name, name2) = (d.name.clone(), d.name.clone());
+            let this_one = d.current;
+            if let Some(typed) = self.renaming.as_ref().filter(|_| this_one) {
+                let field = crate::screens::field(t, "rename", typed, "Name", true, |_| {}, cx);
+                return row(t, i).child(div().flex_1().min_w_0().child(field)).child(button(
+                    t,
+                    "save-name",
+                    "Save",
+                    cx,
+                    |this, cx| this.rename(cx),
+                ));
+            }
+            let methods: Vec<&str> =
+                d.keys.iter().map(|k| k.method.as_str()).filter(|m| !m.is_empty()).collect();
+            row(t, i)
+                .child(
+                    column()
+                        .flex_1()
+                        .child(div().child(name.clone()).when(this_one, |d| {
+                            d.child(div().text_color(t.info).child("[this device]"))
+                        }))
+                        .when(!methods.is_empty(), |c| c.child(t.alt(methods.join(", ")))),
+                )
+                .when(this_one, |d| {
+                    d.child(link(t, "rename", "Rename", cx, move |this, cx| {
+                        this.renaming = Some(name.clone());
+                        crate::keyboard(true);
+                        cx.notify();
                     }))
-                    .when(this_one, |d| {
-                        d.child(link(t, "rename", "Rename", cx, move |this, cx| {
-                            this.renaming = Some(name.clone());
-                            crate::keyboard(true);
-                            cx.notify();
-                        }))
-                    })
-                    .when(removable, |d| {
-                        d.child(link(t, id_for("remove", &k.id), "Remove", cx, move |this, cx| {
-                            let (id, name) = (id.clone(), name2.clone());
-                            this.ask(Confirm::RemoveDevice { id, name }, cx)
-                        }))
-                    })
-            });
+                })
+                .when(removable, |row| {
+                    row.child(link(t, id_for("remove", &d.id), "Remove", cx, move |this, cx| {
+                        let (keys, name) = (keys.clone(), name2.clone());
+                        this.ask(Confirm::RemoveDevice { keys, name }, cx)
+                    }))
+                })
+        });
         let devices: Vec<Div> = devices.collect();
         let add_device =
             button(t, "add-device", "Add a device", cx, |this, cx| this.invite("device", cx));
@@ -588,27 +706,42 @@ impl Shell {
             Some(Trust::Pin(k)) => crate::screens::fingerprint(&k),
             _ => "certificate verified".into(),
         };
-        // How this device approves, and a way to change it: a new key under
-        // the new way takes this one's place.
-        #[cfg(target_os = "android")]
-        let approve_rows = {
-            let way = match self.device.as_ref().map(|d| d.key.method()) {
-                Some(crate::android::Method::ScreenLock) => "Screen lock",
-                Some(crate::android::Method::SecurityKey) => "Security key",
-                _ => "Fingerprint or face",
-            };
-            vec![("Way".to_string(), div().child(way).into_any_element())]
-        };
-        #[cfg(not(target_os = "android"))]
-        let approve_rows = {
-            let rows = self.device.as_ref().map(|d| d.key.rows()).unwrap_or_default();
-            let rows =
-                rows.into_iter().map(|(k, v)| (k.to_string(), div().child(v).into_any_element()));
-            rows.collect::<Vec<_>>()
-        };
-        let change = div().flex().child(button(t, "change-way", "Change", cx, |this, cx| {
-            this.new_key(Next::Rotate, cx)
-        }));
+        // Each way this device approves, the one that signs ticked: another
+        // takes over once the ticked one approves, and one not ticked can go.
+        let mine = self.device.as_ref().map(|d| (d.keys.clone(), crate::device::id(&d.key)));
+        let (mine, signing) = mine.unwrap_or_default();
+        let several = mine.len() > 1;
+        let methods = mine.iter().enumerate().map(|(i, k)| {
+            let id = crate::device::id(k);
+            let (on, title) = (id == signing, k.title());
+            let (use_id, drop_id, drop_title) = (id.clone(), id.clone(), title.clone());
+            row(t, i)
+                .child(
+                    clickable(id_for("method", &id), cx, move |this, cx| {
+                        if !on {
+                            this.use_method(use_id.clone(), cx)
+                        }
+                    })
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .gap(chars(1.))
+                    .child(crate::now::checkbox(t, on))
+                    .child(title),
+                )
+                .when(several && !on, |row| {
+                    row.child(link(t, id_for("drop", &id), "Remove", cx, move |this, cx| {
+                        let (id, title) = (drop_id.clone(), drop_title.clone());
+                        this.ask(Confirm::DropMethod { id, title }, cx)
+                    }))
+                })
+        });
+        let methods: Vec<Div> = methods.collect();
+        let add_method = (!self.methods_left().is_empty()).then(|| {
+            div().flex().child(button(t, "add-method", "Add a method", cx, |this, cx| {
+                this.new_key(Next::Add, cx)
+            }))
+        });
         let lock = clickable("lock", cx, |this, cx| this.set_lock(!this.lock, cx))
             .flex()
             .items_center()
@@ -626,8 +759,8 @@ impl Shell {
             .child(column().border_2().border_color(t.text).children(devices))
             .child(div().flex().child(add_device))
             .child(t.heading("How you approve"))
-            .child(table(t, approve_rows))
-            .child(change)
+            .child(column().border_2().border_color(t.text).children(methods))
+            .children(add_method)
             .child(lock)
             .child(t.heading("Never share"))
             .child(if self.hidden.is_empty() {
@@ -716,14 +849,122 @@ pub(crate) struct Loaded {
     pub query: HistoryQuery,
 }
 
-/// The filter chips, and the group of kinds each asks for.
+/// Activity's sheets: the kinds, or the days of a month (or the months of
+/// its year).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum HistorySheet {
+    Kinds,
+    Days { year: i32, month: i32, months: bool },
+}
+
+/// The days with entries in a span (first and last day), for the kinds and
+/// search they were counted for; None while they load or if they failed.
+pub(crate) struct Marks {
+    key: MarksKey,
+    days: Option<HashMap<String, u32>>,
+}
+
+type MarksKey = ((String, String), Option<&'static str>, String);
+
+/// The kinds Activity can show, and the group of kinds each asks for.
 const KINDS: [(&str, Option<&str>); 5] = [
-    ("All", None),
+    ("All activity", None),
     ("Reads", Some("reads")),
     ("Sends", Some("sends")),
     ("Requests", Some("requests")),
     ("Logins & devices", Some("access")),
 ];
+
+/// A tap target's height, as Material asks: 48 dp.
+const TARGET: gpui::Pixels = gpui::px(48.);
+
+/// A month's days in the day picker, the month rolled into its year.
+fn days_of(year: i32, month: i32) -> HistorySheet {
+    let (year, month, _) = words::ymd(words::midnight(year, month, 1));
+    HistorySheet::Days { year, month: month as i32, months: false }
+}
+
+/// A day or month of the day picker: its label over a dot when it has
+/// entries; it picks unless it is still to come.
+#[allow(clippy::too_many_arguments)]
+fn mark_cell(
+    t: Theme,
+    id: (&'static str, usize),
+    label: Div,
+    has: bool,
+    future: bool,
+    height: Pixels,
+    cx: &mut Context<Shell>,
+    pick: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
+) -> AnyElement {
+    let dot = div().size(px(4.)).when(has, |d| d.bg(t.grant_hi));
+    let cell = div().h(height).flex().flex_col().items_center().justify_center().gap(px(2.));
+    let cell = cell.child(label).child(dot);
+    // Days and months still to come are fainter than empty ones past.
+    if future {
+        return cell.opacity(0.3).into_any_element();
+    }
+    clickable(id, cx, pick).child(cell).into_any_element()
+}
+
+/// The day picker's height below its head, the same for a month's days
+/// (weekday letters over up to six weeks) and a year's months.
+fn picker_height() -> Pixels {
+    lines(1.) + TARGET * 6.
+}
+
+/// The day picker's head: back, the title that opens the wider view, and
+/// on, where there is a later span to go to.
+fn sheet_head(
+    t: Theme,
+    title: String,
+    back: HistorySheet,
+    on: Option<HistorySheet>,
+    wider: HistorySheet,
+    cx: &mut Context<Shell>,
+) -> Div {
+    let go = |sheet: HistorySheet| {
+        move |this: &mut Shell, cx: &mut Context<Shell>| {
+            this.history_sheet = Some(sheet);
+            cx.notify();
+        }
+    };
+    let on = match on {
+        Some(on) => icon_button(t, "sheet-on", "chevron-right", cx, go(on)).into_any_element(),
+        None => div().size(lines(2.5)).into_any_element(),
+    };
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(icon_button(t, "sheet-back", "chevron-left", cx, go(back)))
+        .child(
+            clickable("sheet-title", cx, go(wider))
+                .h(TARGET)
+                .flex()
+                .items_center()
+                .gap(chars(0.5))
+                .px(chars(1.))
+                .font_weight(MEDIUM)
+                .child(title)
+                .child(icon("chevron-down", t.text)),
+        )
+        .child(on)
+}
+
+/// Cells in rows of n, each an equal share of the width.
+fn grid(n: usize, cells: impl Iterator<Item = AnyElement>) -> Div {
+    let mut rows = Vec::new();
+    let mut cells = cells.peekable();
+    while cells.peek().is_some() {
+        let mut row = div().flex();
+        for _ in 0..n {
+            row = row.child(div().flex_1().children(cells.next()));
+        }
+        rows.push(row);
+    }
+    column().children(rows)
+}
 
 /// How long typing pauses before a search goes to the server.
 const SEARCH_PAUSE: Duration = Duration::from_millis(250);

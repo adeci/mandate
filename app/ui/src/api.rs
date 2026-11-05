@@ -131,6 +131,21 @@ pub struct History {
     pub next: Option<String>,
 }
 
+/// The days with history in a span, for the day picker.
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Days {
+    pub days: Vec<DayCount>,
+}
+
+/// A local day, "2026-11-03", and how many entries it has.
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct DayCount {
+    pub day: String,
+    pub count: u32,
+}
+
 /// A code exchange the owner opened (owner-api.md, Code exchange). Name,
 /// address and payload come once the new party's code matched.
 #[derive(Clone, Default, Deserialize)]
@@ -189,29 +204,31 @@ pub struct Server {
     pub agent_url: String,
 }
 
+/// The devices that sign, from `GET keys`.
 #[derive(Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Keys {
-    pub trusted: Vec<Trusted>,
-    /// Names given in the app, over the names keys were added with.
-    pub names: BTreeMap<String, String>,
-    /// Keys rotated out: still in the log, no device of their own.
-    pub retired: Vec<String>,
+    pub devices: Vec<Signer>,
 }
 
-impl Keys {
-    /// What the owner calls a device: a name given in the app, else the
-    /// one it joined with.
-    pub fn name<'a>(&'a self, k: &'a Trusted) -> &'a str {
-        self.names.get(&k.id).map_or(k.name.as_str(), String::as_str)
-    }
+/// A device and its keys, one per way it approves; retired keys are gone.
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Signer {
+    pub id: String,
+    pub name: String,
+    /// The device asking.
+    pub current: bool,
+    pub keys: Vec<SignerKey>,
 }
 
 #[derive(Clone, Default, Deserialize)]
 #[serde(default)]
-pub struct Trusted {
+pub struct SignerKey {
     pub id: String,
-    pub name: String,
+    /// "fingerprint", "screen lock", "security key" or "token"; empty
+    /// until the device says.
+    pub method: String,
 }
 
 /// A chat or person never shared, whatever the grants say.

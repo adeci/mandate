@@ -114,22 +114,40 @@ enum Screen {
 }
 
 /// What a new device key is for: pairing as the first device, joining the
-/// server at a URL by a code as another, or taking this device's place.
+/// server at a URL by a code as another, or another way this device
+/// approves.
 #[derive(Clone)]
 enum Next {
     Pair(PairLink),
     Join { url: String, code: String },
-    Rotate,
+    Add,
 }
 
 /// An action asked once more in a sheet before it runs; the ones that take
 /// access away also want the owner to prove it is them.
 #[derive(Clone)]
 enum Confirm {
-    DeleteAgent { id: String, name: String },
-    RemoveDevice { id: String, name: String },
-    Unlink { name: String },
-    Close { id: String, what: String },
+    DeleteAgent {
+        id: String,
+        name: String,
+    },
+    /// Every key of a device: one remove each.
+    RemoveDevice {
+        keys: Vec<String>,
+        name: String,
+    },
+    /// One way this device approves, not the one that signs.
+    DropMethod {
+        id: String,
+        title: String,
+    },
+    Unlink {
+        name: String,
+    },
+    Close {
+        id: String,
+        what: String,
+    },
     StopAll,
 }
 
@@ -167,8 +185,6 @@ impl Adjust {
 pub struct Shell {
     dir: PathBuf,
     device: Option<Device>,
-    /// The device key's ID, to mark it among the trusted keys.
-    key_id: String,
     screen: Screen,
     now: Now,
     exchanges: Vec<Exchange>,
@@ -192,8 +208,10 @@ pub struct Shell {
     wanted: tabs::HistoryQuery,
     /// The search text as last typed, applied once typing pauses.
     typed: String,
-    /// The month the day picker shows, while it is open.
-    calendar: Option<(i32, i32)>,
+    /// Activity's sheet for its kinds or its day, while open.
+    history_sheet: Option<tabs::HistorySheet>,
+    /// The days with entries in the span the day picker shows.
+    marks: Option<tabs::Marks>,
     /// Where each day's header of Activity sat on the last frame, for the
     /// one that sticks on top.
     day_tops: std::rc::Rc<std::cell::RefCell<Vec<(String, f32)>>>,
@@ -262,7 +280,6 @@ impl Shell {
         .detach();
         let mut shell = Shell {
             dir,
-            key_id: String::new(),
             device: None,
             screen,
             now: Now::default(),
@@ -279,7 +296,8 @@ impl Shell {
             history_loading: false,
             wanted: tabs::HistoryQuery::default(),
             typed: String::new(),
-            calendar: None,
+            history_sheet: None,
+            marks: None,
             day_tops: Default::default(),
             scroll: ScrollHandle::new(),
             sheet: None,
@@ -311,7 +329,6 @@ impl Shell {
     }
 
     fn paired(&mut self, device: Device, cx: &mut Context<Self>) {
-        self.key_id = device.key.key("").id;
         let saved: Option<Value> = std::fs::read(self.dir.join(device::FILE))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok());
@@ -544,7 +561,7 @@ impl Shell {
         for a in self.adjust.values_mut() {
             a.open = false;
         }
-        (self.sheet, self.renaming, self.unlock) = (None, None, None);
+        (self.sheet, self.renaming, self.unlock, self.history_sheet) = (None, None, None, None);
         keyboard(false);
         cx.notify();
     }
@@ -629,6 +646,7 @@ impl Shell {
                 (this.now, this.exchanges, this.identities, this.connectors) =
                     (now, exchanges, identities, connectors);
                 (this.keys, this.hidden, this.agent_url) = (keys, hidden, server.agent_url);
+                this.label_keys(cx);
                 this.open_pending(cx);
                 this.follow_invite(cx);
                 if this.history.is_some() {
@@ -663,6 +681,26 @@ impl Shell {
         self.go(Screen::Method { next, pin: None }, cx);
         #[cfg(not(target_os = "android"))]
         self.go(Screen::Choose(choose::Choose::new(next)), cx);
+    }
+
+    /// The ways this device could approve but does not yet, by the server's
+    /// labels: on Android those the phone is set up for, on desktop a
+    /// security key and a token.
+    pub(crate) fn methods_left(&self) -> Vec<&'static str> {
+        #[cfg(target_os = "android")]
+        let all = {
+            use android::Method::*;
+            let set_up = |m: &android::Method| match m {
+                Biometric => android::biometrics_enrolled(),
+                ScreenLock => android::screen_lock_set(),
+                SecurityKey => true,
+            };
+            [Biometric, ScreenLock, SecurityKey].into_iter().filter(set_up).map(|m| m.label())
+        };
+        #[cfg(not(target_os = "android"))]
+        let all = ["security key", "token"].into_iter();
+        let keys = self.device.as_ref().map(|d| d.keys.as_slice()).unwrap_or_default();
+        all.filter(|l| !keys.iter().any(|k| k.label() == *l)).collect()
     }
 
     /// Makes a Keystore key that unlocks by method, or asks for a security
@@ -708,7 +746,7 @@ impl Shell {
     fn with_key(&mut self, next: Next, key: device::Key, cx: &mut Context<Self>) {
         let dir = self.dir.clone();
         match next {
-            Next::Rotate => self.rotate(key, cx),
+            Next::Add => self.add_method(key, cx),
             Next::Pair(link) => self.call(
                 cx,
                 move || Device::pair(&dir, &link, key),
@@ -870,16 +908,28 @@ impl Shell {
         check: impl FnOnce(&Record) -> bool + Clone + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        self.sign_then(path, body, check, |_, _| {}, cx)
+    }
+
+    /// sign, then once the server took it, then.
+    fn sign_then(
+        &mut self,
+        path: String,
+        body: Value,
+        check: impl FnOnce(&Record) -> bool + Clone + Send + 'static,
+        then: impl FnOnce(&mut Shell, &mut Context<Shell>) + Clone + 'static,
+        cx: &mut Context<Self>,
+    ) {
         if self.signing {
             return;
         }
-        let (p, b, c) = (path.clone(), body.clone(), check.clone());
-        if !self.ready(move |this, cx| this.sign(p, b, c, cx), cx) {
+        let (p, b, c, t) = (path.clone(), body.clone(), check.clone(), then.clone());
+        if !self.ready(move |this, cx| this.sign_then(p, b, c, t, cx), cx) {
             return;
         }
         let device = self.device();
         let decided = path.clone();
-        self.signing_call(decided, cx, move || {
+        self.signing_call(decided, then, cx, move || {
             let mut envelope = device.client.challenge(&path, &body)?;
             if !check(&envelope.record()?) {
                 return Err(Error::Invalid(
@@ -897,6 +947,7 @@ impl Shell {
     fn signing_call(
         &mut self,
         decided: String,
+        then: impl FnOnce(&mut Shell, &mut Context<Shell>) + 'static,
         cx: &mut Context<Self>,
         work: impl FnOnce() -> Result<Signed, Error> + Send + 'static,
     ) {
@@ -915,6 +966,7 @@ impl Shell {
                         this.decided(&decided);
                         this.decided_here(cx);
                         this.refresh(cx);
+                        then(this, cx);
                     }
                     Err(e) => this.error = Some(e.to_string()),
                 }
@@ -950,10 +1002,15 @@ impl Shell {
             Screen::Admit { exchange, .. } => format!("exchanges/{}", exchange.id),
             _ => String::new(),
         };
-        self.signing_call(decided, cx, move || {
-            envelope.sign(&*device.key)?;
-            device.client.signed(&envelope)
-        });
+        self.signing_call(
+            decided,
+            |_, _| {},
+            cx,
+            move || {
+                envelope.sign(&*device.key)?;
+                device.client.signed(&envelope)
+            },
+        );
     }
 
     fn approve_request(&mut self, r: &Request, cx: &mut Context<Self>) {
@@ -1064,11 +1121,8 @@ impl Shell {
                 },
                 cx,
             ),
-            Confirm::RemoveDevice { id, .. } => {
-                let path = format!("keys/{id}/remove/challenge");
-                let check = move |r: &Record| matches!(r, Record::Key(e) if e.op == mandate_core::Op::Remove && e.key.id == id);
-                self.sign(path, json!({}), check, cx);
-            }
+            Confirm::RemoveDevice { keys, .. } => self.remove_keys(keys, cx),
+            Confirm::DropMethod { id, .. } => self.drop_method(id, cx),
             Confirm::Unlink { name } => self.gate(move |this, cx| this.unlink(name, cx), cx),
             Confirm::Close { id, .. } => {
                 self.post("POST", format!("grants/{id}/close"), cx, |_| Some("Closed.".into()))
@@ -1078,76 +1132,136 @@ impl Shell {
         cx.notify();
     }
 
-    /// Moves this device to key: the current key adds it, it retires the
-    /// current key, and the device token goes with it. Nothing else changes.
-    fn rotate(&mut self, key: device::Key, cx: &mut Context<Self>) {
+    /// Removes keys from the key log, one signature each: a device goes
+    /// with all its ways of approving.
+    fn remove_keys(&mut self, mut keys: Vec<String>, cx: &mut Context<Self>) {
+        let Some(id) = keys.pop() else { return };
+        let path = format!("keys/{id}/remove/challenge");
+        let check = move |r: &Record| matches!(r, Record::Key(e) if e.op == mandate_core::Op::Remove && e.key.id == id);
+        self.sign_then(path, json!({}), check, move |this, cx| this.remove_keys(keys, cx), cx);
+    }
+
+    /// Adds key as another way this device approves: a Keystore key first
+    /// proves it works (a security key or token did as it was made), then
+    /// the key that signs adds it to the key log.
+    fn add_method(&mut self, key: device::Key, cx: &mut Context<Self>) {
         if self.signing {
             return;
         }
-        // The current key signs first; a locked security key wants its PIN.
+        // A locked security key wants its PIN before it signs.
         if self.device().key.locked() {
-            let then: Then = Box::new(move |this, cx| this.rotate(key, cx));
+            let then: Then = Box::new(move |this, cx| this.add_method(key, cx));
             self.unlock = Some(Unlock { pin: String::new(), then, gate: false });
             keyboard(true);
             return cx.notify();
         }
-        let (device, dir, old) = (self.device(), self.dir.clone(), self.key_id.clone());
-        let name = self.keys.trusted.iter().find(|k| k.id == old).map(|k| k.name.clone());
-        let refused = || {
-            Error::Invalid(
-                "Nothing was signed: the server asked for something other than the new key.".into(),
-            )
-        };
-        self.signing = true;
-        self.error = None;
+        let (device, dir) = (self.device(), self.dir.clone());
+        let name = self.keys.devices.iter().find(|d| d.current).map(|d| d.name.clone());
+        (self.signing, self.error) = (true, None);
+        self.prompt = device.key.touch().then_some(TOUCH);
         let work = move || {
+            #[cfg(target_os = "android")]
+            if let android::Key::Keystore(_) = key {
+                key.confirm(None)?;
+            }
             let new = key.key(&name.unwrap_or_else(device::name));
-            let mut add = device.client.challenge("keys/add/challenge", &json!({ "key": new }))?;
+            let body = json!({ "key": new, "method": key.label() });
+            let mut add = device.client.challenge("keys/add/challenge", &body)?;
             if !matches!(add.record()?, Record::Key(e) if e.op == mandate_core::Op::Add && e.key == new)
             {
-                return Err(refused());
+                return Err(Error::Invalid(
+                    "Nothing was signed: the server asked for something other than the new key."
+                        .into(),
+                ));
             }
             add.sign(&*device.key)?;
             device.client.signed(&add)?;
-            // The token is the new key's from here, so the device moves to it
-            // before anything else can fail.
-            let rotated = device.rotate(&dir, key)?;
-            let retire = || {
-                let path = format!("keys/{old}/retire/challenge");
-                let mut retire = rotated.client.challenge(&path, &json!({}))?;
-                if !matches!(retire.record()?, Record::Key(e) if e.op == mandate_core::Op::Retire && e.key.id == old)
-                {
-                    return Err(refused());
-                }
-                retire.sign(&*rotated.key)?;
-                rotated.client.signed(&retire)
-            };
-            let retired = retire().err();
-            Ok((rotated, retired))
+            device.add(&dir, key)
         };
         self.call(
             cx,
             move || Ok(work()),
-            |this, rotated, cx| {
+            |this, added, cx| {
                 (this.signing, this.prompt) = (false, None);
-                match rotated {
-                    Ok((device, retired)) => {
-                        this.key_id = device.key.key("").id;
+                match added {
+                    Ok(device) => {
                         this.device = Some(device);
                         this.root(Tab::Now, cx);
                         this.go(Screen::Settings, cx);
-                        match retired {
-                            None => this.notice = Some("Changed.".into()),
-                            Some(e) => {
-                                this.error = Some(format!(
-                                    "Changed, but the old key is still listed: {e}. Remove it under Devices."
-                                ))
-                            }
-                        }
+                        this.notice = Some("Added.".into());
                         this.refresh(cx);
                     }
                     Err(e) => this.error = Some(e.to_string()),
                 }
+            },
+        );
+    }
+
+    /// Signs with another of this device's keys from now on, once the one
+    /// that signs now proves the owner is here. Nothing is signed.
+    pub(crate) fn use_method(&mut self, id: String, cx: &mut Context<Self>) {
+        self.gate(
+            move |this, _| match this.device().activate(&this.dir, &id) {
+                Ok(device) => {
+                    this.device = Some(device);
+                    this.notice = Some("Switched.".into());
+                }
+                Err(e) => this.error = Some(e.to_string()),
+            },
+            cx,
+        );
+    }
+
+    /// Retires one of this device's keys that does not sign, signed by the
+    /// one that does, then forgets it.
+    fn drop_method(&mut self, id: String, cx: &mut Context<Self>) {
+        let path = format!("keys/{id}/retire/challenge");
+        let gone = id.clone();
+        let check = move |r: &Record| matches!(r, Record::Key(e) if e.op == mandate_core::Op::Retire && e.key.id == gone);
+        let then = move |this: &mut Shell, _: &mut Context<Shell>| match this
+            .device()
+            .forget(&this.dir, &id)
+        {
+            Ok(device) => (this.device, this.notice) = (Some(device), Some("Removed.".into())),
+            Err(e) => this.error = Some(e.to_string()),
+        };
+        self.sign_then(path, json!({}), check, then, cx);
+    }
+
+    /// Tells the server how this device's keys approve where it does not
+    /// know: keys from before several ways, or just paired or joined.
+    fn label_keys(&mut self, cx: &mut Context<Self>) {
+        let Some(device) = self.device.clone() else { return };
+        let Some(this_device) = self.keys.devices.iter().find(|d| d.current) else { return };
+        let unlabeled: Vec<(String, &'static str)> = this_device
+            .keys
+            .iter()
+            .filter(|k| k.method.is_empty())
+            .filter_map(|k| {
+                let key = device.keys.iter().find(|d| device::id(d) == k.id)?;
+                Some((k.id.clone(), key.label()))
+            })
+            .collect();
+        if unlabeled.is_empty() {
+            return;
+        }
+        self.call(
+            cx,
+            move || {
+                for (id, method) in &unlabeled {
+                    let body = json!({ "method": method });
+                    device.client.send::<Value>("PATCH", &format!("keys/{id}"), &body)?;
+                }
+                Ok(unlabeled)
+            },
+            |this, labeled, cx| {
+                let keys = this.keys.devices.iter_mut().flat_map(|d| d.keys.iter_mut());
+                for k in keys {
+                    if let Some((_, method)) = labeled.iter().find(|(id, _)| *id == k.id) {
+                        k.method = (*method).into();
+                    }
+                }
+                cx.notify();
             },
         );
     }
@@ -1375,6 +1489,9 @@ impl gpui::AssetSource for Assets {
             "icons/arrow-left.svg" => include_bytes!("../assets/icons/arrow-left.svg"),
             "icons/bell.svg" => include_bytes!("../assets/icons/bell.svg"),
             "icons/bot.svg" => include_bytes!("../assets/icons/bot.svg"),
+            "icons/chevron-down.svg" => include_bytes!("../assets/icons/chevron-down.svg"),
+            "icons/chevron-left.svg" => include_bytes!("../assets/icons/chevron-left.svg"),
+            "icons/chevron-right.svg" => include_bytes!("../assets/icons/chevron-right.svg"),
             "icons/plug.svg" => include_bytes!("../assets/icons/plug.svg"),
             "icons/search.svg" => include_bytes!("../assets/icons/search.svg"),
             "icons/settings.svg" => include_bytes!("../assets/icons/settings.svg"),

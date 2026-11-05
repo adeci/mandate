@@ -373,4 +373,40 @@ with subtest("Settings names each run's key"):
     sh(2, "xdotool mousemove 938 115 click 1")
     see(2, "PKCS11 token")
     shot(2, "settings-dark")
+
+with subtest("the first run adds a token as a second way, ticks it, and drops its FIDO2 key"):
+    sh(1, "xdotool mousemove 938 115 click 1")  # the settings icon
+    tap(1, "Add a method")
+    see(1, "PKCS11 token")
+    assert find(1, "FIDO2") is None, "a security key is offered twice"
+    tap(1, "PKCS11 token")
+    typed(1, module, enter=True)
+    see(1, "desktop PIN")
+    typed(1, HSM_PIN, enter=True)
+    tap(1, "Make a new key")
+    until("the PIN prompt or the new way", lambda: find(1, "to sign") or find(1, "Added"))
+    sign(1, PIN)  # the FIDO2 key signs the token's key in
+    see(1, "Added")
+    tap(1, "PKCS11 token desktop")
+    until("the PIN prompt or the switch", lambda: find(1, "to confirm") or find(1, "Switched"))
+    if find(1, "to confirm"):
+        typed(1, PIN, enter=True)
+    see(1, "Switched")
+    desktop.succeed("grep -q token_id /tmp/data1/mandate/device.json")
+    # OCR misses the small REMOVE link at the security key's row's right end:
+    # clicks from the page's right edge inward until its sheet opens.
+    _, y = see(1, "security key canokeysorg canokey")
+    for x in range(950, 860, -10):
+        sh(1, f"xdotool mousemove {x} {y} click 1")
+        time.sleep(1)
+        if find(1, "stops approving with it"):
+            break
+    # OCR misses the sheet's small REMOVE, two lines under what it says.
+    _, y = see(1, "stops approving with it")
+    sh(1, f"xdotool mousemove 640 {y + 42} click 1")
+    until("the PIN prompt or the removal", lambda: find(1, "to sign") or find(1, "Removed"))
+    sign(1, HSM_PIN)  # the token's key retires the FIDO2 key
+    see(1, "Removed")
+    gone(1, "Security key")
+    shot(1, "methods-light")
     desktop.copy_from_machine(shots, "")

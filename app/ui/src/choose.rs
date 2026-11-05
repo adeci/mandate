@@ -65,7 +65,7 @@ impl Shell {
 
     pub(crate) fn choose_screen(&self, t: Theme, c: &Choose, cx: &mut Context<Self>) -> Div {
         match c.kind {
-            None => kinds(t, cx),
+            None => kinds(t, &self.methods_left(), cx),
             Some(Kind::Fido) => fido_step(t, c, cx),
             Some(Kind::Pkcs11) => pkcs11_step(t, c, cx),
         }
@@ -175,28 +175,32 @@ impl Shell {
     }
 }
 
-fn kinds(t: Theme, cx: &mut Context<Shell>) -> Div {
-    let mut choice = |id: &'static str, kind: Kind, name: &str, text: &str| {
-        clickable(id, cx, move |this, cx| this.pick_kind(kind, cx))
-            .border_2()
-            .border_color(t.text)
-            .px(chars(1.))
-            .py(lines(0.5))
-            .hover(|s| s.bg(t.bg_alt))
-            .child(div().font_weight(BOLD).child(name.to_uppercase()))
-            .child(text.to_string())
+fn kinds(t: Theme, left: &[&str], cx: &mut Context<Shell>) -> Div {
+    let mut choice = |id: &'static str, kind: Kind, label: &str, name: &str, text: &str| {
+        left.contains(&label).then(|| {
+            clickable(id, cx, move |this, cx| this.pick_kind(kind, cx))
+                .border_2()
+                .border_color(t.text)
+                .px(chars(1.))
+                .py(lines(0.5))
+                .hover(|s| s.bg(t.bg_alt))
+                .child(div().font_weight(BOLD).child(name.to_uppercase()))
+                .child(text.to_string())
+        })
     };
     column()
         .child("Which key signs approvals on this computer?")
-        .child(choice(
+        .children(choice(
             "fido",
             Kind::Fido,
+            "security key",
             "Security key (FIDO2)",
             "A YubiKey, Nitrokey, SoloKey or other FIDO2 key. Recommended.",
         ))
-        .child(choice(
+        .children(choice(
             "pkcs11",
             Kind::Pkcs11,
+            "token",
             "PKCS#11 token",
             "A P-256 key on a smart card, a TPM or a YubiKey's PIV.",
         ))

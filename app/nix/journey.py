@@ -357,5 +357,34 @@ with subtest("Stop all closes the grant"):
     assert status != 0 and "mandate request test" in out, (status, out)
     assert len(sent()) == 1, sent()
 
+
+# The screen lock's own prompt, outside the app, takes the phone's PIN. A
+# fingerprint prompt may follow at once, so it only waits for the PIN to
+# land.
+def credential() -> None:
+    until("the screen lock prompt", lambda: "dev.mandate.app" not in focus(), timeout=30)
+    time.sleep(2)
+    print(f"the screen lock prompt: {focus()}")
+    adb("shell", "input", "text", "1111")
+    adb("shell", "input", "keyevent", "66")
+    time.sleep(3)
+
+
+with subtest("a second way to approve takes over, and the first goes"):
+    tap("Add a method", scroll=True)
+    tap("Screen")  # OCR reads its "lock" as "1lock"
+    credential()  # the new key proves it works
+    finger()  # the fingerprint's key adds it
+    see("Added")
+    tap("Screen", scroll=True)
+    finger()  # the ticked way lets the other take over
+    see("Switched")
+    tap("Remove", scroll=True)
+    see("stops approving with it")
+    tap("Remove")
+    credential()  # the screen lock's key retires the fingerprint's
+    see("Removed")
+    gone("Fingerprint or face")
+
 emulator.terminate()
 emulator.wait()

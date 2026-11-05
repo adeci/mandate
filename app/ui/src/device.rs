@@ -1,8 +1,6 @@
 //! The paired device as saved in the app's data dir.
 
-#[cfg(not(target_os = "android"))]
-use mandate_core::DeviceKey;
-use mandate_core::{Client, Error, Join, PairLink, Trust};
+use mandate_core::{Client, DeviceKey, Error, Join, PairLink, Trust};
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -24,17 +22,27 @@ pub fn name() -> String {
     }
 }
 
-/// The device key: on Android in the Keystore or on a FIDO2 security key, on
-/// desktop on the FIDO2 authenticator or PKCS#11 token the owner chose.
+/// A device key: on Android in the Keystore or on a FIDO2 security key, on
+/// desktop on a FIDO2 authenticator or a PKCS#11 token.
 #[cfg(target_os = "android")]
 pub type Key = crate::android::Key;
 #[cfg(not(target_os = "android"))]
 pub type Key = crate::desktop::Key;
 
+/// A paired device. Each way it approves is a key of its own in the key
+/// log, and the one the owner ticked signs.
 #[derive(Clone)]
 pub struct Device {
     pub client: Client,
+    /// The key that signs.
     pub key: Arc<Key>,
+    /// Every key of the device, the one that signs among them.
+    pub keys: Vec<Arc<Key>>,
+}
+
+/// A key's ID in the key log.
+pub fn id(key: &Key) -> String {
+    key.key("").id
 }
 
 impl Device {
@@ -45,9 +53,25 @@ impl Device {
             Some(pin) => Trust::Pin(unhex(pin)?.try_into().ok()?),
             None => Trust::Roots,
         };
-        let (key, token) = secrets(&v)?;
+        // A file from before several ways kept its one key at the top.
+        let keys: Vec<Arc<Key>> = match v.get("keys").and_then(Value::as_array) {
+            Some(keys) => keys.iter().filter_map(Key::load).map(Arc::new).collect(),
+            #[cfg(target_os = "android")]
+            None => vec![Arc::new(Key::load(&v)?)],
+            #[cfg(not(target_os = "android"))]
+            None => vec![Arc::new(Key::load(&v["key"])?)],
+        };
+        let active = |k: &&Arc<Key>| v["active"].as_str() == Some(id(k).as_str());
+        let key = keys.iter().find(active).or(keys.first())?.clone();
+        #[cfg(target_os = "android")]
+        let token = crate::android::unseal(&unhex(v["sealed"].as_str()?)?)?;
+        #[cfg(not(target_os = "android"))]
+        let token = {
+            let first = id(&keys[0]);
+            crate::desktop::load_token(&v, v["token_id"].as_str().unwrap_or(&first))?
+        };
         let client = Client::new(v["url"].as_str()?, trust, &token).ok()?;
-        Some(Device { client, key: Arc::new(key) })
+        Some(Device { client, key, keys })
     }
 
     /// Pairs as the first device and saves what that made.
@@ -73,29 +97,86 @@ impl Device {
         if let Trust::Pin(p) = client.trust() {
             saved["pin"] = hex(&p).into();
         }
-        save_secrets(&mut saved, &key, token)?;
-        write(dir, &saved)?;
+        #[cfg(target_os = "android")]
+        {
+            saved["sealed"] = hex(&crate::android::seal(token)?).into();
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let first = id(&key);
+            crate::desktop::save_token(&mut saved, &first, token);
+            saved["token_id"] = first.into();
+        }
+        let key = Arc::new(key);
+        let device = Device { client, key: key.clone(), keys: vec![key] };
+        device.store(dir, saved)?;
         #[cfg(target_os = "android")]
         crate::android::listen();
-        Ok(Device { client, key: Arc::new(key) })
+        Ok(device)
     }
 
-    /// Moves the device to key once the server has accepted it in the key
-    /// log: the file keeps the address and token under the new key, and the
-    /// old key is removed.
-    pub fn rotate(&self, dir: &Path, key: Key) -> Result<Device, Error> {
-        let invalid = || Error::Invalid(format!("{FILE} is not as saved"));
-        let mut saved: Value =
-            serde_json::from_slice(&fs::read(dir.join(FILE))?).map_err(|_| invalid())?;
-        let (_, token) = secrets(&saved).ok_or_else(invalid)?;
-        save_secrets(&mut saved, &key, &token)?;
-        write(dir, &saved)?;
-        #[cfg(target_os = "android")]
-        self.key.delete()?;
-        #[cfg(not(target_os = "android"))]
-        crate::desktop::forget_token(&self.key.key("").id);
-        Ok(Device { client: self.client.clone(), key: Arc::new(key) })
+    /// Adds key as another way to approve, once the key log has it.
+    pub fn add(&self, dir: &Path, key: Key) -> Result<Device, Error> {
+        let mut keys = self.keys.clone();
+        keys.push(Arc::new(key));
+        self.change(dir, keys, self.key.clone())
     }
+
+    /// Signs with the key of that ID from now on.
+    pub fn activate(&self, dir: &Path, key_id: &str) -> Result<Device, Error> {
+        let key = self.keys.iter().find(|k| id(k) == key_id).ok_or_else(unknown)?;
+        self.change(dir, self.keys.clone(), key.clone())
+    }
+
+    /// Forgets a key that does not sign, once the key log retired it; on
+    /// Android, the Keystore key goes too.
+    pub fn forget(&self, dir: &Path, key_id: &str) -> Result<Device, Error> {
+        if id(&self.key) == key_id {
+            return Err(Error::Invalid("The key that signs stays.".into()));
+        }
+        let (gone, keys): (Vec<_>, Vec<_>) =
+            self.keys.iter().cloned().partition(|k| id(k) == key_id);
+        let device = self.change(dir, keys, self.key.clone())?;
+        #[cfg(target_os = "android")]
+        for k in gone {
+            k.delete()?;
+        }
+        #[cfg(not(target_os = "android"))]
+        drop(gone);
+        Ok(device)
+    }
+
+    /// The device with keys, key signing, once the file says so.
+    fn change(&self, dir: &Path, keys: Vec<Arc<Key>>, key: Arc<Key>) -> Result<Device, Error> {
+        let invalid = || Error::Invalid(format!("{FILE} is not as saved"));
+        let saved: Value =
+            serde_json::from_slice(&fs::read(dir.join(FILE))?).map_err(|_| invalid())?;
+        let device = Device { client: self.client.clone(), key, keys };
+        device.store(dir, saved)?;
+        Ok(device)
+    }
+
+    /// Writes the keys and which one signs into saved, and saved to the file.
+    fn store(&self, dir: &Path, mut saved: Value) -> Result<(), Error> {
+        if let Some(obj) = saved.as_object_mut() {
+            for old in ["alias", "fido2", "key"] {
+                obj.remove(old);
+            }
+        }
+        // A file from before several ways kept the token under its one key,
+        // which comes first.
+        #[cfg(not(target_os = "android"))]
+        if saved["token_id"].is_null() {
+            saved["token_id"] = id(&self.keys[0]).into();
+        }
+        saved["keys"] = self.keys.iter().map(|k| k.saved()).collect();
+        saved["active"] = id(&self.key).into();
+        write(dir, &saved)
+    }
+}
+
+fn unknown() -> Error {
+    Error::Invalid("This device has no such key.".into())
 }
 
 fn write(dir: &Path, saved: &Value) -> Result<(), Error> {
@@ -109,44 +190,6 @@ fn write(dir: &Path, saved: &Value) -> Result<(), Error> {
     f.write_all(saved.to_string().as_bytes())?;
     Ok(())
 }
-
-/// The key and the token from the file: the token sealed by the Keystore.
-#[cfg(target_os = "android")]
-fn secrets(v: &Value) -> Option<(Key, String)> {
-    let key = match v.get("fido2") {
-        Some(f) => {
-            let point = unhex(f["public_key"].as_str()?)?.try_into().ok()?;
-            let id = unhex(f["credential_id"].as_str()?)?;
-            Key::Fido(crate::fido::android::Fido::new(point, id))
-        }
-        None => {
-            let alias = v["alias"].as_str().unwrap_or(crate::android::FIRST_ALIAS);
-            Key::Keystore(crate::android::Keystore::load(alias)?)
-        }
-    };
-    Some((key, crate::android::unseal(&unhex(v["sealed"].as_str()?)?)?))
-}
-
-#[cfg(target_os = "android")]
-fn save_secrets(saved: &mut Value, key: &Key, token: &str) -> Result<(), Error> {
-    let obj = saved.as_object_mut().expect("device.json is an object");
-    obj.remove("alias");
-    obj.remove("fido2");
-    match key {
-        Key::Keystore(k) => saved["alias"] = k.alias().into(),
-        Key::Fido(k) => {
-            saved["fido2"] = json!({
-                "public_key": hex(&k.public_key()),
-                "credential_id": hex(k.credential_id()),
-            })
-        }
-    }
-    saved["sealed"] = hex(&crate::android::seal(token)?).into();
-    Ok(())
-}
-
-#[cfg(not(target_os = "android"))]
-use crate::desktop::{load_secrets as secrets, save_secrets};
 
 pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()

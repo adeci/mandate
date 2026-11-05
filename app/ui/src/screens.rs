@@ -6,20 +6,25 @@ use crate::device::hex;
 use crate::theme::{BOLD, FONT, MEDIUM, NORMAL, SIZE, Theme, bold, chars, lines};
 use crate::{Screen, Shell, Tab, words};
 use gpui::{
-    Animation, AnimationExt, AnyElement, BoxShadow, ClickEvent, Context, DispatchPhase, Div,
-    ElementId, Hsla, LongPressEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    ScrollWheelEvent, SharedString, Stateful, Svg, TouchDragEvent, TouchPhase, Window, canvas, div,
-    ease_out_quint, fill, hsla, point, prelude::*, px, relative, rgb, svg,
+    Animation, AnimationExt, AnyElement, ClickEvent, Context, DispatchPhase, Div, ElementId, Hsla,
+    LongPressEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent,
+    SharedString, Stateful, Svg, TouchDragEvent, TouchPhase, Window, canvas, div, ease_out_quint,
+    fill, hsla, prelude::*, px, relative, rgb, svg,
 };
 use mandate_core::{Envelope, PairLink, Record};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
-/// The launch: the wordmark glows in, holds, and gives way to the first
-/// page, all within LAUNCH_MAX of the tap; a slow start shortens the hold.
-const GLOW_IN: Duration = Duration::from_millis(800);
-const HOLD: Duration = Duration::from_millis(300);
+/// The launch: a block cursor types the wordmark and blinks, then gives way
+/// to the first page. A second blink holds it a moment longer, within
+/// LAUNCH_MAX of the tap; a slow start drops that hold, never the typing.
+const TYPING: Duration = Duration::from_millis(975);
+const HOLD: Duration = Duration::from_millis(220);
+/// When each letter of "mandate" lands, in ms: a person's uneven pace.
+const KEYS: [f32; 7] = [80., 205., 300., 455., 540., 685., 790.];
+/// When the cursor is off as it blinks after typing, in ms.
+const BLINKS: [(f32, f32); 2] = [(815., 915.), (1035., 1135.)];
 const LAUNCH_MAX: Duration = Duration::from_millis(1500);
 /// A new page fades in this fast: enough to see the change, never enough
 /// to wait for it.
@@ -54,35 +59,31 @@ impl Render for Shell {
             .pb(px(bottom))
             .child(touches());
         if self.launching {
-            if self.launch.is_none() {
-                self.start_launch(cx);
-            }
+            let total = match self.launch {
+                Some(total) => total,
+                None => self.start_launch(cx),
+            };
             // The wordmark spans about 60% of the narrower side, a monospace
-            // character being 0.6 em wide; capped for big screens.
+            // cell being 0.6 em wide; capped for big screens. Its box holds
+            // the cursor's cell too, so nothing moves as it types.
             let view = window.viewport_size();
             let width = (view.width.min(view.height) * 0.6).min(px(360.));
             let size = width / (0.6 * 7.);
-            let (glow, text) = (t.grant_hi, t.text);
-            // One unhurried motion: it fades and grows in, emerald, while a
-            // glow swells behind it and settles as it turns the text color.
-            let mark = wordmark()
+            let (cell, cursor, ms) = (size * 0.6, t.grant_hi, total.as_secs_f32() * 1000.);
+            let mark = div()
+                .flex()
+                .items_center()
+                .w(cell * 8.)
+                .h(size * 1.2)
+                .font_weight(BOLD)
                 .text_size(size)
                 .line_height(size * 1.2)
-                .px(size * 0.4)
-                .rounded_full()
-                .with_animation("launch", Animation::new(GLOW_IN), move |d, v| {
-                    let rise = v * v * (3. - 2. * v);
-                    let bloom = (v * std::f32::consts::PI).sin();
-                    d.opacity((v * 2.5).min(1.))
-                        .text_size(size * (0.94 + 0.06 * rise))
-                        .text_color(mix(glow, text, rise))
-                        .shadow(vec![BoxShadow {
-                            color: glow.opacity(0.45 * bloom),
-                            offset: point(px(0.), px(0.)),
-                            blur_radius: size * (1.2 * bloom),
-                            spread_radius: size * (0.25 * bloom),
-                            inset: false,
-                        }])
+                .with_animation("launch", Animation::new(total), move |d, v| {
+                    let at = v * ms;
+                    let typed = KEYS.iter().filter(|&&k| at >= k).count();
+                    let off = BLINKS.iter().any(|&(a, b)| at >= a && at < b);
+                    d.child("mandate"[..typed].to_string())
+                        .child(div().w(cell).h(size * 1.1).when(!off, |d| d.bg(cursor)))
                 });
             return root
                 .items_center()
@@ -138,6 +139,7 @@ impl Render for Shell {
                 Some(h) if h.next.is_some() && near => self.more_history(cx),
                 Some(_) => {}
             }
+            self.load_marks(cx);
             self.sticky_day()
         } else {
             None
@@ -278,15 +280,16 @@ impl Render for Shell {
         .when_some(tab.filter(|_| !typing), |d, tab| d.child(self.tab_bar(t, tab, pad, cx)))
         .when(tab == Some(Tab::Now), |d| d.children(self.adjust_sheet(t, bottom, cx)))
         .children(self.confirm_sheet(t, bottom, cx))
+        .when(tab == Some(Tab::Activity), |d| d.children(self.history_sheet(t, bottom, cx)))
         .into_any_element()
     }
 }
 
 impl Shell {
     /// Fixes the launch's length at its first frame, and ends it then.
-    fn start_launch(&mut self, cx: &mut Context<Self>) {
-        let spare = LAUNCH_MAX.saturating_sub(process_age() + GLOW_IN);
-        let total = GLOW_IN + HOLD.min(spare);
+    fn start_launch(&mut self, cx: &mut Context<Self>) -> Duration {
+        let fits = process_age() + TYPING + HOLD <= LAUNCH_MAX;
+        let total = if fits { TYPING + HOLD } else { TYPING };
         self.launch = Some(total);
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(total).await;
@@ -296,10 +299,12 @@ impl Shell {
             });
         })
         .detach();
+        total
     }
 }
 
-/// How long ago this process started, as /proc tells; zero elsewhere.
+/// How long ago this process started: its start in /proc against the
+/// boot clock; zero where either is missing.
 fn process_age() -> Duration {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -308,10 +313,14 @@ fn process_age() -> Duration {
         let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
         let start = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(19));
         let start = start.and_then(|s| s.parse::<f64>().ok());
-        let uptime = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
-        let up = uptime.split_whitespace().next().and_then(|s| s.parse::<f64>().ok());
-        // SAFETY: sysconf only reads a configuration value.
-        let tick = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+        // SAFETY: sysconf only reads a configuration value, and
+        // clock_gettime fills the timespec it is given.
+        let (tick, up) = unsafe {
+            let mut now: libc::timespec = std::mem::zeroed();
+            let ok = libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut now) == 0;
+            let up = ok.then(|| now.tv_sec as f64 + now.tv_nsec as f64 / 1e9);
+            (libc::sysconf(libc::_SC_CLK_TCK) as f64, up)
+        };
         if let (Some(start), Some(up)) = (start, up)
             && tick > 0.
         {
@@ -324,12 +333,6 @@ fn process_age() -> Duration {
 /// "mandate", as the launch shows it and the welcome greets with.
 fn wordmark() -> Div {
     div().font_weight(BOLD).text_size(px(SIZE * 2.5)).line_height(px(SIZE * 3.)).child("mandate")
-}
-
-/// The color v of the way from a to b.
-fn mix(a: Hsla, b: Hsla, v: f32) -> Hsla {
-    let at = |x: f32, y: f32| x + (y - x) * v;
-    Hsla { h: at(a.h, b.h), s: at(a.s, b.s), l: at(a.l, b.l), a: at(a.a, b.a) }
 }
 
 thread_local! {
@@ -460,7 +463,7 @@ thread_local! {
 }
 
 /// Follows a finger for the pressed shade: down, until it lifts as a tap,
-/// a scroll or a long press.
+/// a scroll or a claimed long press.
 fn touches() -> impl IntoElement {
     fn lift(window: &mut Window) {
         if TOUCH.take().is_some() {
@@ -486,8 +489,11 @@ fn touches() -> impl IntoElement {
                     lift(window)
                 }
             });
-            window.on_mouse_event(|_: &LongPressEvent, phase, window, _| {
-                if phase == DispatchPhase::Capture {
+            // gpui offers every held touch as a long press after half a
+            // second; unclaimed, the touch goes on and still taps on release,
+            // so only the end of a claimed one lifts the shade.
+            window.on_mouse_event(|e: &LongPressEvent, phase, window, _| {
+                if phase == DispatchPhase::Capture && e.phase != TouchPhase::Started {
                     lift(window)
                 }
             });
@@ -521,11 +527,38 @@ fn page(pad: f32) -> Div {
     column().w_full().max_w(chars(80.)).mx_auto().px(chars(pad))
 }
 
+/// A sheet over the foot of the page, on a scrim that closes it.
+pub(crate) fn bottom_sheet(
+    t: Theme,
+    bottom: f32,
+    cx: &mut Context<Shell>,
+    close: fn(&mut Shell),
+    content: Div,
+) -> Div {
+    let scrim = div().id("sheet-scrim").flex_1().bg(hsla(0., 0., 0., 0.4)).on_click(cx.listener(
+        move |this, _, _, cx| {
+            close(this);
+            cx.notify();
+        },
+    ));
+    let sheet = div()
+        .id("sheet")
+        .occlude()
+        .bg(t.bg)
+        .border_t_2()
+        .border_color(t.text)
+        .pt(lines(1.))
+        .pb(px(bottom) + lines(1.))
+        .px(chars(1.))
+        .child(content.w_full().max_w(chars(60.)).mx_auto());
+    div().absolute().top_0().left_0().size_full().flex().flex_col().child(scrim).child(sheet)
+}
+
 pub fn icon(name: &str, color: Hsla) -> Svg {
     svg().path(format!("icons/{name}.svg")).size(px(20.)).flex_none().text_color(color)
 }
 
-fn icon_button(
+pub(crate) fn icon_button(
     t: Theme,
     id: &'static str,
     name: &str,
@@ -559,6 +592,10 @@ impl Shell {
             cx.notify();
             return true;
         }
+        if self.history_sheet.take().is_some() {
+            cx.notify();
+            return true;
+        }
         if self.unlock.take().is_some() {
             crate::keyboard(false);
             cx.notify();
@@ -585,6 +622,9 @@ impl Shell {
             RemoveDevice { name, .. } => {
                 (format!("Remove {name}?"), "It can no longer approve.", "Remove")
             }
+            DropMethod { title, .. } => {
+                (format!("Remove {title}?"), "This device stops approving with it.", "Remove")
+            }
             Unlink { name } => (
                 format!("Unlink {}?", words::connector(name)),
                 "Its session is forgotten.",
@@ -600,46 +640,16 @@ impl Shell {
         let stop = matches!(self.sheet, Some(StopAll));
         let act = button(t, "sheet-act", action, cx, |this, cx| this.confirmed(cx))
             .when(stop, |b| b.bg(t.danger).border_color(t.danger).text_color(rgb(0xffffff)));
-        let scrim = div().id("sheet-scrim").flex_1().bg(hsla(0., 0., 0., 0.4)).on_click(
-            cx.listener(|this, _, _, cx| {
+        let content = column()
+            .gap(lines(1.))
+            .child(bold(question))
+            .when(!then.is_empty(), |d| d.child(then))
+            .child(act)
+            .child(button(t, "sheet-cancel", "Cancel", cx, |this, cx| {
                 this.sheet = None;
                 cx.notify();
-            }),
-        );
-        let sheet = div()
-            .id("sheet")
-            .occlude()
-            .bg(t.bg)
-            .border_t_2()
-            .border_color(t.text)
-            .pt(lines(1.))
-            .pb(px(bottom) + lines(1.))
-            .px(chars(1.))
-            .child(
-                column()
-                    .w_full()
-                    .max_w(chars(60.))
-                    .mx_auto()
-                    .gap(lines(1.))
-                    .child(bold(question))
-                    .when(!then.is_empty(), |d| d.child(then))
-                    .child(act)
-                    .child(button(t, "sheet-cancel", "Cancel", cx, |this, cx| {
-                        this.sheet = None;
-                        cx.notify();
-                    })),
-            );
-        Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .flex()
-                .flex_col()
-                .child(scrim)
-                .child(sheet),
-        )
+            }));
+        Some(bottom_sheet(t, bottom, cx, |this| this.sheet = None, content))
     }
 
     /// The device key's PIN, asked before it signs or proves the owner is
@@ -669,7 +679,7 @@ impl Shell {
 
     /// How this device approves: fingerprint or face (the screen lock as
     /// backup), the screen lock alone, or a security key, whichever the
-    /// phone has. When changing, the current way is marked.
+    /// phone has and the device does not approve with yet.
     #[cfg(target_os = "android")]
     fn method_screen(
         &self,
@@ -679,33 +689,31 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Div {
         use crate::android::Method;
-        let current = matches!(next, crate::Next::Rotate)
-            .then(|| self.device.as_ref().map(|d| d.key.method()))
-            .flatten();
-        let choice = |id: &'static str, method: Method, label: &str, cx: &mut Context<Self>| {
+        let left = self.methods_left();
+        let choice = |id: &'static str, method: Method, cx: &mut Context<Self>| {
             let next = next.clone();
-            let on = current == Some(method) || (method == Method::SecurityKey && pin.is_some());
-            clickable(id, cx, move |this, cx| {
-                if !on {
-                    this.make_key(next.clone(), method, cx)
-                }
+            let on = method == Method::SecurityKey && pin.is_some();
+            left.contains(&method.label()).then(|| {
+                clickable(id, cx, move |this, cx| {
+                    if !on {
+                        this.make_key(next.clone(), method, cx)
+                    }
+                })
+                .flex()
+                .items_center()
+                .gap(chars(1.))
+                .border_2()
+                .border_color(t.text)
+                .px(chars(1.))
+                .py(lines(1.))
+                .font_weight(MEDIUM)
+                .child(crate::now::checkbox(t, on))
+                .child(method.title())
             })
-            .flex()
-            .items_center()
-            .gap(chars(1.))
-            .border_2()
-            .border_color(t.text)
-            .px(chars(1.))
-            .py(lines(1.))
-            .font_weight(MEDIUM)
-            .child(crate::now::checkbox(t, on))
-            .child(label.to_string())
         };
-        let biometric = crate::android::biometrics_enrolled()
-            .then(|| choice("biometric", Method::Biometric, "Fingerprint or face", cx));
-        let screen_lock = crate::android::screen_lock_set()
-            .then(|| choice("screen-lock", Method::ScreenLock, "Screen lock", cx));
-        let security_key = choice("security-key", Method::SecurityKey, "Security key", cx);
+        let biometric = choice("biometric", Method::Biometric, cx);
+        let screen_lock = choice("screen-lock", Method::ScreenLock, cx);
+        let security_key = choice("security-key", Method::SecurityKey, cx);
         let key_pin = pin.map(|pin| {
             column()
                 .gap(lines(0.5))
@@ -718,7 +726,7 @@ impl Shell {
             .child(bold("How do you want to approve?"))
             .children(biometric)
             .children(screen_lock)
-            .child(security_key)
+            .children(security_key)
             .children(key_pin)
     }
 

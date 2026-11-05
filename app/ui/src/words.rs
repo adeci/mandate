@@ -161,6 +161,16 @@ pub fn weekday(unix: i64) -> u32 {
     (strftime(unix, c"%u").parse::<u32>().unwrap_or(1) + 6) % 7
 }
 
+/// "2026-11-03", the local date of a Unix time.
+pub fn iso_day(unix: i64) -> String {
+    strftime(unix, c"%Y-%m-%d")
+}
+
+/// "Nov", a Unix time's month, short, in local time.
+pub fn month_short(unix: i64) -> String {
+    strftime(unix, c"%b")
+}
+
 /// When a routine runs right now in local time, the clock time it ends.
 pub fn running(s: &crate::api::Schedule) -> Option<String> {
     let now = Time::now().unix();
