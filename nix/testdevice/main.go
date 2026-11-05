@@ -3,8 +3,8 @@
 // showed, calls the owner API with its device token, and signs challenges
 // with its P-256 key.
 //
-//	testdevice [--state FILE] pair LINK [NAME]
-//	testdevice [--state FILE] join URL SPKI CODE [NAME]
+//	testdevice [--state FILE] [--fido2] pair LINK [NAME]
+//	testdevice [--state FILE] [--fido2] join URL SPKI CODE [NAME]
 //	testdevice [--state FILE] call METHOD PATH [BODY]
 //	testdevice [--state FILE] sign PATH [BODY]
 //	testdevice [--state FILE] rotate [NAME]
@@ -13,6 +13,8 @@
 // PATH, signs the envelope it answers and posts it to /owner/v1/signed,
 // printing the answer with the record and the envelope it signed. pair
 // keeps the key of an earlier pairing, as an app would after mandate reset.
+// --fido2 makes the new device's key a fido2 one, signed in software with
+// the flags a security key sets (UP and UV).
 // rotate swaps the device's key as the app's "How you approve" does: the
 // current key adds a new one, which then retires it.
 package main
@@ -35,11 +37,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/adeci/mandate/internal/exchange"
 	"github.com/adeci/mandate/record"
 )
+
+var fido2 bool
 
 // device is what the app keeps.
 type device struct {
@@ -47,10 +52,13 @@ type device struct {
 	SPKI  string `json:"spki"`
 	Token string `json:"token"`
 	Key   []byte `json:"key"` // PKCS #8
+	// CredentialID is set for a fido2 key.
+	CredentialID []byte `json:"credential_id,omitempty"`
 }
 
 func main() {
 	state := flag.String("state", "device.json", "the device's state file")
+	flag.BoolVar(&fido2, "fido2", false, "make a fido2 key")
 	flag.Parse()
 	if err := run(context.Background(), *state, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "testdevice:", err)
@@ -157,15 +165,51 @@ func newDevice(u, spki, name string, der []byte) (*device, *ecdsa.PrivateKey, re
 			return nil, nil, record.Key{}, err
 		}
 	}
+	if fido2 {
+		d.CredentialID = make([]byte, 16)
+		rand.Read(d.CredentialID)
+	}
 	priv, err := d.key()
 	if err != nil {
 		return nil, nil, record.Key{}, err
 	}
-	k, err := record.P256Key(&priv.PublicKey, name)
+	k, err := d.recordKey(priv, name)
 	if err != nil {
 		return nil, nil, record.Key{}, err
 	}
 	return d, priv, k, nil
+}
+
+// recordKey is priv's public key as the key log names it.
+func (d *device) recordKey(priv *ecdsa.PrivateKey, name string) (record.Key, error) {
+	k, err := record.P256Key(&priv.PublicKey, name)
+	if err == nil && d.CredentialID != nil {
+		k.Type, k.CredentialID = "fido2", d.CredentialID
+	}
+	return k, err
+}
+
+var rpIDHash = sha256.Sum256([]byte("mandate"))
+
+// signEnv signs e with priv, as a security key would for a fido2 device.
+func (d *device) signEnv(e *record.Envelope, priv *ecdsa.PrivateKey) error {
+	if d.CredentialID == nil {
+		return record.Sign(e, priv)
+	}
+	k, err := d.recordKey(priv, "")
+	if err != nil {
+		return err
+	}
+	// rp ID hash, flags UP|UV, sign count 1
+	ad := append(append(rpIDHash[:0:0], rpIDHash[:]...), 0x05, 0, 0, 0, 1)
+	digest := sha256.Sum256(append(slices.Clone(ad), e.Challenge()...))
+	r, s, err := ecdsa.Sign(rand.Reader, priv, digest[:])
+	if err != nil {
+		return err
+	}
+	e.Key, e.AuthenticatorData = k.ID, ad
+	e.Sig = append(r.FillBytes(make([]byte, 32)), s.FillBytes(make([]byte, 32))...)
+	return nil
 }
 
 // client pins the server key the link or the command line named.
@@ -259,7 +303,7 @@ func pair(ctx context.Context, state, link, name string) error {
 	if err != nil {
 		return err
 	}
-	if err := record.Sign(&env, priv); err != nil {
+	if err := d.signEnv(&env, priv); err != nil {
 		return err
 	}
 	token := d.Token
@@ -358,7 +402,7 @@ func (d *device) sign(ctx context.Context, path, body string) error {
 	if err != nil {
 		return err
 	}
-	if err := record.Sign(&env, priv); err != nil {
+	if err := d.signEnv(&env, priv); err != nil {
 		return err
 	}
 	signed, err := json.Marshal(env)
@@ -377,7 +421,7 @@ func (d *device) sign(ctx context.Context, path, body string) error {
 
 // signed signs env with priv and posts it to /owner/v1/signed.
 func (d *device) signed(ctx context.Context, env record.Envelope, priv *ecdsa.PrivateKey) error {
-	if err := record.Sign(&env, priv); err != nil {
+	if err := d.signEnv(&env, priv); err != nil {
 		return err
 	}
 	var out map[string]string
@@ -389,11 +433,12 @@ func (d *device) rotate(ctx context.Context, state, name string) error {
 	if err != nil {
 		return err
 	}
-	oldKey, err := record.P256Key(&oldPriv.PublicKey, name)
+	oldKey, err := d.recordKey(oldPriv, name)
 	if err != nil {
 		return err
 	}
-	_, newPriv, newKey, err := newDevice(d.URL, d.SPKI, name, nil)
+	fido2 = d.CredentialID != nil // the same kind of key
+	next, newPriv, newKey, err := newDevice(d.URL, d.SPKI, name, nil)
 	if err != nil {
 		return err
 	}
@@ -405,9 +450,7 @@ func (d *device) rotate(ctx context.Context, state, name string) error {
 		return err
 	}
 	// The token belongs to the new key now.
-	if d.Key, err = x509.MarshalPKCS8PrivateKey(newPriv); err != nil {
-		return err
-	}
+	d.Key, d.CredentialID = next.Key, next.CredentialID
 	if err := d.save(state); err != nil {
 		return err
 	}

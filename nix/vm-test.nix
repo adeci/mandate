@@ -82,8 +82,8 @@ in
         args = ["call", method, path] + ([json.dumps(body)] if body is not None else [])
         return device(*args, state=state)
 
-    def sign(path, body=None):
-        return device("sign", path, json.dumps(body or {}))
+    def sign(path, body=None, state="/root/phone.json"):
+        return device("sign", path, json.dumps(body or {}), state=state)
 
     # Calls a socket as a process whose primary group is group, which is how
     # the processes tell each other apart.
@@ -211,7 +211,8 @@ in
         out = call("POST", "/owner/v1/exchanges", {"kind": "device"})
         assert out["status"] == 201, out
         ex = out["body"]
-        join = f"testdevice --state /root/tablet.json join https://localhost:8443 {spki}"
+        # The tablet's key is a fido2 one, as a desktop's security key is.
+        join = f"testdevice --state /root/tablet.json --fido2 join https://localhost:8443 {spki}"
         status, out = server.execute(f"{join} {other(ex['code'])} tablet 2>&1")
         assert status != 0 and "403" in out and "attempts_left:2" in out, (status, out)
         server.succeed(f"({join} {ex['code']} tablet >/tmp/join.log 2>&1; echo $? >/tmp/join.exit) >/dev/null 2>&1 &")
@@ -222,6 +223,7 @@ in
         assert out["status"] == 200 and out["body"]["kind"] == "key", out
         record = out["record"]
         assert record["op"] == "add" and record["seq"] == 1 and record["key"] == waiting["payload"]["key"], (record, waiting)
+        assert record["key"]["type"] == "fido2", record
         server.wait_until_succeeds("test $(cat /tmp/join.exit) = 0")
         assert call("GET", "/owner/v1/now", state="/root/tablet.json")["status"] == 200
         server.wait_until_succeeds("test $(testdevice --state /root/phone.json call GET /owner/v1/keys | jq '.body.trusted | length') = 2")
@@ -251,8 +253,10 @@ in
         [waiting] = call("GET", "/owner/v1/exchanges")["body"]
         assert waiting["id"] == ex["id"] and waiting["kind"] == "agent" and waiting["name"] == "laptop", waiting
         assert f" {waiting['address']}/" in laptop.succeed("ip -o addr show eth1"), waiting
-        out = sign(f"/owner/v1/exchanges/{ex['id']}/challenge")
+        # Admitted with the tablet's fido2 key, so the gateway verifies it.
+        out = sign(f"/owner/v1/exchanges/{ex['id']}/challenge", state="/root/tablet.json")
         assert out["status"] == 200 and out["body"]["kind"] == "identity", out
+        assert "authenticator_data" in out["envelope"], out
         assert out["record"]["token_sha256"] == waiting["payload"]["token_sha256"], (out, waiting)
         identity = out["body"]["id"]
         laptop.wait_until_succeeds("test $(cat /tmp/login.exit) = 0")
