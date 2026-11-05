@@ -581,6 +581,81 @@ func TestProposalChecks(t *testing.T) {
 	}
 }
 
+// A mailbox grant covers the threads filed directly in it when read: not a
+// folder under it, nor its threads, nor what moved to another mailbox.
+func TestMailboxGrant(t *testing.T) {
+	e := newEnv(t, self(), self())
+	ctx := t.Context()
+	st := e.conn.st
+	for _, c := range []store.Container{
+		{ID: "mailbox:in", Kind: "mailbox", Name: "Inbox"},
+		{ID: "mailbox:rec", Kind: "mailbox", Name: "Receipts", ParentID: "mailbox:in"},
+		{ID: "mailbox:trash", Kind: "mailbox", Name: "Trash"},
+		{ID: "mailbox:archive", Kind: "mailbox", Name: "Archive"},
+		{ID: "t-in", Kind: "thread", Name: "Dinner", ParentID: "mailbox:in"},
+		{ID: "t-rec", Kind: "thread", Name: "Your order", ParentID: "mailbox:rec"},
+		{ID: "t-trash", Kind: "thread", Name: "Old", ParentID: "mailbox:trash"},
+	} {
+		if err := st.UpsertContainer(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, m := range []store.Message{
+		{ID: "e-in", ContainerID: "t-in", SenderID: "sam@example.com", SentAt: time.Now().Add(-time.Hour), Body: "dinner at 8"},
+		{ID: "e-rec", ContainerID: "t-rec", SenderID: "shop@example.com", SentAt: time.Now().Add(-time.Hour), Body: "order shipped"},
+		{ID: "e-trash", ContainerID: "t-trash", SenderID: "kim@example.com", SentAt: time.Now().Add(-time.Hour), Body: "old mail"},
+	} {
+		if err := st.UpsertMessage(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// An agent asking for "inbox" finds the mailbox first, then what is in it.
+	e.push(nil)
+	if s, body := e.call(http.MethodPost, "/agent/v1/access/requests", map[string]any{
+		"connector": "chat", "chats": []string{"inbox"}, "reason": "triage",
+	}); s != http.StatusAccepted {
+		t.Fatalf("request: %d %s", s, body)
+	}
+	if got := e.owner.got().requests[0].Terms[0].Chats; len(got) == 0 || got[0].ID != "mailbox:in" {
+		t.Errorf("inbox matches %+v", got)
+	}
+
+	e.push([]record.Envelope{e.grant(e.phone, []string{"mailbox:in"}, 0, -time.Hour, time.Hour)})
+	status, body := e.call(http.MethodGet, "/agent/v1/chat/chats", nil)
+	if status != http.StatusOK || !strings.Contains(body, `"Inbox / Dinner"`) || strings.Contains(body, "t-rec") || strings.Contains(body, "t-trash") {
+		t.Errorf("chats: %d %s", status, body)
+	}
+	if _, got := e.rows("/agent/v1/chat/messages?chat=t-in"); !eq(got, []string{"dinner at 8"}) {
+		t.Errorf("thread in Inbox: %v", got)
+	}
+	for _, chat := range []string{"t-rec", "t-trash", "mailbox:rec"} {
+		if s, _ := e.rows("/agent/v1/chat/messages?chat=" + chat); s != http.StatusNotFound {
+			t.Errorf("%s under an Inbox grant: %d", chat, s)
+		}
+	}
+	if _, got := e.rows("/agent/v1/chat/search?text=e"); !eq(got, []string{"dinner at 8"}) {
+		t.Errorf("search: %v", got)
+	}
+	if s, _ := e.call(http.MethodPost, "/agent/v1/chat/send", opRequest{Args: map[string]string{"chat": "t-in", "text": "yes"}}); s != http.StatusAccepted {
+		t.Errorf("reply in Inbox: %d", s)
+	}
+	if got := e.owner.got().proposals; len(got) != 1 || !strings.Contains(string(got[0]), `"mailbox":"mailbox:in"`) {
+		t.Errorf("owner side got %s", got)
+	}
+
+	// Archiving the thread takes it out of the grant.
+	if _, err := st.DB().ExecContext(ctx, `UPDATE containers SET parent_id = 'mailbox:archive' WHERE id = 't-in'`); err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := e.rows("/agent/v1/chat/messages?chat=t-in"); s != http.StatusNotFound {
+		t.Errorf("thread moved to Archive: %d", s)
+	}
+	if s, _ := e.call(http.MethodPost, "/agent/v1/chat/send", opRequest{Args: map[string]string{"chat": "t-in", "text": "x"}}); s != http.StatusNotFound {
+		t.Errorf("reply in Archive: %d", s)
+	}
+}
+
 func TestCallerGroups(t *testing.T) {
 	for _, tt := range []struct {
 		name         string

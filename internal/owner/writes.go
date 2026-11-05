@@ -17,7 +17,9 @@ type newProposal struct {
 	Connector string             `json:"connector"`
 	Op        string             `json:"op"`
 	Prepared  connector.Prepared `json:"prepared"`
-	Note      string             `json:"note"`
+	// Mailbox is the mailbox the chat is filed in, whose grant covers it.
+	Mailbox string `json:"mailbox"`
+	Note    string `json:"note"`
 }
 
 func (s *Server) postProposal(w http.ResponseWriter, r *http.Request) {
@@ -39,8 +41,10 @@ func (s *Server) postProposal(w http.ResponseWriter, r *http.Request) {
 	// Close; the proposal becomes durable only under a grant still live.
 	covered := false
 	for _, g := range s.st.Grants {
+		chats := g.Record.Chats
 		covered = covered || g.Record.Identity == np.Identity && g.Record.Connector == np.Connector && g.live(s.now()) &&
-			(np.Prepared.Container == "" || len(g.Record.Chats) == 0 || slices.Contains(g.Record.Chats, np.Prepared.Container))
+			(np.Prepared.Container == "" || len(chats) == 0 || slices.Contains(chats, np.Prepared.Container) ||
+				np.Mailbox != "" && slices.Contains(chats, np.Mailbox))
 	}
 	if !covered {
 		fail(w, http.StatusNotFound, "no live grant covers the chat")

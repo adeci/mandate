@@ -74,9 +74,11 @@ func (f *fixture) synced() {
 	})
 }
 
+// eventually waits generously: a sync commits to the store dozens of times,
+// each syncing the disk, which a loaded builder makes take seconds.
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
 		if cond() {
 			return
 		}
@@ -299,6 +301,78 @@ func TestSync(t *testing.T) {
 	}
 	if got := f.message("e5"); got.Chat != "t6" {
 		t.Fatalf("e5 after a full resync: %+v", got)
+	}
+}
+
+// Every mailbox is a chat under its parent, at most two deep, and a thread
+// is filed under the mailbox of its newest email not sent by the owner, or
+// else Sent, following moves.
+func TestFiling(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	seed(f.jm)
+	f.jm.set(func(j *fakeJMAP) {
+		j.mailboxes = append(j.mailboxes,
+			mailbox{ID: "mb-rec", Name: "Receipts", ParentID: "mb-inbox"},
+			mailbox{ID: "mb-2026", Name: "2026", ParentID: "mb-rec"},
+			mailbox{ID: "mb-q4", Name: "Q4", ParentID: "mb-2026"})
+	})
+	f.jm.add(textEmail("e6", "t7", owner, []address{alice}, "Hi", "hello", now.Add(-time.Hour), "mb-sent"))
+	f.link()
+
+	chats := func() map[string]string {
+		got := map[string]string{}
+		rows, err := f.c.st.DB().Query(`SELECT id, kind || ' ' || COALESCE(name, '') || ' < ' || COALESCE(parent_id, '') FROM containers`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, v string
+			rows.Scan(&id, &v)
+			got[id] = v
+		}
+		return got
+	}
+	want := map[string]string{
+		"mailbox:mb-inbox":   "mailbox Inbox < ",
+		"mailbox:mb-sent":    "mailbox Sent < ",
+		"mailbox:mb-drafts":  "mailbox Drafts < ",
+		"mailbox:mb-trash":   "mailbox Trash < ",
+		"mailbox:mb-junk":    "mailbox Spam < ",
+		"mailbox:mb-archive": "mailbox Archive < ",
+		"mailbox:mb-rec":     "mailbox Receipts < mailbox:mb-inbox",
+		"mailbox:mb-2026":    "mailbox 2026 < mailbox:mb-rec",
+		"mailbox:mb-q4":      "mailbox Q4 < mailbox:mb-rec",
+		"t1":                 "thread Lunch? < mailbox:mb-inbox", // the owner's answer is in Sent
+		"t2":                 "thread Deals < mailbox:mb-archive",
+		"t7":                 "thread Hi < mailbox:mb-sent",
+	}
+	if got := chats(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("chats\n got %v\nwant %v", got, want)
+	}
+
+	// Archived, and a folder moved to the top.
+	f.jm.update("e1", func(e *email) { e.MailboxIDs = map[string]bool{"mb-archive": true} })
+	f.jm.set(func(j *fakeJMAP) { j.mailboxes[6].ParentID = "" })
+	want["t1"] = "thread Lunch? < mailbox:mb-archive"
+	want["mailbox:mb-rec"] = "mailbox Receipts < "
+	want["mailbox:mb-q4"] = "mailbox Q4 < mailbox:mb-2026"
+	// A sync already running may have read the mailboxes before the move.
+	f.c.current().poke()
+	eventually(t, "the moves synced", func() bool { return reflect.DeepEqual(chats(), want) })
+
+	// A trashed reply leaves the thread where the rest of it is.
+	f.jm.add(textEmail("e7", "t1", alice, []address{owner}, "Re: Lunch?", "x", now, "mb-trash"))
+	f.jm.destroy("e3")
+	f.c.current().poke()
+	eventually(t, "e7 filed and e3 gone", func() bool {
+		var n int
+		f.c.st.DB().QueryRow(`SELECT count(*) FROM fastmail_filed WHERE id = 'e7'`).Scan(&n)
+		return n == 1 && chats()["t2"] == "thread Deals < "
+	})
+	if got := chats()["t1"]; got != "thread Lunch? < mailbox:mb-archive" {
+		t.Fatalf("t1 after a trashed reply: %q", got)
 	}
 }
 

@@ -47,6 +47,19 @@ CREATE TABLE IF NOT EXISTS fastmail_backfill (
     account_id TEXT PRIMARY KEY
 );
 CREATE INDEX IF NOT EXISTS fastmail_emails_message_id ON fastmail_emails(message_id);
+-- The mailbox each email seen is filed in, which files its thread.
+CREATE TABLE IF NOT EXISTS fastmail_filed (
+    id          TEXT PRIMARY KEY,
+    thread_id   TEXT NOT NULL,
+    mailbox     TEXT NOT NULL, -- its chat ID
+    rank        INTEGER NOT NULL, -- 0 a folder, 1 Trash or Spam, 2 Sent or Drafts
+    received_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fastmail_filed_thread ON fastmail_filed(thread_id);
+-- Accounts whose emails stored before filing was recorded are filed.
+CREATE TABLE IF NOT EXISTS fastmail_filed_backfill (
+    account_id TEXT PRIMARY KEY
+);
 `
 
 // run syncs a every poll interval, or when kicked, until ctx is done or
@@ -90,7 +103,16 @@ func (c *fmConnector) cycle(ctx context.Context, a *account) error {
 	a.mu.Lock()
 	a.conn = cn
 	a.mu.Unlock()
+	if !slices.Equal(a.boxes, cn.boxes) {
+		if err := c.storeMailboxes(ctx, cn.boxes); err != nil {
+			return err
+		}
+		a.boxes = cn.boxes
+	}
 	if err := c.backfill(ctx, a, cn); err != nil {
+		return err
+	}
+	if err := c.fileStored(ctx, a, cn); err != nil {
 		return err
 	}
 	var state string
@@ -192,6 +214,9 @@ func (c *fmConnector) changes(ctx context.Context, a *account, cn *conn, since s
 			if err := c.st.DeleteMessage(ctx, id); err != nil {
 				return err
 			}
+			if err := c.unfile(ctx, id); err != nil {
+				return err
+			}
 		}
 		if err := c.apply(ctx, a, cn, ch.Created, ch.Updated); err != nil {
 			return err
@@ -207,13 +232,16 @@ func (c *fmConnector) changes(ctx context.Context, a *account, cn *conn, since s
 }
 
 // apply stores created emails and follows updated ones in and out of Trash
-// and Spam. An email's content never changes, so a stored one is not read
-// again.
+// and Spam, and between mailboxes. An email's content never changes, so a
+// stored one is not read again.
 func (c *fmConnector) apply(ctx context.Context, a *account, cn *conn, created, updated []string) error {
 	need := slices.Clone(created)
 	for batch := range slices.Chunk(updated, getBatch) {
-		list, err := c.getEmails(ctx, a, cn, batch, []string{"id", "mailboxIds", "keywords", "receivedAt"}, 0)
+		list, err := c.getEmails(ctx, a, cn, batch, []string{"id", "threadId", "mailboxIds", "keywords", "receivedAt"}, 0)
 		if err != nil {
+			return err
+		}
+		if err := c.file(ctx, cn, list); err != nil {
 			return err
 		}
 		for _, e := range list {
@@ -239,6 +267,9 @@ func (c *fmConnector) store(ctx context.Context, a *account, cn *conn, ids []str
 			if err := c.put(ctx, cn, e); err != nil {
 				return err
 			}
+		}
+		if err := c.file(ctx, cn, list); err != nil {
+			return err
 		}
 	}
 	return nil

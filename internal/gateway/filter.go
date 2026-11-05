@@ -12,9 +12,11 @@ import (
 // all JSON arrays.
 //
 // A rule naming chats covers exactly those, nothing under them: the owner
-// signs the chats they picked. A rule with an until, an ended grant, shows
-// only what it showed before its end; bounded spares reads, which carry
-// none, the per-rule check.
+// signs the chats they picked. Mail is the one exception: a rule naming a
+// mailbox also covers the chats filed directly in it, which are not
+// mailboxes, as filed when read. A rule with an until, an ended grant,
+// shows only what it showed before its end; bounded spares reads, which
+// carry none, the per-rule check.
 //
 // A DM's ID is not always its other person's (Discord channels, Matrix
 // rooms), so hiding a person also matches DMs by participants and by who
@@ -41,6 +43,7 @@ granted(id) AS (SELECT k.value FROM rule AS g CROSS JOIN json_each(g.chats) AS k
 every(yes) AS (SELECT EXISTS (SELECT 1 FROM rule WHERE chats IS NULL)),
 named AS (
   SELECT c.id, c.kind, c.last_message_at, c.name AS own,
+         iif(p1.kind = 'mailbox' AND c.kind != 'mailbox', p1.id, NULL) AS mailbox,
          concat_ws(' / ',
            iif(p3.id IN (SELECT id FROM granted) OR (SELECT yes FROM every), p3.name, NULL),
            iif(p2.id IN (SELECT id FROM granted) OR (SELECT yes FROM every), p2.name, NULL),
@@ -55,15 +58,16 @@ named AS (
     AND COALESCE(p1.parent_id, '') NOT IN (SELECT id FROM hidden)
     AND COALESCE(p2.parent_id, '') NOT IN (SELECT id FROM hidden)),
 covered AS (
-  SELECT n.id, n.kind, n.last_message_at,
+  SELECT n.id, n.kind, n.last_message_at, n.mailbox, n.own,
          iif(n.prefix = '', n.own, n.prefix || ' / ' || COALESCE(n.own, n.id)) AS name,
          (SELECT min(g.cutoff) FROM rule AS g
-          WHERE g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value = n.id)) AS cutoff,
+          WHERE g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value IN (n.id, n.mailbox))) AS cutoff,
          EXISTS (SELECT 1 FROM rule AS g
-          WHERE g.until != '' AND (g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value = n.id))) AS bounded
+          WHERE g.until != '' AND (g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value IN (n.id, n.mailbox)))) AS bounded
   FROM named AS n),
 chats AS (
-  SELECT id, kind, last_message_at, cutoff, bounded, iif(name_code, '[login code hidden]', name) AS name, name_code
+  SELECT id, kind, last_message_at, mailbox, cutoff, bounded, iif(name_code, '[login code hidden]', name) AS name,
+         iif(name_code, NULL, own) AS own, name_code
   FROM (SELECT *, name IS NOT NULL AND login_code(name) AS name_code FROM covered WHERE cutoff IS NOT NULL)),
 stored AS (
   SELECT m.*, COALESCE(
@@ -74,7 +78,7 @@ stored AS (
   FROM messages AS m JOIN chats AS c ON c.id = m.container_id
   WHERE COALESCE(m.sender_id, '') NOT IN (SELECT id FROM hidden_person) AND m.sent_at >= c.cutoff
     AND (NOT c.bounded OR EXISTS (SELECT 1 FROM rule AS g
-      WHERE (g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value = c.id))
+      WHERE (g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value IN (c.id, c.mailbox)))
         AND m.sent_at >= g.cutoff AND (g.until = '' OR m.sent_at < g.until)))),
 visible AS (
   SELECT *, login_code(concat_ws(' ', files, body)) AS code FROM stored),
@@ -253,7 +257,7 @@ const replyTo = `(SELECT r.seq FROM msgs AS r WHERE r.id = m.reply_to_id)`
 // message (mail threads).
 const listed = `, listed AS MATERIALIZED (
   SELECT * FROM (
-    SELECT c.id, c.kind, c.name, c.name_code, c.cutoff, NULLIF(max(
+    SELECT c.id, c.kind, c.name, c.own, c.name_code, c.cutoff, NULLIF(max(
       COALESCE((SELECT max(sent_at) FROM msgs WHERE container_id = c.id), ''),
       COALESCE(c.last_message_at, '')), '') AS at
     FROM chats AS c
@@ -278,14 +282,17 @@ ORDER BY at DESC NULLS LAST, id LIMIT ?5`, search, limit+1)
 
 // matches finds up to per chats for each term, as chats would list them, in
 // one query: rows of term index, id and name. Resolving every term at once
-// keeps a request's cost from growing with what each term matches.
+// keeps a request's cost from growing with what each term matches. Chats
+// matching by their own name come first, so asking for a mailbox or a
+// guild finds it before what is under it.
 func (v *view) matches(ctx context.Context, terms []string, per int64) ([][]any, error) {
 	b, err := json.Marshal(terms)
 	if err != nil {
 		return nil, err
 	}
 	return v.query(ctx, listed+`SELECT k, id, name FROM (
-  SELECT t.key AS k, l.id, l.name, row_number() OVER (PARTITION BY t.key ORDER BY l.at DESC NULLS LAST, l.id) AS n
+  SELECT t.key AS k, l.id, l.name, row_number() OVER (PARTITION BY t.key
+    ORDER BY instr(lower(COALESCE(l.own, '')), lower(t.value)) = 0, l.at DESC NULLS LAST, l.id) AS n
   FROM json_each(?4) AS t JOIN listed AS l ON `+fmt.Sprintf(matching, "t.value")+`)
 WHERE n <= ?5 ORDER BY k, n`, string(b), per)
 }

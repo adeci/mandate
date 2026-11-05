@@ -64,11 +64,14 @@ type account struct {
 	conn    *conn // nil until the session is fetched
 	syncing bool  // the first sync is running
 	err     error // of the last sync
+
+	boxes []mailbox // as last stored; the sync loop's own
 }
 
 type conn struct {
 	api, download, accountID, username string
 	roles                              map[string]string // mailbox role → ID
+	boxes                              []mailbox
 	identities                         []identity
 }
 
@@ -246,7 +249,7 @@ func (c *fmConnector) connect(ctx context.Context, a *account) (*conn, error) {
 
 func (c *fmConnector) refresh(ctx context.Context, a *account, cn *conn) (*conn, error) {
 	resps, err := a.call(ctx, cn.api,
-		invocation{"Mailbox/get", map[string]any{"accountId": cn.accountID, "properties": []string{"id", "role"}}, "mb"},
+		invocation{"Mailbox/get", map[string]any{"accountId": cn.accountID, "properties": []string{"id", "role", "name", "parentId"}}, "mb"},
 		invocation{"Identity/get", map[string]any{"accountId": cn.accountID}, "id"},
 	)
 	if err != nil {
@@ -267,7 +270,7 @@ func (c *fmConnector) refresh(ctx context.Context, a *account, cn *conn) (*conn,
 			next.roles[m.Role] = m.ID
 		}
 	}
-	next.identities = ids.List
+	next.boxes, next.identities = boxes.List, ids.List
 	return &next, nil
 }
 

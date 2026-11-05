@@ -171,10 +171,11 @@ time a grant opens.
 ## Reads
 
 A read needs a grant open now on the connector, else `403`. Within open
-grants, a message is readable if one of them names its chat (or all chats)
-and it was sent at or after that grant's cutoff (now minus the horizon). The
-owner's never-share list hides chats and people on top, and messages that
-look like login codes read `[login code hidden]`.
+grants, a message is readable if one of them names its chat, the mailbox its
+thread is filed in (mail only), or all chats, and it was sent at or after
+that grant's cutoff (now minus the horizon). The owner's never-share list
+hides chats and people on top, and messages that look like login codes read
+`[login code hidden]`.
 
 Reads answer a table:
 

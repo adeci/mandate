@@ -100,7 +100,7 @@ read them, so they hold nothing secret.
 ```sql
 CREATE TABLE containers (
     id                TEXT PRIMARY KEY,
-    kind              TEXT NOT NULL,     -- dm, group, channel, thread, guild, …
+    kind              TEXT NOT NULL,     -- dm, group, channel, thread, guild, mailbox, …
     parent_id         TEXT,
     name              TEXT,
     is_group          INTEGER NOT NULL DEFAULT 0,
@@ -144,6 +144,10 @@ CREATE TABLE media (
 - IDs are the service's and stable; a chat ID is what `container` params take.
 - `parent_id` chains are acyclic and at most three deep; deeper chats are
   invisible to agents.
+- A grant covers exactly the chats it names, never chats under them, except
+  for mail: a mailbox is a chat of kind `mailbox`, a thread's `parent_id` is
+  the mailbox it is filed in, and a grant on a mailbox also covers the chats
+  filed directly in it that aren't mailboxes, as filed when read.
 - A name the person chose (a profile or push name) starts with `~`;
   address-book names and the owner's own name don't. The owner's chat with
   themself gets the service's name for it.

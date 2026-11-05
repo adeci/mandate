@@ -118,8 +118,11 @@ impl Shell {
         match &p.found {
             None => rows.push(t.alt("Loading chats…").into_any_element()),
             Some(f) => {
-                let fresh = f.iter().filter(|c| !pinned.iter().any(|p| p.id == c.id));
-                rows.extend(fresh.map(|c| row(c, cx)));
+                let fresh = mailboxes_first(f)
+                    .into_iter()
+                    .filter(|c| !pinned.iter().any(|p| p.id == c.id))
+                    .collect::<Vec<_>>();
+                rows.extend(fresh.iter().map(|c| row(c, cx)));
                 if rows.is_empty() {
                     rows.push(t.alt("No chat matches.").into_any_element());
                 }
@@ -186,7 +189,8 @@ impl Shell {
                     };
                     // The chat itself, then each person in it, hidden by
                     // their own ID: a DM's one person, a group's members.
-                    let chat = (("chat", c.id.clone()), "Hide chat".to_string(), display(c));
+                    let noun = if c.kind == "mailbox" { "mailbox" } else { "chat" };
+                    let chat = (("chat", c.id.clone()), format!("Hide {noun}"), display(c));
                     let people = c.participants.iter().map(|p| {
                         let name = if p.name.is_empty() { p.id.clone() } else { p.name.clone() };
                         (("person", p.id.clone()), format!("Hide {name}"), name)
@@ -202,7 +206,7 @@ impl Shell {
                         .children(std::iter::once(chat).chain(people).map(
                             |((kind, id), label, name)| {
                                 if is(kind, &id) {
-                                    let what = if kind == "chat" { "chat" } else { &name };
+                                    let what = if kind == "chat" { noun } else { &name };
                                     return t.alt(format!("[{what} hidden]")).into_any_element();
                                 }
                                 let key = id_for(kind, &format!("{}/{id}", c.id));
@@ -422,7 +426,7 @@ impl Shell {
                                 .gap(chars(1.))
                                 .py(lines(0.25))
                                 .child(checkbox(t, on))
-                                .child(display(c))
+                                .child(chat_name(t, c))
                                 .into_any_element()
                             }))
                         })
@@ -549,7 +553,7 @@ impl Shell {
             .gap(chars(1.))
             .py(lines(0.25))
             .child(checkbox(t, ticked.contains(&c.id)))
-            .child(display(c))
+            .child(chat_name(t, c))
             .into_any_element()
         })
     }
@@ -558,4 +562,33 @@ impl Shell {
 /// A chat's name, or its ID when it has none.
 fn display(c: &Container) -> String {
     if c.name.is_empty() { c.id.clone() } else { c.name.clone() }
+}
+
+/// An email connector's mailboxes before its threads, the server's order
+/// kept otherwise; a nested mailbox is named after its parent too.
+fn mailboxes_first(found: &[Container]) -> Vec<Container> {
+    let names: BTreeMap<&str, &str> = found
+        .iter()
+        .filter(|c| c.kind == "mailbox")
+        .map(|c| (c.id.as_str(), c.name.as_str()))
+        .collect();
+    let (mut boxes, rest): (Vec<Container>, Vec<Container>) =
+        found.iter().cloned().partition(|c| c.kind == "mailbox");
+    for b in &mut boxes {
+        if let Some(parent) = names.get(b.parent_id.as_str()) {
+            b.name = format!("{parent} / {}", b.name);
+        }
+    }
+    boxes.extend(rest);
+    boxes
+}
+
+/// A chat's name in a picker row, a mailbox marked quietly as one.
+fn chat_name(t: Theme, c: &Container) -> Div {
+    div()
+        .flex()
+        .flex_1()
+        .gap(chars(1.))
+        .child(div().flex_1().child(display(c)))
+        .when(c.kind == "mailbox", |d| d.child(t.alt("mailbox")))
 }

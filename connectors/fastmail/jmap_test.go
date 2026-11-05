@@ -56,12 +56,12 @@ func newFakeJMAP(t *testing.T) *fakeJMAP {
 	f := &fakeJMAP{
 		t: t, token: goodToken, emails: map[string]*email{}, blobs: map[string]string{},
 		mailboxes: []mailbox{
-			{ID: "mb-inbox", Role: "inbox"},
-			{ID: "mb-sent", Role: "sent"},
-			{ID: "mb-drafts", Role: "drafts"},
-			{ID: "mb-trash", Role: "trash"},
-			{ID: "mb-junk", Role: "junk"},
-			{ID: "mb-archive"},
+			{ID: "mb-inbox", Role: "inbox", Name: "Inbox"},
+			{ID: "mb-sent", Role: "sent", Name: "Sent"},
+			{ID: "mb-drafts", Role: "drafts", Name: "Drafts"},
+			{ID: "mb-trash", Role: "trash", Name: "Trash"},
+			{ID: "mb-junk", Role: "junk", Name: "Spam"},
+			{ID: "mb-archive", Name: "Archive"},
 		},
 		identities: []identity{
 			{ID: "id-wild", Name: "Owner", Email: "*@owner.dev"},

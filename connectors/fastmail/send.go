@@ -22,7 +22,8 @@ import (
 var fromParam = connector.Param{Name: "from", Doc: "one of the owner's sending addresses; default their own address, or for a reply the one the email was sent to"}
 
 var spec = connector.Spec{
-	Doc: "Chats are email threads. The last 90 days of mail arrive by the first sync, new mail within a minute; " +
+	Doc: "Chats are email threads, each under the mailbox it is filed in; a mailbox (ID mailbox:…) holds no messages itself, " +
+		"and a grant on it covers the threads filed in it. The last 90 days of mail arrive by the first sync, new mail within a minute; " +
 		"Trash, Spam and Drafts are left out, and mail moved there can't be fetched or replied to. A body cut at 16 KiB ends in " + truncatedMarker + ".\n" +
 		"send and reply propose an email; it goes out from the owner's account once they approve it.",
 	Ops: []connector.Op{

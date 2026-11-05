@@ -222,8 +222,10 @@ type setResponse struct {
 }
 
 type mailbox struct {
-	ID   string `json:"id"`
-	Role string `json:"role"`
+	ID       string `json:"id"`
+	Role     string `json:"role"`
+	Name     string `json:"name"`
+	ParentID string `json:"parentId"`
 }
 
 type identity struct {
