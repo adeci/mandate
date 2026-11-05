@@ -56,7 +56,7 @@ On an existing device, the owner:
 - the owner side's key log, identities, grants, device tokens, requests and proposals;
 - every connector's key log, and the gateway's copy of the live set.
 
-It keeps never-share, activity and every connector's spent approvals, so nothing signed before the reset can run again. Then it issues a new setup password and starts `mandate.target` again.
+It keeps never-share, activity and every connector's spent approvals, so nothing signed before the reset can run again. Then it issues a new setup password and starts `mandate.target` again. Linked accounts stay linked, and it lists them (`Still linked`). With `--unlink`, it first has each linked connector `POST /unlink` while it still runs, then deletes every connector's `data.db` and, for those that did not log out (no `unlink`, or not answering), its session in `private/`, listing them (`Not logged out`).
 
 ## Device token
 

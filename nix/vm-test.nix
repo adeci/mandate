@@ -125,10 +125,15 @@ in
 
     # What mandate setup and reset print, and nothing else: the setup link
     # and, in own-key mode, the key.
+    # and what reset adds, as aligned rows.
     def printed(out):
-        m = re.fullmatch(r"Initial setup  (https://server:8443/setup/(\S+))\nKey            ((?:[0-9a-f]{4} ){4}[0-9a-f]{4})\n", out)
+        m = re.fullmatch(r"(Initial setup +)(https://server:8443/setup/(\S+))\nKey +((?:[0-9a-f]{4} ){4}[0-9a-f]{4})\n((?:.+\n)*)", out)
         assert m, out
-        return m[1].replace("server:8443", "localhost:8443"), m[2], m[3]
+        rows = {}
+        for line in out.splitlines():
+            assert line[len(m[1]) - 1] == " " and line[len(m[1])] != " ", ("not aligned", out)
+            rows[line[: len(m[1])].strip()] = line[len(m[1]):]
+        return m[2].replace("server:8443", "localhost:8443"), m[3], m[4], rows
 
     # The pairing link on the page the setup link opens.
     def setup_link(url):
@@ -169,7 +174,8 @@ in
     with subtest("mandate setup prints a link that opens the pairing page; the form is the fallback"):
         assert "waiting to be set up" in server.succeed("curl -skf https://localhost:8443/setup")
         assert server.succeed("curl -sk -o /dev/null -w '%{http_code} %{redirect_url}' https://localhost:8443/") == "302 https://localhost:8443/setup"
-        url, password, key = printed(server.succeed("mandate setup"))
+        url, password, key, rows = printed(server.succeed("mandate setup"))
+        assert list(rows) == ["Initial setup", "Key"], rows
         assert server.succeed("stat -c %a /var/lib/mandate/setup-password").strip() == "600"
         page = server.succeed("curl -skf https://localhost:8443/setup/WRONG-PASS")
         assert "<form" in page and "<svg" not in page, page
@@ -420,8 +426,9 @@ in
         print(f"mandate reset took {took:.1f}s")
         # Every unit exits promptly on SIGTERM, well inside systemd's 90 s.
         assert took < 20, took
-        new_url, new_password, _ = printed(out)
+        new_url, new_password, _, rows = printed(out)
         assert new_password != password
+        assert "test" in rows["Still linked"].split(", ") and "Not logged out" not in rows, rows
         server.wait_for_open_port(8443)
         server.wait_until_succeeds("test -S /run/mandate/owner/socket")
         assert call("GET", "/owner/v1/now")["status"] == 401
@@ -441,5 +448,22 @@ in
         assert len(sent()) == 1, sent()
         hidden = call("GET", "/owner/v1/never-share")["body"]
         assert [(h["connector"], h["kind"], h["id"]) for h in hidden] == [("test", "chat", "sam")], hidden
+
+    with subtest("mandate reset --unlink logs the accounts out and empties their stores"):
+        test_sock = "/run/mandate/connectors/test/socket"
+        assert json.loads(as_group("mandate-owner", test_sock, "GET", "/containers?limit=500")[1]) != []
+        began = time.monotonic()
+        out = server.succeed("mandate reset --unlink")
+        print(f"mandate reset --unlink took {time.monotonic() - began:.1f}s")
+        _, _, _, rows = printed(out)
+        # The test connector logs out itself; nothing is still linked.
+        assert "Still linked" not in rows and "test" not in rows.get("Not logged out", ""), rows
+        server.wait_until_succeeds(f"test -S {test_sock}")
+        code, health = as_group("mandate-gateway", test_sock, "GET", "/health")
+        assert code == 200 and json.loads(health)["state"] == "setup", (code, health)
+        code, chats = as_group("mandate-owner", test_sock, "GET", "/containers?limit=500")
+        assert code == 200 and json.loads(chats) == [], (code, chats)
+        # Its spent approvals stay.
+        server.succeed("test -s /var/lib/private/mandate/connectors/test/private/spent")
   '';
 }

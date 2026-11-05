@@ -19,7 +19,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -423,7 +422,7 @@ func unstored(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func printSetup(ctx context.Context, cfg *config.Config, out io.Writer, password string) {
+func printSetup(ctx context.Context, cfg *config.Config, out io.Writer, password string, more ...[2]string) {
 	// The name the certificate is for, so that the browser accepts it.
 	host := cfg.TLS.Domain
 	if cfg.TLS.Mode == "cert" {
@@ -436,7 +435,7 @@ func printSetup(ctx context.Context, cfg *config.Config, out io.Writer, password
 	if cfg.TLS.Mode == "own" {
 		key = serverKey(ctx, cfg)
 	}
-	writeSetup(out, setupURL(cfg, host, password), key)
+	writeSetup(out, setupURL(cfg, host, password), key, more...)
 }
 
 // certHost is the first DNS name of the certificate in the PEM file at
@@ -478,11 +477,19 @@ func setupURL(cfg *config.Config, host, password string) string {
 }
 
 // writeSetup prints the setup link and, in own-key mode, the key people
-// compare with the app's.
-func writeSetup(out io.Writer, link, key string) {
-	fmt.Fprintf(out, "Initial setup  %s\n", link)
+// compare with the app's, then more, as aligned rows of label and value.
+func writeSetup(out io.Writer, link, key string, more ...[2]string) {
+	rows := [][2]string{{"Initial setup", link}}
 	if key != "" {
-		fmt.Fprintf(out, "Key            %s\n", key)
+		rows = append(rows, [2]string{"Key", key})
+	}
+	rows = append(rows, more...)
+	width := 0
+	for _, r := range rows {
+		width = max(width, len(r[0]))
+	}
+	for _, r := range rows {
+		fmt.Fprintf(out, "%-*s  %s\n", width, r[0], r[1])
 	}
 }
 
@@ -498,96 +505,4 @@ func serverKey(ctx context.Context, cfg *config.Config) string {
 		time.Sleep(500 * time.Millisecond)
 	}
 	return fmt.Sprintf("unknown (%v); the setup page shows it", err)
-}
-
-// Reset stops mandate, forgets the paired devices with the key logs,
-// identities and grants, and makes a new setup password. Connectors keep
-// their spent approvals, so nothing signed before runs again.
-func Reset(ctx context.Context, cfg *config.Config, out io.Writer) error {
-	restart, err := stopServices(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	password, err := wipe()
-	if restart != nil {
-		if rerr := restart(); rerr != nil {
-			err = errors.Join(err, fmt.Errorf("start mandate.target: %w", rerr))
-		}
-	}
-	if err != nil {
-		return err
-	}
-	printSetup(ctx, cfg, out, password)
-	return nil
-}
-
-// stopServices stops mandate.target and returns how to start it again. With
-// no systemd or no target it only makes sure nothing of mandate runs.
-func stopServices(ctx context.Context, cfg *config.Config) (func() error, error) {
-	// systemctl waits only for the jobs it was asked for, and stopping a
-	// target finishes before the units that are PartOf it, so name them too.
-	if _, err := exec.LookPath("systemctl"); err == nil &&
-		exec.CommandContext(ctx, "systemctl", "stop", "mandate.target", "mandate-*.service").Run() == nil {
-		return exec.CommandContext(ctx, "systemctl", "start", "mandate.target").Run, nil
-	}
-	socks := []string{config.Socket("owner"), config.Socket("gateway")}
-	for name := range cfg.Connectors {
-		socks = append(socks, config.ConnectorSocket(name))
-	}
-	for _, sock := range socks {
-		d := net.Dialer{Timeout: time.Second}
-		if c, err := d.DialContext(ctx, "unix", sock); err == nil {
-			c.Close()
-			return nil, fmt.Errorf("%s answers: stop mandate's services first", sock)
-		}
-	}
-	return nil, nil
-}
-
-// wipe empties every key log and the owner side's state but never-share
-// and activity, and makes a new setup password.
-func wipe() (string, error) {
-	dir := config.StateDir("owner")
-	old, err := loadState(dir)
-	if err != nil {
-		return "", err
-	}
-	st := newState()
-	st.NeverShare = old.NeverShare
-	b, err := json.Marshal(&st)
-	if err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
-	if err := writeOwned(stateFile(dir), b, 0o600); err != nil {
-		return "", fmt.Errorf("reset owner state: %w", err)
-	}
-	logs, err := filepath.Glob(filepath.Join(config.ConnectorDir("*"), "private", "keylog.json"))
-	if err != nil {
-		return "", err
-	}
-	for _, f := range logs {
-		if err := os.Remove(f); err != nil {
-			return "", fmt.Errorf("reset connector key log: %w", err)
-		}
-	}
-	// All the gateway keeps derives from the live set the owner side pushes.
-	gw := config.StateDir("gateway")
-	entries, err := os.ReadDir(gw)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return "", err
-	}
-	for _, e := range entries {
-		if err := os.RemoveAll(filepath.Join(gw, e.Name())); err != nil {
-			return "", fmt.Errorf("reset gateway state: %w", err)
-		}
-	}
-	for _, f := range []string{setupFile(dir), config.SetupPasswordFile()} {
-		if err := os.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return "", err
-		}
-	}
-	return setupPassword(dir)
 }

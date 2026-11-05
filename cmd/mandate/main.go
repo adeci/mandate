@@ -25,7 +25,7 @@ const usage = `usage:
   mandate serve gateway
   mandate serve owner
   sudo mandate setup
-  sudo mandate reset
+  sudo mandate reset [--unlink]
   mandate units [--config FILE] --out DIR
   mandate conformance PROGRAM [--config FILE] [--store FILE]`
 
@@ -52,7 +52,8 @@ func run(ctx context.Context, args []string) error {
 			return errUsage
 		}
 		return serve(ctx, args[1])
-	case len(args) == 1 && (args[0] == "setup" || args[0] == "reset"):
+	case len(args) == 1 && args[0] == "setup",
+		len(args) > 0 && args[0] == "reset" && (len(args) == 1 || len(args) == 2 && args[1] == "--unlink"):
 		if args[0] == "setup" {
 			if err := owner.Install(ctx); err != nil {
 				return err
@@ -65,7 +66,7 @@ func run(ctx context.Context, args []string) error {
 		if args[0] == "setup" {
 			return owner.Setup(ctx, cfg, os.Stdout)
 		}
-		return owner.Reset(ctx, cfg, os.Stdout)
+		return owner.Reset(ctx, cfg, os.Stdout, len(args) == 2)
 	case len(args) == 2 && args[0] == "store-acl":
 		return owner.StoreACL(args[1])
 	case len(args) > 0 && args[0] == "units":

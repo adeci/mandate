@@ -1,8 +1,9 @@
 // Command testconnector is the connector of the NixOS VM test: a service
 // that exists only as fixed chats and messages, whose send appends the
 // message to private/sent.jsonl, so the test can count what ran. It starts
-// linked unless the config says unlinked; after an unlink, setup runs a mock
-// dialogue through every kind of step, so the app can be tried against it.
+// linked, with its chats stored, unless the config says unlinked or it was
+// unlinked (private/unlinked); then setup runs a mock dialogue through every
+// kind of step, so the app can be tried against it.
 package main
 
 import (
@@ -40,6 +41,7 @@ type fake struct {
 	account string
 	st      *store.Store
 	sent    string
+	marker  string // private/unlinked, kept across restarts
 	mu      sync.Mutex
 	// linked is the fake session; polls counts the polls of the current
 	// waiting step, which the mock "other device" answers after a few.
@@ -52,11 +54,15 @@ func start(ctx context.Context, env *connector.Env, cfg config) (connector.Conne
 	if err != nil {
 		return nil, err
 	}
-	if err := seed(ctx, st, time.Now()); err != nil {
-		st.Close()
-		return nil, err
+	f := &fake{account: cfg.Account, st: st, sent: filepath.Join(env.PrivateDir(), "sent.jsonl"), marker: filepath.Join(env.PrivateDir(), "unlinked")}
+	_, err = os.Stat(f.marker)
+	if f.linked = !cfg.Unlinked && errors.Is(err, os.ErrNotExist); f.linked {
+		if err := seed(ctx, st, time.Now()); err != nil {
+			st.Close()
+			return nil, err
+		}
 	}
-	return &fake{account: cfg.Account, st: st, sent: filepath.Join(env.PrivateDir(), "sent.jsonl"), linked: !cfg.Unlinked}, nil
+	return f, nil
 }
 
 func (f *fake) Close() error { return f.st.Close() }
@@ -121,7 +127,7 @@ func (f *fake) Unlink(context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.linked, f.polls = false, 0
-	return nil
+	return os.WriteFile(f.marker, nil, 0o600)
 }
 
 // Setup walks account (text, secret, number, choice) → qr → code → confirm
@@ -188,6 +194,12 @@ func (f *fake) Setup(_ context.Context, step string, values map[string]string) (
 			return account, nil
 		}
 		f.linked = true
+		if err := os.Remove(f.marker); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return connector.Step{}, err
+		}
+		if err := seed(context.Background(), f.st, time.Now()); err != nil {
+			return connector.Step{}, err
+		}
 		return connector.Step{ID: "done", Text: "Linked.", Done: true}, nil
 	}
 	return connector.Step{}, connector.Invalid("unknown step %q", step)

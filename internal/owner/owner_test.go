@@ -827,6 +827,17 @@ func TestShutdownEndsStreams(t *testing.T) {
 	}
 }
 
+func TestResetOutput(t *testing.T) {
+	var b strings.Builder
+	writeSetup(&b, "https://box.example:8443/setup/"+testPassword, "6ffd 8c34 742e fa9a 1c18", [2]string{"Still linked", "signal, whatsapp"})
+	want := "Initial setup  https://box.example:8443/setup/" + testPassword + "\n" +
+		"Key            6ffd 8c34 742e fa9a 1c18\n" +
+		"Still linked   signal, whatsapp\n"
+	if b.String() != want {
+		t.Errorf("printed\n%s\nwant\n%s", b.String(), want)
+	}
+}
+
 func TestSetupOutput(t *testing.T) {
 	var b strings.Builder
 	writeSetup(&b, setupURL(&config.Config{Listen: ":8443"}, "box.example", testPassword), "6ffd 8c34 742e fa9a 1c18")
@@ -855,6 +866,76 @@ func TestCopyLinkAllowed(t *testing.T) {
 	sum := sha256.Sum256([]byte(m[1]))
 	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "script-src 'sha256-"+base64.StdEncoding.EncodeToString(sum[:])+"'") {
 		t.Errorf("the policy %q does not allow the script", csp)
+	}
+}
+
+// unlinkable is a linked account whose connector can log out.
+type unlinkable struct {
+	fakeConnector
+	unlinked atomic.Bool
+}
+
+func (u *unlinkable) Unlink(context.Context) error { u.unlinked.Store(true); return nil }
+
+// unlinked needs setup.
+type unlinked struct{ fakeConnector }
+
+func (*unlinked) Health(context.Context) connector.Health {
+	return connector.Health{State: connector.NeedsSetup}
+}
+
+func TestResetSurvey(t *testing.T) {
+	u := &unlinkable{}
+	conns := map[string]*connector.Client{
+		"signal":   serveConnector(t, u, t.TempDir())["test"],
+		"discord":  serveConnector(t, &fakeConnector{}, t.TempDir())["test"],
+		"fastmail": serveConnector(t, &unlinked{}, t.TempDir())["test"],
+		"matrix":   connector.Dial("matrix", "/nonexistent/matrix.sock"),
+	}
+	want := []account{
+		{name: "discord", reached: true, linked: true},
+		{name: "fastmail", reached: true},
+		{name: "matrix"},
+		{name: "signal", reached: true, linked: true},
+	}
+	if got := survey(t.Context(), conns, false); !slices.Equal(got, want) || u.unlinked.Load() {
+		t.Errorf("survey = %+v, unlinked %v", got, u.unlinked.Load())
+	}
+	want[3].loggedOut = true
+	if got := survey(t.Context(), conns, true); !slices.Equal(got, want) || !u.unlinked.Load() {
+		t.Errorf("survey with unlink = %+v, unlinked %v", got, u.unlinked.Load())
+	}
+}
+
+func TestResetForget(t *testing.T) {
+	for _, loggedOut := range []bool{false, true} {
+		dir := t.TempDir()
+		for _, f := range []string{"data.db", "data.db-wal", "private/spent", "private/session.db", "private/keys/a"} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, f)), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, f), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := forget(dir, loggedOut); err != nil {
+			t.Fatal(err)
+		}
+		var left []string
+		filepath.WalkDir(dir, func(p string, d fs.DirEntry, _ error) error {
+			if !d.IsDir() {
+				rel, _ := filepath.Rel(dir, p)
+				left = append(left, rel)
+			}
+			return nil
+		})
+		want := []string{"private/spent"}
+		if loggedOut {
+			want = []string{"private/keys/a", "private/session.db", "private/spent"}
+		}
+		if !slices.Equal(left, want) {
+			t.Errorf("logged out %v: left %v, want %v", loggedOut, left, want)
+		}
 	}
 }
 
@@ -1176,7 +1257,7 @@ func (f *fakeConnector) Execute(_ context.Context, w record.Write) connector.Res
 }
 
 // serveConnector serves f with state in dir and dials it as "test".
-func serveConnector(t *testing.T, f *fakeConnector, dir string) map[string]*connector.Client {
+func serveConnector(t *testing.T, f connector.Connector, dir string) map[string]*connector.Client {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Join(dir, "private"), 0o700); err != nil {
 		t.Fatal(err)
