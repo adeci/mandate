@@ -70,6 +70,9 @@ in
     for unit in ["front", "gateway", "owner", "test"] + bundled:
         server.wait_for_unit(f"mandate-{unit}.service")
     server.wait_for_open_port(8443)
+    # A unit is active before its socket is up.
+    for sock in ["gateway/socket", "owner/socket"] + [f"connectors/{c}/socket" for c in ["test"] + bundled]:
+        server.wait_until_succeeds(f"test -S /run/mandate/{sock}")
 
     def device(*args, state="/root/phone.json"):
         out = server.succeed(f"testdevice --state {state} " + " ".join(shlex.quote(a) for a in args))
@@ -155,6 +158,13 @@ in
         assert "mask::---" in server.succeed("getfacl -p /var/lib/mandate/connectors/test/private")
         assert server.succeed("systemctl show -p MemoryDenyWriteExecute --value mandate-signal").strip() == "yes"
         assert "192.0.2.1" in server.succeed("systemctl show -p IPAddressAllow --value mandate-test")
+        # systemd skips a unit-file value it can't parse with only a warning,
+        # so a sandbox line can silently do nothing.
+        warnings = server.succeed("journalctl -b -o cat _PID=1 | grep -E 'mandate.*(is not known|ignoring|Unknown key|Failed to parse)' || true")
+        assert warnings == "", warnings
+        for u in ["front", "gateway", "owner", "test"]:
+            allowed = server.succeed(f"systemctl show -p SystemCallFilter --value mandate-{u}").split()
+            assert "read" in allowed and "reboot" not in allowed and "mount" not in allowed, (u, allowed)
 
     with subtest("mandate setup prints a link that opens the pairing page; the form is the fallback"):
         assert "waiting to be set up" in server.succeed("curl -skf https://localhost:8443/setup")
@@ -189,7 +199,8 @@ in
         server.fail(f"testdevice --state /root/thief.json pair '{link}'")
         server.fail("mandate setup")
         server.wait_until_succeeds("test $(testdevice --state /root/phone.json call GET /owner/v1/keys | jq '.body.trusted | length') = 1")
-        assert connector_keys() == 1
+        # The owner side pushes the key log to connectors after pairing.
+        retry(lambda _: connector_keys() == 1)
         connectors = {c["name"]: c for c in call("GET", "/owner/v1/connectors")["body"]}
         assert set(connectors) == {"test", "legacy", *bundled}, connectors
         assert connectors["test"]["health"]["state"] == "ok", connectors
@@ -308,6 +319,18 @@ in
         server.fail(f"{as_gateway} /var/lib/mandate/connectors/legacy/private/session")
         assert "mandate-gateway" not in server.succeed(f"getfacl -p {d}/private")
 
+    # Before the write, so that the approval kept across mandate reset is
+    # signed by the key the phone pairs with again.
+    with subtest("the phone rotates its key: what the old key signed stays valid"):
+        before = connector_keys()
+        out = device("rotate", "phone")
+        keys = call("GET", "/owner/v1/keys")["body"]
+        assert keys["retired"] == [out["old"]] and len(keys["trusted"]) == 3, (out, keys)
+        assert out["new"] in [k["id"] for k in keys["trusted"]], (out, keys)
+        # The connectors take the log with the retire entry.
+        retry(lambda _: connector_keys() == before + 2)
+        laptop.succeed("mandate test chats")
+
     with subtest("a write approved with an edit runs exactly once"):
         status, out = agent("test send fam on my way --note 'mum asked' --wait 0")
         assert status == 75, (status, out)
@@ -344,7 +367,8 @@ in
         now = call("GET", "/owner/v1/now")["body"]
         assert now["requests"] == [] and now["grants"] == [], now
         kinds = [e["kind"] for e in call("GET", "/owner/v1/activity?limit=500")["body"]["entries"]]
-        assert kinds[0] == "stop_all" and "request.asked" in kinds and "request.approved" in kinds and "read" in kinds, kinds
+        # Reads the gateway batched may land after it.
+        assert [k for k in kinds if k != "read"][0] == "stop_all" and "request.asked" in kinds and "request.approved" in kinds and "read" in kinds, kinds
 
     with subtest("callers are told apart by their group"):
         for path in ["/internal/live", "/internal/requests", "/index.html"]:
