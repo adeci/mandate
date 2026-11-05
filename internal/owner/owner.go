@@ -178,9 +178,10 @@ func (s *Server) serverInfo(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handler(front, gateway uint32) http.Handler {
 	app := http.NewServeMux()
-	app.HandleFunc("GET /setup", s.setupPage)
-	app.HandleFunc("POST /setup", s.setupPassword)
-	app.HandleFunc("GET /setup/{password}", s.setupLink)
+	app.HandleFunc("GET /{$}", unstored(s.home))
+	app.HandleFunc("GET /setup", unstored(s.setupPage))
+	app.HandleFunc("POST /setup", unstored(s.setupPassword))
+	app.HandleFunc("GET /setup/{password}", unstored(s.setupLink))
 	app.HandleFunc("POST /owner/v1/pair", s.pair)
 	app.HandleFunc("POST /owner/v1/join", s.joinStart("device"))
 	app.HandleFunc("GET /owner/v1/join/{id}", s.joinPoll("device"))
@@ -230,6 +231,7 @@ func (s *Server) handler(front, gateway uint32) http.Handler {
 	internal.HandleFunc("POST /internal/join/{id}", s.joinAnswer("agent"))
 
 	mux := http.NewServeMux()
+	mux.Handle("/{$}", peer.Allow(s.log, app, front))
 	mux.Handle("/owner/", peer.Allow(s.log, app, front))
 	mux.Handle("/setup", peer.Allow(s.log, app, front))
 	mux.Handle("/setup/", peer.Allow(s.log, app, front))

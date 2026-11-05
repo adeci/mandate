@@ -31,7 +31,7 @@ Each unit has its own `RuntimeDirectory=` (`mandate/gateway`, `mandate/owner`, `
 |---|---|---|
 | gateway | `/agent/` | `mandate-front` |
 | gateway | `/internal/` | `mandate-owner` |
-| owner | `/owner/`, `/setup`, `/setup/` | `mandate-front` |
+| owner | `/`, `/owner/`, `/setup`, `/setup/` | `mandate-front` |
 | owner | `/internal/` | `mandate-gateway` |
 | connector | per connector.md | `mandate-gateway`, `mandate-owner` |
 
@@ -45,7 +45,7 @@ Each unit has its own `RuntimeDirectory=` (`mandate/gateway`, `mandate/owner`, `
 ## front
 
 - **TLS modes:** `own` (P-256 key and self-signed certificate, made once, in front's state), `acme` (autocert with TLS-ALPN-01, cache in front's state) and `cert` (files, reloaded when they change).
-- **Routing:** `/agent/` goes to the gateway socket, `/owner/`, `/setup` and `/setup/` to the owner socket, and everything else is `404`.
+- **Routing:** `/agent/` goes to the gateway socket, exactly `/`, `/owner/`, `/setup` and `/setup/` to the owner socket, and everything else is `404`.
 - **Agent-only port:** with `agent_listen` set, front also listens there with the same TLS and forwards only `/agent/`, so a network rule that filters by port (a Tailscale grant) can keep agent machines away from the owner side.
 - **Headers:** front sets these, overwriting anything the client sent:
   - `X-Forwarded-For`: the client's IP;

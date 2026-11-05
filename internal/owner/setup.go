@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"html/template"
@@ -66,12 +68,39 @@ func (s *Server) setupOpen() (setupHash, bool) {
 	return h, true
 }
 
+// pairingJS shows the Copy link button, which needs JavaScript (Open in
+// mandate works without), and moves on to / once a device has paired: /
+// redirects to /setup until then. Without JavaScript the page reloads
+// instead, and a spent setup link redirects to /.
+const pairingJS = `var c = document.getElementById("copy");
+c.hidden = false;
+c.onclick = function () {
+  navigator.clipboard.writeText(document.getElementById("open").getAttribute("href")).then(function () {
+    c.textContent = "Copied";
+    setTimeout(function () { c.textContent = "Copy link"; }, 1500);
+  });
+};
+setInterval(function () {
+  fetch("/", { redirect: "manual", cache: "no-store" }).then(function (r) {
+    if (r.ok) location.replace("/");
+  }, function () {});
+}, 1000);`
+
+// setupCSP allows only the page's own style and pairingJS, and its polls.
+var setupCSP = func() string {
+	sum := sha256.Sum256([]byte(pairingJS))
+	return "default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) +
+		"'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'"
+}()
+
 // setupTmpl is the setup page in the app's look: one monospace, black and
 // white with one grey, 2px rules, light or dark as the system is.
 var setupTmpl = template.Must(template.New("setup").Parse(`<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>Initial setup</title>
+<title>{{if .Home}}mandate{{else}}Initial setup{{end}}</title>
+{{if .Href}}<noscript><meta http-equiv="refresh" content="5"></noscript>
+{{end}}
 <style>
 :root{--fg:#000;--bg:#fff;--grey:#666;--lh:1.5rem;color-scheme:light dark}
 @media (prefers-color-scheme:dark){:root{--fg:#fff;--bg:#000;--grey:#aaa}}
@@ -79,50 +108,64 @@ var setupTmpl = template.Must(template.New("setup").Parse(`<!doctype html>
 html{font:16px/var(--lh) "JetBrains Mono",ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;color:var(--fg);background:var(--bg)}
 body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:var(--lh) 2ch}
 main{width:100%;max-width:46ch}
-h1{font-size:1rem;font-weight:800;text-transform:uppercase;letter-spacing:.12em;margin:0 0 var(--lh);padding-bottom:calc(var(--lh)/2);border-bottom:2px solid var(--fg)}
+h1{text-align:center;font-size:1rem;font-weight:800;text-transform:uppercase;letter-spacing:.12em;margin:0 0 var(--lh);padding-bottom:calc(var(--lh)/2);border-bottom:2px solid var(--fg)}
 p{margin:0 0 var(--lh)}
-.grey,label{color:var(--grey)}
-label{display:block;text-transform:uppercase;letter-spacing:.12em;font-size:.875rem}
-input,button{font:inherit;border:2px solid var(--fg);border-radius:0;padding:calc(var(--lh)/4) 1ch}
+label{display:block;color:var(--grey);text-transform:uppercase;letter-spacing:.12em;font-size:.875rem}
+input,button,.button{font:inherit;border:2px solid var(--fg);border-radius:0;padding:calc(var(--lh)/4) 1ch}
 input{display:block;width:100%;color:var(--fg);background:var(--bg);margin-top:calc(var(--lh)/4)}
-button{color:var(--bg);background:var(--fg);font-weight:700;text-transform:uppercase;letter-spacing:.12em;cursor:pointer}
-button:hover,button:focus-visible{color:var(--fg);background:var(--bg)}
+button,.button{color:var(--bg);background:var(--fg);font-weight:700;text-transform:uppercase;letter-spacing:.12em;cursor:pointer}
+.button{display:inline-block;text-decoration:none}
+button:hover,button:focus-visible,.button:hover,.button:focus-visible{color:var(--fg);background:var(--bg)}
+.center{text-align:center}
 :focus-visible{outline:2px solid var(--fg);outline-offset:2px}
 svg{display:block;width:100%;height:auto;margin:0 0 var(--lh);border:2px solid var(--fg)}
-.key{font-size:1.25rem;font-weight:700;text-align:center;letter-spacing:.06em;padding:calc(var(--lh)/2) 0;border:2px solid var(--fg)}
-a{color:inherit}
+.key{font-size:1.125rem;font-weight:700;text-align:center;letter-spacing:.04em;padding:calc(var(--lh)/2) 0;border:2px solid var(--fg)}
 code{font:inherit;font-weight:700}
-a code{font-weight:inherit;word-break:break-all}
 </style>
 <main>
-<h1>Initial setup</h1>
-{{if .Link}}{{.QR}}
+{{if .Home}}<h1>mandate</h1>
+<p class="center">Set up.</p>
+{{else}}<h1>Initial setup</h1>
+{{if .Href}}{{.QR}}
 {{if .Key}}<p class="key">Key {{.Key}}</p>
-{{end}}<p class="grey"><a href="{{.Href}}"><code>{{.Link}}</code></a></p>
+{{end}}<p class="center"><a class="button" id="open" href="{{.Href}}">Open in mandate</a> <button type="button" id="copy" hidden>Copy link</button></p>
+<script>` + pairingJS + `</script>
 {{else if .Waiting}}<p>mandate is waiting to be set up. On the server, run <code>sudo mandate setup</code> and open the link it prints.</p>
 {{else}}{{if .Wrong}}<p><strong>That password is not right.</strong></p>{{end}}
 <form method="post" action="/setup"><p><label>Setup password<input name="password" autocomplete="off" autocapitalize="characters" spellcheck="false" required autofocus></label></p>
 <p><button>Continue</button></p></form>
-{{end}}</main>`))
+{{end}}{{end}}</main>`))
 
 type setupPage struct {
+	// Home: a device is paired, so / only says so.
+	Home bool
 	// Waiting: no device is paired and no setup password waits.
 	Waiting bool
 	Wrong   bool
-	Link    string
-	Href    template.URL
-	QR      template.HTML
+	// Href is the pairing link, behind the QR code and the button.
+	Href template.URL
+	QR   template.HTML
 	// Key is the server key's fingerprint, in own-key TLS mode only.
 	Key string
 }
 
 func renderSetup(w http.ResponseWriter, status int, p setupPage) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Referrer-Policy", "no-referrer")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", setupCSP)
 	w.WriteHeader(status)
 	_ = setupTmpl.Execute(w, p)
+}
+
+// home answers /: setup until a device is paired, then a page saying so.
+func (s *Server) home(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	paired, _ := s.keys.Head()
+	s.mu.Unlock()
+	if paired == 0 {
+		http.Redirect(w, r, "/setup", http.StatusFound)
+		return
+	}
+	renderSetup(w, http.StatusOK, setupPage{Home: true})
 }
 
 func (s *Server) setupPage(w http.ResponseWriter, r *http.Request) {
@@ -156,11 +199,13 @@ func (s *Server) setupPassword(w http.ResponseWriter, r *http.Request) {
 		renderSetup(w, http.StatusForbidden, setupPage{Wrong: true})
 		return
 	}
-	s.pairingPage(w, r)
+	// The pairing page lives at the setup link, so that reloading it works.
+	http.Redirect(w, r, "/setup/"+url.PathEscape(password), http.StatusSeeOther)
 }
 
 // setupLink opens the pairing page straight from the link mandate setup
-// prints; a wrong or spent password gets the page /setup shows.
+// prints. Once a device is paired it redirects to /; until then a wrong
+// password gets the page /setup shows.
 func (s *Server) setupLink(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	h, ok := s.setupOpen()
@@ -169,7 +214,12 @@ func (s *Server) setupLink(w http.ResponseWriter, r *http.Request) {
 		s.pairingPage(w, r)
 		return
 	}
+	paired, _ := s.keys.Head()
 	s.mu.Unlock()
+	if paired > 0 {
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
 	s.setupPage(w, r)
 }
 
@@ -192,7 +242,7 @@ func (s *Server) pairingPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	p := setupPage{Link: link, Href: template.URL(link), QR: template.HTML(svg)}
+	p := setupPage{Href: template.URL(link), QR: template.HTML(svg)}
 	if !s.certVerified {
 		p.Key = fingerprint(spki)
 	}
@@ -363,8 +413,22 @@ func writeOwned(path string, b []byte, mode fs.FileMode) error {
 	return os.Chown(path, int(st.Uid), int(st.Gid))
 }
 
+// unstored marks the setup pages' answers, whose links may hold the setup
+// password, as never to be kept or passed on as a referrer.
+func unstored(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		h(w, r)
+	}
+}
+
 func printSetup(ctx context.Context, cfg *config.Config, out io.Writer, password string) {
+	// The name the certificate is for, so that the browser accepts it.
 	host := cfg.TLS.Domain
+	if cfg.TLS.Mode == "cert" {
+		host, _ = certHost(cfg.TLS.Cert)
+	}
 	if host == "" {
 		host, _ = os.Hostname()
 	}
@@ -373,6 +437,35 @@ func printSetup(ctx context.Context, cfg *config.Config, out io.Writer, password
 		key = serverKey(ctx, cfg)
 	}
 	writeSetup(out, setupURL(cfg, host, password), key)
+}
+
+// certHost is the first DNS name of the certificate in the PEM file at
+// path, or its common name if it has none.
+func certHost(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	for {
+		var block *pem.Block
+		if block, b = pem.Decode(b); block == nil {
+			return "", fmt.Errorf("%s: no certificate", path)
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", path, err)
+		}
+		if len(c.DNSNames) > 0 {
+			return c.DNSNames[0], nil
+		}
+		if c.Subject.CommonName == "" {
+			return "", fmt.Errorf("%s: no DNS name", path)
+		}
+		return c.Subject.CommonName, nil
+	}
 }
 
 // setupURL is the link that opens the pairing page with password.

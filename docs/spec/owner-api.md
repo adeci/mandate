@@ -1,6 +1,6 @@
 # Owner API
 
-The app talks to the owner side under `/owner/v1/`, on the one HTTPS port. `front` terminates TLS and forwards `/owner/`, `/setup` and `/setup/` to the owner side's socket.
+The app talks to the owner side under `/owner/v1/`, on the one HTTPS port. `front` terminates TLS and forwards `/`, `/owner/`, `/setup` and `/setup/` to the owner side's socket. `GET /` redirects to `/setup` until a device is paired, then shows only that mandate is set up.
 
 Bodies are JSON, and durations are in integer seconds. Records and envelopes are as in `records.md`.
 
@@ -18,14 +18,14 @@ Pairing gives the app the server's SPKI SHA-256, which it checks on first connec
 
 **First device.**
 
-1. `sudo mandate setup` makes a setup password (also kept in a root-only file) and prints the setup link, `https://HOST:PORT/setup/<password>`, and, in TLS mode `own` only, the server key's fingerprint: the SPKI SHA-256's first 80 bits as five groups of four hex digits (`bf0d 5832 2e59 4fbf e037`), which the setup page and the app show too:
+1. `sudo mandate setup` makes a setup password (also kept in a root-only file) and prints the setup link, `https://HOST:PORT/setup/<password>` (HOST is the name the certificate is for: `tls.domain`, the `cert` file's first DNS name, or in mode `own` the machine's hostname), and, in TLS mode `own` only, the server key's fingerprint: the SPKI SHA-256's first 80 bits as five groups of four hex digits (`bf0d 5832 2e59 4fbf e037`), which the setup page and the app show too:
 
    ```
    Initial setup  https://box.example:8443/setup/JIWH-MKI6-LCU4-FE27
    Key            bf0d 5832 2e59 4fbf e037
    ```
 
-2. The setup link shows a QR code and the same link as text (a wrong or spent password gets what `/setup` shows; there, a form takes the password instead):
+2. The setup link shows a QR code and the same link as text (a wrong password gets what `/setup` shows, where a form takes the password instead; once a device is paired, the link redirects to `/`, and so does the open page):
 
    ```
    mandate://pair?url=https%3A%2F%2Fbox.example%3A8443&spki=<hex>&secret=<32 bytes, base64url>

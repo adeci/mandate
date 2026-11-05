@@ -158,6 +158,7 @@ in
 
     with subtest("mandate setup prints a link that opens the pairing page; the form is the fallback"):
         assert "waiting to be set up" in server.succeed("curl -skf https://localhost:8443/setup")
+        assert server.succeed("curl -sk -o /dev/null -w '%{http_code} %{redirect_url}' https://localhost:8443/") == "302 https://localhost:8443/setup"
         url, password, key = printed(server.succeed("mandate setup"))
         assert server.succeed("stat -c %a /var/lib/mandate/setup-password").strip() == "600"
         page = server.succeed("curl -skf https://localhost:8443/setup/WRONG-PASS")
@@ -169,16 +170,22 @@ in
         link = setup_link(url)
         spki = grab(r"spki=([0-9a-f]{64})", link)
         assert spki.startswith(key.replace(" ", "")) and "url=https%3A%2F%2Flocalhost%3A8443" in link, (key, link)
-        page = server.succeed(f"curl -sk --data-urlencode password={password} https://localhost:8443/setup")
+        page = server.succeed(f"curl -skL --data-urlencode password={password} https://localhost:8443/setup")
         assert f"spki={spki}" in html.unescape(page), page
         assert password not in server.succeed("journalctl -u mandate-front -u mandate-owner")
 
     with subtest("the first device pairs, which spends the link and the setup page"):
+        # What the open pairing page polls: / redirects to /setup until a
+        # device pairs.
+        assert server.succeed("curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/") == "302"
         out = device("pair", link, "phone")
         assert out["kind"] == "key", out
         assert call("GET", "/owner/v1/server")["body"] == {"agent_url": "https://localhost:8444"}
         assert server.succeed("curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/setup") == "404"
-        assert server.succeed(f"curl -sk -o /dev/null -w '%{{http_code}}' {url}") == "404"
+        assert '<p class="center">Set up.</p>' in server.succeed("curl -skf https://localhost:8443/")
+        # The open pairing page polls /, which no longer redirects, and a
+        # reload of the spent link lands there too.
+        assert server.succeed(f"curl -sk -o /dev/null -w '%{{http_code}} %{{redirect_url}}' {url}") == "302 https://localhost:8443/"
         server.fail(f"testdevice --state /root/thief.json pair '{link}'")
         server.fail("mandate setup")
         server.wait_until_succeeds("test $(testdevice --state /root/phone.json call GET /owner/v1/keys | jq '.body.trusted | length') = 1")
@@ -340,10 +347,10 @@ in
         assert kinds[0] == "stop_all" and "request.asked" in kinds and "request.approved" in kinds and "read" in kinds, kinds
 
     with subtest("callers are told apart by their group"):
-        for path in ["/internal/live", "/internal/requests", "/"]:
+        for path in ["/internal/live", "/internal/requests", "/index.html"]:
             code = server.succeed(f"curl -sk -o /dev/null -w '%{{http_code}}' https://localhost:8443{path}")
             assert code == "404", (path, code)
-        for path, want in [("/owner/v1/now", "404"), ("/setup", "404"), ("/agent/v1/connectors", "401")]:
+        for path, want in [("/", "404"), ("/owner/v1/now", "404"), ("/setup", "404"), ("/agent/v1/connectors", "401")]:
             code = server.succeed(f"curl -sk -o /dev/null -w '%{{http_code}}' https://localhost:8444{path}")
             assert code == want, ("agent port", path, code)
         for sock, path in [("gateway", "/internal/live"), ("owner", "/internal/requests")]:

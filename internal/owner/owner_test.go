@@ -6,15 +6,22 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"io/fs"
 	"log/slog"
 	"maps"
+	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -416,6 +423,33 @@ func hasGrant(l live, id string) bool {
 	return slices.ContainsFunc(l.Grants, func(e record.Envelope) bool { return bytes.Contains(e.Record, []byte(`"id":"`+id+`"`)) })
 }
 
+func TestHome(t *testing.T) {
+	h := start(t, nil)
+	home := func() (int, string, string) {
+		req, _ := http.NewRequest(http.MethodGet, "http://box.example:8443/", nil)
+		resp, err := h.http.Transport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.Header.Get("Cache-Control") != "no-store" || resp.Header.Get("Referrer-Policy") != "no-referrer" {
+			t.Errorf("/ headers = %v", resp.Header)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header.Get("Location"), string(b)
+	}
+	if st, to, _ := home(); st != http.StatusFound || to != "/setup" {
+		t.Errorf("/ before pairing = %d to %q", st, to)
+	}
+	h.pair()
+	if st, _, page := home(); st != http.StatusOK || !strings.Contains(page, "<h1>mandate</h1>\n<p class=\"center\">Set up.</p>\n</main>") {
+		t.Errorf("/ once paired = %d %q", st, page)
+	}
+	if st := h.do("GET", "/index.html", "", nil, nil); st != http.StatusNotFound {
+		t.Errorf("/index.html = %d", st)
+	}
+}
+
 func TestFirstPairing(t *testing.T) {
 	h := start(t, nil)
 	if st, page := h.setupPageText(); st != http.StatusOK || !strings.Contains(page, "waiting to be set up") || strings.Contains(page, "<form") {
@@ -453,6 +487,10 @@ func TestFirstPairing(t *testing.T) {
 	}
 	if st := h.do("GET", "/setup", "", nil, nil); st != http.StatusNotFound {
 		t.Errorf("setup page after pairing = %d", st)
+	}
+	// An open pairing page moves on to / by itself, by script or reload.
+	if st, page := h.page("/setup/" + testPassword); st != http.StatusOK || !strings.Contains(page, "Set up.") {
+		t.Errorf("the spent setup link = %d %q", st, page)
 	}
 	if st := h.pairWith(secret, newDevice(t, "thief")); st != http.StatusConflict {
 		t.Errorf("second pairing = %d", st)
@@ -602,6 +640,56 @@ func TestSetupOutput(t *testing.T) {
 	writeSetup(&b, setupURL(&config.Config{Listen: ":443"}, "mandate.example", testPassword), "")
 	if want := "Initial setup  https://mandate.example/setup/" + testPassword + "\n"; b.String() != want {
 		t.Errorf("certificate:\n%s\nwant\n%s", b.String(), want)
+	}
+}
+
+func TestCopyLinkAllowed(t *testing.T) {
+	w := httptest.NewRecorder()
+	renderSetup(w, http.StatusOK, setupPage{Href: "mandate://pair?x", QR: "<svg></svg>"})
+	m := regexp.MustCompile(`(?s)<script>(.*?)</script>`).FindStringSubmatch(w.Body.String())
+	if m == nil {
+		t.Fatalf("no script on the pairing page:\n%s", w.Body)
+	}
+	if !strings.Contains(w.Body.String(), `<noscript><meta http-equiv="refresh" content="5"></noscript>`) {
+		t.Error("without JavaScript, the pairing page does not reload")
+	}
+	sum := sha256.Sum256([]byte(m[1]))
+	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "script-src 'sha256-"+base64.StdEncoding.EncodeToString(sum[:])+"'") {
+		t.Errorf("the policy %q does not allow the script", csp)
+	}
+}
+
+func TestCertModeSetupHost(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, c x509.Certificate) string {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.SerialNumber = big.NewInt(1)
+		der, err := x509.CreateCertificate(rand.Reader, &c, &c, &key.PublicKey, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	for _, tt := range []struct {
+		cert x509.Certificate
+		want string
+	}{
+		{x509.Certificate{Subject: pkix.Name{CommonName: "cn.example"}, DNSNames: []string{"mandate.example", "other.example"}}, "mandate.example"},
+		{x509.Certificate{Subject: pkix.Name{CommonName: "cn.example"}}, "cn.example"},
+	} {
+		cfg := &config.Config{Listen: ":443", TLS: config.TLS{Mode: "cert", Cert: write(tt.want+".pem", tt.cert)}}
+		var b strings.Builder
+		printSetup(t.Context(), cfg, &b, testPassword)
+		if want := "Initial setup  https://" + tt.want + "/setup/" + testPassword + "\n"; b.String() != want {
+			t.Errorf("printed %q, want %q", b.String(), want)
+		}
 	}
 }
 

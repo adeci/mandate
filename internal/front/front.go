@@ -102,7 +102,7 @@ func handler(stopping context.Context, gateway, owner http.Handler) http.Handler
 		case p != path.Clean(p) && p != path.Clean(p)+"/":
 		case strings.HasPrefix(p, "/agent/"):
 			h = gateway
-		case strings.HasPrefix(p, "/owner/"), p == "/setup", strings.HasPrefix(p, "/setup/"):
+		case p == "/", strings.HasPrefix(p, "/owner/"), p == "/setup", strings.HasPrefix(p, "/setup/"):
 			h = owner
 		}
 		if h == nil {
