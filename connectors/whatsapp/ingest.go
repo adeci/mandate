@@ -62,26 +62,27 @@ func (in *ingester) handle(ctx context.Context, evt any) bool {
 	case *events.PushName:
 		in.renameDM(ctx, e.JID)
 	case *events.Contact:
+		if a := e.Action; a.GetFullName() != "" || a.GetFirstName() != "" {
+			in.storeDM(ctx, e.JID)
+		}
 		in.renameDM(ctx, e.JID)
 	case *events.GroupInfo:
 		in.groupChanged(ctx, e)
 	case *events.JoinedGroup:
-		in.mu.Lock()
-		in.seen[e.JID.ToNonAD()] = true
-		in.mu.Unlock()
-		if err := in.st.UpsertContainer(ctx, groupContainer(&e.GroupInfo, in.pn, in.nameFunc(ctx))); err != nil {
-			in.log.Error("store group", "chat", e.JID.String(), "err", err)
-		}
+		in.storeGroups(ctx, []*types.GroupInfo{&e.GroupInfo})
 	case *events.AppStateSyncComplete:
 		// A full sync stores contacts without a Contact event per contact.
 		if e.Name == appstate.WAPatchCriticalUnblockLow {
+			in.storeContacts(ctx)
 			in.nameDMs(ctx)
 		}
 	case *events.IdentityChange:
 		in.identityChanged(ctx, e)
 	case *events.Connected:
 		in.log.Info("connected")
+		in.storeContacts(ctx)
 		in.nameDMs(ctx)
+		go in.syncGroups(ctx)
 	case *events.Disconnected:
 		in.log.Warn("disconnected; whatsmeow will reconnect")
 	}
@@ -294,6 +295,62 @@ func (in *ingester) ensureContainer(ctx context.Context, chat types.JID, base st
 		return err
 	}
 	return nil
+}
+
+// storeContacts stores a DM for the owner's own chat and every contact in
+// the address book, so the owner can grant one that has had no messages
+// since linking. Contacts with only a push name are group members the
+// owner may never have written to.
+func (in *ingester) storeContacts(ctx context.Context) {
+	if own := in.cli.Store.GetJID(); !own.IsEmpty() {
+		in.storeDM(ctx, own)
+	}
+	contacts, err := in.cli.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		in.log.Error("load contacts", "err", err)
+		return
+	}
+	for j, c := range contacts {
+		if c.FullName != "" || c.FirstName != "" {
+			in.storeDM(ctx, j)
+		}
+	}
+}
+
+// storeDM stores the DM with the user j, under their phone number if known
+// and named from either ID.
+func (in *ingester) storeDM(ctx context.Context, j types.JID) {
+	chat := in.pn(j)
+	if chat.Server != types.DefaultUserServer && chat.Server != types.HiddenUserServer {
+		return
+	}
+	if err := in.ensureContainer(ctx, chat, store.Container{Name: in.chatName(ctx, chat, j.ToNonAD())}); err != nil {
+		in.log.Error("store dm", "chat", chat.String(), "err", err)
+	}
+}
+
+// syncGroups stores every group the account is in, as storeContacts does
+// contacts.
+func (in *ingester) syncGroups(ctx context.Context) {
+	qctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	groups, err := in.cli.GetJoinedGroups(qctx)
+	cancel()
+	if err != nil {
+		in.log.Warn("joined groups query failed", "err", err)
+		return
+	}
+	in.storeGroups(ctx, groups)
+}
+
+func (in *ingester) storeGroups(ctx context.Context, groups []*types.GroupInfo) {
+	for _, g := range groups {
+		in.mu.Lock()
+		in.seen[g.JID.ToNonAD()] = true
+		in.mu.Unlock()
+		if err := in.st.UpsertContainer(ctx, groupContainer(g, in.pn, in.nameFunc(ctx))); err != nil {
+			in.log.Error("store group", "chat", g.JID.String(), "err", err)
+		}
+	}
 }
 
 // Unseen users are ignored so group members don't become DMs.

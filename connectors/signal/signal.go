@@ -63,15 +63,14 @@ func start(ctx context.Context, env *connector.Env, _ struct{}) (connector.Conne
 	provision := func(ctx context.Context) <-chan signalmeow.ProvisioningResponse {
 		return signalmeow.PerformProvisioning(ctx, sess.devices, deviceName, false)
 	}
-	newClient := func(dev *sgstore.Device, onEvent func(events.SignalEvent)) sgClient {
+	newClient := func(dev *sgstore.Device, onEvent func(events.SignalEvent)) (sgClient, *ingester) {
 		var in *ingester
 		cli := signalmeow.NewClient(dev, zl, func(evt events.SignalEvent) bool {
 			onEvent(evt)
 			return in.handle(ctx, evt)
 		})
 		in = newIngester(cli, dev, st, sess, env.Log)
-		in.nameOwnChat(ctx)
-		return cli
+		return cli, in
 	}
 	c := newConnector(ctx, st, env.Log, sess, dev, provision, newClient)
 	if err := c.connect(); err != nil {

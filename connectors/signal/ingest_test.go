@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+	"go.mau.fi/mautrix-signal/pkg/signalmeow"
 	"go.mau.fi/mautrix-signal/pkg/signalmeow/events"
 	"go.mau.fi/mautrix-signal/pkg/signalmeow/protobuf/signalpb"
 	"go.mau.fi/mautrix-signal/pkg/signalmeow/types"
@@ -78,7 +83,7 @@ func TestReceive(t *testing.T) {
 	for id, wantChat := range map[string]chat{
 		dm:                {name: "Farid Haddad", last: "2026-12-23T04:26:40.000Z", participants: "[]"},
 		group:             {name: "Climbing crew", last: "2026-12-23T04:26:41.000Z", participants: `[{"id":"` + owner.String() + `","name":"Owner"},{"id":"` + farid.String() + `","name":"Farid Haddad"},{"id":"` + mallory.String() + `","name":"~Mom"}]`},
-		stranger.String(): {last: "2026-12-23T04:26:42.000Z", participants: "[]"},
+		stranger.String(): {name: "+15557654321", last: "2026-12-23T04:26:42.000Z", participants: "[]"},
 	} {
 		var got chat
 		if err := f.st.DB().QueryRow(`SELECT COALESCE(name, ''), COALESCE(last_message_at, ''), participants_json FROM containers WHERE id = ?`, id).
@@ -91,9 +96,10 @@ func TestReceive(t *testing.T) {
 	}
 }
 
-// Contacts synced from the owner's devices name stored DMs; only the
-// address book or a nickname gives an unmarked name. A DM stored under a
-// phone number identity lists the person.
+// Contacts synced from the owner's devices name stored DMs and get one
+// when they have none; only the address book or a nickname gives an
+// unmarked name. A DM stored under a phone number identity lists the
+// person.
 func TestContactListNamesDMs(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -103,27 +109,33 @@ func TestContactListNamesDMs(t *testing.T) {
 	if err := f.st.UpsertContainer(ctx, store.Container{ID: pniChat, Kind: "dm"}); err != nil {
 		t.Fatal(err)
 	}
+	lou, pat, blocked := uuid.New(), uuid.New(), uuid.New()
 	in.handle(ctx, &events.ContactList{Contacts: []*types.Recipient{
 		{ACI: farid, ContactName: "Farid Haddad", Profile: types.Profile{Name: "Bank Support"}},
 		{ACI: mallory, Profile: types.Profile{Name: "Mom"}},
 		{ACI: sam, Nickname: "Sam"},
 		{ACI: stranger, PNI: strangerPNI, Profile: types.Profile{Name: "Kim"}},
+		{ACI: lou, Whitelisted: new(true), Profile: types.Profile{Name: "Lou"}},
+		{ACI: pat, Profile: types.Profile{Name: "Pat"}},
+		{ACI: blocked, ContactName: "Ex", Blocked: true},
 	}})
 	for id, want := range map[string]string{
 		farid.String():   "Farid Haddad",
 		mallory.String(): "~Mom",
+		sam.String():     "Sam",
+		lou.String():     "~Lou",
 	} {
 		var got string
 		if err := f.st.DB().QueryRow(`SELECT COALESCE(name, '') FROM containers WHERE id = ?`, id).Scan(&got); err != nil {
-			t.Fatal(err)
+			t.Fatalf("%s: %v", id, err)
 		}
 		if got != want {
 			t.Errorf("%s named %q, want %q", id, got, want)
 		}
 	}
 	var n int
-	if err := f.st.DB().QueryRow(`SELECT count(*) FROM containers WHERE id = ?`, sam.String()).Scan(&n); err != nil || n != 0 {
-		t.Fatalf("contact without a chat became a chat: %d, %v", n, err)
+	if err := f.st.DB().QueryRow(`SELECT count(*) FROM containers WHERE id IN (?, ?)`, pat.String(), blocked.String()).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("a stranger or a blocked contact became a chat: %d, %v", n, err)
 	}
 	var parts string
 	if err := f.st.DB().QueryRow(`SELECT participants_json FROM containers WHERE id = ?`, pniChat).Scan(&parts); err != nil {
@@ -144,7 +156,7 @@ func TestOwnChatIsNoteToSelf(t *testing.T) {
 		t.Fatal(err)
 	}
 	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, discard)
-	in.nameOwnChat(ctx)
+	in.syncChats(ctx)
 	in.handle(ctx, &events.ContactList{Contacts: []*types.Recipient{{ACI: owner, Profile: types.Profile{Name: "Owner"}}}})
 	in.handle(ctx, &events.ChatEvent{Info: events.MessageInfo{Sender: owner, ChatID: owner.String()}, Event: &signalpb.DataMessage{
 		Body: new("milk"), Timestamp: new(uint64(1798000000000)),
@@ -155,5 +167,51 @@ func TestOwnChatIsNoteToSelf(t *testing.T) {
 	}
 	if got != noteToSelf {
 		t.Errorf("own chat named %q, want %q", got, noteToSelf)
+	}
+}
+
+// A sync stores a chat for every contact and every group the account is
+// in, without messages.
+func TestSyncChats(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t)
+	quiet := types.GroupIdentifier(base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32)))
+	left := types.GroupIdentifier(base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{3}, 32)))
+	f.groups[quiet] = &signalmeow.Group{GroupIdentifier: quiet, Title: "Book club", Members: []*signalmeow.GroupMember{{ACI: owner}, {ACI: sam}}}
+	for _, gid := range []types.GroupIdentifier{climbing, quiet, left} {
+		if err := f.c.dev.GroupStore.StoreMasterKey(ctx, gid, "key"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, discard)
+	in.syncChats(ctx)
+
+	rows, err := f.st.DB().Query(`SELECT id, kind, COALESCE(name, ''), COALESCE(last_message_at, ''), participants_json FROM containers`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	got := map[string]string{}
+	for rows.Next() {
+		var id, kind, name, last, parts string
+		if err := rows.Scan(&id, &kind, &name, &last, &parts); err != nil {
+			t.Fatal(err)
+		}
+		got[id] = strings.Join([]string{kind, name, last, parts}, "|")
+	}
+	member := func(id uuid.UUID, name string) string { return `{"id":"` + id.String() + `","name":"` + name + `"}` }
+	want := map[string]string{
+		string(quiet):      "group|Book club||[" + member(owner, "Owner") + "," + member(sam, "Sam") + "]",
+		string(climbing):   "group|Climbing crew||[" + member(owner, "Owner") + "," + member(farid, "Farid Haddad") + "," + member(mallory, "~Mom") + "]",
+		string(bouldering): "group|Climbing crew||[]",
+		owner.String():     "dm|Note to Self||[]",
+		farid.String():     "dm|Farid Haddad||[]",
+		sam.String():       "dm|Sam||[]",
+		mallory.String():   "dm|~Mom||[]",
+		stranger.String():  "dm|+15557654321||[]", // no name but a number
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("chats\n got %q\nwant %q", got, want)
 	}
 }

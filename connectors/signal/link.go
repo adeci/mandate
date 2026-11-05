@@ -36,7 +36,7 @@ type sgClient interface {
 	lookup
 	StartReceiveLoops(ctx context.Context) (chan signalmeow.SignalConnectionStatus, error)
 	StopReceiveLoops() error
-	QueueStorageSync(ctx context.Context)
+	StorageSync(ctx context.Context)
 	Unlink(ctx context.Context) error
 	SendMessage(ctx context.Context, to libsignalgo.ServiceID, content *signalpb.Content) signalmeow.SendMessageResult
 	SendGroupMessage(ctx context.Context, gid types.GroupIdentifier, content *signalpb.Content) (*signalmeow.GroupMessageSendResult, error)
@@ -58,13 +58,14 @@ type sgConnector struct {
 	ctx       context.Context
 	provision func(ctx context.Context) <-chan signalmeow.ProvisioningResponse
 	// newClient wires onEvent, then ingest, into a client for dev.
-	newClient func(dev *sgstore.Device, onEvent func(events.SignalEvent)) sgClient
+	newClient func(dev *sgstore.Device, onEvent func(events.SignalEvent)) (sgClient, *ingester)
 	// download fetches an attachment from Signal's CDN and decrypts it into a file.
 	download func(ctx context.Context, p *signalpb.AttachmentPointer, into *os.File) error
 
 	mu sync.Mutex
-	// cli and dev are nil until linked.
+	// cli and dev are nil until linked; in ingests for cli.
 	cli           sgClient
+	in            *ingester
 	dev           *sgstore.Device
 	connected     bool
 	everConnected bool
@@ -74,7 +75,7 @@ type sgConnector struct {
 
 func newConnector(ctx context.Context, st *store.Store, log *slog.Logger, sess *session, dev *sgstore.Device,
 	provision func(context.Context) <-chan signalmeow.ProvisioningResponse,
-	newClient func(*sgstore.Device, func(events.SignalEvent)) sgClient,
+	newClient func(*sgstore.Device, func(events.SignalEvent)) (sgClient, *ingester),
 ) *sgConnector {
 	c := &sgConnector{
 		st: st, log: log, devices: sess.devices, timers: sess.timers, identities: sess.identities,
@@ -89,7 +90,7 @@ func newConnector(ctx context.Context, st *store.Store, log *slog.Logger, sess *
 // use needs c.mu, except during construction.
 func (c *sgConnector) use(dev *sgstore.Device) {
 	var cli sgClient
-	cli = c.newClient(dev, func(evt events.SignalEvent) { c.event(cli, evt) })
+	cli, c.in = c.newClient(dev, func(evt events.SignalEvent) { c.event(cli, evt) })
 	c.cli, c.dev = cli, dev
 }
 
@@ -160,12 +161,16 @@ func (c *sgConnector) status(cli sgClient, s signalmeow.SignalConnectionStatus) 
 	}
 	c.connected = s.Event == signalmeow.SignalConnectionEventConnected
 	c.everConnected = c.everConnected || c.connected
+	in := c.in
 	c.mu.Unlock()
 	switch s.Event {
 	case signalmeow.SignalConnectionEventConnected:
 		c.log.Info("connected")
-		// Contact names come from the storage service.
-		cli.QueueStorageSync(c.ctx)
+		// Contacts and the account's groups come from the storage service.
+		go func() {
+			cli.StorageSync(c.ctx)
+			in.syncChats(c.ctx)
+		}()
 	case signalmeow.SignalConnectionEventDisconnected, signalmeow.SignalConnectionEventError,
 		signalmeow.SignalConnectionEventFatalError:
 		c.log.Warn("disconnected; signalmeow will reconnect", "err", s.Err)

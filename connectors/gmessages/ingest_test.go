@@ -5,6 +5,7 @@ import (
 	"errors"
 	"maps"
 	"slices"
+	"strconv"
 	"testing"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
@@ -109,6 +110,42 @@ func TestSync(t *testing.T) {
 	f.phone.fetchErr["1"] = libgm.ErrPhoneNotResponding
 	if err := f.c.in.syncOnce(ctx, f.cli()); !errors.Is(err, libgm.ErrPhoneNotResponding) {
 		t.Fatalf("sync with the phone gone: %v", err)
+	}
+}
+
+// A sync stores every conversation, past the first page and archived; only
+// the recent ones get their messages and activity.
+func TestSyncListsAllConversations(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, true)
+	conv := func(id string, at int64) *gmproto.Conversation {
+		return &gmproto.Conversation{
+			ConversationID: id, Name: "Chat " + id, LastMessageTimestamp: at, DefaultOutgoingID: "1",
+			Participants: []*gmproto.Participant{self("1"), contact(participant("p"+id, "+1555"+id, id), "Chat "+id)},
+		}
+	}
+	var inbox []*gmproto.Conversation
+	for i := range syncConversations + 5 {
+		inbox = append(inbox, conv(strconv.Itoa(1000+i), ts(2)))
+	}
+	f.phone.set(func(p *phone) { p.convs, p.archived = inbox, []*gmproto.Conversation{conv("9001", ts(1))} })
+
+	f.c.in.sync(context.Background(), f.cli())
+	got := chats(t, f)
+	if len(got) != syncConversations+6 {
+		t.Fatalf("%d chats stored", len(got))
+	}
+	for id, want := range map[string]string{
+		"1000": "dm Chat 1000 2026-10-01T12:02:00.000Z",
+		"1104": "dm Chat 1104 -",
+		"9001": "dm Chat 9001 -",
+	} {
+		if got[id] != want {
+			t.Errorf("chat %s: %q, want %q", id, got[id], want)
+		}
+	}
+	if n := len(f.phone.fetched()); n != syncConversations {
+		t.Errorf("fetched the messages of %d conversations", n)
 	}
 }
 

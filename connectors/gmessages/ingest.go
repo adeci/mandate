@@ -36,6 +36,7 @@ type ingester struct {
 	syncing, again bool
 	phoneSyncing   bool
 	dmsFilled      bool
+	listed         bool
 }
 
 func newIngester(st *store.Store, log *slog.Logger) *ingester {
@@ -251,11 +252,63 @@ func (in *ingester) syncOnce(ctx context.Context, cli gmClient) error {
 	}
 	in.log.Info("synced", "conversations", len(resp.GetConversations()), "fetched", fetched, "messages", msgs)
 	in.mu.Lock()
-	filled := in.dmsFilled
+	filled, listed := in.dmsFilled, in.listed
 	in.mu.Unlock()
+	if !listed {
+		if err := in.listAll(ctx, cli, resp); err != nil {
+			return err
+		}
+	}
 	if !filled {
 		return in.fillDMs(ctx, cli)
 	}
+	return nil
+}
+
+// listAll stores every conversation, past the first page and archived, so
+// the owner can find one with no recent activity. Their activity is
+// recorded with their messages, once a sync finds them among the recent.
+func (in *ingester) listAll(ctx context.Context, cli gmClient, inbox *gmproto.ListConversationsResponse) error {
+	var n int
+	for _, folder := range []gmproto.ListConversationsRequest_Folder{gmproto.ListConversationsRequest_INBOX, gmproto.ListConversationsRequest_ARCHIVE} {
+		resp, seen := inbox, map[string]bool{}
+		var cursor *gmproto.Cursor
+		if folder != gmproto.ListConversationsRequest_INBOX {
+			resp = nil
+		}
+		for {
+			if resp == nil {
+				var err error
+				if resp, err = cli.ListConversations(ctx, &gmproto.ListConversationsRequest{Count: syncConversations, Folder: folder, Cursor: cursor}); err != nil {
+					return fmt.Errorf("list conversations: %w", err)
+				}
+			}
+			added := 0
+			for _, conv := range resp.GetConversations() {
+				if seen[conv.GetConversationID()] {
+					continue
+				}
+				seen[conv.GetConversationID()] = true
+				added++
+				in.remember(conv)
+				c := container(conv)
+				c.LastMessageAt = time.Time{}
+				if err := in.st.UpsertContainer(ctx, c); err != nil {
+					return err
+				}
+			}
+			n += added
+			// A cursor that brings nothing new would page forever.
+			if resp.GetCursor() == nil || added == 0 || len(resp.GetConversations()) < syncConversations {
+				break
+			}
+			cursor, resp = resp.GetCursor(), nil
+		}
+	}
+	in.log.Info("listed conversations", "count", n)
+	in.mu.Lock()
+	in.listed = true
+	in.mu.Unlock()
 	return nil
 }
 

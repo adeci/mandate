@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
@@ -662,6 +663,45 @@ FROM containers AS c LEFT JOIN containers AS p ON p.id = c.parent_id WHERE c.id 
 	}
 	if n := len(h.discord.all()); n != 0 {
 		t.Errorf("%d REST requests", n)
+	}
+}
+
+// READY lists every DM and group DM, so the owner finds them without a
+// sync; recipients come as IDs into READY's users.
+func TestGatewayReadyStoresDMs(t *testing.T) {
+	const (
+		bobUser = "1000000000000000003"
+		groupDM = "1100000000000000006"
+	)
+	h := newHarness(t, nil)
+	ready := h.gw.ready
+	h.gw.ready = func() map[string]any {
+		r := ready()
+		r["users"] = []map[string]any{{"id": aliceUser, "username": "alice", "global_name": "Alice A"}}
+		r["private_channels"] = []map[string]any{
+			{"id": dmID, "type": 1, "recipient_ids": []string{aliceUser}},
+			{"id": groupDM, "type": 3, "last_message_id": msg3, "recipients": []map[string]any{
+				{"id": aliceUser, "username": "alice", "global_name": "Alice A"}, {"id": bobUser, "username": "bob"},
+			}},
+		}
+		return r
+	}
+	h.start()
+	h.gw.conn(t).ops(t, 5)
+	chat := func(id string) []any {
+		return h.queryRow(`SELECT kind, name, participants_json, last_message_at FROM containers WHERE id = ?`, id)
+	}
+	eventually(t, "READY DMs stored", func() bool {
+		var n int
+		_ = h.st.DB().QueryRow(`SELECT count(*) FROM containers WHERE id = ?`, groupDM).Scan(&n)
+		return n == 1
+	})
+	if row := chat(dmID); !reflect.DeepEqual(row, []any{kindDM, "~Alice A", `[{"id":"` + aliceUser + `","name":"~Alice A"}]`, nil}) {
+		t.Errorf("dm %v", row)
+	}
+	want := []any{kindGroup, "~Alice A, ~bob", `[{"id":"` + aliceUser + `","name":"~Alice A"},{"id":"` + bobUser + `","name":"~bob"}]`, snowflakeTimeString(msg3)}
+	if row := chat(groupDM); !reflect.DeepEqual(row, want) {
+		t.Errorf("group dm %v", row)
 	}
 }
 

@@ -630,8 +630,10 @@ func (c *conn) dispatch(ctx context.Context, p payload, bo *backoff) error {
 			User             struct {
 				ID string `json:"id"`
 			} `json:"user"`
-			UserSettingsProto string    `json:"user_settings_proto"`
-			Guilds            []gwGuild `json:"guilds"`
+			UserSettingsProto string             `json:"user_settings_proto"`
+			Guilds            []gwGuild          `json:"guilds"`
+			PrivateChannels   []gwPrivateChannel `json:"private_channels"`
+			Users             []apiUser          `json:"users"`
 		}
 		if err := json.Unmarshal(p.D, &r); err != nil || r.SessionID == "" {
 			return errors.New("READY without a session")
@@ -643,11 +645,15 @@ func (c *conn) dispatch(ctx context.Context, p payload, bo *backoff) error {
 		if err := c.afterReady(settingsStatus(r.UserSettingsProto, g.clock.Now())); err != nil {
 			return err
 		}
-		// Every guild with its channels, so live messages land in named,
-		// dated chats without a sync.
+		// Every guild with its channels and every DM, so live messages land
+		// in named, dated chats and the owner finds them without a sync.
 		var cs []store.Container
 		for i := range r.Guilds {
 			cs = append(cs, r.Guilds[i].containers()...)
+		}
+		cs = append(cs, dmContainers(r.PrivateChannels, r.Users)...)
+		if err := saveHandles(ctx, g.store.DB(), r.Users); err != nil {
+			g.log.Error("store handles", "err", err)
 		}
 		g.storeContainers(ctx, cs)
 		return nil
@@ -718,6 +724,36 @@ func (g *gateway) storeContainers(ctx context.Context, cs []store.Container) {
 	if err := g.store.UpsertContainers(ctx, cs); err != nil {
 		g.log.Error("store chats", "count", len(cs), "err", err)
 	}
+}
+
+// gwPrivateChannel is a DM or group DM in READY. With deduplicated user
+// objects it names its recipients by ID, from READY's users.
+type gwPrivateChannel struct {
+	apiChannel
+	RecipientIDs []string `json:"recipient_ids"`
+}
+
+func dmContainers(chans []gwPrivateChannel, users []apiUser) []store.Container {
+	byID := make(map[string]apiUser, len(users))
+	for _, u := range users {
+		byID[u.ID] = u
+	}
+	var out []store.Container
+	for i := range chans {
+		ch := chans[i].apiChannel
+		if len(ch.Recipients) == 0 {
+			for _, id := range chans[i].RecipientIDs {
+				ch.Recipients = append(ch.Recipients, cmp.Or(byID[id], apiUser{ID: id}))
+			}
+		}
+		if ch.Type != channelDM && ch.Type != channelGroupDM || !isSnowflake(ch.ID) {
+			continue
+		}
+		if c, ok := channelContainer(&ch); ok {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // gwGuild is a guild in READY, GUILD_CREATE or GUILD_UPDATE. The user

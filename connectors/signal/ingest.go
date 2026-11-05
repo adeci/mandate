@@ -31,22 +31,18 @@ type lookup interface {
 }
 
 type ingester struct {
-	cli        lookup
-	dev        *sgstore.Device
-	st         *store.Store
-	timers     *timers
-	identities *identities
-	log        *slog.Logger
+	cli  lookup
+	dev  *sgstore.Device
+	st   *store.Store
+	sess *session
+	log  *slog.Logger
 
 	mu   sync.Mutex
 	seen map[string]uint32 // chats upserted by this process, with the group revision
 }
 
 func newIngester(cli lookup, dev *sgstore.Device, st *store.Store, sess *session, log *slog.Logger) *ingester {
-	return &ingester{
-		cli: cli, dev: dev, st: st, timers: sess.timers, identities: sess.identities, log: log,
-		seen: make(map[string]uint32),
-	}
+	return &ingester{cli: cli, dev: dev, st: st, sess: sess, log: log, seen: make(map[string]uint32)}
 }
 
 // Returning false for a message leaves it unacknowledged, so the server
@@ -56,9 +52,9 @@ func (in *ingester) handle(ctx context.Context, evt events.SignalEvent) bool {
 	case *events.ChatEvent:
 		return in.chatEvent(ctx, e)
 	case *events.ContactList:
-		in.renameDMs(ctx, e.Contacts)
+		in.storeContacts(ctx, e.Contacts)
 	case *events.IdentityChange:
-		if err := in.identities.changed(ctx, e.ServiceID.String(), time.Now()); err != nil {
+		if err := in.sess.identities.changed(ctx, e.ServiceID.String(), time.Now()); err != nil {
 			in.log.Error("store identity change", "service_id", e.ServiceID.String(), "err", err)
 		} else {
 			in.log.Warn("safety number changed", "service_id", e.ServiceID.String())
@@ -71,7 +67,7 @@ func (in *ingester) chatEvent(ctx context.Context, e *events.ChatEvent) bool {
 	chat := in.chatID(ctx, e.Info.ChatID)
 	if dm, ok := e.Event.(*signalpb.DataMessage); ok {
 		if !isGroup(chat) {
-			if err := in.timers.observe(ctx, chat, dm); err != nil {
+			if err := in.sess.timers.observe(ctx, chat, dm); err != nil {
 				in.log.Error("store disappearing timer", "chat", chat, "err", err)
 				return false
 			}
@@ -149,6 +145,15 @@ func displayName(r *types.Recipient, own uuid.UUID) string {
 	return ""
 }
 
+// chatName is displayName, else the phone number, which unlike a chosen
+// name nobody can spoof.
+func chatName(r *types.Recipient, own uuid.UUID) string {
+	if n := displayName(r, own); n != "" || r == nil {
+		return n
+	}
+	return r.E164
+}
+
 // contactName may fetch the profile, at most hourly per user.
 func (in *ingester) contactName(ctx context.Context, aci uuid.UUID) string {
 	qctx, cancel := context.WithTimeout(ctx, queryTimeout)
@@ -158,7 +163,7 @@ func (in *ingester) contactName(ctx context.Context, aci uuid.UUID) string {
 		in.log.Warn("contact lookup failed", "aci", aci.String(), "err", err)
 		return ""
 	}
-	return displayName(r, in.dev.ACI)
+	return chatName(r, in.dev.ACI)
 }
 
 func (in *ingester) localName(ctx context.Context, aci uuid.UUID) string {
@@ -193,6 +198,14 @@ func (in *ingester) ensureContainer(ctx context.Context, chat string, revision u
 		cancel()
 		if err != nil {
 			in.log.Warn("group lookup failed", "chat", chat, "err", err)
+			// Without a message there is nothing to store: no name, no
+			// members, maybe not even membership.
+			if at.IsZero() {
+				in.mu.Lock()
+				delete(in.seen, chat)
+				in.mu.Unlock()
+				return nil
+			}
 		} else {
 			c.Name = g.Title
 			c.Participants = make([]store.Participant, 0, len(g.Members))
@@ -222,51 +235,62 @@ func (in *ingester) own(aci uuid.UUID) bool {
 	return in.dev != nil && aci != uuid.Nil && aci == in.dev.ACI
 }
 
-// nameOwnChat names a stored chat with the owner's own ACI as Signal does,
-// so one stored under an older name is renamed on connecting.
-func (in *ingester) nameOwnChat(ctx context.Context) {
-	if in.dev == nil || in.dev.ACI == uuid.Nil {
-		return
+// syncChats stores a chat for every contact and every group of the
+// account, so the owner can grant one that has had no messages since
+// linking.
+func (in *ingester) syncChats(ctx context.Context) {
+	in.storeDM(ctx, store.Container{ID: in.dev.ACI.String(), Kind: "dm", Name: noteToSelf}, true)
+	contacts, err := in.dev.RecipientStore.LoadAllContacts(ctx)
+	if err != nil {
+		in.log.Error("load contacts", "err", err)
 	}
-	if _, err := in.st.DB().ExecContext(ctx, `UPDATE containers SET name = ?1 WHERE id = ?2 AND kind = 'dm' AND name IS NOT ?1`,
-		noteToSelf, in.dev.ACI.String()); err != nil {
-		in.log.Error("name own chat", "err", err)
+	in.storeContacts(ctx, contacts)
+	groups, err := in.sess.groups(ctx, in.dev.ACI)
+	if err != nil {
+		in.log.Error("load groups", "err", err)
+	}
+	for _, gid := range groups {
+		if err := in.ensureContainer(ctx, gid, 0, time.Time{}); err != nil {
+			in.log.Error("store group", "chat", gid, "err", err)
+		}
 	}
 }
 
-// renameDMs names the stored DMs of contacts the owner's devices synced. A
-// DM stored under a phone number identity (PNI) lists the person's ACI, the
-// ID their messages carry.
-func (in *ingester) renameDMs(ctx context.Context, contacts []*types.Recipient) {
+// storeContacts stores a DM for each contact: someone in the address book,
+// given a nickname, or whose messages the owner accepted. Others' stored
+// DMs are renamed. A DM stored under a phone number identity (PNI) lists
+// the person's ACI, the ID their messages carry.
+func (in *ingester) storeContacts(ctx context.Context, contacts []*types.Recipient) {
 	for _, r := range contacts {
-		name := displayName(r, in.dev.ACI)
-		if in.own(r.ACI) {
-			name = noteToSelf
-		}
 		if r.ACI == uuid.Nil {
 			continue
 		}
-		if name != "" {
-			in.updateDM(ctx, store.Container{ID: r.ACI.String(), Kind: "dm", Name: name})
+		name := chatName(r, in.dev.ACI)
+		contact := !r.Blocked && (r.ContactName != "" || r.Nickname != "" || r.Whitelisted != nil && *r.Whitelisted)
+		if in.own(r.ACI) {
+			name, contact = noteToSelf, true
 		}
+		in.storeDM(ctx, store.Container{ID: r.ACI.String(), Kind: "dm", Name: name}, contact)
 		if r.PNI != uuid.Nil {
-			in.updateDM(ctx, store.Container{
+			in.storeDM(ctx, store.Container{
 				ID: libsignalgo.NewPNIServiceID(r.PNI).String(), Kind: "dm", Name: name,
 				Participants: []store.Participant{{ID: r.ACI.String(), Name: name}},
-			})
+			}, false)
 		}
 	}
 }
 
-// updateDM stores c if a DM with its ID is stored and c changes it.
-func (in *ingester) updateDM(ctx context.Context, c store.Container) {
+// storeDM stores c if it changes a stored DM, or if create, as a new one.
+func (in *ingester) storeDM(ctx context.Context, c store.Container, create bool) {
 	var name, parts string
 	err := in.st.DB().QueryRowContext(ctx, `SELECT COALESCE(name, ''), participants_json FROM containers WHERE id = ?1 AND kind = 'dm'`, c.ID).
 		Scan(&name, &parts)
-	if errors.Is(err, sql.ErrNoRows) {
+	switch {
+	case errors.Is(err, sql.ErrNoRows) && create:
+		err = in.st.UpsertContainer(ctx, c)
+	case errors.Is(err, sql.ErrNoRows):
 		return
-	}
-	if err == nil {
+	case err == nil:
 		b, _ := json.Marshal(c.Participants)
 		if (c.Name == "" || c.Name == name) && (c.Participants == nil || string(b) == parts) {
 			return
@@ -276,6 +300,25 @@ func (in *ingester) updateDM(ctx context.Context, c store.Container) {
 	if err != nil {
 		in.log.Error("store dm", "chat", c.ID, "err", err)
 	}
+}
+
+// groups lists the groups whose keys signalmeow holds: those of the
+// storage service and those messages came from.
+func (s *session) groups(ctx context.Context, aci uuid.UUID) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT group_identifier FROM signalmeow_groups WHERE account_id = ?1`, aci.String())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var gids []string
+	for rows.Next() {
+		var gid string
+		if err := rows.Scan(&gid); err != nil {
+			return nil, err
+		}
+		gids = append(gids, gid)
+	}
+	return gids, rows.Err()
 }
 
 const timersSchema = `

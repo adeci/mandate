@@ -82,10 +82,13 @@ func (f *fakeClient) StopReceiveLoops() error {
 	return nil
 }
 
-func (f *fakeClient) QueueStorageSync(context.Context) {
+// StorageSync never returns, so the chat sync after it runs only where a
+// test calls it.
+func (f *fakeClient) StorageSync(ctx context.Context) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.syncs++
+	f.mu.Unlock()
+	<-ctx.Done()
 }
 
 func (f *fakeClient) Unlink(context.Context) error {
@@ -190,12 +193,12 @@ func (f *fixture) start(t *testing.T, dev *sgstore.Device) {
 			f.provisions = append(f.provisions, ch)
 			return ch
 		},
-		func(dev *sgstore.Device, _ func(events.SignalEvent)) sgClient {
+		func(dev *sgstore.Device, _ func(events.SignalEvent)) (sgClient, *ingester) {
 			cli := &fakeClient{dev: dev, groups: f.groups}
 			f.mu.Lock()
 			f.clients = append(f.clients, cli)
 			f.mu.Unlock()
-			return cli
+			return cli, newIngester(cli, dev, f.st, f.sess, discard)
 		})
 	if err := f.c.connect(); err != nil {
 		t.Fatal(err)

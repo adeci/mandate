@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -28,7 +29,8 @@ import (
 // phone is what the fake clients of one fixture talk to.
 type phone struct {
 	mu        sync.Mutex
-	convs     []*gmproto.Conversation
+	convs     []*gmproto.Conversation // the inbox, newest first
+	archived  []*gmproto.Conversation
 	msgs      map[string][]*gmproto.Message
 	fetchErr  map[string]error
 	fetches   []string
@@ -128,10 +130,25 @@ func (f *fakeClient) SetActiveSession(context.Context) error {
 	return nil
 }
 
-func (f *fakeClient) ListConversations(context.Context, *gmproto.ListConversationsRequest) (*gmproto.ListConversationsResponse, error) {
+// ListConversations pages a folder as the phone does: each page's cursor
+// names its last conversation.
+func (f *fakeClient) ListConversations(_ context.Context, req *gmproto.ListConversationsRequest) (*gmproto.ListConversationsResponse, error) {
 	f.p.mu.Lock()
 	defer f.p.mu.Unlock()
-	return &gmproto.ListConversationsResponse{Conversations: f.p.convs}, nil
+	convs := f.p.convs
+	if req.GetFolder() == gmproto.ListConversationsRequest_ARCHIVE {
+		convs = f.p.archived
+	}
+	if id := req.GetCursor().GetLastItemID(); id != "" {
+		i := slices.IndexFunc(convs, func(c *gmproto.Conversation) bool { return c.GetConversationID() == id })
+		convs = convs[i+1:]
+	}
+	resp := &gmproto.ListConversationsResponse{Conversations: convs}
+	if n := int(req.GetCount()); len(convs) > n {
+		resp.Conversations = convs[:n]
+		resp.Cursor = &gmproto.Cursor{LastItemID: convs[n-1].GetConversationID()}
+	}
+	return resp, nil
 }
 
 // FetchMessages answers a cursor with the messages sent before it, as the
