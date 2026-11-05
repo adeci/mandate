@@ -203,6 +203,8 @@ pub struct Shell {
     focus: FocusHandle,
     /// The wordmark shows alone for a moment after Android's splash.
     launching: bool,
+    /// How long the launch runs, fixed at its first frame.
+    launch: Option<Duration>,
     /// The page last drawn, and how many pages have been, so that a new
     /// one fades in.
     page: (Option<Page>, usize),
@@ -250,14 +252,6 @@ impl Shell {
             }
         })
         .detach();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(screens::LAUNCH).await;
-            let _ = this.update(cx, |this, cx| {
-                this.launching = false;
-                cx.notify();
-            });
-        })
-        .detach();
         let mut shell = Shell {
             dir,
             key_id: String::new(),
@@ -289,6 +283,7 @@ impl Shell {
             pending: None,
             focus: cx.focus_handle(),
             launching: true,
+            launch: None,
             page: (None, 0),
             pair_check: None,
             agent_url: String::new(),

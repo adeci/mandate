@@ -16,10 +16,11 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
-/// How long the wordmark shows alone at launch, and how long its glow
-/// takes to bloom and settle.
-pub const LAUNCH: Duration = Duration::from_millis(340);
-const WORDMARK_IN: Duration = Duration::from_millis(300);
+/// The launch: the wordmark glows in, holds, and gives way to the first
+/// page, all within LAUNCH_MAX of the tap; a slow start shortens the hold.
+const GLOW_IN: Duration = Duration::from_millis(800);
+const HOLD: Duration = Duration::from_millis(300);
+const LAUNCH_MAX: Duration = Duration::from_millis(1500);
 /// A new page fades in this fast: enough to see the change, never enough
 /// to wait for it.
 const PAGE_IN: Duration = Duration::from_millis(90);
@@ -53,25 +54,36 @@ impl Render for Shell {
             .pb(px(bottom))
             .child(touches());
         if self.launching {
-            // A quick emerald bloom behind the wordmark, which starts in
-            // emerald too and settles to the text color.
+            if self.launch.is_none() {
+                self.start_launch(cx);
+            }
+            // The wordmark spans about 60% of the narrower side, a monospace
+            // character being 0.6 em wide; capped for big screens.
+            let view = window.viewport_size();
+            let width = (view.width.min(view.height) * 0.6).min(px(360.));
+            let size = width / (0.6 * 7.);
             let (glow, text) = (t.grant_hi, t.text);
-            let mark = wordmark().px(chars(1.)).rounded_full().with_animation(
-                "launch",
-                Animation::new(WORDMARK_IN),
-                move |d, v| {
+            // One unhurried motion: it fades and grows in, emerald, while a
+            // glow swells behind it and settles as it turns the text color.
+            let mark = wordmark()
+                .text_size(size)
+                .line_height(size * 1.2)
+                .px(size * 0.4)
+                .rounded_full()
+                .with_animation("launch", Animation::new(GLOW_IN), move |d, v| {
+                    let rise = v * v * (3. - 2. * v);
                     let bloom = (v * std::f32::consts::PI).sin();
-                    d.opacity((v * 4.).min(1.)).text_color(mix(glow, text, v)).shadow(vec![
-                        BoxShadow {
-                            color: glow.opacity(0.5 * bloom),
+                    d.opacity((v * 2.5).min(1.))
+                        .text_size(size * (0.94 + 0.06 * rise))
+                        .text_color(mix(glow, text, rise))
+                        .shadow(vec![BoxShadow {
+                            color: glow.opacity(0.45 * bloom),
                             offset: point(px(0.), px(0.)),
-                            blur_radius: px(32. * bloom),
-                            spread_radius: px(8. * bloom),
+                            blur_radius: size * (1.2 * bloom),
+                            spread_radius: size * (0.25 * bloom),
                             inset: false,
-                        },
-                    ])
-                },
-            );
+                        }])
+                });
             return root
                 .items_center()
                 .justify_center()
@@ -268,6 +280,45 @@ impl Render for Shell {
         .children(self.confirm_sheet(t, bottom, cx))
         .into_any_element()
     }
+}
+
+impl Shell {
+    /// Fixes the launch's length at its first frame, and ends it then.
+    fn start_launch(&mut self, cx: &mut Context<Self>) {
+        let spare = LAUNCH_MAX.saturating_sub(process_age() + GLOW_IN);
+        let total = GLOW_IN + HOLD.min(spare);
+        self.launch = Some(total);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(total).await;
+            let _ = this.update(cx, |this, cx| {
+                this.launching = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+}
+
+/// How long ago this process started, as /proc tells; zero elsewhere.
+fn process_age() -> Duration {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // Field 22 of stat is the start in clock ticks after boot; the
+        // fields after the name start at 3.
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let start = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(19));
+        let start = start.and_then(|s| s.parse::<f64>().ok());
+        let uptime = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
+        let up = uptime.split_whitespace().next().and_then(|s| s.parse::<f64>().ok());
+        // SAFETY: sysconf only reads a configuration value.
+        let tick = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+        if let (Some(start), Some(up)) = (start, up)
+            && tick > 0.
+        {
+            return Duration::from_secs_f64((up - start / tick).max(0.));
+        }
+    }
+    Duration::ZERO
 }
 
 /// "mandate", as the launch shows it and the welcome greets with.
