@@ -168,10 +168,12 @@ extern "system" fn Java_dev_mandate_app_Main_clock(
 }
 
 /// Shows or hides the soft keyboard. NativeActivity hands its keys to gpui
-/// as KeyDownEvents, as with a hardware keyboard.
+/// as KeyDownEvents, as with a hardware keyboard. Every show is asked for
+/// explicitly, as a tap is the user's request: Android may ignore an
+/// implicit one after the user put the keyboard away.
 pub fn keyboard(show: bool) {
     if let Some(app) = gpui_jni::android_app() {
-        if show { app.show_soft_input(true) } else { app.hide_soft_input(false) }
+        if show { app.show_soft_input(false) } else { app.hide_soft_input(false) }
     }
 }
 

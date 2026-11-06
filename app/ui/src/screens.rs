@@ -803,11 +803,23 @@ impl Shell {
                 .gap(chars(1.))
                 .h(lines(2.5))
                 .child(icon("search", t.alt))
-                .child(if q.is_empty() {
-                    t.alt("Search").flex_1()
-                } else {
-                    div().flex_1().child(q.clone())
-                })
+                // A tap on the field brings the keyboard back, after Enter or
+                // Back put it away.
+                .child(
+                    clickable("search-field", cx, |_, cx| {
+                        crate::keyboard(true);
+                        cx.notify();
+                    })
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .child(if q.is_empty() {
+                        t.alt("Search")
+                    } else {
+                        div().child(q.clone())
+                    }),
+                )
                 .child(icon_button(t, "clear", "x", cx, |this, cx| {
                     this.search = None;
                     crate::keyboard(false);
