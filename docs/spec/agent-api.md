@@ -143,7 +143,7 @@ sealed         3b3b1c233fad60e0e148b7ac79f6a6845841af004b042d709ed21d95a840babe
                77b217
 ```
 
-`mandate login URL [--name NAME]` prompts `Code from the mandate app: ` and
+`mandate login URL [--name NAME]` prompts `Code from Agents → Add an agent in the mandate app: ` and
 reads the code from the terminal, or from stdin when that isn't one; no flag
 takes it, so it stays out of shell history. After a wrong code it asks again
 while attempts are left. It keeps the result in

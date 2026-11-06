@@ -39,6 +39,8 @@ func main() {
 	case errors.Is(err, errUsage):
 		fmt.Fprintln(os.Stderr, usage)
 		os.Exit(2)
+	case errors.Is(err, context.Canceled):
+		os.Exit(130)
 	case err != nil:
 		fmt.Fprintf(os.Stderr, "mandate: %v\n", err)
 		os.Exit(cli.ExitCode(err))

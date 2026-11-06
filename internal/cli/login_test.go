@@ -2,10 +2,13 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/adeci/mandate/internal/exchange"
 )
@@ -111,7 +115,7 @@ func TestLogin(t *testing.T) {
 	}{
 		"pinned":           {typed: "123456\n", spki: same, says: "Code confirmed"},
 		"rooted":           {typed: "123 456\n", spki: same, rooted: true, says: "Code confirmed"},
-		"wrong then right": {typed: "111111\n12345\n123456", spki: same, says: "Wrong code; attempts left: 2.\nCode from the mandate app: The code is 6 digits."},
+		"wrong then right": {typed: "111111\n12345\n123456", spki: same, says: "Wrong code; attempts left: 2.\nCode from Agents → Add an agent in the mandate app: The code is 6 digits."},
 		"wrong three times": {
 			typed: "111111\n222222\n333333\n123456\n", spki: same, says: "attempts left: 1.", err: "wrong code three times",
 		},
@@ -172,6 +176,28 @@ func TestLogin(t *testing.T) {
 				t.Errorf("connectors after login: %v %q", err, after)
 			}
 		})
+	}
+}
+
+// Ctrl-C at the code prompt ends the login, though the terminal never sends
+// a line.
+func TestLoginInterrupted(t *testing.T) {
+	t.Parallel()
+	srv := (&joinServer{spki: func(b []byte) []byte { return b }}).start(t)
+	stdin, _ := io.Pipe()
+	home := t.TempDir()
+	c := &cli{in: stdin, out: &bytes.Buffer{}, errOut: &bytes.Buffer{}, getenv: func(k string) string { return map[string]string{"HOME": home}[k] }}
+	ctx, cancel := context.WithCancel(t.Context())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	done := make(chan error, 1)
+	go func() { done <- c.run(ctx, []string{"login", srv.URL, "--name", "laptop"}) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("login: %v, want canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("login still waits for a code after Ctrl-C")
 	}
 }
 

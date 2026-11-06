@@ -13,7 +13,7 @@ app. `mandate --help` and `mandate <connector> --help` list the commands.
 ## Logging in
 
 If commands answer `not logged in` or `unknown or revoked token`, ask the
-owner for mandate's address and to open Add an agent in the mandate app,
+owner for mandate's address and to open Agents → Add an agent in the mandate app,
 which shows a 6-digit code. Then pass the code on stdin:
 
 ```sh

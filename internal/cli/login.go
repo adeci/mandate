@@ -175,15 +175,31 @@ func (c *cli) login(ctx context.Context, args []string) error {
 
 	token := exchange.NewToken()
 	payload := exchange.Payload{TokenSHA256: exchange.TokenSHA256(token)}
-	in := bufio.NewReader(c.in)
+	// A read blocks until a line comes, so it runs aside and Ctrl-C ends the
+	// prompt at once.
+	type read struct {
+		line string
+		err  error
+	}
+	in, reads := bufio.NewReader(c.in), make(chan read, 1)
 	var id string
 	for id == "" {
-		fmt.Fprint(c.errOut, "Code from the mandate app: ")
-		line, err := in.ReadString('\n')
-		code := strings.Join(strings.Fields(line), "")
+		fmt.Fprint(c.errOut, "Code from Agents → Add an agent in the mandate app: ")
+		go func() {
+			line, err := in.ReadString('\n')
+			reads <- read{line, err}
+		}()
+		var r read
+		select {
+		case <-ctx.Done():
+			fmt.Fprintln(c.errOut)
+			return ctx.Err()
+		case r = <-reads:
+		}
+		code := strings.Join(strings.Fields(r.line), "")
 		switch {
-		case code == "" && err != nil:
-			return errors.New("no code given; the owner opens Add an agent in the mandate app, which shows it")
+		case code == "" && r.err != nil:
+			return errors.New("no code given; the owner opens Agents → Add an agent in the mandate app, which shows it")
 		case len(code) != 6 || strings.Trim(code, "0123456789") != "":
 			fmt.Fprintln(c.errOut, "The code is 6 digits.")
 		default:
