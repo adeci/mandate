@@ -174,7 +174,16 @@ func (s *Server) getActivity(w http.ResponseWriter, r *http.Request) {
 		}
 		before = &c
 	}
-	entries, next, err := readActivity(s.dir, before, limit, s.activityFilter(q))
+	var after time.Time
+	if v := q.Get("after"); v != "" {
+		t, err := time.Parse(time.RFC3339Nano, v)
+		if err != nil {
+			fail(w, http.StatusBadRequest, "after is an RFC 3339 time")
+			return
+		}
+		after = t.UTC()
+	}
+	entries, next, err := readActivity(s.dir, before, after, limit, s.activityFilter(q))
 	if err != nil {
 		s.log.Error("read activity", "err", err)
 		failErr(w, err)
@@ -302,9 +311,10 @@ func (a activity) matches(text, identity string) bool {
 	return slices.ContainsFunc(fields, func(f string) bool { return strings.Contains(strings.ToLower(f), text) })
 }
 
-// readActivity is up to limit entries before before (if set) that match,
-// newest first, and the cursor of the page after them if there is one.
-func readActivity(dir string, before *cursor, limit int, match func(activity) bool) ([]activity, string, error) {
+// readActivity is up to limit entries that match, before before (if set)
+// and strictly after after (if not zero), newest first, and the cursor of
+// the page after them if there is one.
+func readActivity(dir string, before *cursor, after time.Time, limit int, match func(activity) bool) ([]activity, string, error) {
 	des, err := os.ReadDir(activityDir(dir))
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, "", err
@@ -322,11 +332,16 @@ func readActivity(dir string, before *cursor, limit int, match func(activity) bo
 		if before != nil && day > before.at.Format(time.DateOnly) {
 			continue
 		}
+		if !after.IsZero() && day < after.Format(time.DateOnly) {
+			break // older days end before after
+		}
 		es, err := readDay(filepath.Join(activityDir(dir), day+".jsonl"))
 		if err != nil {
 			return nil, "", err
 		}
-		es = slices.DeleteFunc(es, func(e placed) bool { return before != nil && !e.at.before(*before) || !match(e.activity) })
+		es = slices.DeleteFunc(es, func(e placed) bool {
+			return before != nil && !e.at.before(*before) || !e.At.After(after) || !match(e.activity)
+		})
 		slices.SortFunc(es, func(a, b placed) int {
 			if a.at.before(b.at) {
 				return 1

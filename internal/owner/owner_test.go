@@ -778,13 +778,16 @@ func TestActivityFilters(t *testing.T) {
 		return got
 	}
 	for query, want := range map[string][]string{
-		"kinds=reads":                 {"read d3", "read d2", "read d1"},
-		"kinds=access":                {"device.paired Pixel 9"},
-		"kinds=device,sends":          {"device.paired Pixel 9"},
-		"kinds=read&limit=1":          {"read d3"},
-		"before=2026-01-03T00:00:00Z": {"read d2", "read d1"},
-		"before=2026-01-02T12:00:00Z": {"read d1"},
-		"kinds=requests":              nil,
+		"kinds=reads":                            {"read d3", "read d2", "read d1"},
+		"kinds=access":                           {"device.paired Pixel 9"},
+		"kinds=device,sends":                     {"device.paired Pixel 9"},
+		"kinds=read&limit=1":                     {"read d3"},
+		"before=2026-01-03T00:00:00Z":            {"read d2", "read d1"},
+		"before=2026-01-02T12:00:00Z":            {"read d1"},
+		"kinds=requests":                         nil,
+		"after=2026-01-01T12:00:00Z&kinds=reads": {"read d3", "read d2"},
+		"after=2026-01-01T11:59:59Z&before=2026-01-03T00:00:00Z":               {"read d2", "read d1"},
+		"after=2026-01-02T12:59:59%2B01:00&before=2026-01-03T13:00:01%2B01:00": {"read d3", "read d2"},
 	} {
 		if got := list(query); !slices.Equal(got, want) {
 			t.Errorf("activity?%s = %v, want %v", query, got, want)
@@ -792,6 +795,14 @@ func TestActivityFilters(t *testing.T) {
 	}
 	if st := h.do("GET", "/owner/v1/activity?before=yesterday", owner.token, nil, nil); st != http.StatusBadRequest {
 		t.Errorf("bad before = %d", st)
+	}
+	// Paging stays above after, and ends there.
+	var first, second activityPage
+	h.do("GET", "/owner/v1/activity?kinds=reads&limit=1&after=2026-01-01T12:00:00Z", owner.token, nil, &first)
+	h.do("GET", "/owner/v1/activity?kinds=reads&limit=1&after=2026-01-01T12:00:00Z&before="+url.QueryEscape(first.Next), owner.token, nil, &second)
+	if len(first.Entries) != 1 || first.Entries[0].Detail != "d3" || first.Next == "" ||
+		len(second.Entries) != 1 || second.Entries[0].Detail != "d2" || second.Next != "" {
+		t.Errorf("paged after: %+v, %+v", first, second)
 	}
 }
 
