@@ -409,4 +409,18 @@ with subtest("the first run adds a token as a second way, ticks it, and drops it
     see(1, "Removed")
     gone(1, "Security key")
     shot(1, "methods-light")
+
+with subtest("Connections, a Now card and Activity show each connector's mark"):
+    status, out = agent("request signal --chat Family --for 30m --reason 'plan dinner' --wait 0")
+    assert status == 75, (status, out)
+    for n, mode in ((1, "light"), (2, "dark")):
+        now(n)
+        see(n, "laptop wants to read")
+        shot(n, f"marks-now-{mode}")
+        sh(n, "xdotool mousemove 722 785 click 1")  # the Connections tab
+        see(n, "Discord")  # the first, by name
+        shot(n, f"marks-connections-{mode}")
+        sh(n, "xdotool mousemove 880 785 click 1")  # the Activity tab
+        see(n, "asked to read Signal")
+        shot(n, f"marks-activity-{mode}")
     desktop.copy_from_machine(shots, "")

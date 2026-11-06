@@ -21,8 +21,8 @@ use std::time::Duration;
 const CALL: Wait = Wait::Total(Duration::from_secs(60));
 /// How long a join poll waits on the server, in seconds.
 const POLL: u64 = 60;
-/// The stream sends a comment every 30 seconds.
-const STREAM: Wait = Wait::Idle(Duration::from_secs(90));
+/// The stream sends a comment every 30 seconds; two missed, it is dead.
+const STREAM: Wait = Wait::Idle(Duration::from_secs(65));
 /// A stream event's data; the server's are far smaller.
 const MAX_EVENT: usize = 64 << 10;
 

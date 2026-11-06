@@ -19,13 +19,13 @@ use std::time::Duration;
 /// The launch: a block cursor types the wordmark and blinks, then gives way
 /// to the first page. A second blink holds it a moment longer, within
 /// LAUNCH_MAX of the tap; a slow start drops that hold, never the typing.
-const TYPING: Duration = Duration::from_millis(975);
-const HOLD: Duration = Duration::from_millis(220);
+const TYPING: Duration = Duration::from_millis(610);
+const HOLD: Duration = Duration::from_millis(140);
 /// When each letter of "mandate" lands, in ms: a person's uneven pace.
-const KEYS: [f32; 7] = [80., 205., 300., 455., 540., 685., 790.];
+const KEYS: [f32; 7] = [40., 105., 165., 245., 305., 380., 450.];
 /// When the cursor is off as it blinks after typing, in ms.
-const BLINKS: [(f32, f32); 2] = [(815., 915.), (1035., 1135.)];
-const LAUNCH_MAX: Duration = Duration::from_millis(1500);
+const BLINKS: [(f32, f32); 2] = [(470., 540.), (610., 680.)];
+const LAUNCH_MAX: Duration = Duration::from_millis(1100);
 /// A new page fades in this fast: enough to see the change, never enough
 /// to wait for it.
 const PAGE_IN: Duration = Duration::from_millis(90);
@@ -42,6 +42,12 @@ impl Render for Shell {
         let ((top, bottom), typing) = (crate::android::insets(), crate::android::keyboard_up());
         #[cfg(not(target_os = "android"))]
         let ((top, bottom), typing) = ((0., 0.), false);
+        // Sheets sit on the navigation bar, never on the keyboard, which
+        // opening one drops.
+        if !typing {
+            self.nav_bottom = bottom;
+        }
+        let sheet_bottom = self.nav_bottom;
         let pin = self.pin_prompt(t, cx);
         let root = div()
             .size_full()
@@ -133,7 +139,10 @@ impl Render for Shell {
                 (f32::from(self.scroll.offset().y), f32::from(self.scroll.max_offset().y));
             let near = -at >= end - 2. * f32::from(window.viewport_size().height);
             self.searched(self.search.clone().unwrap_or_default(), cx);
+            // Out of reach, Activity keeps what it shows until a retry
+            // gets through, rather than asking again on every frame.
             match &self.history {
+                _ if self.offline => {}
                 Some(h) if h.query != self.wanted => self.load_history(cx),
                 None => self.load_history(cx),
                 Some(h) if h.next.is_some() && near => self.more_history(cx),
@@ -203,9 +212,11 @@ impl Render for Shell {
                 let (envelope, deny) =
                     (envelope.clone(), format!("proposals/{}/deny", proposal.id));
                 column()
-                    .child(column().child(who(&proposal.identity_name, "wants to send")).child(
-                        div().font_weight(MEDIUM).child(words::connector(&proposal.connector)),
-                    ))
+                    .child(
+                        column().child(who(&proposal.identity_name, "wants to send")).child(
+                            connector_label(&proposal.connector, t.text).font_weight(MEDIUM),
+                        ),
+                    )
                     .child(table(t, fields))
                     .children(reason(t, &proposal.note))
                     .child(approve(
@@ -253,9 +264,19 @@ impl Render for Shell {
             )
             .into_any_element()
         };
+        // One quiet notice while the server can't be reached; every page
+        // keeps what it last showed.
+        let host = self.server.split("://").last().unwrap_or_default();
+        let host = host.split(['/', ':']).next().unwrap_or_default().to_string();
+        let offline = div()
+            .bg(t.bg_alt)
+            .text_color(t.alt)
+            .py(lines(0.25))
+            .child(page(pad).child(format!("Can't reach {host}")));
         root.when(!matches!(self.screen, Screen::Welcome), |d| {
             d.child(self.top_bar(t, title, tab.is_some(), pad, cx))
         })
+        .when(self.offline, |d| d.child(offline))
         .child(
             div()
                 .relative()
@@ -279,8 +300,8 @@ impl Render for Shell {
         // The soft keyboard sits where the tab bar would; it returns as the keyboard goes.
         .when_some(tab.filter(|_| !typing), |d, tab| d.child(self.tab_bar(t, tab, pad, cx)))
         .when(tab == Some(Tab::Now), |d| d.children(self.adjust_sheet(t, bottom, cx)))
-        .children(self.confirm_sheet(t, bottom, cx))
-        .when(tab == Some(Tab::Activity), |d| d.children(self.history_sheet(t, bottom, cx)))
+        .children(self.confirm_sheet(t, sheet_bottom, cx))
+        .when(tab == Some(Tab::Activity), |d| d.children(self.history_sheet(t, sheet_bottom, cx)))
         .into_any_element()
     }
 }
@@ -558,6 +579,16 @@ pub fn icon(name: &str, color: Hsla) -> Svg {
     svg().path(format!("icons/{name}.svg")).size(px(20.)).flex_none().text_color(color)
 }
 
+/// A connector's mark beside its name, wherever the connector is named.
+pub fn connector_label(name: &str, color: Hsla) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(chars(1.))
+        .child(icon(words::connector_icon(name), color))
+        .child(words::connector(name))
+}
+
 pub(crate) fn icon_button(
     t: Theme,
     id: &'static str,
@@ -575,10 +606,15 @@ pub(crate) fn icon_button(
 }
 
 impl Shell {
-    /// One step back: closes what is open on the page, else returns to the
-    /// screen it came from. False at a root, where Android's Back leaves the
-    /// app.
+    /// One step back: closes the topmost thing open on the page (a sheet,
+    /// then the chat picker, then search or a name being typed), else
+    /// returns to the screen it came from. False at a root, where Android's
+    /// Back leaves the app.
     pub(crate) fn go_back(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.sheet.take().is_some() || self.history_sheet.take().is_some() {
+            cx.notify();
+            return true;
+        }
         if self.picker.is_some() {
             self.close_picker(cx);
             return true;
@@ -586,13 +622,9 @@ impl Shell {
         if self.close_adjust(cx) {
             return true;
         }
-        if self.search.is_some() || self.sheet.is_some() || self.renaming.is_some() {
-            (self.search, self.sheet, self.renaming) = (None, None, None);
+        if self.search.is_some() || self.renaming.is_some() {
+            (self.search, self.renaming) = (None, None);
             crate::keyboard(false);
-            cx.notify();
-            return true;
-        }
-        if self.history_sheet.take().is_some() {
             cx.notify();
             return true;
         }

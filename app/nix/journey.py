@@ -225,6 +225,9 @@ with subtest("the phone boots with a PIN and a fingerprint"):
     until("the emulator to boot", lambda: adb("shell", "getprop", "sys.boot_completed").strip() == "1", timeout=600)
     until("the home screen", unlocked)
     adb("shell", "svc", "power", "stayon", "true")
+    # A heads-up notification can cover the app and carry its own "Let laptop
+    # in"; notifications still reach the shade.
+    adb("shell", "settings", "put", "global", "heads_up_notifications_enabled", "0")
     adb("shell", "locksettings", "set-pin", "1111")
     adb("shell", "am", "start", "-a", "android.settings.FINGERPRINT_ENROLL")
     until("the PIN check", lambda: "ConfirmLock" in focus())
@@ -256,8 +259,8 @@ with subtest("the app pairs by the setup page's link"):
 
 # The code the app shows on Add an agent, between "Then type this code:" and
 # "Copy code". Read with the rest of the page, a leading 5 in its large type
-# comes out as 2 or 9, so the code alone is read again at half and quarter
-# size, as digits only; both readings must agree, on two screenshots in a row.
+# comes out as 2 or 9, so the code alone is read again at three sizes, as
+# digits only; two readings must agree, on two screenshots in a row.
 def shown_code() -> str:
     last: list[str] = []
 
@@ -271,15 +274,15 @@ def shown_code() -> str:
                 bottom = min(w[2] for w in line)
         if top is None or bottom is None or bottom <= top:
             return None
-        readings = set()
-        for size in (50, 25):
+        readings = []
+        for size in (50, 35, 25):
             crop = run(magick, "png:-", "-crop", f"1080x{bottom - top}+0+{top}", "+repage", "-resize", f"{size}%",
                        "-bordercolor", "white", "-border", "20", "png:-", input=png)
             digits = run(tesseract, "stdin", "stdout", "--psm", "7", "-c", "tessedit_char_whitelist=0123456789",
                          input=crop).decode()
-            readings.add(re.sub(r"\s", "", digits))
-        code = readings.pop() if len(readings) == 1 else ""
-        return code if re.fullmatch(r"\d{6}", code) else None
+            readings.append(re.sub(r"\s", "", digits))
+        codes = [c for c in readings if re.fullmatch(r"\d{6}", c)]
+        return next((c for c in codes if codes.count(c) >= 2), None)
 
     def look() -> str | None:
         code = read(screenshot())

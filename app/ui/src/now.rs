@@ -3,10 +3,10 @@
 use crate::api::{Exchange, Grant, Proposal, Request};
 use crate::pick::Pick;
 use crate::screens::{
-    DEVICE_JOIN, approve, button, clickable, column, deny_exchange, device_rows, device_warning,
-    id_for, link, panel, reason, slider, table, who,
+    DEVICE_JOIN, approve, button, clickable, column, connector_label, deny_exchange, device_rows,
+    device_warning, id_for, link, panel, reason, slider, table, who,
 };
-use crate::theme::{MEDIUM, Theme, bold, chars, lines};
+use crate::theme::{BOLD, MEDIUM, Theme, bold, chars, lines};
 use crate::words::{self, connector, horizon, span};
 use crate::{Adjust, Shell};
 use gpui::{AnyElement, Context, Div, ElementId, Stateful, div, hsla, prelude::*, px, relative};
@@ -163,7 +163,7 @@ impl Shell {
             .child(
                 column()
                     .child(who(&r.identity_name, &verb))
-                    .child(div().font_weight(MEDIUM).child(connector(&r.connector))),
+                    .child(connector_label(&r.connector, t.text).font_weight(MEDIUM)),
             )
             .child(column().gap(lines(0.25)).child(table(t, rows)).children(adjust))
             .when(nothing, |d| {
@@ -374,9 +374,11 @@ fn send_card(t: Theme, p: &Proposal, cx: &mut Context<Shell>) -> Div {
         if p.op == "send" { "wants to send".to_string() } else { format!("wants to {}", p.op) };
     panel(t)
         .child(
-            column()
-                .child(who(&p.identity_name, &verb))
-                .child(div().font_weight(MEDIUM).child(format!("{}{to}", connector(&p.connector)))),
+            column().child(who(&p.identity_name, &verb)).child(
+                connector_label(&p.connector, t.text)
+                    .font_weight(MEDIUM)
+                    .when(!to.is_empty(), |d| d.child(to.trim_start().to_string())),
+            ),
         )
         .children(p.field("Text").map(|text| text.to_string()))
         .children(reason(t, &p.note))
@@ -408,6 +410,18 @@ fn send_card(t: Theme, p: &Proposal, cx: &mut Context<Shell>) -> Div {
         )
 }
 
+/// "laptop · [mark] Signal", in bold.
+fn grant_title(t: Theme, g: &Grant) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(chars(1.))
+        .font_weight(BOLD)
+        .child(g.identity_name.clone())
+        .child("·")
+        .child(connector_label(&g.connector, t.text))
+}
+
 fn chat_list(g: &Grant) -> String {
     if g.chats.is_empty() {
         return "every chat".into();
@@ -426,7 +440,7 @@ fn open_grant(t: Theme, g: &Grant, cx: &mut Context<Shell>) -> Div {
         .border_color(t.open)
         .child(
             column()
-                .child(bold(format!("{} · {}", g.identity_name, connector(&g.connector))))
+                .child(grant_title(t, g))
                 .children(until.map(|u| div().text_color(t.open).child(u))),
         )
         .child(chat_list(g))
@@ -484,7 +498,7 @@ fn routine(t: Theme, g: &Grant, stopped: bool, cx: &mut Context<Shell>) -> Div {
                     div()
                         .flex()
                         .justify_between()
-                        .child(bold(format!("{} · {}", g.identity_name, connector(&g.connector))))
+                        .child(grant_title(t, g))
                         .when(stopped, |d| d.child(t.alt("[paused]"))),
                 )
                 .children(running.map(|r| div().text_color(t.routine).child(r))),
@@ -515,11 +529,21 @@ pub(crate) fn chip(
     cx: &mut Context<Shell>,
     f: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
 ) -> Stateful<Div> {
+    chip_frame(t, id, on, cx, f).child(label.to_string())
+}
+
+/// A chip without its label, for chips that hold more than text.
+pub(crate) fn chip_frame(
+    t: Theme,
+    id: impl Into<ElementId>,
+    on: bool,
+    cx: &mut Context<Shell>,
+    f: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
+) -> Stateful<Div> {
     clickable(id, cx, f)
         .px(chars(1.))
         .py(lines(0.5))
         .border_2()
         .border_color(t.text)
         .when(on, |d| d.bg(t.text).text_color(t.bg))
-        .child(label.to_string())
 }

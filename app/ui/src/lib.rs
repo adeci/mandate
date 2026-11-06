@@ -43,6 +43,17 @@ const TOUCH: &str = "Plug in your security key or hold it to the back of the pho
 #[cfg(not(target_os = "android"))]
 const TOUCH: &str = "Touch your security key.";
 
+/// How long to wait before trying an unreachable server again, at first
+/// and at most; each failure doubles the wait.
+const RETRY_FIRST: Duration = Duration::from_secs(2);
+const RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// What a refresh fetches, by route; the last answers are kept on disk so
+/// that a start without the server still shows them.
+const ROUTES: [&str; 7] =
+    ["now", "exchanges", "identities", "connectors", "keys", "never-share", "server"];
+const CACHE: &str = "cache.json";
+
 /// A page as drawn: the screen's kind, and the tab on the tabs.
 type Page = (Discriminant<Screen>, Option<Tab>);
 
@@ -226,6 +237,17 @@ pub struct Shell {
     unlock: Option<Unlock>,
     /// A waiting item to open once a refresh shows it, from a notification.
     pending: Option<String>,
+    /// The server can't be reached: one notice says so, the last content
+    /// stays, and a refresh tries again after backoff.
+    offline: bool,
+    backoff: Duration,
+    /// The bottom inset with the keyboard down, which sheets sit on.
+    nav_bottom: f32,
+    retrying: bool,
+    /// Wakes the event stream's thread to connect again at once.
+    nudge: Option<std::sync::mpsc::Sender<()>>,
+    /// The last answers of the server, by route, as kept on disk.
+    cache: serde_json::Map<String, Value>,
     focus: FocusHandle,
     /// The wordmark shows alone for a moment after Android's splash.
     launching: bool,
@@ -306,6 +328,12 @@ impl Shell {
             prompt: None,
             unlock: None,
             pending: None,
+            offline: false,
+            backoff: RETRY_FIRST,
+            nav_bottom: 0.,
+            retrying: false,
+            nudge: None,
+            cache: serde_json::Map::new(),
             focus: cx.focus_handle(),
             launching: true,
             launch: None,
@@ -334,16 +362,71 @@ impl Shell {
             .and_then(|b| serde_json::from_slice(&b).ok());
         self.server = saved.and_then(|v| Some(v["url"].as_str()?.to_string())).unwrap_or_default();
         self.device = Some(device);
+        // What this server last answered shows until it answers again.
+        let cache: Option<serde_json::Map<String, Value>> =
+            std::fs::read(self.dir.join(CACHE)).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        if let Some(cache) = cache.filter(|c| c.get("url") == Some(&json!(self.server))) {
+            self.cache = cache;
+            self.show_cache(cx);
+            if let Some(page) = self.cache.get("activity").cloned() {
+                self.history = Some(tabs::Loaded::from_page(page));
+            }
+        }
         self.listen(cx);
     }
 
     /// The app is back on screen after being away: locked again if the owner
-    /// chose so.
+    /// chose so, and the server tried again at once if it was out of reach.
     pub fn foreground(&mut self, cx: &mut Context<Self>) {
         if self.lock && self.device.is_some() {
             (self.locked, self.unlocking) = (true, false);
             cx.notify();
         }
+        if self.offline {
+            if let Some(nudge) = &self.nudge {
+                let _ = nudge.send(());
+            }
+            self.refresh(cx);
+        }
+    }
+
+    /// Shows what failed: a server out of reach as the one notice, tried
+    /// again after a backoff until it answers; anything else as an error.
+    fn fail(&mut self, e: Error, cx: &mut Context<Self>) {
+        if !matches!(e, Error::Io(_)) || self.device.is_none() {
+            self.error = Some(e.to_string());
+            return;
+        }
+        self.offline = true;
+        if self.retrying {
+            return;
+        }
+        self.retrying = true;
+        let wait = self.backoff;
+        self.backoff = (self.backoff * 2).min(RETRY_MAX);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            this.update(cx, |this, cx| {
+                this.retrying = false;
+                if this.offline {
+                    this.refresh(cx);
+                }
+            })
+        })
+        .detach();
+    }
+
+    /// The server answered: the notice goes, and the backoff starts over.
+    fn reached(&mut self) {
+        (self.offline, self.backoff) = (false, RETRY_FIRST);
+    }
+
+    /// Keeps answers of the server on disk, by route, for the next start.
+    fn keep(&mut self, answers: impl IntoIterator<Item = (String, Value)>) {
+        self.cache.insert("url".into(), json!(self.server));
+        self.cache.extend(answers);
+        let cache = serde_json::to_vec(&self.cache).unwrap_or_default();
+        let _ = std::fs::write(self.dir.join(CACHE), cache);
     }
 
     /// Asks the owner to prove it is them, and unlocks the app.
@@ -419,7 +502,7 @@ impl Shell {
                 this.opening = false;
                 match opened {
                     Ok(opened) => this.go(Screen::Invite { kind, opened }, cx),
-                    Err(e) => this.error = Some(e.to_string()),
+                    Err(e) => this.fail(e, cx),
                 }
             },
         );
@@ -485,7 +568,10 @@ impl Shell {
                         this.go(admit, cx)
                     }
                 }
-                Err(e) => (this.admitting, this.error) = (None, Some(e.to_string())),
+                Err(e) => {
+                    this.admitting = None;
+                    this.fail(e, cx)
+                }
             },
         );
     }
@@ -579,7 +665,10 @@ impl Shell {
             this.update(cx, |this, cx| {
                 match result {
                     Ok(v) => done(this, v, cx),
-                    Err(e) => (this.error, this.prompt) = (Some(e.to_string()), None),
+                    Err(e) => {
+                        this.prompt = None;
+                        this.fail(e, cx)
+                    }
                 }
                 cx.notify();
             })
@@ -591,33 +680,47 @@ impl Shell {
     /// connecting and on every event.
     fn listen(&mut self, cx: &mut Context<Self>) {
         let device = self.device();
-        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<Result<(), Error>>();
+        let (nudge, woken) = std::sync::mpsc::channel();
+        self.nudge = Some(nudge);
         std::thread::spawn(move || {
+            let mut wait = RETRY_FIRST;
             while !tx.is_closed() {
                 match device.client.events() {
                     Ok(events) => {
-                        let _ = tx.unbounded_send(None);
+                        wait = RETRY_FIRST;
+                        let _ = tx.unbounded_send(Ok(()));
                         for event in events {
-                            if event.is_err() || tx.unbounded_send(None).is_err() {
-                                break;
+                            match event {
+                                // Silent past two of its pings, or cut: the
+                                // server is out of reach until it answers.
+                                Err(e @ Error::Io(_)) => {
+                                    let _ = tx.unbounded_send(Err(e));
+                                    break;
+                                }
+                                Err(_) => break,
+                                Ok(_) if tx.unbounded_send(Ok(())).is_err() => break,
+                                Ok(_) => {}
                             }
                         }
                     }
                     Err(e) => {
-                        let _ = tx.unbounded_send(Some(e.to_string()));
+                        let _ = tx.unbounded_send(Err(e));
+                        wait = (wait * 2).min(RETRY_MAX);
                     }
                 }
-                std::thread::sleep(Duration::from_secs(5));
+                // The app coming back to the foreground connects at once.
+                let _ = woken.recv_timeout(wait);
             }
         });
         cx.spawn(async move |this, cx| {
-            while let Some(error) = rx.next().await {
-                let update = this.update(cx, |this, cx| match error {
-                    Some(e) => {
-                        this.error = Some(e);
+            while let Some(connected) = rx.next().await {
+                let update = this.update(cx, |this, cx| match connected {
+                    Ok(()) => this.refresh(cx),
+                    Err(e) => {
+                        this.fail(e, cx);
                         cx.notify();
                     }
-                    None => this.refresh(cx),
                 });
                 if update.is_err() {
                     break;
@@ -627,33 +730,42 @@ impl Shell {
         .detach();
     }
 
+    /// Fetches everything but Activity; a failed fetch leaves what showed.
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let client = self.device().client;
         self.call(
             cx,
-            move || {
-                let now: Now = client.get("now")?;
-                let exchanges: Vec<Exchange> = client.get("exchanges")?;
-                let identities: Vec<Identity> = client.get("identities")?;
-                let connectors: Vec<Connector> = client.get("connectors")?;
-                let keys: Keys = client.get("keys")?;
-                let hidden: Vec<Hidden> = client.get("never-share")?;
-                let server: api::Server = client.get("server")?;
-                Ok((now, exchanges, identities, connectors, keys, hidden, server))
-            },
-            |this, (now, exchanges, identities, connectors, keys, hidden, server), cx| {
-                this.adjust.retain(|id, _| now.requests.iter().any(|r| &r.id == id));
-                (this.now, this.exchanges, this.identities, this.connectors) =
-                    (now, exchanges, identities, connectors);
-                (this.keys, this.hidden, this.agent_url) = (keys, hidden, server.agent_url);
-                this.label_keys(cx);
-                this.open_pending(cx);
-                this.follow_invite(cx);
+            move || ROUTES.iter().map(|r| Ok((r.to_string(), client.get::<Value>(r)?))).collect(),
+            |this, answers: Vec<(String, Value)>, cx| {
+                this.reached();
+                this.keep(answers);
+                this.show_cache(cx);
                 if this.history.is_some() {
                     this.load_history(cx);
                 }
             },
         );
+    }
+
+    /// Shows the server's last answers: those just fetched, or those kept
+    /// from before.
+    fn show_cache(&mut self, cx: &mut Context<Self>) {
+        fn take<T: serde::de::DeserializeOwned + Default>(
+            c: &serde_json::Map<String, Value>,
+            route: &str,
+        ) -> T {
+            c.get(route).and_then(|v| T::deserialize(v).ok()).unwrap_or_default()
+        }
+        let c = &self.cache;
+        let (now, server): (Now, api::Server) = (take(c, "now"), take(c, "server"));
+        (self.exchanges, self.identities) = (take(c, "exchanges"), take(c, "identities"));
+        (self.connectors, self.keys, self.hidden) =
+            (take(c, "connectors"), take(c, "keys"), take(c, "never-share"));
+        self.adjust.retain(|id, _| now.requests.iter().any(|r| &r.id == id));
+        (self.now, self.agent_url) = (now, server.agent_url);
+        self.label_keys(cx);
+        self.open_pending(cx);
+        self.follow_invite(cx);
     }
 
     /// Connects to a pairing link's server before the owner pairs, to show
@@ -968,7 +1080,7 @@ impl Shell {
                         this.refresh(cx);
                         then(this, cx);
                     }
-                    Err(e) => this.error = Some(e.to_string()),
+                    Err(e) => this.fail(e, cx),
                 }
             },
         );
@@ -1103,8 +1215,10 @@ impl Shell {
         });
     }
 
-    /// Asks once more, in a sheet, before c runs.
+    /// Asks once more, in a sheet, before c runs; the sheet never rides on
+    /// the keyboard.
     pub(crate) fn ask(&mut self, c: Confirm, cx: &mut Context<Self>) {
+        keyboard(false);
         self.sheet = Some(c);
         cx.notify();
     }
@@ -1191,7 +1305,7 @@ impl Shell {
                         this.notice = Some("Added.".into());
                         this.refresh(cx);
                     }
-                    Err(e) => this.error = Some(e.to_string()),
+                    Err(e) => this.fail(e, cx),
                 }
             },
         );
@@ -1297,8 +1411,15 @@ impl Shell {
     /// Typing into the field that takes it, from the keyboard or a paste.
     fn typed(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
-        let typed = k.key_char.as_deref().unwrap_or_default();
+        // Every field is one line: a pasted line break types a space.
+        let typed = k.key_char.as_deref().unwrap_or_default().replace(['\n', '\r'], " ");
+        let typed = typed.as_str();
         if let Some(p) = &mut self.picker {
+            // Search runs as it is typed; Enter only puts the keyboard away.
+            if k.key == "enter" {
+                keyboard(false);
+                return cx.notify();
+            }
             if k.key == "backspace" {
                 p.q.pop();
             } else {
@@ -1342,6 +1463,7 @@ impl Shell {
                     value.push_str(typed);
                 }
             }
+            (Screen::Tab(_), Some(_)) if k.key == "enter" => keyboard(false),
             (Screen::Tab(_), Some(q)) if k.key == "backspace" => {
                 q.pop();
             }
@@ -1358,6 +1480,7 @@ impl Shell {
                 code.retain(|c| c.is_ascii_digit());
                 code.truncate(6);
             }
+            (Screen::Pair { .. }, _) if k.key == "enter" => keyboard(false),
             (Screen::Pair { text } | Screen::Join { url: text, .. }, _) => type_into(text, ev, cx),
             _ => return,
         }
@@ -1401,11 +1524,12 @@ fn type_into(text: &mut String, ev: &KeyDownEvent, cx: &App) {
     let k = &ev.keystroke;
     if k.modifiers.secondary() && k.key == "v" {
         let pasted = cx.read_from_clipboard().and_then(|c| c.text());
-        text.push_str(pasted.unwrap_or_default().trim());
+        let pasted = pasted.unwrap_or_default();
+        text.push_str(&pasted.trim().replace(['\n', '\r'], " "));
     } else if k.key == "backspace" {
         text.pop();
     } else {
-        text.push_str(k.key_char.as_deref().unwrap_or_default());
+        text.push_str(&k.key_char.as_deref().unwrap_or_default().replace(['\n', '\r'], " "));
     }
 }
 
@@ -1423,14 +1547,15 @@ fn waiting(client: &Client) -> Result<Vec<(String, String)>, Error> {
         };
         (e.id, text)
     });
-    let requests = now
-        .requests
-        .into_iter()
-        .map(|r| (r.id, format!("{} wants to read {}", r.identity_name, r.connector)));
-    let proposals = now
-        .proposals
-        .into_iter()
-        .map(|p| (p.id, format!("{} wants to {} on {}", p.identity_name, p.op, p.connector)));
+    let requests = now.requests.into_iter().map(|r| {
+        (r.id, format!("{} wants to read {}", r.identity_name, words::connector(&r.connector)))
+    });
+    let proposals = now.proposals.into_iter().map(|p| {
+        (
+            p.id,
+            format!("{} wants to {} on {}", p.identity_name, p.op, words::connector(&p.connector)),
+        )
+    });
     Ok(exchanges.chain(requests).chain(proposals).collect())
 }
 
@@ -1496,6 +1621,12 @@ impl gpui::AssetSource for Assets {
             "icons/search.svg" => include_bytes!("../assets/icons/search.svg"),
             "icons/settings.svg" => include_bytes!("../assets/icons/settings.svg"),
             "icons/x.svg" => include_bytes!("../assets/icons/x.svg"),
+            "icons/discord.svg" => include_bytes!("../assets/icons/discord.svg"),
+            "icons/fastmail.svg" => include_bytes!("../assets/icons/fastmail.svg"),
+            "icons/gmessages.svg" => include_bytes!("../assets/icons/gmessages.svg"),
+            "icons/matrix.svg" => include_bytes!("../assets/icons/matrix.svg"),
+            "icons/signal.svg" => include_bytes!("../assets/icons/signal.svg"),
+            "icons/whatsapp.svg" => include_bytes!("../assets/icons/whatsapp.svg"),
             _ => return Ok(None),
         };
         Ok(Some(Cow::Borrowed(svg)))

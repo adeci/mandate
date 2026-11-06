@@ -21,7 +21,11 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-const CONNECT: Duration = Duration::from_secs(15);
+/// How long the TCP connect and then the TLS handshake may each take: a
+/// server out of reach shows quickly, whatever the request may take after.
+const CONNECT: Duration = Duration::from_secs(4);
+/// How long one write may block.
+const WRITE: Duration = Duration::from_secs(15);
 /// A line of a response head or of a stream. The servers' are far shorter.
 pub(crate) const MAX_LINE: u64 = 8 << 10;
 const MAX_HEAD: usize = 64 << 10;
@@ -124,8 +128,8 @@ impl Server {
             Wait::Idle(d) => (None, d),
         };
         let tcp = connect(&self.host, self.port)?;
-        tcp.set_read_timeout(Some(idle))?;
-        tcp.set_write_timeout(Some(CONNECT))?;
+        tcp.set_read_timeout(Some(CONNECT))?;
+        tcp.set_write_timeout(Some(WRITE))?;
         let verifier = Arc::new(Verifier { trust: self.trust, peer: Mutex::new(None) });
         let config = ClientConfig::builder_with_provider(TLS.provider.clone())
             // Spelled out, since another crate of the app may build TLS 1.2
@@ -153,8 +157,9 @@ impl Server {
         }
         head.push_str("\r\n");
         // rustls finishes the handshake, and so the checks, before it sends
-        // any of this.
+        // any of this; past the handshake, reads wait as the request may.
         conn.tls.write_all(head.as_bytes())?;
+        conn.tls.sock.set_read_timeout(Some(idle))?;
         conn.tls.write_all(body.unwrap_or_default())?;
         conn.tls.flush()?;
         let peer =

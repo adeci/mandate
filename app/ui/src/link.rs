@@ -2,9 +2,9 @@
 //! Setup), shown one at a time, and unlinking.
 
 use crate::api::{SetupField, Step};
-use crate::screens::{button, clickable, column, id_for};
-use crate::theme::{BOLD, MEDIUM, SIZE, Theme, bold, chars, lines};
-use crate::words::connector;
+use crate::screens::{button, clickable, column, icon, id_for};
+use crate::theme::{BOLD, MEDIUM, SIZE, Theme, chars, lines};
+use crate::words::{connector, connector_icon};
 use crate::{Screen, Shell, keyboard, segment};
 use gpui::{Context, Div, div, prelude::*, px, rgb};
 use qrcode::{Color, QrCode};
@@ -92,11 +92,19 @@ impl Shell {
             .iter()
             .all(|f| !f.required || values.get(&f.name).is_some_and(|v| !v.is_empty()));
         column()
-            .child(bold(if step.title.is_empty() {
-                format!("Link {}", connector(name))
-            } else {
-                step.title.clone()
-            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(chars(1.))
+                    .font_weight(BOLD)
+                    .child(icon(connector_icon(name), t.text))
+                    .child(if step.title.is_empty() {
+                        format!("Link {}", connector(name))
+                    } else {
+                        step.title.clone()
+                    }),
+            )
             .when(!step.text.is_empty(), |d| d.child(step.text.clone()))
             .children(step.fields.iter().map(|f| field(t, f, values, focus.as_deref(), cx)))
             .when(!step.qr.is_empty(), |d| d.child(qr(&step.qr)))

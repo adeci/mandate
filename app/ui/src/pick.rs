@@ -3,8 +3,8 @@
 //! chats of the owner's own grant.
 
 use crate::api::Container;
-use crate::now::{FOR, HORIZON, checkbox, chip, stops};
-use crate::screens::{approve, button, clickable, column, id_for, link, slider};
+use crate::now::{FOR, HORIZON, checkbox, chip, chip_frame, stops};
+use crate::screens::{approve, button, clickable, column, connector_label, id_for, link, slider};
 use crate::theme::{MEDIUM, Theme, chars, lines};
 use crate::words::{self, connector, horizon, span};
 use crate::{Adjust, Screen, Shell, keyboard, segment};
@@ -147,7 +147,8 @@ impl Shell {
                         t.alt(format!("Search {} chats", connector(&p.connector))).flex_1()
                     } else {
                         div().flex_1().child(format!("{}▏", p.q))
-                    }),
+                    })
+                    .child(crate::screens::icon(words::connector_icon(&p.connector), t.alt)),
             )
             .child(crate::scroll::view(
                 "chat-list",
@@ -166,10 +167,12 @@ impl Shell {
             .map(|c| {
                 let name = c.name.clone();
                 let on = current.as_deref() == Some(c.name.as_str());
-                chip(t, id_for("conn", &c.name), &connector(&c.name), on, cx, move |this, cx| {
+                let label = connector_label(&c.name, if on { t.bg } else { t.text });
+                chip_frame(t, id_for("conn", &c.name), on, cx, move |this, cx| {
                     this.screen = Screen::Hide { connector: Some(name.clone()) };
                     this.open_picker(crate::pick::Pick::Hide, name.clone(), cx);
                 })
+                .child(label)
             })
             .collect::<Vec<_>>();
         let hidden: BTreeSet<(String, String, String)> = self
@@ -264,19 +267,15 @@ impl Shell {
             .filter(|c| !c.setup)
             .map(|c| {
                 let name = c.name.clone();
-                chip(
-                    t,
-                    id_for("conn", &c.name),
-                    &connector(&c.name),
-                    g.connector == c.name,
-                    cx,
-                    move |this, cx| {
-                        if let Screen::Grant(g) = &mut this.screen {
-                            (g.connector, g.chats) = (name.clone(), None);
-                        }
-                        this.close_picker(cx);
-                    },
-                )
+                let on = g.connector == c.name;
+                let label = connector_label(&c.name, if on { t.bg } else { t.text });
+                chip_frame(t, id_for("conn", &c.name), on, cx, move |this, cx| {
+                    if let Screen::Grant(g) = &mut this.screen {
+                        (g.connector, g.chats) = (name.clone(), None);
+                    }
+                    this.close_picker(cx);
+                })
+                .child(label)
             })
             .collect::<Vec<_>>();
         let fors = slider(t, "for", stops(&FOR, g.for_, span), g.for_, cx, |this, v| {

@@ -53,10 +53,15 @@ public final class Stream extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int id) {
+        // A tap opens the app as its launcher icon does: Main is singleTask,
+        // so a running app comes to the front as it was.
+        Intent open = getPackageManager().getLaunchIntentForPackage(getPackageName());
         Notification connected =
                 new Notification.Builder(this, CONNECTED)
                         .setSmallIcon(R.drawable.notification)
                         .setContentTitle("mandate is connected")
+                        .setContentIntent(
+                                PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_IMMUTABLE))
                         .build();
         startForeground(1, connected);
         return START_STICKY;

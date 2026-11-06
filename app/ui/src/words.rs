@@ -98,6 +98,19 @@ pub fn connector(name: &str) -> String {
     known.iter().find(|(k, _)| *k == name).map_or(name, |(_, v)| v).to_string()
 }
 
+/// The bundled mark of a connector the app knows, else the plug.
+pub fn connector_icon(name: &str) -> &'static str {
+    match name {
+        "whatsapp" => "whatsapp",
+        "signal" => "signal",
+        "discord" => "discord",
+        "fastmail" => "fastmail",
+        "gmessages" => "gmessages",
+        "matrix" => "matrix",
+        _ => "plug",
+    }
+}
+
 /// The end of a long ID, for showing beside a chat's name.
 pub fn short_id(id: &str) -> String {
     let chars: Vec<char> = id.chars().collect();

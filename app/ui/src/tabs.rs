@@ -4,16 +4,18 @@ use crate::api::{Activity, Days, Grant, History};
 use crate::now::checkbox;
 use crate::pick::NewGrant;
 use crate::screens::{
-    bottom_sheet, button, clickable, column, icon, icon_button, id_for, link, panel, shade, table,
+    bottom_sheet, button, clickable, column, connector_label, icon, icon_button, id_for, link,
+    panel, shade, table,
 };
 use crate::theme::{BOLD, MEDIUM, Theme, bold, chars, lines};
 use crate::words::{self, connector, horizon};
 use crate::{Confirm, Next, Screen, Shell, segment};
 use gpui::{
-    AnyElement, Context, Div, ElementId, Pixels, SharedString, canvas, div, prelude::*, px,
+    Animation, AnimationExt, AnyElement, Context, Div, ElementId, Pixels, SharedString, canvas,
+    div, prelude::*, px,
 };
 use mandate_core::{Time, Trust};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
@@ -76,11 +78,15 @@ impl Shell {
             panel(t)
                 .when(c.setup, |d| d.border_dashed())
                 .child(
-                    div().flex().justify_between().child(bold(connector(&c.name))).child(
-                        div()
-                            .when(state != "ok", |d| d.font_weight(MEDIUM))
-                            .child(format!("[{state}]")),
-                    ),
+                    div()
+                        .flex()
+                        .justify_between()
+                        .child(connector_label(&c.name, t.text).font_weight(BOLD))
+                        .child(
+                            div()
+                                .when(state != "ok", |d| d.font_weight(MEDIUM))
+                                .child(format!("[{state}]")),
+                        ),
                 )
                 .children(rows.into_iter().map(|(k, v)| {
                     div()
@@ -166,6 +172,9 @@ impl Shell {
                         crate::scroll::lazy_with(id.clone(), move |_, _| {
                             let who = names.get(&a.identity).map_or("an agent", String::as_str);
                             let (time, text) = (words::clock(&a.at), Shell::line(&a, who));
+                            // Device and key events name no connector: a blank, so times align.
+                            let mark = (!a.connector.is_empty())
+                                .then(|| words::connector_icon(&a.connector));
                             div()
                                 .id(id)
                                 .cursor_pointer()
@@ -180,7 +189,20 @@ impl Shell {
                                 .border_t_1()
                                 .border_color(t.bg_alt)
                                 .child(shade())
-                                .child(t.alt(time).w(chars(9.)).flex_none())
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_none()
+                                        .gap(chars(1.))
+                                        .child(match mark {
+                                            Some(m) => icon(m, t.alt).into_any_element(),
+                                            None => div()
+                                                .w(gpui::px(20.))
+                                                .flex_none()
+                                                .into_any_element(),
+                                        })
+                                        .child(t.alt(time).w(chars(9.))),
+                                )
                                 .child(div().flex_1().min_w_0().child(text))
                                 .into_any_element()
                         })
@@ -192,56 +214,115 @@ impl Shell {
             })
             .collect();
         let query = &history.query;
-        let narrowed = !query.q.is_empty() || query.kinds.is_some() || query.before.is_some();
+        let narrowed = !query.q.is_empty() || query.kinds.is_some() || query.days.is_some();
         let end = match (&history.next, history.entries.is_empty()) {
             (Some(_), _) => Some(t.alt("Loading more…")),
             (None, true) if narrowed => Some(t.alt("Nothing matches.")),
             (None, true) => Some(t.alt("Nothing yet.")),
             (None, false) => None,
         };
-        column().gap(lines(1.)).child(top).children(sections).children(end)
+        // One change, one swap: while a change loads, the rows it replaces
+        // stay and, past a moment, dim a little; the new rows fade in.
+        let list = column().gap(lines(1.)).children(sections).children(end);
+        let list = if changing {
+            let key = format!("dim {:?}", self.wanted);
+            list.with_animation(ElementId::Name(key.into()), Animation::new(SLOW + FADE), |d, v| {
+                let late = SLOW.as_secs_f32() / (SLOW + FADE).as_secs_f32();
+                d.opacity(1. - 0.35 * ((v - late) / (1. - late)).max(0.))
+            })
+            .into_any_element()
+        } else {
+            let key = format!("fresh {:?}", history.query);
+            list.with_animation(ElementId::Name(key.into()), Animation::new(FADE), |d, v| {
+                d.opacity(0.65 + 0.35 * v)
+            })
+            .into_any_element()
+        };
+        column().gap(lines(1.)).child(top).child(list)
     }
 
-    /// Two equal controls, the kinds shown and the day the list starts at;
-    /// under them a rule that turns emerald while a change loads, in place
-    /// of the list it replaces.
+    /// Two equal controls, the kinds shown and the days shown; under them a
+    /// rule that turns emerald when a change takes a while to load.
     fn history_filters(&self, t: Theme, changing: bool, cx: &mut Context<Self>) -> Div {
         let kind = KINDS.iter().find(|(_, k)| *k == self.wanted.kinds).map_or("", |(l, _)| *l);
-        let day = match self.wanted.before {
-            Some(before) => format!("Up to {}", words::day(before - 1)),
-            None => "Any day".into(),
-        };
-        let (year, month, _) = words::ymd(self.wanted.before.map_or(Time::now().unix(), |b| b - 1));
+        let shown = self.wanted.days.map_or(Time::now().unix(), |(_, last)| last);
+        let (year, month, _) = words::ymd(shown);
         let days = HistorySheet::Days { year, month: month as i32, months: false };
+        let open = |sheet: HistorySheet| {
+            move |this: &mut Shell, cx: &mut Context<Shell>| {
+                // A sheet never rides on the keyboard.
+                crate::keyboard(false);
+                this.history_sheet = Some(sheet);
+                cx.notify();
+            }
+        };
         let control =
             |id: &'static str, label: String, sheet: HistorySheet, cx: &mut Context<Self>| {
-                clickable(id, cx, move |this, cx| {
-                    this.history_sheet = Some(sheet);
-                    cx.notify();
-                })
-                .flex_1()
-                .min_w_0()
-                .h(TARGET)
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(chars(1.))
-                .px(chars(1.))
-                .border_2()
-                .border_color(t.text)
-                .child(div().min_w_0().truncate().child(label))
-                .child(icon("chevron-down", t.text))
+                clickable(id, cx, open(sheet))
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(chars(1.))
+                    .px(chars(1.))
+                    .child(div().min_w_0().truncate().child(label))
+                    .child(icon("chevron-down", t.text))
             };
+        let frame = || div().flex_1().min_w_0().h(TARGET).flex().border_2().border_color(t.text);
+        let day = match self.wanted.days {
+            Some(range) => {
+                frame().child(control("day-filter", range_label(range), days, cx)).child(
+                    icon_button(t, "day-clear", "x", cx, |this, cx| {
+                        this.wanted.days = None;
+                        cx.notify();
+                    })
+                    .h_full(),
+                )
+            }
+            None => frame().child(control("day-filter", "Latest".into(), days, cx)),
+        };
+        // The rule shows only once a load has taken a moment.
+        let rule = div().h(px(2.)).when(changing, |d| d.bg(t.grant_hi));
+        let rule = match changing {
+            true => rule
+                .with_animation(
+                    ElementId::Name(format!("rule {:?}", self.wanted).into()),
+                    Animation::new(SLOW),
+                    |d, v| d.opacity(if v < 1. { 0. } else { 1. }),
+                )
+                .into_any_element(),
+            false => rule.into_any_element(),
+        };
         column()
             .gap(lines(0.5))
             .child(
                 div()
                     .flex()
                     .gap(chars(1.))
-                    .child(control("kind-filter", kind.into(), HistorySheet::Kinds, cx))
-                    .child(control("day-filter", day, days, cx)),
+                    .child(frame().child(control(
+                        "kind-filter",
+                        kind.into(),
+                        HistorySheet::Kinds,
+                        cx,
+                    )))
+                    .child(day),
             )
-            .child(div().h(px(2.)).when(changing, |d| d.bg(t.grant_hi)))
+            .child(rule)
+    }
+
+    /// Picks a day for Activity: a first tap shows that day alone, a second
+    /// one makes the range between the two and closes the sheet.
+    fn pick_day(&mut self, day: i64, cx: &mut Context<Self>) {
+        match self.wanted.days {
+            Some((first, last)) if first == last && first != day => {
+                self.wanted.days = Some((first.min(day), first.max(day)));
+                self.history_sheet = None;
+            }
+            _ => self.wanted.days = Some((day, day)),
+        }
+        cx.notify();
     }
 
     /// Activity's open sheet: the kinds to show, or a day to start at.
@@ -270,13 +351,7 @@ impl Shell {
             HistorySheet::Days { year, month, months: false } => self.days(t, year, month, cx),
             HistorySheet::Days { year, month, months: true } => self.months(t, year, month, cx),
         };
-        let latest = self.wanted.before.is_some().then(|| {
-            button(t, "latest", "Latest", cx, |this, cx| {
-                (this.wanted.before, this.history_sheet) = (None, None);
-                cx.notify();
-            })
-        });
-        let content = column().gap(lines(1.)).child(content).children(latest);
+        let content = column().gap(lines(1.)).child(content);
         Some(bottom_sheet(t, bottom, cx, |this| this.history_sheet = None, content))
     }
 
@@ -303,7 +378,9 @@ impl Shell {
             let day = words::iso_day(start);
             let count = marks.map(|m| m.get(&day).copied().unwrap_or(0));
             let (has, future) = (count.is_some_and(|n| n > 0), start > now);
-            let picked = self.wanted.before == Some(words::midnight(year, month, d + 1));
+            let (first, last) = self.wanted.days.unwrap_or((i64::MAX, i64::MIN));
+            let picked = start == first || start == last;
+            let inside = start > first && start < last;
             let number = div()
                 .size(lines(1.6))
                 .flex()
@@ -313,11 +390,10 @@ impl Shell {
                 .when(has, |d| d.font_weight(BOLD))
                 .when((future || count == Some(0)) && !picked, |d| d.text_color(t.alt))
                 .when(picked, |d| d.bg(t.text).text_color(t.bg))
+                .when(inside, |d| d.bg(t.bg_alt))
                 .child(d.to_string());
             mark_cell(t, ("day", d as usize), number, has, future, TARGET, cx, move |this, cx| {
-                this.wanted.before = Some(words::midnight(year, month, d + 1));
-                this.history_sheet = None;
-                cx.notify();
+                this.pick_day(start, cx)
             })
         }));
         let letters =
@@ -451,7 +527,17 @@ impl Shell {
         }
         add("From", a.address.clone());
         add("Device", a.device.clone());
-        let rows = rows.into_iter().map(|(l, v)| (l, div().child(v).into_any_element())).collect();
+        let rows = rows
+            .into_iter()
+            .map(|(l, v)| {
+                let value = if l == "Account" {
+                    connector_label(&a.connector, t.text)
+                } else {
+                    div().child(v)
+                };
+                (l, value.into_any_element())
+            })
+            .collect();
         column().gap(lines(1.)).child(bold(self.entry(a))).child(table(t, rows))
     }
 
@@ -562,10 +648,14 @@ impl Shell {
         self.history_loading = true;
         let query = self.wanted.clone();
         let mut path = "activity?limit=100".to_string();
-        let before =
-            cursor.clone().or_else(|| query.before.map(|t| Time::from_unix(t).to_string()));
-        if let Some(before) = &before {
-            path += &format!("&before={}", segment(before));
+        // The days shown run from the first's midnight (after the second
+        // before it, as after= is exclusive) to the midnight after the last.
+        let end = query.days.map(|(_, last)| Time::from_unix(day_after(last)).to_string());
+        if let Some(before) = cursor.clone().or(end) {
+            path += &format!("&before={}", segment(&before));
+        }
+        if let Some((first, _)) = query.days {
+            path += &format!("&after={}", segment(&Time::from_unix(first - 1).to_string()));
         }
         if let Some(kinds) = query.kinds {
             path += &format!("&kinds={kinds}");
@@ -576,7 +666,7 @@ impl Shell {
         let client = self.device().client;
         self.call(
             cx,
-            move || Ok(client.get::<History>(&path)),
+            move || Ok(client.get::<Value>(&path)),
             move |this, page, cx| {
                 this.history_loading = false;
                 // Asked for something else meanwhile; the next frame asks again.
@@ -585,6 +675,9 @@ impl Shell {
                 }
                 let page = match page {
                     Ok(page) => page,
+                    // Out of reach, the list stays as it was, and the retry
+                    // after a backoff loads it again.
+                    Err(e @ mandate_core::Error::Io(_)) => return this.fail(e, cx),
                     // No retry on every frame: the next refresh tries the
                     // newest page again.
                     Err(e) => {
@@ -593,6 +686,12 @@ impl Shell {
                         return this.error = Some(e.to_string());
                     }
                 };
+                // The newest page of everything shows at the next start
+                // until the server answers.
+                if cursor.is_none() && query == HistoryQuery::default() {
+                    this.keep([("activity".to_string(), page.clone())]);
+                }
+                let page: History = serde_json::from_value(page).unwrap_or_default();
                 let entries = page.entries.into_iter().map(Rc::new);
                 match (&mut this.history, cursor) {
                     // Older entries go after what is loaded.
@@ -690,11 +789,17 @@ impl Shell {
                 format!("never-share/{}/{}/{}", segment(&h.connector), h.kind, segment(&h.id));
             let name = if h.name.is_empty() { h.id.clone() } else { h.name.clone() };
             row(t, i)
-                .child(column().flex_1().child(name.clone()).child(t.alt(format!(
-                    "{} on {}",
-                    h.kind,
-                    connector(&h.connector)
-                ))))
+                .child(
+                    column().flex_1().child(name.clone()).child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(chars(1.))
+                            .text_color(t.alt)
+                            .child(format!("{} on", h.kind))
+                            .child(connector_label(&h.connector, t.alt)),
+                    ),
+                )
                 .child(link(t, id_for("share", &path), "Share again", cx, move |this, cx| {
                     let notice = format!("{name} is shared again, where grants allow.");
                     this.post("DELETE", path.clone(), cx, move |_| Some(notice))
@@ -820,7 +925,14 @@ fn grant_line(t: Theme, g: &Grant) -> Div {
         _ => String::new(),
     };
     column()
-        .child(format!("{chats} · {}", connector(&g.connector)))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(chars(1.))
+                .child(format!("{chats} ·"))
+                .child(connector_label(&g.connector, t.text)),
+        )
         .child(div().text_color(if g.schedule.is_some() { t.routine } else { t.open }).child(state))
         .child(t.alt(horizon(g.horizon)))
 }
@@ -831,14 +943,15 @@ pub(crate) fn day_heading(day: &str) -> Div {
 }
 
 /// What Activity asks the server for.
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct HistoryQuery {
     /// Search text, "" for everything.
     pub q: String,
     /// A named group of kinds, None for all.
     pub kinds: Option<&'static str>,
-    /// Only before this Unix time: the start of the day after the one jumped to.
-    pub before: Option<i64>,
+    /// The days shown, by the starts of the first and the last; None for
+    /// the latest.
+    pub days: Option<(i64, i64)>,
 }
 
 /// History loaded so far for a query, newest first.
@@ -847,6 +960,15 @@ pub(crate) struct Loaded {
     pub entries: Vec<Rc<Activity>>,
     pub next: Option<String>,
     pub query: HistoryQuery,
+}
+
+impl Loaded {
+    /// The newest page of everything, as kept from before.
+    pub fn from_page(page: Value) -> Loaded {
+        let page: History = serde_json::from_value(page).unwrap_or_default();
+        let entries = page.entries.into_iter().map(Rc::new).collect();
+        Loaded { entries, next: page.next, query: HistoryQuery::default() }
+    }
 }
 
 /// Activity's sheets: the kinds, or the days of a month (or the months of
@@ -865,6 +987,27 @@ pub(crate) struct Marks {
 }
 
 type MarksKey = ((String, String), Option<&'static str>, String);
+
+/// How long a change may load before it shows as loading, and how long the
+/// new rows take to fade in.
+const SLOW: Duration = Duration::from_millis(300);
+const FADE: Duration = Duration::from_millis(150);
+
+/// The start of the day after the one starting at day.
+fn day_after(day: i64) -> i64 {
+    let (y, m, d) = words::ymd(day);
+    words::midnight(y, m as i32, d as i32 + 1)
+}
+
+/// "3 Nov" for a day, "1–3 Nov" or "28 Oct – 3 Nov" for a range.
+fn range_label((first, last): (i64, i64)) -> String {
+    let ((y1, m1, d1), (y2, m2, _)) = (words::ymd(first), words::ymd(last));
+    match (first == last, (y1, m1) == (y2, m2)) {
+        (true, _) => words::day(first),
+        (false, true) => format!("{d1}–{}", words::day(last)),
+        (false, false) => format!("{} – {}", words::day(first), words::day(last)),
+    }
+}
 
 /// The kinds Activity can show, and the group of kinds each asks for.
 const KINDS: [(&str, Option<&str>); 5] = [
