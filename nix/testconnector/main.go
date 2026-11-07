@@ -1,5 +1,6 @@
-// Command testconnector is the connector of the NixOS VM test: a service
-// that exists only as fixed chats and messages, whose send appends the
+// Command testconnector is the connector of the NixOS VM test and the demo:
+// a service that exists only as fixed chats and messages, shaped as the
+// config's shape says (shapes.go), whose send appends the
 // message to private/sent.jsonl, so the test can count what ran. It starts
 // linked, with its chats stored, unless the config says unlinked or it was
 // unlinked (private/unlinked); then setup runs a mock dialogue through every
@@ -24,11 +25,17 @@ import (
 type config struct {
 	Account  string `json:"account"`
 	Unlinked bool   `json:"unlinked"`
+	// Shape seeds chats as the named connector stores them (shapes.go);
+	// empty is the VM test's few chats.
+	Shape string `json:"shape"`
 }
 
 func (c *config) Validate() error {
 	if c.Account == "" {
 		return errors.New("account is required")
+	}
+	if _, ok := shapes[c.Shape]; !ok {
+		return errors.New("shape is discord, fastmail, signal or empty")
 	}
 	return nil
 }
@@ -39,6 +46,7 @@ func main() {
 
 type fake struct {
 	account string
+	shape   string
 	st      *store.Store
 	sent    string
 	marker  string // private/unlinked, kept across restarts
@@ -54,10 +62,10 @@ func start(ctx context.Context, env *connector.Env, cfg config) (connector.Conne
 	if err != nil {
 		return nil, err
 	}
-	f := &fake{account: cfg.Account, st: st, sent: filepath.Join(env.PrivateDir(), "sent.jsonl"), marker: filepath.Join(env.PrivateDir(), "unlinked")}
+	f := &fake{account: cfg.Account, shape: cfg.Shape, st: st, sent: filepath.Join(env.PrivateDir(), "sent.jsonl"), marker: filepath.Join(env.PrivateDir(), "unlinked")}
 	_, err = os.Stat(f.marker)
 	if f.linked = !cfg.Unlinked && errors.Is(err, os.ErrNotExist); f.linked {
-		if err := seed(ctx, st, time.Now()); err != nil {
+		if err := seed(ctx, st, cfg.Shape, time.Now()); err != nil {
 			st.Close()
 			return nil, err
 		}
@@ -67,30 +75,17 @@ func start(ctx context.Context, env *connector.Env, cfg config) (connector.Conne
 
 func (f *fake) Close() error { return f.st.Close() }
 
-// seed stores the fixture once: messages from now, one from a month ago
-// beyond a week's horizon, and a login code.
-func seed(ctx context.Context, st *store.Store, now time.Time) error {
+// seed stores the shape's fixture once.
+func seed(ctx context.Context, st *store.Store, shape string, now time.Time) error {
 	var n int
 	if err := st.DB().QueryRowContext(ctx, "SELECT count(*) FROM containers").Scan(&n); err != nil || n > 0 {
 		return err
 	}
-	sam := store.Participant{ID: "+15550003", Name: "~Sam"}
-	chats := []store.Container{
-		{ID: "fam", Kind: "group", Name: "Family", IsGroup: true},
-		{ID: "club", Kind: "group", Name: "Book club", IsGroup: true},
-		{ID: "sam", Kind: "dm", Name: "~Sam", Participants: []store.Participant{sam}},
-	}
+	chats, msgs := shapes[shape](now)
 	if err := st.UpsertContainers(ctx, chats); err != nil {
 		return err
 	}
-	old := now.AddDate(0, -1, 0)
-	for _, m := range []store.Message{
-		{ID: "fam/1", ContainerID: "fam", SenderID: "+15550001", SenderName: "Mum", SentAt: old, Body: "dinner at 7?"},
-		{ID: "fam/2", ContainerID: "fam", SenderID: "+15550001", SenderName: "Mum", SentAt: now.Add(-2 * time.Minute), Body: "fresh family"},
-		{ID: "fam/3", ContainerID: "fam", SenderID: "+15550002", SenderName: "Dad", SentAt: now.Add(-time.Minute), Body: "Your login code: 482913"},
-		{ID: "club/1", ContainerID: "club", SenderID: "+15550004", SenderName: "Ann", SentAt: now.Add(-time.Minute), Body: "fresh club"},
-		{ID: "sam/1", ContainerID: "sam", SenderID: sam.ID, SenderName: sam.Name, SentAt: now.Add(-time.Minute), Body: "fresh secret"},
-	} {
+	for _, m := range msgs {
 		if err := st.UpsertMessage(ctx, m); err != nil {
 			return err
 		}
@@ -197,7 +192,7 @@ func (f *fake) Setup(_ context.Context, step string, values map[string]string) (
 		if err := os.Remove(f.marker); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return connector.Step{}, err
 		}
-		if err := seed(context.Background(), f.st, time.Now()); err != nil {
+		if err := seed(context.Background(), f.st, f.shape, time.Now()); err != nil {
 			return connector.Step{}, err
 		}
 		return connector.Step{ID: "done", Text: "Linked.", Done: true}, nil
