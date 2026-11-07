@@ -102,8 +102,8 @@ def screenshot() -> bytes:
     return run(f"{sdk}/platform-tools/adb", "-s", "emulator-5554", "exec-out", "screencap", "-p")
 
 
-def lines(png: bytes | None = None) -> list[list[tuple[str, int, int, int, int]]]:
-    tsv = run(tesseract, "stdin", "stdout", "tsv", input=png or screenshot()).decode()
+def lines(png: bytes | None = None, *opts: str) -> list[list[tuple[str, int, int, int, int]]]:
+    tsv = run(tesseract, "stdin", "stdout", *opts, "tsv", input=png or screenshot()).decode()
     found: dict[tuple[str, ...], list[tuple[str, int, int, int, int]]] = {}
     for row in tsv.splitlines()[1:]:
         f = row.split("\t")
@@ -115,28 +115,39 @@ def lines(png: bytes | None = None) -> list[list[tuple[str, int, int, int, int]]
     return list(found.values())
 
 
-# The centre of the label's lowest appearance: "Let laptop in" is also the
-# heading above its button, and a sheet's buttons sit below what it covers.
-def find(label: str) -> tuple[int, int] | None:
-    want = label.lower().split()
-    at = None
-    for line in lines():
-        for i in range(len(line) - len(want) + 1):
-            box = line[i : i + len(want)]
-            if [w[0] for w in box] == want:
-                top, bottom = min(w[2] for w in box), max(w[4] for w in box)
-                if at is None or (top + bottom) // 2 > at[1]:
-                    at = ((box[0][1] + box[-1][3]) // 2, (top + bottom) // 2)
+# The centre of the label's lowest appearance, below the label below if
+# given: "Let laptop in" is also the heading above its button, and a sheet's
+# buttons sit below what it covers.
+def find(label: str, below: str | None = None) -> tuple[int, int] | None:
+    found = lines()
+
+    def lowest(label: str) -> tuple[int, int] | None:
+        want = label.lower().split()
+        at = None
+        for line in found:
+            for i in range(len(line) - len(want) + 1):
+                box = line[i : i + len(want)]
+                if [w[0] for w in box] == want:
+                    top, bottom = min(w[2] for w in box), max(w[4] for w in box)
+                    if at is None or (top + bottom) // 2 > at[1]:
+                        at = ((box[0][1] + box[-1][3]) // 2, (top + bottom) // 2)
+        return at
+
+    at = lowest(label)
+    if below is not None:
+        floor = lowest(below)
+        if floor is None or at is None or at[1] <= floor[1]:
+            return None
     return at
 
 
 # Waits for the label to sit still (cards come and go as the server's news
 # arrives), scrolling down if asked.
-def see(label: str, scroll: bool = False) -> tuple[int, int]:
+def see(label: str, scroll: bool = False, below: str | None = None) -> tuple[int, int]:
     last: list[tuple[int, int]] = []
 
     def look() -> tuple[int, int] | None:
-        at = find(label)
+        at = find(label, below)
         if at is None and scroll:
             adb("shell", "input", "swipe", "540", "1800", "540", "800", "600")
         settled = at and last and abs(at[0] - last[0][0]) + abs(at[1] - last[0][1]) < 8
@@ -149,8 +160,8 @@ def see(label: str, scroll: bool = False) -> tuple[int, int]:
         raise AssertionError(f"no {label!r} on screen, which reads: {seen}")
 
 
-def tap(label: str, scroll: bool = False) -> None:
-    x, y = see(label, scroll)
+def tap(label: str, scroll: bool = False, below: str | None = None) -> None:
+    x, y = see(label, scroll, below)
     print(f"tap {label!r} at {x},{y}; the screen reads: {seen}")
     adb("shell", "input", "tap", str(x), str(y))
 
@@ -306,7 +317,8 @@ with subtest("an agent gets in with the code the app shows"):
         " echo $? >/tmp/login.exit) >/dev/null 2>&1 &"
     )
     try:
-        tap("Let laptop in")
+        # The button sits below Deny and can show after the heading does.
+        tap("Let laptop in", below="Deny")
     except AssertionError as e:
         raise AssertionError(f"{e}; mandate login says: {server.succeed('cat /tmp/login.log')!r}")
     finger()
@@ -348,6 +360,111 @@ with subtest("an approved send runs once"):
     assert status == 0 and "done" in out, (status, out)
     assert len(sent()) == 1 and "on my way" in sent()[0], sent()
     gone("Approve and send")
+
+
+# The IDs a connector's chats list shows the agent.
+def chat_ids(connector: str) -> list[str]:
+    status, out = agent(f"{connector} chats")
+    assert status == 0, (status, out)
+    return sorted(line.split("\t")[0] for line in out.splitlines()[1:])
+
+
+def save(name: str) -> None:
+    (driver.out_dir / f"{name}.png").write_bytes(screenshot())
+
+
+# The demo's discord has #general on servers "main" and "other", and a
+# thread under main's (nix/testconnector/shapes.go). With the chats in its
+# label, OCR can miss Approve's first letters; "30 min" is only there.
+with subtest("a term that matched nothing is fixed in one place on its card"):
+    status, out = agent("request discord --chat 'main / nosuch' --for 30m --reason 'catch up' --wait 0")
+    assert status == 75, (status, out)
+    assert agent("discord chats")[0] != 0
+    tap("Now")
+    see("Nothing matched")
+    tap("Choose")
+    # The sheet opens with the picker searching the term, and keys go to its
+    # search; a tap above the sheet would close it.
+    see("No chat matches")
+    adb("shell", "input", "keyevent", *["KEYCODE_DEL"] * 20)
+    # input text drops keys while the app catches up, so a few at a time.
+    for chunk in ("main", "%s", "gen", "era", "l"):
+        adb("shell", "input", "text", chunk)
+        time.sleep(1)
+    # The search reads "main general" above the one chat it finds. The page
+    # layout skips the picker's boxed rows, so they are read as one block.
+    rows: list[tuple[str, int, int, int, int]] = []
+
+    def found() -> bool:
+        rows[:] = [w for line in lines(None, "--psm", "6") for w in line if w[0] in ("general", "random", "rollout")]
+        return [w[0] for w in rows] == ["general", "general"]
+
+    try:
+        until("the picker to find main's #general alone", found, 60)
+    finally:
+        save("seed-picker")
+        print(f"the picker reads: {seen}")
+    _, left, top, right, bottom = rows[-1]
+    adb("shell", "input", "tap", str((left + right) // 2), str((top + bottom) // 2))
+    # Back confirms the pick and closes the sheet; the first may close the
+    # picker alone. The sheet covers Deny until it closes.
+    for _ in range(2):
+        adb("shell", "input", "keyevent", "KEYCODE_BACK")
+        try:
+            until("the sheet to close", lambda: find("Deny"), 15)
+            break
+        except AssertionError:
+            pass
+    tap("30 min")
+    finger()
+    server.wait_until_succeeds("mandate discord chats")
+    assert chat_ids("discord") == ["main-general"], chat_ids("discord")
+    gone("30 min")
+
+with subtest("a term naming a server and a channel finds that one channel"):
+    status, out = agent("request discord --chat 'main general' --for 30m --reason 'catch up' --wait 0")
+    assert status == 75, (status, out)
+    tap("Now")
+    see("30 min")
+    card = [line.split() for line in seen if "min" not in line.split()]
+    general = [words for words in card if "general" in words]
+    assert len(general) == 1 and "main" in general[0], f"want only main / #general on the card, which reads: {seen}"
+    assert not any("other" in words or "rollout" in words for words in card), seen
+    tap("30 min")
+    finger()
+    server.wait_until_succeeds("mandate discord chats")
+    assert chat_ids("discord") == ["main-general"], chat_ids("discord")
+    gone("30 min")
+    # main's #general holds more than a page.
+    status, out = agent("discord messages main-general")
+    assert status == 0 and "next: --before" in out, (status, out)
+
+# The demo's fastmail files a 130-character subject and a 126-character one
+# without spaces in its Inbox.
+long_subject = (
+    "Invoice_2026-11_ACME-Corporation_Professional-Services_Statement-of-Work_Amendment-No.3_Final_Signed_Countersigned_Archive.pdf"
+)
+with subtest("long names fit the request card and Activity"):
+    status, out = agent(
+        f"request fastmail --chat 'Quarterly planning' --chat {long_subject} --for 30m --reason 'file the invoice' --wait 0"
+    )
+    assert status == 75, (status, out)
+    tap("Now")
+    see("30 min")
+    # Both long names show, however the app fits them to the width.
+    see("Inbox Quarterly")
+    assert any(w.startswith("invoice") for line in seen for w in line.split()), seen
+    save("seed-request")
+    tap("30 min")
+    finger()
+    server.wait_until_succeeds("mandate fastmail chats")
+    assert chat_ids("fastmail") == ["T00", "T01"], chat_ids("fastmail")
+    gone("30 min")
+    # More reads than Activity's first page holds.
+    server.succeed("set -e; for i in $(seq 55); do mandate fastmail messages T00; mandate fastmail messages T01; done >/dev/null")
+    tap("Activity")
+    see("fastmail")
+    save("seed-activity")
 
 with subtest("Stop all closes the grant"):
     # Settings is the gear at the top bar's right end, which has no text.

@@ -4,7 +4,7 @@ use crate::api::{Exchange, Grant, Proposal, Request};
 use crate::pick::Pick;
 use crate::screens::{
     DEVICE_JOIN, approve, button, clickable, column, connector_label, deny_exchange, device_rows,
-    device_warning, id_for, link, panel, reason, slider, table, who,
+    device_warning, headline, id_for, link, panel, reason, slider, table, who,
 };
 use crate::theme::{BOLD, MEDIUM, Theme, bold, chars, lines};
 use crate::words::{self, connector, horizon, span};
@@ -111,6 +111,30 @@ impl Shell {
         } else {
             let unmatched =
                 r.terms.iter().flatten().filter(|t| t.chats.as_ref().is_none_or(Vec::is_empty));
+            // A term that matched nothing is one tap from the picker, its
+            // words already searched.
+            let unmatched = unmatched.enumerate().map(|(i, u)| {
+                let (r, term) = (r.clone(), u.term.clone());
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_x(chars(1.))
+                    .child(
+                        t.alt(format!("Nothing matched \"{}\"", words::chat_narrow(&u.term)))
+                            .min_w_0(),
+                    )
+                    .child(
+                        link(
+                            t,
+                            id_for("choose", &format!("{}/{i}", r.id)),
+                            "Choose",
+                            cx,
+                            move |this, cx| this.choose_for(&r, &term, cx),
+                        )
+                        .font_weight(MEDIUM),
+                    )
+            });
+            let unmatched: Vec<_> = unmatched.collect();
             column()
                 .children(a.names.iter().map(|(id, name)| {
                     // An ID only tells apart chats that share a name.
@@ -119,10 +143,10 @@ impl Shell {
                         .flex()
                         .flex_wrap()
                         .gap_x(chars(1.))
-                        .child(name.clone())
+                        .child(div().min_w_0().child(words::chat_narrow(name)))
                         .when(twin, |d| d.child(t.alt(words::short_id(id))))
                 }))
-                .children(unmatched.map(|u| t.alt(format!("no chat matched \"{}\"", u.term))))
+                .children(unmatched)
                 .into_any_element()
         };
         // An extend keeps the grant's chats and horizon; it asks only for time.
@@ -134,7 +158,7 @@ impl Shell {
         let chosen = match a.chats.len() {
             _ if !named => Some("every chat".to_string()),
             0 => None,
-            1 => a.chats.first().and_then(|id| a.names.get(id)).cloned(),
+            1 => a.chats.first().and_then(|id| a.names.get(id)).map(|n| words::chat(n)),
             n => Some(format!("{n} chats")),
         };
         let label = match (&chosen, r.kind.as_str()) {
@@ -143,8 +167,7 @@ impl Shell {
             (None, _) => "Approve".into(),
         };
         let ready = chosen.is_some() || r.kind == "extend";
-        let (id, terms) =
-            (r.id.clone(), r.terms.iter().flatten().map(|t| format!("\"{}\"", t.term)));
+        let id = r.id.clone();
         let deny = format!("requests/{id}/deny");
         let name = r.identity_name.clone();
         let (ra, rb) = (r.clone(), r.clone());
@@ -160,19 +183,8 @@ impl Shell {
         // Deny sits above, so that Approve's full width at the bottom is
         // where the thumb lands, and nothing else is.
         panel(t)
-            .child(
-                column()
-                    .child(who(&r.identity_name, &verb))
-                    .child(connector_label(&r.connector, t.text).font_weight(MEDIUM)),
-            )
+            .child(headline(t, &r.identity_name, &verb, &r.connector))
             .child(column().gap(lines(0.25)).child(table(t, rows)).children(adjust))
-            .when(nothing, |d| {
-                d.child(format!(
-                    "Nothing matched {} on {}.",
-                    terms.collect::<Vec<_>>().join(" or "),
-                    connector(&r.connector)
-                ))
-            })
             .children(reason(t, &r.reason))
             .child(button(t, id_for("deny", &id), "Deny", cx, move |this, cx| {
                 let notice = format!("You denied {name}'s request.");
@@ -206,6 +218,16 @@ impl Shell {
         }
     }
 
+    /// Opens the chat picker of a request with a term that matched nothing
+    /// already searched, for the owner to pick from.
+    fn choose_for(&mut self, r: &Request, term: &str, cx: &mut Context<Self>) {
+        self.open_adjust(r, cx);
+        if let Some(p) = &mut self.picker {
+            p.q = term.to_string();
+        }
+        self.find_chats(cx);
+    }
+
     /// Closes Adjust, keeping what the owner chose; false if none was open.
     pub(crate) fn close_adjust(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(a) = self.adjust.values_mut().find(|a| a.open) else { return false };
@@ -227,16 +249,17 @@ impl Shell {
         let a = &self.adjust[&r.id];
         let picking = self.picker.as_ref().is_some_and(|p| p.pick == Pick::Request(r.id.clone()));
         let picker = picking.then(|| self.request_picker(t, &r.id, a, cx));
-        let scrim = div().id("scrim").flex_1().bg(hsla(0., 0., 0., 0.4)).on_click(cx.listener(
-            |this, _, _, cx| {
+        // Modal, as every sheet: the scrim takes each touch outside it.
+        let scrim = div().id("scrim").occlude().flex_1().bg(hsla(0., 0., 0., 0.4)).on_click(
+            cx.listener(|this, _, _, cx| {
                 this.close_adjust(cx);
-            },
-        ));
+            }),
+        );
         let sheet = crate::scroll::view(
             "sheet",
             div()
                 .occlude()
-                .max_h(relative(0.85))
+                .min_h_0()
                 .bg(t.bg)
                 .border_t_2()
                 .border_color(t.text)
@@ -248,22 +271,22 @@ impl Shell {
                 .max_w(chars(80.))
                 .mx_auto()
                 .gap(lines(1.))
-                .child(who(&r.identity_name, "wants to read"))
+                .child(headline(t, &r.identity_name, "wants to read", &r.connector))
                 .child(adjust_panel(t, r, a, picker, cx))
                 .child(button(t, "done", "Done", cx, |this, cx| {
                     this.close_adjust(cx);
                 })),
         );
         Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .flex()
-                .flex_col()
-                .child(scrim)
-                .child(sheet),
+            div().absolute().top_0().left_0().size_full().flex().flex_col().child(scrim).child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .max_h(relative(0.85))
+                    .child(sheet)
+                    .child(crate::screens::modal()),
+            ),
         )
     }
 }
@@ -290,7 +313,7 @@ fn adjust_panel(
         .flex()
         .gap(chars(1.))
         .child(checkbox(t, on))
-        .child(name.clone())
+        .child(div().min_w_0().truncate().child(words::chat(name)))
     });
     let ticks: Vec<_> = ticks.collect();
     let (rf, rh) = (r.clone(), r.clone());
@@ -374,10 +397,8 @@ fn send_card(t: Theme, p: &Proposal, cx: &mut Context<Shell>) -> Div {
         if p.op == "send" { "wants to send".to_string() } else { format!("wants to {}", p.op) };
     panel(t)
         .child(
-            column().child(who(&p.identity_name, &verb)).child(
-                connector_label(&p.connector, t.text)
-                    .font_weight(MEDIUM)
-                    .when(!to.is_empty(), |d| d.child(to.trim_start().to_string())),
+            headline(t, &p.identity_name, &verb, &p.connector).children(
+                to.split(' ').filter(|w| !w.is_empty()).map(|w| div().child(w.to_string())),
             ),
         )
         .children(p.field("Text").map(|text| text.to_string()))
@@ -414,8 +435,9 @@ fn send_card(t: Theme, p: &Proposal, cx: &mut Context<Shell>) -> Div {
 fn grant_title(t: Theme, g: &Grant) -> Div {
     div()
         .flex()
+        .flex_wrap()
         .items_center()
-        .gap(chars(1.))
+        .gap_x(chars(1.))
         .font_weight(BOLD)
         .child(g.identity_name.clone())
         .child("·")
@@ -426,9 +448,8 @@ fn chat_list(g: &Grant) -> String {
     if g.chats.is_empty() {
         return "every chat".into();
     }
-    let names: Vec<&str> =
-        g.chats.iter().map(|id| g.chat_names.get(id).map_or(id.as_str(), String::as_str)).collect();
-    names.join(", ")
+    let name = |id: &String| words::chat(g.chat_names.get(id).unwrap_or(id));
+    g.chats.iter().map(name).collect::<Vec<_>>().join(", ")
 }
 
 fn open_grant(t: Theme, g: &Grant, cx: &mut Context<Shell>) -> Div {

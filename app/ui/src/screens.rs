@@ -6,10 +6,10 @@ use crate::device::hex;
 use crate::theme::{BOLD, FONT, MEDIUM, NORMAL, SIZE, Theme, bold, chars, lines};
 use crate::{Screen, Shell, Tab, words};
 use gpui::{
-    Animation, AnimationExt, AnyElement, ClickEvent, Context, DispatchPhase, Div, ElementId, Hsla,
-    LongPressEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent,
-    SharedString, Stateful, Svg, TouchDragEvent, TouchPhase, Window, canvas, div, ease_out_quint,
-    fill, hsla, prelude::*, px, relative, rgb, svg,
+    Animation, AnimationExt, AnyElement, Bounds, ClickEvent, Context, DispatchPhase, Div,
+    ElementId, Hsla, LongPressEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollWheelEvent, SharedString, Stateful, Svg, TouchDragEvent, TouchPhase, Window, canvas, div,
+    ease_out_quint, fill, hsla, prelude::*, px, relative, rgb, svg,
 };
 use mandate_core::{Envelope, PairLink, Record};
 use std::cell::Cell;
@@ -33,6 +33,7 @@ const PAGE_IN: Duration = Duration::from_millis(90);
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = Theme::of(window);
+        words::set_width(f32::from(window.viewport_size().width));
         // Back and typing reach the shell through its focus, which a system
         // prompt (fingerprint, screen lock) can take away.
         if window.focused(cx).is_none() {
@@ -212,11 +213,12 @@ impl Render for Shell {
                 let (envelope, deny) =
                     (envelope.clone(), format!("proposals/{}/deny", proposal.id));
                 column()
-                    .child(
-                        column().child(who(&proposal.identity_name, "wants to send")).child(
-                            connector_label(&proposal.connector, t.text).font_weight(MEDIUM),
-                        ),
-                    )
+                    .child(headline(
+                        t,
+                        &proposal.identity_name,
+                        "wants to send",
+                        &proposal.connector,
+                    ))
                     .child(table(t, fields))
                     .children(reason(t, &proposal.note))
                     .child(approve(
@@ -481,6 +483,8 @@ thread_local! {
     /// finger lifts, a press and a release together, so `active` styles
     /// never show on touch; clickables shade themselves from this instead.
     static TOUCH: Cell<Option<Point<Pixels>>> = const { Cell::new(None) };
+    /// The open sheet's bounds this frame: nothing outside it shades.
+    static MODAL: Cell<Option<Bounds<Pixels>>> = const { Cell::new(None) };
 }
 
 /// Follows a finger for the pressed shade: down, until it lifts as a tap,
@@ -492,7 +496,8 @@ fn touches() -> impl IntoElement {
         }
     }
     canvas(
-        |_, _, _| (),
+        // First on the page, so that a sheet drawn after marks itself anew.
+        |_, _, _| MODAL.set(None),
         |_, _, window, _| {
             window.on_mouse_event(|e: &TouchDragEvent, phase, window, _| {
                 if phase == DispatchPhase::Capture && e.phase == TouchPhase::Started {
@@ -531,7 +536,8 @@ pub(crate) fn shade() -> impl IntoElement {
         |_, _, _| (),
         |bounds, _, window, _| {
             let at = TOUCH.get().filter(|p| window.content_mask().bounds.contains(p));
-            if at.is_some_and(|p| bounds.contains(&p)) {
+            let open = |p: &Point<Pixels>| MODAL.get().is_none_or(|m| m.contains(p));
+            if at.is_some_and(|p| bounds.contains(&p) && open(&p)) {
                 window.paint_quad(fill(bounds, hsla(0., 0., 0.5, 0.3)));
             }
         },
@@ -548,7 +554,15 @@ fn page(pad: f32) -> Div {
     column().w_full().max_w(chars(80.)).mx_auto().px(chars(pad))
 }
 
-/// A sheet over the foot of the page, on a scrim that closes it.
+/// Makes the sheet it is in modal for the pressed shade; its scrim takes
+/// every touch outside it.
+pub(crate) fn modal() -> impl IntoElement {
+    canvas(|bounds, _, _| MODAL.set(Some(bounds)), |_, _, _, _| {}).absolute().size_full()
+}
+
+/// A sheet over the foot of the page, on a scrim that closes it. It is
+/// modal: a touch outside it, on anything that shows behind, only closes
+/// it, and nothing behind presses or scrolls.
 pub(crate) fn bottom_sheet(
     t: Theme,
     bottom: f32,
@@ -556,21 +570,23 @@ pub(crate) fn bottom_sheet(
     close: fn(&mut Shell),
     content: Div,
 ) -> Div {
-    let scrim = div().id("sheet-scrim").flex_1().bg(hsla(0., 0., 0., 0.4)).on_click(cx.listener(
-        move |this, _, _, cx| {
+    let scrim = div().id("sheet-scrim").occlude().flex_1().bg(hsla(0., 0., 0., 0.4)).on_click(
+        cx.listener(move |this, _, _, cx| {
             close(this);
             cx.notify();
-        },
-    ));
+        }),
+    );
     let sheet = div()
         .id("sheet")
         .occlude()
+        .relative()
         .bg(t.bg)
         .border_t_2()
         .border_color(t.text)
         .pt(lines(1.))
         .pb(px(bottom) + lines(1.))
         .px(chars(1.))
+        .child(modal())
         .child(content.w_full().max_w(chars(60.)).mx_auto());
     div().absolute().top_0().left_0().size_full().flex().flex_col().child(scrim).child(sheet)
 }
@@ -613,6 +629,10 @@ impl Shell {
     pub(crate) fn go_back(&mut self, cx: &mut Context<Self>) -> bool {
         if self.sheet.take().is_some() || self.history_sheet.take().is_some() {
             cx.notify();
+            return true;
+        }
+        if self.picker.as_ref().is_some_and(|p| p.parent.is_some()) {
+            self.open_parent(None, cx);
             return true;
         }
         if self.picker.is_some() {
@@ -1173,9 +1193,22 @@ pub fn column() -> Div {
     div().flex().flex_col()
 }
 
-/// "laptop wants to read": the name stands out.
+/// "laptop wants to read": the name stands out; a narrow screen wraps it
+/// word by word, at the normal line gap.
 pub fn who(name: &str, rest: &str) -> Div {
-    div().flex().flex_wrap().gap_x(chars(1.)).child(bold(name.to_string())).child(rest.to_string())
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_x(chars(1.))
+        .child(bold(name.to_string()))
+        .children(rest.split(' ').map(|w| div().child(w.to_string())))
+}
+
+/// "praxis wants to read [icon] Signal": who, what, and on which account
+/// inline, the account's icon kept with its name.
+pub fn headline(t: Theme, name: &str, rest: &str, connector: &str) -> Div {
+    who(name, rest).child(connector_label(connector, t.text).font_weight(MEDIUM).flex_none())
 }
 
 /// The agent's own words, set apart.
@@ -1219,7 +1252,15 @@ pub fn table(t: Theme, rows: Vec<(String, AnyElement)>) -> Div {
                         .font_weight(MEDIUM)
                         .child(label.to_uppercase()),
                 )
-                .child(div().flex_1().min_w_0().px(chars(1.)).py(lines(0.5)).child(value))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .px(chars(1.))
+                        .py(lines(0.5))
+                        .child(value),
+                )
         },
     ))
 }
@@ -1239,7 +1280,7 @@ pub fn clickable(
 }
 
 /// Every button's shape: a 2px block at least two lines high, its label
-/// in capitals, centered.
+/// in capitals, centered, wrapping when the width runs out.
 fn block(d: Stateful<Div>, t: Theme, label: &str) -> Stateful<Div> {
     d.min_h(lines(2.))
         .px(chars(1.))
@@ -1251,7 +1292,7 @@ fn block(d: Stateful<Div>, t: Theme, label: &str) -> Stateful<Div> {
         .border_2()
         .border_color(t.text)
         .font_weight(MEDIUM)
-        .child(label.to_uppercase())
+        .child(div().min_w_0().child(label.to_uppercase()))
 }
 
 /// A button that inverts while pressed.

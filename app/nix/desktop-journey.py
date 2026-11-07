@@ -171,14 +171,27 @@ def keys(screen: int, n: int) -> None:
     )
 
 
-# The 6-digit code an invite shows.
+# The 6-digit code an invite shows. Enlarged, as lines() reads it, a leading
+# 5 in its large type comes out as 2 or 9, so lines() only finds it, and the
+# code alone is read as digits at full and half size; both must agree.
 def code(n: int) -> str:
     def read() -> str | None:
-        for line in lines(n):
-            for w in line:
-                if re.fullmatch(r"\d{6}", w[0]):
-                    return w[0]
-        return None
+        boxes = [w for line in lines(n) for w in line if re.fullmatch(r"\d{6}", w[0])]
+        if not boxes:
+            return None
+        _, left, top, right, bottom = boxes[0]
+        crop = f"{right - left + 40}x{bottom - top + 20}+{left - 20}+{top - 10}"
+        readings = {
+            sh(
+                n,
+                f"magick /tmp/ocr.png -crop {crop} +repage -resize {size}% -bordercolor white -border 20 png:- "
+                "| tesseract stdin stdout --psm 7 -c tessedit_char_whitelist=0123456789 2>/dev/null",
+            ).strip()
+            for size in (100, 50)
+        }
+        print(f"the code reads {readings} on screen {n}")
+        got = readings.pop() if len(readings) == 1 else ""
+        return got if re.fullmatch(r"\d{6}", got) else None
 
     return until(f"a code on screen {n}", read)
 
@@ -411,7 +424,7 @@ with subtest("the first run adds a token as a second way, ticks it, and drops it
     shot(1, "methods-light")
 
 with subtest("Connections, a Now card and Activity show each connector's mark"):
-    status, out = agent("request signal --chat Family --for 30m --reason 'plan dinner' --wait 0")
+    status, out = agent("request signal --chat Hiking --for 30m --reason 'plan the hike' --wait 0")
     assert status == 75, (status, out)
     for n, mode in ((1, "light"), (2, "dark")):
         now(n)

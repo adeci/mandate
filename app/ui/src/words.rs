@@ -121,6 +121,47 @@ pub fn short_id(id: &str) -> String {
     }
 }
 
+/// How many characters a one-line chat name may take on this screen: its
+/// width, less a card's padding, rules and a checkbox. Set every frame.
+static CHAT_COLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(36);
+
+/// Takes the window's width in pixels, for `chat`.
+pub fn set_width(width: f32) {
+    let cols = (width / f32::from(crate::theme::chars(1.))) as usize;
+    CHAT_COLS.store(cols.min(80).saturating_sub(10).max(16), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A chat's name on one line of this screen; see `fit`.
+pub fn chat(name: &str) -> String {
+    fit(name, CHAT_COLS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// A chat's name in a card's table, whose value column is about eight
+/// characters narrower than a one-line row.
+pub fn chat_narrow(name: &str) -> String {
+    let cols = CHAT_COLS.load(std::sync::atomic::Ordering::Relaxed);
+    fit(name, cols.saturating_sub(8).max(12))
+}
+
+/// name in at most n characters. A "Parent / Child" name, such as a
+/// Discord "server / channel" or a mailbox's thread, keeps both: the parent
+/// gives way first, to a few characters, and the child keeps the rest.
+/// What is cut ends in "…".
+pub fn fit(name: &str, n: usize) -> String {
+    let len = |s: &str| s.chars().count();
+    let cut = |s: &str, k: usize| match len(s) <= k {
+        true => s.to_string(),
+        false => format!("{}…", s.chars().take(k.saturating_sub(1)).collect::<String>()),
+    };
+    if len(name) <= n {
+        return name.into();
+    }
+    let Some((parent, child)) = name.split_once(" / ") else { return cut(name, n) };
+    let child = cut(child, n.saturating_sub(3 + len(parent).min(6)));
+    let parent = cut(parent, n.saturating_sub(3 + len(&child)));
+    format!("{parent} / {child}")
+}
+
 pub fn unix(t: &str) -> Option<i64> {
     t.parse::<Time>().ok().map(Time::unix)
 }
@@ -243,4 +284,22 @@ pub fn zone() -> String {
         .ok()
         .and_then(|p| p.to_str()?.split_once("zoneinfo/").map(|(_, z)| z.to_string()))
         .unwrap_or_else(|| "UTC".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit;
+
+    #[test]
+    fn fit_keeps_both_parts() {
+        assert_eq!(fit("Book club", 20), "Book club");
+        assert_eq!(fit(&"x".repeat(30), 10), format!("{}…", "x".repeat(9)));
+        let long = format!("{} / {}", "Inbox".repeat(10), "rewindvm selected for the corpus hub");
+        let short = fit(&long, 30);
+        assert_eq!(short.chars().count(), 30);
+        assert!(short.starts_with("Inbox…") && short.contains(" / rewindvm"));
+        // A short parent stays whole; the child gives way.
+        let both = fit(&format!("main / {}", "general".repeat(10)), 20);
+        assert_eq!((both.chars().count(), &both[..7]), (20, "main / "));
+    }
 }

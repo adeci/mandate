@@ -249,6 +249,9 @@ pub struct Container {
     pub name: String,
     pub kind: String,
     pub parent_id: String,
+    /// The parent's full name, "main" or "Inbox / Receipts"; empty at the
+    /// top.
+    pub parent_name: String,
     pub last_activity: Option<String>,
     /// The people in it, where the connector lists them (connector.md,
     /// Chats); a person is hidden by their own ID, not the chat's.

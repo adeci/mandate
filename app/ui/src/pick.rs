@@ -28,8 +28,16 @@ pub struct Picker {
     pub pick: Pick,
     pub connector: String,
     pub q: String,
+    /// The server or space whose chats show, by ID and name; None for all.
+    pub parent: Option<(String, String)>,
     /// None until the first answer.
     pub found: Option<Vec<Container>>,
+}
+
+/// Whether a chat only holds others, a Discord server or a Matrix space:
+/// it opens to its chats, as a grant on it would cover none of them.
+fn holds_chats(c: &Container) -> bool {
+    matches!(c.kind.as_str(), "guild" | "space" | "category")
 }
 
 const LENGTHS: [u64; 5] = [1800, 3600, 7200, 14400, 28800];
@@ -73,7 +81,7 @@ impl NewGrant {
 impl Shell {
     pub(crate) fn open_picker(&mut self, pick: Pick, connector: String, cx: &mut Context<Self>) {
         self.search = None;
-        self.picker = Some(Picker { pick, connector, q: String::new(), found: None });
+        self.picker = Some(Picker { pick, connector, q: String::new(), parent: None, found: None });
         self.find_chats(cx);
     }
 
@@ -83,24 +91,36 @@ impl Shell {
         cx.notify();
     }
 
-    /// Asks the connector for the chats matching the picker's search.
+    /// Asks the connector for the chats matching the picker's search, under
+    /// the server or space it shows.
     pub(crate) fn find_chats(&mut self, cx: &mut Context<Self>) {
         let Some(p) = &self.picker else { return };
-        let (q, conn) = (p.q.clone(), p.connector.clone());
-        let path = format!("connectors/{}/chats?limit=50&q={}", segment(&conn), segment(&q));
+        let (q, conn, parent) = (p.q.clone(), p.connector.clone(), p.parent.clone());
+        let mut path = format!("connectors/{}/chats?limit=50&q={}", segment(&conn), segment(&q));
+        if let Some((id, _)) = &parent {
+            path += &format!("&parent={}", segment(id));
+        }
         let client = self.device().client;
         self.call(
             cx,
             move || client.get::<Vec<Container>>(&path),
             move |this, found, _| {
                 if let Some(p) = &mut this.picker
-                    && p.q == q
-                    && p.connector == conn
+                    && (&p.q, &p.connector, &p.parent) == (&q, &conn, &parent)
                 {
                     p.found = Some(found);
                 }
             },
         );
+    }
+
+    /// Shows the chats under a server or space, or all again with None.
+    pub(crate) fn open_parent(&mut self, parent: Option<(String, String)>, cx: &mut Context<Self>) {
+        if let Some(p) = &mut self.picker {
+            (p.parent, p.found) = (parent, None);
+        }
+        self.find_chats(cx);
+        cx.notify();
     }
 
     /// One bordered element: the search over a scrollable list of the
@@ -115,14 +135,42 @@ impl Shell {
     ) -> Div {
         let Some(p) = &self.picker else { return column() };
         let mut rows: Vec<AnyElement> = pinned.iter().map(|c| row(c, cx)).collect();
+        // A server or space is a heading that opens to its chats; in the
+        // never-share list it can be hidden as a whole.
+        let heading = |c: &Container, cx: &mut Context<Self>| {
+            let parent = Some((c.id.clone(), display(c)));
+            clickable(id_for("open", &c.id), cx, move |this, cx| {
+                this.open_parent(parent.clone(), cx)
+            })
+            .flex()
+            .items_center()
+            .gap(chars(1.))
+            .py(lines(0.25))
+            .child(div().flex_1().min_w_0().font_weight(MEDIUM).child(words::chat(&display(c))))
+            .child(crate::screens::icon("chevron-right", t.alt))
+            .into_any_element()
+        };
+        let back = p.parent.as_ref().map(|(_, name)| {
+            clickable("close-parent", cx, |this, cx| this.open_parent(None, cx))
+                .flex()
+                .items_center()
+                .gap(chars(1.))
+                .py(lines(0.25))
+                .child(crate::screens::icon("chevron-left", t.alt))
+                .child(div().flex_1().min_w_0().font_weight(MEDIUM).child(words::chat(name)))
+        });
         match &p.found {
             None => rows.push(t.alt("Loading chats…").into_any_element()),
             Some(f) => {
-                let fresh = mailboxes_first(f)
+                let inside = p.parent.as_ref().map(|(id, _)| id.as_str());
+                let fresh = named(f, inside)
                     .into_iter()
                     .filter(|c| !pinned.iter().any(|p| p.id == c.id))
                     .collect::<Vec<_>>();
-                rows.extend(fresh.iter().map(|c| row(c, cx)));
+                let opens = |c: &Container| p.pick != Pick::Hide && holds_chats(c);
+                rows.extend(
+                    fresh.iter().map(|c| if opens(c) { heading(c, cx) } else { row(c, cx) }),
+                );
                 if rows.is_empty() {
                     rows.push(t.alt("No chat matches.").into_any_element());
                 }
@@ -154,6 +202,7 @@ impl Shell {
                 "chat-list",
                 div().max_h(lines(12.)).px(chars(1.)).py(lines(0.25)),
                 column()
+                    .children(back)
                     .children(rows)
                     .when(more, |d| d.child(t.alt("Search for more").py(lines(0.25)))),
             ))
@@ -204,7 +253,7 @@ impl Shell {
                         .items_center()
                         .gap_x(chars(1.))
                         .py(lines(0.25))
-                        .child(div().flex_1().child(display(c)))
+                        .child(div().flex_1().min_w_0().child(words::chat(&display(c))))
                         .child(t.alt(c.kind.clone()))
                         .children(std::iter::once(chat).chain(people).map(
                             |((kind, id), label, name)| {
@@ -314,29 +363,31 @@ impl Shell {
                 })
             })
             .collect::<Vec<_>>();
-        let picked: Vec<Div> =
-            g.chats
-                .iter()
-                .flatten()
-                .map(|(id, name)| {
-                    let id2 = id.clone();
-                    div().flex().gap(chars(1.)).child(div().flex_1().child(name.clone())).child(
-                        link(t, id_for("unpick", id), "Remove", cx, move |this, cx| {
-                            if let Screen::Grant(g) = &mut this.screen
-                                && let Some(c) = &mut g.chats
-                            {
-                                c.remove(&id2);
-                            }
-                            cx.notify();
-                        }),
-                    )
-                })
-                .collect();
+        let picked: Vec<Div> = g
+            .chats
+            .iter()
+            .flatten()
+            .map(|(id, name)| {
+                let id2 = id.clone();
+                div()
+                    .flex()
+                    .gap(chars(1.))
+                    .child(div().flex_1().min_w_0().child(words::chat(name)))
+                    .child(link(t, id_for("unpick", id), "Remove", cx, move |this, cx| {
+                        if let Screen::Grant(g) = &mut this.screen
+                            && let Some(c) = &mut g.chats
+                        {
+                            c.remove(&id2);
+                        }
+                        cx.notify();
+                    }))
+            })
+            .collect();
         let named = self.identities.iter().find(|a| a.id == g.identity).map(|a| a.name.clone());
         let chats = match &g.chats {
             None => Some("every chat".to_string()),
             Some(c) if c.is_empty() => None,
-            Some(c) if c.len() == 1 => c.values().next().cloned(),
+            Some(c) if c.len() == 1 => c.values().next().map(|n| words::chat(n)),
             Some(c) => Some(format!("{} chats", c.len())),
         };
         let window = if g.routine {
@@ -564,21 +615,17 @@ fn display(c: &Container) -> String {
 }
 
 /// An email connector's mailboxes before its threads, the server's order
-/// kept otherwise; a nested mailbox is named after its parent too.
-fn mailboxes_first(found: &[Container]) -> Vec<Container> {
-    let names: BTreeMap<&str, &str> = found
-        .iter()
-        .filter(|c| c.kind == "mailbox")
-        .map(|c| (c.id.as_str(), c.name.as_str()))
-        .collect();
+/// kept otherwise. A chat is named after the server, space or mailbox it
+/// is in, unless that is the one shown: "main / #general", "Inbox / Invoice".
+fn named(found: &[Container], inside: Option<&str>) -> Vec<Container> {
     let (mut boxes, rest): (Vec<Container>, Vec<Container>) =
         found.iter().cloned().partition(|c| c.kind == "mailbox");
-    for b in &mut boxes {
-        if let Some(parent) = names.get(b.parent_id.as_str()) {
-            b.name = format!("{parent} / {}", b.name);
+    boxes.extend(rest);
+    for c in &mut boxes {
+        if !c.parent_name.is_empty() && Some(c.parent_id.as_str()) != inside {
+            c.name = format!("{} / {}", c.parent_name, c.name);
         }
     }
-    boxes.extend(rest);
     boxes
 }
 
@@ -587,7 +634,8 @@ fn chat_name(t: Theme, c: &Container) -> Div {
     div()
         .flex()
         .flex_1()
+        .min_w_0()
         .gap(chars(1.))
-        .child(div().flex_1().child(display(c)))
+        .child(div().flex_1().min_w_0().child(words::chat(&display(c))))
         .when(c.kind == "mailbox", |d| d.child(t.alt("mailbox")))
 }

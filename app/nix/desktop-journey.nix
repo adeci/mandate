@@ -8,21 +8,19 @@
 }:
 mandate.inputs.nixpkgs.legacyPackages.x86_64-linux.testers.runNixOSTest {
   name = "mandate-desktop-journey";
-  # The demo server, plus the fake connector under each brand's name, so that
-  # the screenshots show every connector's mark.
+  # The demo server, plus the fake connector under the brands' names the demo
+  # doesn't seed, so that the screenshots show every connector's mark.
   nodes.server =
     { lib, pkgs, ... }:
     {
       imports = [ (import "${mandate}/nix/demo.nix" mandate) ];
       virtualisation.memorySize = 2048;
-      services.mandate.connectors =
-        lib.genAttrs [ "whatsapp" "signal" "discord" "matrix" "gmessages" "fastmail" ]
-          (_: {
-            package =
-              import "${mandate}/nix/test-programs.nix"
-                mandate.packages.${pkgs.stdenv.hostPlatform.system}.mandate;
-            config.account = "demo";
-          });
+      services.mandate.connectors = lib.genAttrs [ "whatsapp" "matrix" "gmessages" ] (_: {
+        package =
+          import "${mandate}/nix/test-programs.nix"
+            mandate.packages.${pkgs.stdenv.hostPlatform.system}.mandate;
+        config.account = "demo";
+      });
     };
   nodes.desktop =
     { lib, pkgs, ... }:

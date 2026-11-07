@@ -550,10 +550,10 @@ impl Shell {
     /// An entry's line, given its agent's name.
     fn line(a: &Activity, who: &str) -> String {
         let on = connector(&a.connector);
-        let chats: Vec<&str> = a
+        let chats: Vec<String> = a
             .chats
             .iter()
-            .map(|c| if c.name.is_empty() { c.id.as_str() } else { c.name.as_str() })
+            .map(|c| words::chat(if c.name.is_empty() { &c.id } else { &c.name }))
             .collect();
         let chats = chats.join(", ");
         let n = |what: &str| {
@@ -913,7 +913,7 @@ fn grant_line(t: Theme, g: &Grant) -> Div {
     } else {
         g.chats
             .iter()
-            .map(|id| g.chat_names.get(id).map_or(id.as_str(), String::as_str))
+            .map(|id| words::chat(g.chat_names.get(id).unwrap_or(id)))
             .collect::<Vec<_>>()
             .join(", ")
     };
