@@ -1,0 +1,39 @@
+[
+  {
+    "id": "1",
+    "kind": "dm",
+    "name": "Farid Haddad",
+    "participants": [
+      {
+        "id": "+15551230001",
+        "name": "Farid Haddad"
+      }
+    ]
+  },
+  {
+    "id": "2",
+    "kind": "dm",
+    "name": "(555) 999-0002",
+    "participants": [
+      {
+        "id": "+15559990002",
+        "name": "(555) 999-0002"
+      }
+    ]
+  },
+  {
+    "id": "3",
+    "kind": "group",
+    "name": "Family",
+    "participants": [
+      {
+        "id": "+15551230001",
+        "name": "Farid Haddad"
+      },
+      {
+        "id": "+15551230003",
+        "name": "Mina"
+      }
+    ]
+  }
+]

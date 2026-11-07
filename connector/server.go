@@ -339,10 +339,13 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 
 // Container is a stored chat as GET /containers lists it.
 type Container struct {
-	ID           string    `json:"id"`
-	Name         string    `json:"name"`
-	Kind         string    `json:"kind"`
-	ParentID     string    `json:"parent_id"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Kind     string `json:"kind"`
+	ParentID string `json:"parent_id"`
+	// ParentName is the parent's path, "Inbox / Receipts", for showing the
+	// chat as "Inbox / Receipts / Your order"; empty at the top.
+	ParentName   string    `json:"parent_name,omitempty"`
 	LastActivity time.Time `json:"last_activity,omitzero"`
 	// Participants is set for DMs only.
 	Participants []store.Participant `json:"participants,omitempty"`
@@ -369,8 +372,21 @@ func (s *Server) containers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// listContainers lists the chats whose name contains q (any case) or whose
-// ID is q, under parent if it is set, most recently active first.
+// pickerChats is every chat with its path and last activity, for
+// store.Matching.
+const pickerChats = `WITH candidates AS (
+  SELECT c.id, c.kind, c.parent_id, c.name AS own,
+         concat_ws(' / ', p3.name, p2.name, p1.name, c.name) AS path,
+         concat_ws(' / ', p3.name, p2.name, p1.name) AS parent_path,
+         NULLIF(max(COALESCE(c.last_message_at, ''), COALESCE((SELECT max(sent_at) FROM messages WHERE container_id = c.id), '')), '') AS at
+  FROM containers AS c
+  LEFT JOIN containers AS p1 ON p1.id = c.parent_id
+  LEFT JOIN containers AS p2 ON p2.id = p1.parent_id
+  LEFT JOIN containers AS p3 ON p3.id = p2.parent_id)`
+
+// listContainers lists the chats under parent if it is set: all of them,
+// the most recently active first, or those q finds as an agent's request
+// term would.
 func (s *Server) listContainers(ctx context.Context, q, parent string, limit int) ([]Container, error) {
 	out := []Container{}
 	path := filepath.Join(s.dir, "data.db")
@@ -382,14 +398,22 @@ func (s *Server) listContainers(ctx context.Context, q, parent string, limit int
 		return nil, err
 	}
 	defer db.Close()
-	rs, err := db.QueryContext(ctx, `
-SELECT id, kind, COALESCE(parent_id, ''), COALESCE(name, ''), participants_json,
-       max(COALESCE(last_message_at, ''), COALESCE((SELECT max(sent_at) FROM messages WHERE container_id = c.id), '')) AS active
-FROM containers AS c
-WHERE (?1 = '' OR id = ?1 OR instr(lower(COALESCE(name, '')), lower(?1)))
-  AND (?2 = '' OR parent_id = ?2)
-ORDER BY active DESC, id
-LIMIT ?3`, q, parent, limit)
+	const columns = `SELECT c.id, c.kind, COALESCE(c.parent_id, ''), COALESCE(c.name, ''), cand.parent_path, c.participants_json, cand.at`
+	query := pickerChats + `
+` + columns + ` FROM candidates AS cand JOIN containers AS c ON c.id = cand.id
+WHERE ?2 = '' OR c.parent_id = ?2
+ORDER BY cand.at DESC NULLS LAST, c.id LIMIT ?3`
+	var terms string
+	if q != "" {
+		if terms, err = store.Terms([]string{q}); err != nil {
+			return nil, err
+		}
+		query = pickerChats + `, ` + store.Matching("?1") + `
+` + columns + ` FROM matched AS m JOIN containers AS c ON c.id = m.id JOIN candidates AS cand ON cand.id = m.id
+WHERE ?2 = '' OR c.parent_id = ?2
+ORDER BY m.n LIMIT ?3`
+	}
+	rs, err := db.QueryContext(ctx, query, terms, parent, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -400,7 +424,7 @@ LIMIT ?3`, q, parent, limit)
 			parts  string
 			active sql.NullString
 		)
-		if err := rs.Scan(&c.ID, &c.Kind, &c.ParentID, &c.Name, &parts, &active); err != nil {
+		if err := rs.Scan(&c.ID, &c.Kind, &c.ParentID, &c.Name, &c.ParentName, &parts, &active); err != nil {
 			return nil, err
 		}
 		if c.Kind == "dm" {

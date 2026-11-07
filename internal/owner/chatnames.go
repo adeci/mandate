@@ -60,7 +60,8 @@ func (s *Server) chatName(ctx context.Context, conn, id string) string {
 	if client == nil || ctx.Err() != nil {
 		return ""
 	}
-	// q also matches names, so look for the exact ID among the matches.
+	// q also matches names, so look for the exact ID among the matches; it
+	// comes first. The name is the chat's path, as request cards show it.
 	chats, err := client.Containers(ctx, id, "", 50)
 	if err != nil {
 		s.log.Warn("look up chat name", "connector", conn, "chat", id, "err", err)
@@ -69,6 +70,9 @@ func (s *Server) chatName(ctx context.Context, conn, id string) string {
 	name := ""
 	if i := slices.IndexFunc(chats, func(c connector.Container) bool { return c.ID == id }); i >= 0 {
 		name = chats[i].Name
+		if p := chats[i].ParentName; p != "" {
+			name = p + " / " + name
+		}
 	}
 	s.names.mu.Lock()
 	if s.names.m == nil {

@@ -148,6 +148,8 @@ CREATE TABLE media (
   for mail: a mailbox is a chat of kind `mailbox`, a thread's `parent_id` is
   the mailbox it is filed in, and a grant on a mailbox also covers the chats
   filed directly in it that aren't mailboxes, as filed when read.
+- Chats that only hold others, of kind `guild`, `space` or `category`, hold no
+  messages; agents never get them by name, only the chats in them.
 - A name the person chose (a profile or push name) starts with `~`;
   address-book names and the owner's own name don't. The owner's chat with
   themself gets the service's name for it.
@@ -268,13 +270,16 @@ chat picker, so the owner side never opens the store:
 
 ```json
 [{"id": "…", "name": "Family 🏡", "kind": "group", "parent_id": "", "last_activity": "2026-11-02T08:10:00Z"},
+ {"id": "…", "name": "#general", "kind": "channel", "parent_id": "…", "parent_name": "main"},
  {"id": "…", "name": "Ana", "kind": "dm", "parent_id": "", "participants": [{"id": "…", "name": "Ana"}]}]
 ```
 
 `participants` is set for `dm` chats only, from `participants_json`.
+`parent_name` is the parent's path, the chat's own being `parent_name / name`.
 
-`q` matches name or ID, `parent` lists a chat's children, `limit` is at most
-500.
+`q` finds chats as an agent's request term does
+([agent-api.md](agent-api.md#access)), `parent` lists a chat's children,
+`limit` is at most 500.
 
 ## Conformance kit
 

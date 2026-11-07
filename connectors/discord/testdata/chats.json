@@ -1,0 +1,62 @@
+[
+  {
+    "id": "1100000000000000001",
+    "kind": "guild",
+    "name": "main"
+  },
+  {
+    "id": "1100000000000000011",
+    "kind": "channel",
+    "parent_id": "1100000000000000001",
+    "name": "#general"
+  },
+  {
+    "id": "1100000000000000012",
+    "kind": "channel",
+    "parent_id": "1100000000000000001",
+    "name": "#releases"
+  },
+  {
+    "id": "1100000000000000013",
+    "kind": "thread",
+    "parent_id": "1100000000000000012",
+    "name": "v2 rollout"
+  },
+  {
+    "id": "1200000000000000001",
+    "kind": "guild",
+    "name": "other"
+  },
+  {
+    "id": "1200000000000000011",
+    "kind": "channel",
+    "parent_id": "1200000000000000001",
+    "name": "#general"
+  },
+  {
+    "id": "1300000000000000001",
+    "kind": "dm",
+    "name": "~Sam Park",
+    "participants": [
+      {
+        "id": "1000000000000000002",
+        "name": "~Sam Park"
+      }
+    ]
+  },
+  {
+    "id": "1300000000000000002",
+    "kind": "group",
+    "name": "climbing",
+    "participants": [
+      {
+        "id": "1000000000000000002",
+        "name": "~Sam Park"
+      },
+      {
+        "id": "1000000000000000003",
+        "name": "~kim"
+      }
+    ]
+  }
+]

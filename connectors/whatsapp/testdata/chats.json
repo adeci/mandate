@@ -1,0 +1,71 @@
+[
+  {
+    "id": "111222333@lid",
+    "kind": "dm",
+    "name": "Sam Park",
+    "participants": [
+      {
+        "id": "447700900123@s.whatsapp.net",
+        "name": "Sam Park"
+      }
+    ]
+  },
+  {
+    "id": "120363000000000777@g.us",
+    "kind": "group",
+    "name": "Climbing crew",
+    "participants": [
+      {
+        "id": "15551234567@s.whatsapp.net"
+      },
+      {
+        "id": "447700900123@s.whatsapp.net"
+      }
+    ]
+  },
+  {
+    "id": "120363000000000888@g.us",
+    "kind": "group",
+    "name": "Climbing crew"
+  },
+  {
+    "id": "120363000000000999@g.us",
+    "kind": "group",
+    "name": "Book club",
+    "participants": [
+      {
+        "id": "15550001111@s.whatsapp.net",
+        "name": "Sam Lee"
+      },
+      {
+        "id": "15557654321@s.whatsapp.net",
+        "name": "~Mom"
+      }
+    ]
+  },
+  {
+    "id": "15550001111@s.whatsapp.net",
+    "kind": "dm",
+    "name": "Sam Lee"
+  },
+  {
+    "id": "15551234567@s.whatsapp.net",
+    "kind": "dm",
+    "name": "Farid Haddad"
+  },
+  {
+    "id": "15557654321@s.whatsapp.net",
+    "kind": "dm",
+    "name": "~Mom"
+  },
+  {
+    "id": "15559990000@s.whatsapp.net",
+    "kind": "dm",
+    "name": "Message yourself"
+  },
+  {
+    "id": "447700900123@s.whatsapp.net",
+    "kind": "dm",
+    "name": "Sam Park"
+  }
+]

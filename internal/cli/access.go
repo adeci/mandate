@@ -15,11 +15,12 @@ import (
 
 const (
 	accessUsage  = "mandate access"
-	requestUsage = "mandate request CONNECTOR [--chat TEXT]... [--for 30m] [--since 7d] --reason WHY [--wait 15m]"
-	routineUsage = "mandate request CONNECTOR [--chat TEXT]... --every daily|weekdays|weekends|mon,wed,... --at HH:MM [--for 30m] [--since 7d] --reason WHY [--wait 15m]"
+	requestUsage = "mandate request CONNECTOR [--chat NAME]... [--for 30m] [--since 7d] --reason WHY [--wait 15m]"
+	routineUsage = "mandate request CONNECTOR [--chat NAME]... --every daily|weekdays|weekends|mon,wed,... --at HH:MM [--for 30m] [--since 7d] --reason WHY [--wait 15m]"
 	extendUsage  = "mandate request CONNECTOR --extend [--for 30m] --reason WHY [--wait 15m]"
 	// requestUsages is every form of mandate request, one per line.
-	requestUsages = requestUsage + "\n  " + routineUsage + "\n  " + extendUsage
+	requestUsages = requestUsage + "\n  " + routineUsage + "\n  " + extendUsage +
+		"\nNAME is a chat's name, or its path to tell same-named chats apart: \"Server / channel\", \"Folder / Subject\"."
 )
 
 // defaultWait is how long request, status and a proposal wait for the

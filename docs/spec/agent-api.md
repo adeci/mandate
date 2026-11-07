@@ -236,6 +236,10 @@ A one-off grant has `from` and `until` instead of `schedule`.
 - `chats` are 1–10 search terms of 1–200 characters. Each finds at most 5
   visible chats; terms that match nothing reach the owner as such. The
   answer does not depend on what matched.
+- A term's words (split on spaces and `/`, a leading `#` or `~` ignored) must
+  all be in a chat's path, `Server / #channel`, or the term in its ID. A
+  mailbox's exact name finds that mailbox alone; a server's or space's
+  finds the chats in it.
 - `for` defaults to 1800, at most 43200. `horizon` defaults to 604800; 0 is
   all history.
 - A routine's `days` are 0 (Sunday) to 6, empty for every day; `start` is

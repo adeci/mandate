@@ -610,15 +610,16 @@ func TestMailboxGrant(t *testing.T) {
 		}
 	}
 
-	// An agent asking for "inbox" finds the mailbox first, then what is in it.
+	// Asking for "Inbox" asks for the mailbox alone; TestMatchesConnectorChats
+	// covers terms on the connectors' own chats.
 	e.push(nil)
 	if s, body := e.call(http.MethodPost, "/agent/v1/access/requests", map[string]any{
-		"connector": "chat", "chats": []string{"inbox"}, "reason": "triage",
+		"connector": "chat", "chats": []string{"Inbox"}, "reason": "triage",
 	}); s != http.StatusAccepted {
 		t.Fatalf("request: %d %s", s, body)
 	}
-	if got := e.owner.got().requests[0].Terms[0].Chats; len(got) == 0 || got[0].ID != "mailbox:in" {
-		t.Errorf("inbox matches %+v", got)
+	if got := e.owner.got().requests[0].Terms[0].Chats; len(got) != 1 || got[0].ID != "mailbox:in" {
+		t.Errorf("Inbox matches %+v", got)
 	}
 
 	e.push([]record.Envelope{e.grant(e.phone, []string{"mailbox:in"}, 0, -time.Hour, time.Hour)})

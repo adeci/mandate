@@ -1,0 +1,56 @@
+[
+  {
+    "id": "mailbox:mb-archive",
+    "kind": "mailbox",
+    "name": "Archive"
+  },
+  {
+    "id": "mailbox:mb-drafts",
+    "kind": "mailbox",
+    "name": "Drafts"
+  },
+  {
+    "id": "mailbox:mb-inbox",
+    "kind": "mailbox",
+    "name": "Inbox"
+  },
+  {
+    "id": "mailbox:mb-junk",
+    "kind": "mailbox",
+    "name": "Spam"
+  },
+  {
+    "id": "mailbox:mb-rec",
+    "kind": "mailbox",
+    "parent_id": "mailbox:mb-inbox",
+    "name": "Receipts"
+  },
+  {
+    "id": "mailbox:mb-sent",
+    "kind": "mailbox",
+    "name": "Sent"
+  },
+  {
+    "id": "mailbox:mb-trash",
+    "kind": "mailbox",
+    "name": "Trash"
+  },
+  {
+    "id": "t1",
+    "kind": "thread",
+    "parent_id": "mailbox:mb-inbox",
+    "name": "Lunch?"
+  },
+  {
+    "id": "t2",
+    "kind": "thread",
+    "parent_id": "mailbox:mb-archive",
+    "name": "Deals"
+  },
+  {
+    "id": "t9",
+    "kind": "thread",
+    "parent_id": "mailbox:mb-rec",
+    "name": "Your order has shipped"
+  }
+]

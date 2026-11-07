@@ -112,8 +112,14 @@ in
     files = [
       ../cmd
       ../internal
-      # Test vectors.
+      # Test vectors, and the chats each connector stores.
       ../docs/spec
+      ../connectors/discord/testdata/chats.json
+      ../connectors/fastmail/testdata/chats.json
+      ../connectors/gmessages/testdata/chats.json
+      ../connectors/matrix/testdata/chats.json
+      ../connectors/signal/testdata/chats.json
+      ../connectors/whatsapp/testdata/chats.json
       ./testdevice
       ./testconnector
     ];

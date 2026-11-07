@@ -1,0 +1,61 @@
+[
+  {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "kind": "dm",
+    "name": "Note to Self"
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000002",
+    "kind": "dm",
+    "name": "Farid Haddad"
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000003",
+    "kind": "dm",
+    "name": "Sam"
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000004",
+    "kind": "dm",
+    "name": "~Mom"
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000005",
+    "kind": "dm",
+    "name": "+15557654321"
+  },
+  {
+    "id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "kind": "group",
+    "name": "Climbing crew",
+    "participants": [
+      {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "name": "Owner"
+      },
+      {
+        "id": "00000000-0000-4000-8000-000000000002",
+        "name": "Farid Haddad"
+      },
+      {
+        "id": "00000000-0000-4000-8000-000000000004",
+        "name": "~Mom"
+      }
+    ]
+  },
+  {
+    "id": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+    "kind": "group",
+    "name": "Bouldering",
+    "participants": [
+      {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "name": "Owner"
+      },
+      {
+        "id": "00000000-0000-4000-8000-000000000003",
+        "name": "Sam"
+      }
+    ]
+  }
+]

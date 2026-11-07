@@ -1,0 +1,24 @@
+[
+  {
+    "id": "!general:example.org",
+    "kind": "group",
+    "parent_id": "!space:example.org",
+    "name": "general"
+  },
+  {
+    "id": "!lobby:example.org",
+    "kind": "group",
+    "name": "general"
+  },
+  {
+    "id": "!space:example.org",
+    "kind": "space",
+    "name": "Club"
+  },
+  {
+    "id": "!team:example.org",
+    "kind": "group",
+    "parent_id": "!space:example.org",
+    "name": "Team"
+  }
+]

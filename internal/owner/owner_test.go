@@ -1378,7 +1378,8 @@ func serveConnector(t *testing.T, f connector.Connector, dir string) map[string]
 	return map[string]*connector.Client{"test": connector.Dial("test", sock)}
 }
 
-// storeChats writes a data.db in dir with a group and a DM.
+// storeChats writes a data.db in dir with a group, a DM, and a channel of a
+// server.
 func storeChats(t *testing.T, dir string) {
 	t.Helper()
 	st, err := store.Open(t.Context(), filepath.Join(dir, "data.db"))
@@ -1389,6 +1390,8 @@ func storeChats(t *testing.T, dir string) {
 	if err := st.UpsertContainers(t.Context(), []store.Container{
 		{ID: "c3", Kind: "group", Name: "Book club", IsGroup: true, Participants: []store.Participant{{ID: "u1", Name: "Ana"}, {ID: "u2", Name: "Bo"}}},
 		{ID: "d1", Kind: "dm", Name: "Ana", Participants: []store.Participant{{ID: "u1", Name: "Ana"}}},
+		{ID: "g1", Kind: "guild", Name: "main"},
+		{ID: "g1-general", Kind: "channel", Name: "#general", ParentID: "g1"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1401,7 +1404,7 @@ func TestPickedChatNamed(t *testing.T) {
 	owner := h.pair()
 	agent := h.agent(owner)
 	req := h.request(agent)
-	if st, _ := h.sign(owner, h.challenge(owner, "/owner/v1/requests/"+req+"/challenge", map[string]any{"chats": []string{"c1", "c3", "c9"}})); st != http.StatusOK {
+	if st, _ := h.sign(owner, h.challenge(owner, "/owner/v1/requests/"+req+"/challenge", map[string]any{"chats": []string{"c1", "c3", "c9", "g1-general"}})); st != http.StatusOK {
 		t.Fatalf("sign = %d", st)
 	}
 	var now struct {
@@ -1410,7 +1413,8 @@ func TestPickedChatNamed(t *testing.T) {
 		}
 	}
 	h.do("GET", "/owner/v1/now", owner.token, nil, &now)
-	want := map[string]string{"c1": "Family", "c3": "Book club"}
+	// A picked chat is named by its path, as request cards name it.
+	want := map[string]string{"c1": "Family", "c3": "Book club", "g1-general": "main / #general"}
 	if len(now.Grants) != 1 || !maps.Equal(now.Grants[0].ChatNames, want) {
 		t.Errorf("grants = %+v, want names %v", now.Grants, want)
 	}
@@ -1429,7 +1433,7 @@ func TestChatsListDMParticipants(t *testing.T) {
 	for _, c := range chats {
 		got[c.ID] = c.Participants
 	}
-	if len(chats) != 2 || got["c3"] != nil || !slices.Equal(got["d1"], []store.Participant{{ID: "u1", Name: "Ana"}}) {
+	if len(chats) != 4 || got["c3"] != nil || !slices.Equal(got["d1"], []store.Participant{{ID: "u1", Name: "Ana"}}) {
 		t.Errorf("chats = %+v", chats)
 	}
 }
