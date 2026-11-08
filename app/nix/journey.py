@@ -4,6 +4,7 @@
 # found by their text (OCR), and Android's own screens through uiautomator.
 # journey.nix defines sdk, apk, tesseract and magick.
 import html
+import itertools
 import os
 import re
 import shlex
@@ -428,9 +429,13 @@ with subtest("a term naming a server and a channel finds that one channel"):
     assert status == 75, (status, out)
     tap("Now")
     see("30 min")
-    card = [line.split() for line in seen if "min" not in line.split()]
+    # Only the waiting card: open grants follow under "OPEN NOW".
+    waiting = list(itertools.takewhile(lambda line: not line.startswith("open"), seen))
+    card = [line.split() for line in waiting if "min" not in line.split()]
     general = [words for words in card if "general" in words]
-    assert len(general) == 1 and "main" in general[0], f"want only main / #general on the card, which reads: {seen}"
+    # The server heads its chats, a line above them.
+    has_main = any("main" in words for words in card)
+    assert len(general) == 1 and has_main, f"want only main / #general on the card, which reads: {seen}"
     assert not any("other" in words or "rollout" in words for words in card), seen
     tap("30 min")
     finger()
@@ -440,6 +445,24 @@ with subtest("a term naming a server and a channel finds that one channel"):
     # main's #general holds more than a page.
     status, out = agent("discord messages main")
     assert status == 0 and "next: --before" in out, (status, out)
+
+with subtest("a server's name asks for all of it"):
+    status, out = agent("request discord --chat main --for 30m --reason 'catch up' --wait 0")
+    assert status == 75, (status, out)
+    tap("Now")
+    see("30 min")
+    see("all channels")
+    card = [line.split() for line in seen if "min" not in line.split()]
+    assert not any("other" in words or "general" in words for words in card), f"want all of main on the card, which reads: {seen}"
+    tap("30 min")
+    finger()
+    # Earlier grants on main's #general are still open, so wait for the new one.
+    want = ["main", "main-random", "main-rollout"]
+    try:
+        until("the grant on all of main", lambda: chat_ids("discord") == want, 60)
+    finally:
+        print(f"discord chats: {chat_ids('discord')}")
+    gone("30 min")
 
 # The demo's fastmail files a 130-character subject and a 126-character one
 # without spaces in its Inbox.
@@ -453,8 +476,10 @@ with subtest("long names fit the request card and Activity"):
     assert status == 75, (status, out)
     tap("Now")
     see("30 min")
-    # Both long names show, however the app fits them to the width.
-    see("Inbox Quarterly")
+    # Both long names show under their mailbox's heading, however the app
+    # fits them to the width.
+    see("Quarterly planning")
+    see("Inbox")
     assert any(w.startswith("invoice") for line in seen for w in line.split()), seen
     save("seed-request")
     tap("30 min")

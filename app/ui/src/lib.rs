@@ -1,6 +1,7 @@
 #[cfg(target_os = "android")]
 mod android;
 mod api;
+mod chats;
 #[cfg(not(target_os = "android"))]
 mod choose;
 #[cfg(not(target_os = "android"))]
@@ -178,17 +179,17 @@ type Then = Box<dyn FnOnce(&mut Shell, &mut Context<Shell>)>;
 struct Adjust {
     open: bool,
     chats: BTreeSet<String>,
-    /// The names of the chats to tick: those the terms matched, then those
-    /// the owner picked.
-    names: BTreeMap<String, String>,
+    /// The chats to tick, with their paths: those the terms matched, then
+    /// those the owner picked.
+    names: BTreeMap<String, api::Chat>,
     for_: u64,
     horizon: u64,
 }
 
 impl Adjust {
     fn of(r: &Request) -> Adjust {
-        let names: BTreeMap<String, String> =
-            r.chats().iter().map(|c| (c.id.clone(), c.name.clone())).collect();
+        let names: BTreeMap<String, api::Chat> =
+            r.chats().into_iter().map(|c| (c.id.clone(), c.clone())).collect();
         let chats = names.keys().cloned().collect();
         Adjust { open: false, chats, names, for_: r.for_, horizon: r.horizon }
     }
@@ -214,6 +215,8 @@ pub struct Shell {
     adjust: HashMap<String, Adjust>,
     /// The chat picker, while one is open.
     picker: Option<pick::Picker>,
+    /// Sets of chats unfolded past "+N more", by key.
+    sets_open: BTreeSet<String>,
     /// History loaded so far, newest first; None until Activity first shows.
     history: Option<tabs::Loaded>,
     history_loading: bool,
@@ -305,6 +308,7 @@ impl Shell {
         .detach();
         let mut shell = Shell {
             pictures: picture::Pictures::new(dir.join("pictures")),
+            sets_open: BTreeSet::new(),
             dir,
             device: None,
             screen,

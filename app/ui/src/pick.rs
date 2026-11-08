@@ -4,7 +4,9 @@
 
 use crate::api::Container;
 use crate::now::{FOR, HORIZON, checkbox, chip, chip_frame, stops};
-use crate::screens::{approve, button, clickable, column, connector_label, id_for, link, slider};
+use crate::screens::{
+    approve, button, clickable, column, connector_label, id_for, in_button, link, slider,
+};
 use crate::theme::{MEDIUM, Theme, chars, lines};
 use crate::words::{self, connector, horizon, span};
 use crate::{Adjust, Screen, Shell, keyboard, segment};
@@ -44,9 +46,15 @@ const LIMIT: usize = 50;
 const RECENT: usize = 5;
 
 /// Whether a chat only holds others, a Discord server or forum, or a Matrix
-/// space: it opens to its chats, as a grant on it would cover none of them.
+/// space: listed apart, it opens to its chats, and a tick on it is all of
+/// them, as they come.
 fn holds_chats(c: &Container) -> bool {
-    matches!(c.kind.as_str(), "guild" | "space" | "forum" | "media")
+    covers_all(&c.kind)
+}
+
+/// Whether a tick on a chat of this kind covers all under it, at any depth.
+fn covers_all(kind: &str) -> bool {
+    matches!(kind, "guild" | "space" | "forum" | "media")
 }
 
 const LENGTHS: [u64; 5] = [1800, 3600, 7200, 14400, 28800];
@@ -56,8 +64,8 @@ const LENGTHS: [u64; 5] = [1800, 3600, 7200, 14400, 28800];
 pub struct NewGrant {
     pub identity: String,
     pub connector: String,
-    /// None is every chat; otherwise the picked chats by ID, with names.
-    pub chats: Option<BTreeMap<String, String>>,
+    /// None is every chat; otherwise the picked chats by ID, with paths.
+    pub chats: Option<BTreeMap<String, crate::api::Chat>>,
     pub routine: bool,
     pub for_: u64,
     pub days: Vec<u8>,
@@ -182,12 +190,25 @@ impl Shell {
         true
     }
 
+    /// The chats ticked in the open picker, by ID.
+    fn ticked(&self) -> BTreeSet<String> {
+        match (self.picker.as_ref().map(|p| &p.pick), &self.screen) {
+            (Some(Pick::Request(id)), _) => {
+                self.adjust.get(id).map(|a| a.chats.clone()).unwrap_or_default()
+            }
+            (Some(Pick::Grant), Screen::Grant(g)) => {
+                g.chats.iter().flatten().map(|(id, _)| id.clone()).collect()
+            }
+            _ => BTreeSet::new(),
+        }
+    }
+
     /// One bordered element: the search over a scrollable list of the
     /// connector's chats. At the top: PICKED, RECENT, the shelves (servers,
     /// spaces, mailboxes) and the chats outside them; flat connectors list
     /// their chats alone. `›` opens a row; the back row goes up one level.
-    /// pinned (the chats already picked) stay on top; row draws a chat with
-    /// its control, around the line the picker makes for it.
+    /// pinned (the chats already picked) stay on top at the top level; row
+    /// draws a chat with its control, around the line the picker makes for it.
     pub(crate) fn picker(
         &self,
         t: Theme,
@@ -209,13 +230,17 @@ impl Shell {
         let (shelves, chats): (Vec<Container>, Vec<Container>) =
             found.into_iter().partition(is_shelf);
         let labelled = top && !shelves.is_empty();
-        // The picked chats as their rows show them, once those come.
+        // The picked chats as their rows show them, once those come. They
+        // rise to the top only at the top level: inside a shelf its own chats
+        // keep their order, picks ticked in place.
         let known = |id: &str| {
             let lists = [Some(&p.picked), p.found.as_ref(), p.recent.as_ref()];
             lists.into_iter().flatten().flatten().find(|r| r.id == id).cloned()
         };
-        let pinned: Vec<Container> =
-            pinned.into_iter().map(|c| known(&c.id).unwrap_or(c)).collect();
+        let pinned: Vec<Container> = match inside {
+            Some(_) => Vec::new(),
+            None => pinned.into_iter().map(|c| known(&c.id).unwrap_or(c)).collect(),
+        };
         let pinned_ids: BTreeSet<String> = pinned.iter().map(|c| c.id.clone()).collect();
         let mut parts = vec![part(labelled.then(|| "PICKED".into()), pinned)];
         if labelled {
@@ -239,6 +264,16 @@ impl Shell {
             let name = own_path(c, place(c)).join(" / ");
             names.iter().filter(|n| **n == name).count() > 1
         };
+        // A ticked holder covers all under it; a ticked mailbox the threads
+        // filed in it. Those rows show ticked and dim, and don't untick.
+        let ticked = self.ticked();
+        let covered = |c: &Container| {
+            let by = |a: &crate::api::ParentRef| ticked.contains(&a.id);
+            c.parents.iter().any(|a| by(a) && covers_all(&a.kind))
+                || (c.kind != "mailbox"
+                    && c.parents.last().is_some_and(|a| by(a) && a.kind == "mailbox"))
+        };
+        let dim = Theme { text: t.alt, ..t };
         let mut rows: Vec<AnyElement> = Vec::new();
         for (label, chats) in parts {
             if chats.is_empty() {
@@ -249,18 +284,16 @@ impl Shell {
             );
             for c in &chats {
                 let line = self.chat_line(t, c, place(c), twin(c), cx);
-                let heading = holds_chats(c) && p.pick != Pick::Hide;
-                rows.push(match heading {
-                    // A holder has no tick: the row opens.
-                    true => {
-                        let r = c.clone();
-                        clickable(id_for("open", &c.id), cx, move |this, cx| {
-                            this.open_row(r.clone(), cx)
-                        })
+                rows.push(match covered(c) && !c.hidden {
+                    true => div()
+                        .flex()
+                        .items_center()
+                        .gap(chars(1.))
                         .py(lines(0.25))
+                        .text_color(t.alt)
+                        .child(checkbox(dim, true))
                         .child(line)
-                        .into_any_element()
-                    }
+                        .into_any_element(),
                     false => row(c, line, cx),
                 });
             }
@@ -560,31 +593,31 @@ impl Shell {
                 })
             })
             .collect::<Vec<_>>();
-        let picked: Vec<Div> = g
-            .chats
-            .iter()
-            .flatten()
-            .map(|(id, name)| {
-                let id2 = id.clone();
-                div()
-                    .flex()
-                    .gap(chars(1.))
-                    .child(div().flex_1().min_w_0().child(words::chat(name)))
-                    .child(link(t, id_for("unpick", id), "Remove", cx, move |this, cx| {
-                        if let Screen::Grant(g) = &mut this.screen
-                            && let Some(c) = &mut g.chats
-                        {
-                            c.remove(&id2);
-                        }
-                        cx.notify();
-                    }))
-            })
-            .collect();
+        // The picked chats as a set, each with its Remove, a whole server
+        // with one.
+        let chosen: Vec<&crate::api::Chat> = g.chats.iter().flatten().map(|(_, c)| c).collect();
+        let unpick: fn(&mut Shell, &str) = |this, id| {
+            if let Screen::Grant(g) = &mut this.screen
+                && let Some(c) = &mut g.chats
+            {
+                c.remove(id);
+            }
+        };
+        let picked = self.chat_set(
+            t,
+            &g.connector,
+            &chosen,
+            "new-grant",
+            words::chat_cols(),
+            crate::chats::Whole::Beneath,
+            Some(unpick),
+            cx,
+        );
         let named = self.identities.iter().find(|a| a.id == g.identity).map(|a| a.name.clone());
         let chats = match &g.chats {
             None => Some("every chat".to_string()),
             Some(c) if c.is_empty() => None,
-            Some(c) if c.len() == 1 => c.values().next().map(|n| words::chat(n)),
+            Some(c) if c.len() == 1 => Some("1 chat".to_string()),
             Some(c) => Some(format!("{} chats", c.len())),
         };
         let window = if g.routine {
@@ -593,10 +626,26 @@ impl Shell {
         } else {
             span(g.for_)
         };
+        let short = if g.routine {
+            let (days, start) = (words::days_short(&g.days), words::start_short(&g.start()));
+            format!("{days} {start} · {}", words::span_short(g.length))
+        } else {
+            words::span_short(g.for_)
+        };
         let ready = named.is_some() && !g.connector.is_empty() && chats.is_some();
+        // One line, whatever the room: the form above says the rest. Each
+        // part has its compact form, tried before it goes.
+        let cols = words::button_cols(in_button());
         let label = match (&named, &chats) {
             (Some(n), Some(c)) if ready => {
-                format!("Grant {n} · {window} · {c} · {}", horizon(g.horizon))
+                let verb = format!("Grant {}", words::fit(n, cols.saturating_sub(6)));
+                let parts = [
+                    (verb.clone(), verb),
+                    (window, short),
+                    (horizon(g.horizon), words::horizon_short(g.horizon)),
+                    (c.clone(), c.clone()),
+                ];
+                words::summary(&parts, cols)
             }
             _ => "Grant".into(),
         };
@@ -646,17 +695,9 @@ impl Shell {
                             )),
                     )
                     .when(g.chats.is_some(), |d| {
-                        let pinned: Vec<Container> = ng
-                            .chats
-                            .iter()
-                            .flatten()
-                            .map(|(id, name)| Container {
-                                id: id.clone(),
-                                name: name.clone(),
-                                ..Container::default()
-                            })
-                            .collect();
-                        d.when(!picking, |d| d.children(picked)).when(picking, |d| {
+                        let pinned: Vec<Container> =
+                            ng.chats.iter().flatten().map(|(_, c)| as_row(c)).collect();
+                        d.when(!picking, |d| d.child(picked)).when(picking, |d| {
                             d.child(self.picker(t, pinned, cx, |c, line, cx| {
                                 if c.hidden {
                                     return div()
@@ -666,13 +707,13 @@ impl Shell {
                                         .into_any_element();
                                 }
                                 let on = matches!(&ng.chats, Some(m) if m.contains_key(&c.id));
-                                let (id, name) = (c.id.clone(), full_name(c));
+                                let (id, chat) = (c.id.clone(), as_chat(c));
                                 clickable(id_for("pick", &c.id), cx, move |this, cx| {
                                     if let Screen::Grant(g) = &mut this.screen
                                         && let Some(m) = &mut g.chats
                                         && m.remove(&id).is_none()
                                     {
-                                        m.insert(id.clone(), name.clone());
+                                        m.insert(id.clone(), chat.clone());
                                     }
                                     cx.notify();
                                 })
@@ -784,23 +825,15 @@ impl Shell {
     ) -> Div {
         let id = id.to_string();
         let ticked = a.chats.clone();
-        let pinned = a
-            .names
-            .iter()
-            .map(|(id, name)| Container {
-                id: id.clone(),
-                name: name.clone(),
-                ..Container::default()
-            })
-            .collect();
+        let pinned = a.names.values().map(as_row).collect();
         self.picker(t, pinned, cx, move |c, line, cx| {
             if c.hidden {
                 return div().py(lines(0.25)).pl(chars(3.)).child(line).into_any_element();
             }
-            let (rid, cid, name) = (id.clone(), c.id.clone(), full_name(c));
+            let (rid, cid, chat) = (id.clone(), c.id.clone(), as_chat(c));
             clickable(id_for("pick", &c.id), cx, move |this, cx| {
                 if let Some(a) = this.adjust.get_mut(&rid) {
-                    a.names.entry(cid.clone()).or_insert_with(|| name.clone());
+                    a.names.entry(cid.clone()).or_insert_with(|| chat.clone());
                     if !a.chats.remove(&cid) {
                         a.chats.insert(cid.clone());
                     }
@@ -848,6 +881,29 @@ fn display(c: &Container) -> String {
 /// A chat's full path name, as a picked chat keeps it: "main / #general".
 fn full_name(c: &Container) -> String {
     own_path(c, None).join(" / ")
+}
+
+/// A row as a set of chats keeps it: its full path, kind and parents.
+fn as_chat(c: &Container) -> crate::api::Chat {
+    crate::api::Chat {
+        id: c.id.clone(),
+        name: full_name(c),
+        kind: c.kind.clone(),
+        parents: c.parents.clone(),
+        icon: c.icon.clone(),
+    }
+}
+
+/// A picked chat as the picker's row draws it, until its own row comes.
+fn as_row(c: &crate::api::Chat) -> Container {
+    Container {
+        id: c.id.clone(),
+        name: c.own().to_string(),
+        kind: c.kind.clone(),
+        parents: c.parents.clone(),
+        icon: c.icon.clone(),
+        ..Container::default()
+    }
 }
 
 /// A chat's path below the row opened, its own name last: "main", "#general"

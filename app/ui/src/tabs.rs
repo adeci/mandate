@@ -1,6 +1,7 @@
 //! Agents, Connections, Activity and Settings, as the console laid them out.
 
-use crate::api::{Activity, Days, Grant, History};
+use crate::api::{Activity, Chat, Days, Grant, History};
+use crate::chats::Whole;
 use crate::now::checkbox;
 use crate::pick::NewGrant;
 use crate::screens::{
@@ -29,7 +30,12 @@ impl Shell {
                 format!("last seen {} {}", words::date(s), words::clock(s))
             });
             let (id, name, grantee) = (a.id.clone(), a.name.clone(), a.id.clone());
-            let open: Vec<&Grant> = a.grants.iter().filter(|g| g.closed_at.is_none()).collect();
+            let open: Vec<Div> = a
+                .grants
+                .iter()
+                .filter(|g| g.closed_at.is_none())
+                .map(|g| self.grant_line(t, g, cx))
+                .collect();
             panel(t)
                 .child(
                     column()
@@ -37,7 +43,7 @@ impl Shell {
                         .child(t.alt(format!("created {} · {seen}", words::date(&a.created_at)))),
                 )
                 .when(open.is_empty(), |d| d.child(t.alt("No grants.")))
-                .children(open.into_iter().map(|g| grant_line(t, g)))
+                .children(open)
                 .child(div().flex().child(button(
                     t,
                     id_for("grant", &a.id),
@@ -171,6 +177,8 @@ impl Shell {
                         let (a, names, shell) = (a.clone(), names.clone(), shell.clone());
                         crate::scroll::lazy_with(id.clone(), move |_, _| {
                             let who = names.get(&a.identity).map_or("an agent", String::as_str);
+                            // A run of reads shows its start; its line says
+                            // it is a run, and the entry its span.
                             let (time, text) = (words::clock(&a.at), Shell::line(&a, who));
                             // Device and key events name no connector: a blank, so times align.
                             let mark = (!a.connector.is_empty())
@@ -489,16 +497,20 @@ impl Shell {
 
     /// An entry in full: who, what, the agent's words, the chats and the
     /// terms, what was approved or sent, when, and on which device.
-    pub(crate) fn entry_screen(&self, t: Theme, a: &Activity) -> Div {
+    pub(crate) fn entry_screen(&self, t: Theme, a: &Activity, cx: &mut Context<Self>) -> Div {
         let who = self.identities.iter().find(|i| i.id == a.identity).map(|i| i.name.clone());
-        let chats: Vec<&str> = a
-            .chats
-            .iter()
-            .map(|c| if c.name.is_empty() { c.id.as_str() } else { c.name.as_str() })
-            .collect();
+        let chats: Vec<&Chat> = a.chats.iter().collect();
+        let cols = words::chat_cols().saturating_sub(8).max(12);
+        let key = format!("entry/{}/{}", a.at, a.kind);
+        let mut chats = (!chats.is_empty())
+            .then(|| self.chat_set(t, &a.connector, &chats, &key, cols, Whole::Beneath, None, cx));
         let terms: Vec<String> = a.terms.iter().map(|t| format!("\"{}\"", t.term)).collect();
+        let when = match &a.until {
+            Some(u) => words::clock_span(&a.at, u),
+            None => words::clock(&a.at),
+        };
         let mut rows: Vec<(String, String)> =
-            vec![("When".into(), format!("{} {}", words::date(&a.at), words::clock(&a.at)))];
+            vec![("When".into(), format!("{} {when}", words::date(&a.at)))];
         let mut add = |label: &str, value: String| {
             if !value.is_empty() {
                 rows.push((label.into(), value));
@@ -510,7 +522,8 @@ impl Shell {
             if a.connector.is_empty() { String::new() } else { connector(&a.connector) },
         );
         add("Asked for", terms.join(" or "));
-        add("Chats", chats.join(", "));
+        // A mark that the row shows: the set takes its place below.
+        add("Chats", if chats.is_some() { "-".into() } else { String::new() });
         add("Reason", a.reason.clone());
         add("Note", a.note.clone());
         // A send's detail is what was approved, field by field.
@@ -530,15 +543,20 @@ impl Shell {
         let rows = rows
             .into_iter()
             .map(|(l, v)| {
-                let value = if l == "Account" {
-                    connector_label(&a.connector, t.text)
-                } else {
-                    div().child(v)
+                let value = match l.as_str() {
+                    "Account" => connector_label(&a.connector, t.text),
+                    "Chats" => chats.take().unwrap_or_else(div),
+                    _ => div().child(v),
                 };
                 (l, value.into_any_element())
             })
             .collect();
-        column().gap(lines(1.)).child(bold(self.entry(a))).child(table(t, rows))
+        // A run of reads says what they did, quietly, under its line.
+        let did = (a.merged() && !a.verbs.is_empty()).then(|| t.alt(verbs(&a.verbs)));
+        column()
+            .gap(lines(1.))
+            .child(column().child(bold(self.entry(a))).children(did))
+            .child(table(t, rows))
     }
 
     /// One plain line for an entry: who did what, and how it ended.
@@ -550,18 +568,31 @@ impl Shell {
     /// An entry's line, given its agent's name.
     fn line(a: &Activity, who: &str) -> String {
         let on = connector(&a.connector);
-        let chats: Vec<String> = a
-            .chats
-            .iter()
-            .map(|c| words::chat(if c.name.is_empty() { &c.id } else { &c.name }))
-            .collect();
-        let chats = chats.join(", ");
+        // One chat by name, more by their number: the entry shows them all.
+        let chats = match &a.chats[..] {
+            [c] => words::chat(if c.name.is_empty() { &c.id } else { &c.name }),
+            cs => format!("{} chats", cs.len()),
+        };
         let n = |what: &str| {
             let n = a.count.unwrap_or(0);
             format!("{n} {what}{}", if n == 1 { "" } else { "s" })
         };
         let d = &a.detail;
         match a.kind.as_str() {
+            // Reads in one run: what they reached, in sum.
+            "read" if a.merged() => {
+                let mut parts = vec![format!("{who} read {on}")];
+                if !a.chats.is_empty() {
+                    parts.push(chats);
+                }
+                if a.verbs.iter().any(|v| v == "messages") {
+                    parts.push(n("message"));
+                }
+                if parts.len() == 1 {
+                    parts.push(verbs(&a.verbs));
+                }
+                parts.join(" · ")
+            }
             "read" => match d.as_str() {
                 "messages" => format!("{who} read {chats} on {on} · {}", n("message")),
                 "chats" => format!("{who} listed {on} chats"),
@@ -699,12 +730,18 @@ impl Shell {
                         h.entries.extend(entries);
                         h.next = page.next;
                     }
-                    // Newer ones go before it, up to the first already there.
+                    // Newer ones go before it, up to the first already there,
+                    // which a run of reads may have grown: its newest copy stands.
                     (Some(h), None) if h.query == query && !h.entries.is_empty() => {
-                        let first = h.entries[0].clone();
-                        let fresh: Vec<_> = entries
-                            .take_while(|e| (&e.at, &e.kind) != (&first.at, &first.kind))
-                            .collect();
+                        let first = (h.entries[0].at.clone(), h.entries[0].kind.clone());
+                        let mut fresh = Vec::new();
+                        for e in entries {
+                            if (&e.at, &e.kind) == (&first.0, &first.1) {
+                                h.entries[0] = e;
+                                break;
+                            }
+                            fresh.push(e);
+                        }
                         h.entries.splice(0..0, fresh);
                     }
                     // A new search, kind or day: the list starts over at its top.
@@ -763,7 +800,7 @@ impl Shell {
                     column()
                         .flex_1()
                         .child(div().child(name.clone()).when(this_one, |d| {
-                            d.child(div().text_color(t.info).child("[this device]"))
+                            d.child(div().text_color(t.info).child("this device"))
                         }))
                         .when(!methods.is_empty(), |c| c.child(t.alt(methods.join(", ")))),
                 )
@@ -909,6 +946,44 @@ impl Shell {
             ))
             .child(stop)
     }
+
+    /// An agent's grant: its account, its chats as a set, when it is open
+    /// and how far back it reads.
+    fn grant_line(&self, t: Theme, g: &Grant, cx: &mut Context<Self>) -> Div {
+        // No brackets: a bracket's glyph sits right of its cell, off the
+        // text's edge.
+        let state = match (&g.until, &g.schedule) {
+            (_, Some(s)) => {
+                format!("{} at {}", words::days(&s.days), words::time_of_day(&s.start))
+            }
+            (Some(u), None) => format!("until {}", words::clock(u)),
+            _ => String::new(),
+        };
+        column()
+            .child(connector_label(&g.connector, t.text))
+            .child(self.grant_chats(t, g, words::chat_cols(), cx))
+            .child(
+                div()
+                    .text_color(if g.schedule.is_some() { t.routine } else { t.open })
+                    .child(state),
+            )
+            .child(t.alt(horizon(g.horizon)))
+    }
+}
+
+/// A run of reads' verbs, as one quiet line: "listed chats · read messages".
+fn verbs(vs: &[String]) -> String {
+    let said: Vec<String> = vs
+        .iter()
+        .map(|v| match v.as_str() {
+            "chats" => "listed chats".to_string(),
+            "messages" => "read messages".to_string(),
+            "search" => "searched".to_string(),
+            "media" => "opened files".to_string(),
+            op => format!("used {op}"),
+        })
+        .collect();
+    said.join(" · ")
 }
 
 /// A row of a ruled list.
@@ -920,36 +995,6 @@ fn row(t: Theme, i: usize) -> Div {
         .px(chars(1.))
         .py(lines(0.5))
         .when(i > 0, |d| d.border_t_2().border_color(t.text))
-}
-
-fn grant_line(t: Theme, g: &Grant) -> Div {
-    let chats = if g.chats.is_empty() {
-        "every chat".to_string()
-    } else {
-        g.chats
-            .iter()
-            .map(|id| words::chat(g.chat_names.get(id).unwrap_or(id)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let state = match (&g.until, &g.schedule) {
-        (_, Some(s)) => {
-            format!("[{} at {}]", words::days(&s.days), words::time_of_day(&s.start))
-        }
-        (Some(u), None) => format!("[until {}]", words::clock(u)),
-        _ => String::new(),
-    };
-    column()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(chars(1.))
-                .child(format!("{chats} ·"))
-                .child(connector_label(&g.connector, t.text)),
-        )
-        .child(div().text_color(if g.schedule.is_some() { t.routine } else { t.open }).child(state))
-        .child(t.alt(horizon(g.horizon)))
 }
 
 /// A day's header in Activity, in the list and stuck on top.

@@ -45,7 +45,26 @@ pub struct Term {
 #[serde(default)]
 pub struct Chat {
     pub id: String,
+    /// Its full path name: "main / #general".
     pub name: String,
+    /// guild, channel, dm and so on; a guild, space or forum is all of it.
+    pub kind: String,
+    /// Outermost first, as the listing gives them.
+    pub parents: Vec<ParentRef>,
+    pub icon: Option<String>,
+}
+
+impl Chat {
+    /// Its own name, without its parents' path.
+    pub fn own(&self) -> &str {
+        let path: Vec<&str> = self.parents.iter().map(|p| p.name.as_str()).collect();
+        let prefix = format!("{} / ", path.join(" / "));
+        match self.name.strip_prefix(&prefix) {
+            Some(own) if !self.parents.is_empty() => own,
+            _ if self.name.is_empty() => &self.id,
+            _ => &self.name,
+        }
+    }
 }
 
 impl Request {
@@ -94,6 +113,8 @@ pub struct Grant {
     pub connector: String,
     pub chats: Vec<String>,
     pub chat_names: BTreeMap<String, String>,
+    /// Its chats in order, with their kinds and parents.
+    pub chat_refs: Vec<Chat>,
     pub horizon: u64,
     pub until: Option<String>,
     pub schedule: Option<Schedule>,
@@ -106,6 +127,11 @@ pub struct Grant {
 #[serde(default)]
 pub struct Activity {
     pub at: String,
+    /// The last of several reads merged into this one; `at` is the first.
+    pub until: Option<String>,
+    /// What the reads did, in the order first done: chats, messages,
+    /// search, media.
+    pub verbs: Vec<String>,
     /// read, request.asked, proposal.done, stop_all and so on.
     pub kind: String,
     pub identity: String,
@@ -123,6 +149,14 @@ pub struct Activity {
     pub device: String,
     /// Where a login or join came from.
     pub address: String,
+}
+
+impl Activity {
+    /// Several reads merged into one: `until` marks them, and entries
+    /// written before it did have more than one verb.
+    pub fn merged(&self) -> bool {
+        self.kind == "read" && (self.until.is_some() || self.verbs.len() > 1)
+    }
 }
 
 /// A page of history, newest first; next pages back from its last entry.
@@ -278,6 +312,8 @@ pub struct Container {
 pub struct ParentRef {
     pub id: String,
     pub name: String,
+    /// guild, channel, mailbox and so on.
+    pub kind: String,
     pub icon: Option<String>,
 }
 

@@ -1,10 +1,11 @@
 //! Now: what waits for the owner, open grants and routines.
 
-use crate::api::{Exchange, Grant, Proposal, Request};
+use crate::api::{Chat, Exchange, Grant, Proposal, Request};
+use crate::chats::{Whole, whole};
 use crate::pick::Pick;
 use crate::screens::{
     DEVICE_JOIN, approve, button, clickable, column, connector_label, deny_exchange, device_rows,
-    device_warning, headline, id_for, link, panel, reason, slider, table, who,
+    device_warning, headline, id_for, in_card, link, panel, reason, slider, table, who,
 };
 use crate::theme::{BOLD, MEDIUM, Theme, bold, chars, lines};
 use crate::words::{self, connector, horizon, span};
@@ -51,7 +52,8 @@ impl Shell {
             }
         }
         let shown = |g: &&Grant| {
-            self.shown(&format!("{} {} {}", g.identity_name, g.connector, chat_list(g)))
+            let names: Vec<&str> = g.chat_refs.iter().map(|c| c.name.as_str()).collect();
+            self.shown(&format!("{} {} {}", g.identity_name, g.connector, names.join(" ")))
         };
         let open: Vec<&Grant> = self.now.grants.iter().filter(shown).collect();
         let routines: Vec<&Grant> = self.now.routines.iter().filter(shown).collect();
@@ -76,13 +78,23 @@ impl Shell {
             })
             .children(waiting)
             .when(!open.is_empty(), |d| {
-                d.child(t.heading("Open now"))
-                    .children(open.into_iter().map(|g| open_grant(t, g, cx)))
+                let cards: Vec<Div> = open
+                    .into_iter()
+                    .map(|g| open_grant(t, g, self.grant_chats(t, g, words::chat_cols(), cx), cx))
+                    .collect();
+                d.child(t.heading("Open now")).children(cards)
             })
             .when(!routines.is_empty() || !stopped.is_empty(), |d| {
-                d.child(t.heading("Routines"))
-                    .children(routines.into_iter().map(|g| routine(t, g, false, cx)))
-                    .children(stopped.into_iter().map(|g| routine(t, g, true, cx)))
+                let cards: Vec<Div> = routines
+                    .into_iter()
+                    .map(|g| (g, false))
+                    .chain(stopped.into_iter().map(|g| (g, true)))
+                    .map(|(g, paused)| {
+                        let chats = self.grant_chats(t, g, words::chat_cols(), cx);
+                        routine(t, g, paused, chats, cx)
+                    })
+                    .collect();
+                d.child(t.heading("Routines")).children(cards)
             })
     }
 
@@ -132,17 +144,11 @@ impl Shell {
                 )
             });
             let unmatched: Vec<_> = unmatched.collect();
+            let chats: Vec<&Chat> = a.names.values().collect();
+            let cols = words::chat_cols().saturating_sub(8).max(12);
+            let key = format!("request/{}", r.id);
             column()
-                .children(a.names.iter().map(|(id, name)| {
-                    // An ID only tells apart chats that share a name.
-                    let twin = a.names.iter().any(|(other, n)| other != id && n == name);
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_x(chars(1.))
-                        .child(div().min_w_0().child(words::chat_narrow(name)))
-                        .when(twin, |d| d.child(t.alt(words::short_id(id))))
-                }))
+                .child(self.chat_set(t, &r.connector, &chats, &key, cols, Whole::Inline, None, cx))
                 .children(unmatched)
                 .into_any_element()
         };
@@ -155,12 +161,38 @@ impl Shell {
         let chosen = match a.chats.len() {
             _ if !named => Some("every chat".to_string()),
             0 => None,
-            1 => a.chats.first().and_then(|id| a.names.get(id)).map(|n| words::chat(n)),
+            1 => a
+                .chats
+                .first()
+                .and_then(|id| a.names.get(id))
+                .map(|c| whole(&c.kind).map_or_else(|| "1 chat".to_string(), str::to_string)),
             n => Some(format!("{n} chats")),
         };
+        // One line, whatever the room: the card says the rest. Each part
+        // has its compact form, tried before it goes.
+        let short = match (r.kind.as_str(), &r.schedule) {
+            ("extend", _) => format!("+{}", words::span_short(r.for_)),
+            (_, Some(s)) => format!(
+                "{} {} · {}",
+                words::days_short(&s.days),
+                words::start_short(&s.start),
+                words::span_short(s.length)
+            ),
+            _ => words::span_short(a.for_),
+        };
+        let cols = words::button_cols(in_card());
+        let approve_ = ("Approve".to_string(), "Approve".to_string());
         let label = match (&chosen, r.kind.as_str()) {
-            (_, "extend") => format!("Approve · {window}"),
-            (Some(c), _) => format!("Approve · {window} · {c} · {}", horizon(a.horizon)),
+            (_, "extend") => words::summary(&[approve_, (window.clone(), short)], cols),
+            (Some(c), _) => words::summary(
+                &[
+                    approve_,
+                    (window.clone(), short),
+                    (horizon(a.horizon), words::horizon_short(a.horizon)),
+                    (c.clone(), c.clone()),
+                ],
+                cols,
+            ),
             (None, _) => "Approve".into(),
         };
         let ready = chosen.is_some() || r.kind == "extend";
@@ -298,7 +330,7 @@ fn adjust_panel(
     cx: &mut Context<Shell>,
 ) -> Div {
     let named = r.terms.is_some();
-    let ticks = a.names.iter().map(|(cid, name)| {
+    let ticks = a.names.iter().map(|(cid, c)| {
         let (r, id, on) = (r.clone(), cid.clone(), a.chats.contains(cid));
         clickable(id_for("tick", cid), cx, move |this, cx| {
             let a = this.adjust.entry(r.id.clone()).or_insert_with(|| Adjust::of(&r));
@@ -310,7 +342,7 @@ fn adjust_panel(
         .flex()
         .gap(chars(1.))
         .child(checkbox(t, on))
-        .child(div().min_w_0().truncate().child(words::chat(name)))
+        .child(div().min_w_0().truncate().child(words::chat(&c.name)))
     });
     let ticks: Vec<_> = ticks.collect();
     let (rf, rh) = (r.clone(), r.clone());
@@ -441,17 +473,10 @@ fn grant_title(t: Theme, g: &Grant) -> Div {
         .child(connector_label(&g.connector, t.text))
 }
 
-fn chat_list(g: &Grant) -> String {
-    if g.chats.is_empty() {
-        return "every chat".into();
-    }
-    let name = |id: &String| words::chat(g.chat_names.get(id).unwrap_or(id));
-    g.chats.iter().map(name).collect::<Vec<_>>().join(", ")
-}
-
-fn open_grant(t: Theme, g: &Grant, cx: &mut Context<Shell>) -> Div {
+fn open_grant(t: Theme, g: &Grant, chats: Div, cx: &mut Context<Shell>) -> Div {
+    // No bracket: its glyph sits right of its cell, off the text's edge.
     let until =
-        g.until.as_deref().map(|u| format!("[until {} · {}]", words::clock(u), words::left(u)));
+        g.until.as_deref().map(|u| format!("until {} · {}", words::clock(u), words::left(u)));
     let (id, id2, conn) = (g.id.clone(), g.id.clone(), g.connector.clone());
     let what = format!("{}'s grant on {}", g.identity_name, connector(&g.connector));
     panel(t)
@@ -461,7 +486,7 @@ fn open_grant(t: Theme, g: &Grant, cx: &mut Context<Shell>) -> Div {
                 .child(grant_title(t, g))
                 .children(until.map(|u| div().text_color(t.open).child(u))),
         )
-        .child(chat_list(g))
+        .child(chats)
         .child(t.alt(horizon(g.horizon)))
         .child(
             div()
@@ -485,7 +510,7 @@ fn open_grant(t: Theme, g: &Grant, cx: &mut Context<Shell>) -> Div {
         )
 }
 
-fn routine(t: Theme, g: &Grant, stopped: bool, cx: &mut Context<Shell>) -> Div {
+fn routine(t: Theme, g: &Grant, stopped: bool, chats: Div, cx: &mut Context<Shell>) -> Div {
     let when = g.schedule.as_ref().map_or(String::new(), |s| {
         let start = words::time_of_day(&s.start);
         format!("{} at {start} for {} · ", words::days(&s.days), span(s.length))
@@ -496,7 +521,7 @@ fn routine(t: Theme, g: &Grant, stopped: bool, cx: &mut Context<Shell>) -> Div {
         .as_ref()
         .filter(|_| !stopped)
         .and_then(words::running)
-        .map(|end| format!("[running until {end}]"));
+        .map(|end| format!("running until {end}"));
     let action = if stopped {
         button(t, id_for("resume", &id), "Resume", cx, move |this, cx| {
             let check = |r: &Record| matches!(r, Record::Grant(g) if g.schedule.is_some());
@@ -521,7 +546,7 @@ fn routine(t: Theme, g: &Grant, stopped: bool, cx: &mut Context<Shell>) -> Div {
                 )
                 .children(running.map(|r| div().text_color(t.routine).child(r))),
         )
-        .child(chat_list(g))
+        .child(chats)
         .child(t.alt(format!("{when}{}", horizon(g.horizon))))
         .child(div().flex().child(action))
 }

@@ -9,9 +9,10 @@
 //! while they show, so a frame costs the screen, not the history.
 
 use gpui::{
-    AnyElement, App, AvailableSpace, Bounds, DispatchPhase, Div, ElementId, GlobalElementId,
-    Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, Pixels, ScrollHandle,
-    ScrollWheelEvent, Size, Style, TouchPhase, Window, div, point, prelude::*, px, relative, size,
+    AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Div, ElementId,
+    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, Pixels,
+    ScrollHandle, ScrollWheelEvent, Size, Style, TouchPhase, Window, div, point, prelude::*, px,
+    relative, size,
 };
 use std::{cell::RefCell, rc::Rc, time::Instant};
 
@@ -391,9 +392,11 @@ impl Spring {
     }
 }
 
-/// A row of a long list, built only when it is laid out: while its size is
-/// still unknown, and while it shows. Once laid out it keeps its size, and
-/// off screen it is only that size. Rows keep their sizes by id, so ids
+/// A row of a long list, built only when it is laid out. A row that showed
+/// last frame, or whose size is unknown, is laid out in place, so its height
+/// is always its content's; one that didn't is only a box of its last height.
+/// A row scrolled into view with a stale height is clipped to its slot for
+/// that one frame, then laid out anew. Rows keep their sizes by id, so ids
 /// should follow the content rather than its place in the list.
 pub fn lazy_with(
     id: impl Into<ElementId>,
@@ -418,10 +421,19 @@ impl IntoElement for Lazy {
     }
 }
 
+/// What a lazy row remembers between frames.
+#[derive(Clone, Copy, Default)]
+struct Seen {
+    /// Its last laid-out size.
+    size: Option<Size<Pixels>>,
+    /// It showed in the last frame.
+    shown: bool,
+}
+
 impl Element for Lazy {
     /// The row, when it was laid out in place.
     type RequestLayoutState = Option<AnyElement>;
-    /// The row, when it was laid out on its own because it shows.
+    /// The row, when it was laid out on its own because it came into view.
     type PrepaintState = Option<AnyElement>;
 
     fn id(&self) -> Option<ElementId> {
@@ -439,14 +451,14 @@ impl Element for Lazy {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Option<AnyElement>) {
-        let known = window.with_element_state(
+        let seen = window.with_element_state(
             id.expect("a lazy row has an id"),
-            |known: Option<Option<Size<Pixels>>>, _| {
-                let known = known.flatten();
-                (known, known)
+            |seen: Option<Seen>, _| {
+                let seen = seen.unwrap_or_default();
+                (seen, seen)
             },
         );
-        match known {
+        match seen.size.filter(|_| !seen.shown) {
             Some(known) => {
                 let style = Style {
                     size: size(relative(1.).into(), known.height.into()),
@@ -472,34 +484,37 @@ impl Element for Lazy {
         cx: &mut App,
     ) -> Option<AnyElement> {
         let id = id.expect("a lazy row has an id");
+        let shows = bounds.intersects(&window.content_mask().bounds);
         if let Some(row) = placed {
             row.prepaint(window, cx);
-            window.with_element_state(id, |_: Option<Option<Size<Pixels>>>, _| {
-                ((), Some(bounds.size))
+            window.with_element_state(id, |_: Option<Seen>, _| {
+                ((), Seen { size: Some(bounds.size), shown: shows })
             });
             return None;
         }
         let build = self.row.take().expect("laid out once");
-        window.with_element_state(id, |known: Option<Option<Size<Pixels>>>, window| {
-            let known = known.flatten();
-            if !bounds.intersects(&window.content_mask().bounds) {
-                // Off screen it stays a box; a new width wraps it anew, so it
-                // is laid out in place next frame.
-                return (None, known.filter(|k| k.width == bounds.size.width));
+        window.with_element_state(id, |seen: Option<Seen>, window| {
+            let known = seen.and_then(|s| s.size);
+            if !shows {
+                // A new width wraps it anew: laid out in place next frame.
+                let size = known.filter(|k| k.width == bounds.size.width);
+                return (None, Seen { size, shown: false });
             }
-            let row = build(window, cx);
-            let mut row = div().w(bounds.size.width).child(row).into_any_element();
+            let mut row = div().w(bounds.size.width).child(build(window, cx)).into_any_element();
             let laid = row.layout_as_root(
                 size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::MinContent),
                 window,
                 cx,
             );
-            row.prepaint_at(bounds.origin, window, cx);
-            if known != Some(laid) {
-                // Its content changed: the list moves to fit it next frame.
-                window.refresh();
+            // Clipped to its slot, taps included, until the list makes room.
+            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                row.prepaint_at(bounds.origin, window, cx)
+            });
+            if laid != bounds.size {
+                // A redraw asked for while drawing would be dropped.
+                window.on_next_frame(|window, _| window.refresh());
             }
-            (Some(row), Some(laid))
+            (Some(row), Seen { size: Some(laid), shown: true })
         })
     }
 
@@ -507,14 +522,16 @@ impl Element for Lazy {
         &mut self,
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         placed: &mut Option<AnyElement>,
         shown: &mut Option<AnyElement>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        if let Some(row) = placed.as_mut().or(shown.as_mut()) {
+        if let Some(row) = placed {
             row.paint(window, cx);
+        } else if let Some(row) = shown {
+            window.with_content_mask(Some(ContentMask { bounds }), |window| row.paint(window, cx));
         }
     }
 }

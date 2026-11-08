@@ -199,7 +199,7 @@ impl Render for Shell {
             #[cfg(target_os = "android")]
             Screen::Method { next, pin } => self.method_screen(t, next, pin.as_deref(), cx),
             Screen::Settings => self.settings(t, cx),
-            Screen::Entry(a) => self.entry_screen(t, a),
+            Screen::Entry(a) => self.entry_screen(t, a, cx),
             Screen::Admit { exchange, envelope } => admit(t, exchange, envelope, cx),
             Screen::Review { proposal, envelope } => {
                 let fields: Vec<(String, AnyElement)> = match envelope.record() {
@@ -1150,8 +1150,10 @@ fn admit(t: Theme, ex: &Exchange, envelope: &Envelope, cx: &mut Context<Shell>) 
     if !ex.address.is_empty() {
         rows.push(("From".into(), div().child(ex.address.clone()).into_any_element()));
     }
+    // One line: a long name gives way, as the question above says it whole.
+    let name = words::fit(&ex.name, words::button_cols(in_button()).saturating_sub(7));
     column().child(bold(format!("Let {} in?", ex.name))).child(table(t, rows)).child(deny).child(
-        approve(t, "admit", format!("Let {} in", ex.name).into(), true, cx, move |this, cx| {
+        approve(t, "admit", format!("Let {name} in").into(), true, cx, move |this, cx| {
             this.approve(envelope.clone(), cx)
         }),
     )
@@ -1308,6 +1310,17 @@ pub fn button(
     block(clickable(id, cx, f), t, label)
         .active(|s| s.bg(t.text).text_color(t.bg))
         .hover(|s| s.bg(t.bg_alt))
+}
+
+/// What a button's border and padding take from its label's room.
+pub fn in_button() -> Pixels {
+    chars(2.) + px(4.)
+}
+
+/// What a card's border and padding, and its button's, take from a label's
+/// room.
+pub fn in_card() -> Pixels {
+    chars(4.) + px(8.)
 }
 
 /// The button that grants access, saying what it grants: the same shape,

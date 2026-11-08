@@ -86,6 +86,41 @@ pub fn days(days: &[u8]) -> String {
     }
 }
 
+/// A span in a button's few columns: "30m", "2h", "7d".
+pub fn span_short(secs: u64) -> String {
+    match secs {
+        s if s > 0 && s % 86400 == 0 => format!("{}d", s / 86400),
+        s if s > 0 && s % 3600 == 0 => format!("{}h", s / 3600),
+        s => format!("{}m", s.div_ceil(60)),
+    }
+}
+
+/// History in a button's few columns: "7d", "all".
+pub fn horizon_short(secs: u64) -> String {
+    if secs == 0 { "all".into() } else { span_short(secs) }
+}
+
+/// Days in a button's few columns: "daily", "weekdays", "Mon–Wed", "Mon Fri".
+pub fn days_short(days: &[u8]) -> String {
+    const NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let name = |d: u8| NAMES[usize::from(d) % 7];
+    match days {
+        [] | [0, 1, 2, 3, 4, 5, 6] => "daily".into(),
+        [1, 2, 3, 4, 5] => "weekdays".into(),
+        [0, 6] => "weekends".into(),
+        [first, .., last] if days.len() > 2 && days.windows(2).all(|w| w[1] == w[0] + 1) => {
+            format!("{}–{}", name(*first), name(*last))
+        }
+        d => d.iter().map(|&d| name(d)).collect::<Vec<_>>().join(" "),
+    }
+}
+
+/// A routine's "HH:MM" start in a button's few columns, on a 24-hour
+/// clock that needs no AM or PM: "9:00", "21:30".
+pub fn start_short(hhmm: &str) -> String {
+    hhmm.strip_prefix('0').filter(|s| s.len() == 4).unwrap_or(hhmm).to_string()
+}
+
 pub fn connector(name: &str) -> String {
     let known = [
         ("whatsapp", "WhatsApp"),
@@ -125,10 +160,46 @@ pub fn short_id(id: &str) -> String {
 /// width, less a card's padding, rules and a checkbox. Set every frame.
 static CHAT_COLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(36);
 
-/// Takes the window's width in pixels, for `chat`.
+/// The window's width in logical pixels, as f32 bits, for `button_cols`.
+static WIDTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Takes the window's width in pixels, for `chat` and `button_cols`.
 pub fn set_width(width: f32) {
+    WIDTH.store(width.to_bits(), std::sync::atomic::Ordering::Relaxed);
     let cols = (width / f32::from(crate::theme::chars(1.))) as usize;
     CHAT_COLS.store(cols.min(80).saturating_sub(10).max(16), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The columns a button's label has on this screen, inside inset of
+/// borders and padding around it. The page is the window's width up to 80
+/// characters, less its padding (screens.rs, `page`); every glyph of the
+/// monospace is one character wide, at every weight, so this is the
+/// label's room exactly.
+pub fn button_cols(inset: gpui::Pixels) -> usize {
+    let width = f32::from_bits(WIDTH.load(std::sync::atomic::Ordering::Relaxed));
+    let ch = f32::from(crate::theme::chars(1.));
+    let pad = if width < 480. { 1. } else { 2. };
+    let content = width.min(80. * ch) - 2. * pad * ch;
+    ((content - f32::from(inset)) / ch).max(0.) as usize
+}
+
+/// A button's label on one line of at most cols columns: parts in priority
+/// order, each with its compact form, joined by " · ". Until it fits, the
+/// parts take their compact forms, lowest first, then the lowest go. The
+/// first stays whatever the room; nothing is cut mid-word.
+pub fn summary(parts: &[(String, String)], cols: usize) -> String {
+    let fits = |said: &[&str]| width(&said.join(" · ")) <= cols;
+    let mut said: Vec<&str> = parts.iter().map(|(full, _)| full.as_str()).collect();
+    for i in (0..parts.len()).rev() {
+        if fits(&said) {
+            break;
+        }
+        said[i] = &parts[i].1;
+    }
+    while said.len() > 1 && !fits(&said) {
+        said.pop();
+    }
+    said.join(" · ")
 }
 
 /// A chat's name on one line of this screen; see `fit`.
@@ -261,6 +332,18 @@ pub fn clock(t: &str) -> String {
     unix(t).map(local_hm).map(|(h, m)| hm(h, m)).unwrap_or_default()
 }
 
+/// From one time of day to another, the shared AM or PM said once:
+/// "4:50–4:58 PM", "11:55 AM–12:03 PM", "16:50–16:58"; one minute is
+/// said once.
+pub fn clock_span(from: &str, to: &str) -> String {
+    let (a, b) = (clock(from), clock(to));
+    match (a.split_once(' '), b.split_once(' ')) {
+        _ if a == b => a,
+        (Some((t, x)), Some((_, y))) if x == y => format!("{t}–{b}"),
+        _ => format!("{a}–{b}"),
+    }
+}
+
 /// "3 Nov", in local time.
 pub fn date(t: &str) -> String {
     unix(t).map(day).unwrap_or_default()
@@ -378,7 +461,9 @@ pub fn zone() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit, fit_path, width};
+    use super::{
+        days_short, fit, fit_path, horizon_short, span_short, start_short, summary, width,
+    };
 
     #[test]
     fn fit_keeps_both_parts() {
@@ -393,6 +478,39 @@ mod tests {
         assert_eq!((both.chars().count(), &both[..7]), (20, "main / "));
         // The parent gives way further if that keeps the child whole.
         assert_eq!(fit("Inbox / Weekly update 5", 22), "Inb… / Weekly update 5");
+    }
+
+    #[test]
+    fn summary_compacts_then_drops_the_lowest_parts() {
+        let parts: Vec<(String, String)> = [
+            ("Approve", "Approve"),
+            ("weekdays 9:00 AM for 30 min", "weekdays 9:00 · 30m"),
+            ("last day", "1d"),
+            ("1 chat", "1 chat"),
+        ]
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .into();
+        assert_eq!(
+            summary(&parts, 60),
+            "Approve · weekdays 9:00 AM for 30 min · last day · 1 chat"
+        );
+        assert_eq!(summary(&parts, 51), "Approve · weekdays 9:00 AM for 30 min · 1d · 1 chat");
+        assert_eq!(summary(&parts, 40), "Approve · weekdays 9:00 · 30m · 1d");
+        assert_eq!(summary(&parts, 20), "Approve");
+        assert_eq!(summary(&parts, 3), "Approve");
+    }
+
+    #[test]
+    fn compact_forms() {
+        assert_eq!(
+            (span_short(1800), span_short(7200), span_short(604800)),
+            ("30m".into(), "2h".into(), "7d".into())
+        );
+        assert_eq!(horizon_short(0), "all");
+        assert_eq!(days_short(&[1, 2, 3, 4, 5]), "weekdays");
+        assert_eq!(days_short(&[1, 2, 3]), "Mon–Wed");
+        assert_eq!(days_short(&[1, 5]), "Mon Fri");
+        assert_eq!((start_short("09:00"), start_short("21:30")), ("9:00".into(), "21:30".into()));
     }
 
     #[test]
