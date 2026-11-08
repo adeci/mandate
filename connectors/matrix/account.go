@@ -64,6 +64,7 @@ type account struct {
 	// Only the sync loop uses these.
 	direct map[id.RoomID]id.UserID // DM rooms and who they are with, from m.direct
 	since  *string                 // nil until loaded
+	full   bool                    // the store has had every room's full state; loaded with since
 
 	mu      sync.Mutex
 	syncErr string

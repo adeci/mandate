@@ -158,11 +158,23 @@ func handle(u *apiUser) string {
 	return u.Username
 }
 
+// guildChat is a guild's chat ID. A guild's first channel may have the
+// guild's own ID, so guilds are stored apart, as mailboxes are.
+func guildChat(id string) string {
+	if id == "" {
+		return ""
+	}
+	return "guild:" + id
+}
+
+// hiddenName is what Discord names a channel the account may not view.
+const hiddenName = "___hidden___"
+
 func guildContainer(g *apiGuild) (store.Container, bool) {
 	if g == nil || g.ID == "" || g.Unavailable {
 		return store.Container{}, false
 	}
-	return store.Container{ID: g.ID, Kind: kindGuild, Name: g.Name}, true
+	return store.Container{ID: guildChat(g.ID), Kind: kindGuild, Name: g.Name}, true
 }
 
 // guildChannelContainers converts chans, which default to guildID. A
@@ -185,7 +197,7 @@ func guildChannelContainers(guildID string, chans []apiChannel) []store.Containe
 		}
 		if c.isThread() && cc.ParentID != "" && !listed[cc.ParentID] {
 			listed[cc.ParentID] = true
-			out = append(out, store.Container{ID: cc.ParentID, Kind: kindChannel, ParentID: c.GuildID})
+			out = append(out, store.Container{ID: cc.ParentID, Kind: kindChannel, ParentID: guildChat(c.GuildID)})
 		}
 		out = append(out, cc)
 	}
@@ -224,7 +236,7 @@ func channelContainer(c *apiChannel) (store.Container, bool) {
 			name = strings.Join(names, ", ")
 		}
 		return store.Container{ID: c.ID, Kind: kindGroup, Name: name, IsGroup: true, Participants: ps, LastMessageAt: last}, true
-	case c.Type == channelGuildCategory, c.GuildID == "":
+	case c.Type == channelGuildCategory, c.GuildID == "", c.Name == hiddenName:
 		return store.Container{}, false
 	case c.isThread():
 		return store.Container{ID: c.ID, Kind: kindThread, ParentID: c.ParentID, Name: c.Name, LastMessageAt: last}, true
@@ -233,7 +245,7 @@ func channelContainer(c *apiChannel) (store.Container, bool) {
 		if name != "" {
 			name = "#" + name
 		}
-		return store.Container{ID: c.ID, Kind: kindChannel, ParentID: c.GuildID, Name: name, LastMessageAt: last}, true
+		return store.Container{ID: c.ID, Kind: kindChannel, ParentID: guildChat(c.GuildID), Name: name, LastMessageAt: last}, true
 	}
 }
 
@@ -250,7 +262,7 @@ func participants(c *apiChannel) []store.Participant {
 }
 
 func fallbackContainer(channelID, guildID string) store.Container {
-	return store.Container{ID: channelID, Kind: kindChannel, ParentID: guildID}
+	return store.Container{ID: channelID, Kind: kindChannel, ParentID: guildChat(guildID)}
 }
 
 func snowflakeTime(id string) (time.Time, bool) {

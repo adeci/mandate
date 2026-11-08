@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"go.mau.fi/mautrix-signal/pkg/signalmeow"
@@ -81,7 +83,7 @@ func TestReceive(t *testing.T) {
 		participants string
 	}
 	for id, wantChat := range map[string]chat{
-		dm:                {name: "Farid Haddad", last: "2026-12-23T04:26:40.000Z", participants: "[]"},
+		dm:                {name: "Farid Haddad", last: "2026-12-23T04:26:43.000Z", participants: "[]"}, // the edit
 		group:             {name: "Climbing crew", last: "2026-12-23T04:26:41.000Z", participants: `[{"id":"` + owner.String() + `","name":"Owner"},{"id":"` + farid.String() + `","name":"Farid Haddad"},{"id":"` + mallory.String() + `","name":"~Mom"}]`},
 		stranger.String(): {name: "+15557654321", last: "2026-12-23T04:26:42.000Z", participants: "[]"},
 	} {
@@ -93,6 +95,67 @@ func TestReceive(t *testing.T) {
 		if got != wantChat {
 			t.Errorf("%s: %+v, want %+v", id, got, wantChat)
 		}
+	}
+}
+
+// Opening a store dates each chat by its newest stored message, unless the
+// chat was active later; one without messages stays undated.
+func TestOpenStoreDatesChats(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "data.db")
+	st, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	day := func(d int) time.Time { return time.Date(2026, 11, d, 12, 0, 0, 0, time.UTC) }
+	for _, c := range []store.Container{
+		{ID: farid.String(), Kind: "dm"},
+		{ID: string(climbing), Kind: "group", IsGroup: true, LastMessageAt: day(1)},
+		{ID: sam.String(), Kind: "dm", LastMessageAt: day(9)},
+		{ID: mallory.String(), Kind: "dm"},
+	} {
+		if err := st.UpsertContainer(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, m := range []struct {
+		chat string
+		at   time.Time
+	}{{farid.String(), day(3)}, {farid.String(), day(2)}, {string(climbing), day(4)}, {sam.String(), day(5)}} {
+		ts := uint64(m.at.UnixMilli())
+		if err := st.UpsertMessage(ctx, store.Message{ID: messageID(m.chat, owner, ts), ContainerID: m.chat, SenderID: owner.String(), SentAt: m.at, IsFromMe: true, Body: "hi"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.Close()
+
+	st, err = openStore(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rows, err := st.DB().Query(`SELECT id, COALESCE(last_message_at, '') FROM containers`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	got := map[string]string{}
+	for rows.Next() {
+		var id, last string
+		if err := rows.Scan(&id, &last); err != nil {
+			t.Fatal(err)
+		}
+		got[id] = last
+	}
+	want := map[string]string{
+		farid.String():   "2026-11-03T12:00:00.000Z",
+		string(climbing): "2026-11-04T12:00:00.000Z",
+		sam.String():     "2026-11-09T12:00:00.000Z",
+		mallory.String(): "",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("chats dated\n got %q\nwant %q", got, want)
 	}
 }
 

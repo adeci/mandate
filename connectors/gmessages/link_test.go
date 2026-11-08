@@ -189,7 +189,7 @@ func (f *fakeClient) DownloadMedia(id string, key []byte) (io.ReadCloser, error)
 func (f *fakeClient) GetConversation(_ context.Context, id string) (*gmproto.Conversation, error) {
 	f.p.mu.Lock()
 	defer f.p.mu.Unlock()
-	for _, c := range f.p.convs {
+	for _, c := range slices.Concat(f.p.convs, f.p.archived) {
 		if c.GetConversationID() == id {
 			return c, nil
 		}

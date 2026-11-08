@@ -466,6 +466,14 @@ func TestExecute(t *testing.T) {
 			if !reflect.DeepEqual(msgs, want) {
 				t.Fatalf("stored\n got %+v\nwant %+v", msgs, want)
 			}
+			var last, sent string
+			if err := f.st.DB().QueryRow(`SELECT COALESCE(c.last_message_at, ''), m.sent_at FROM containers AS c JOIN messages AS m ON m.container_id = c.id WHERE c.id = ?`, tt.chat).
+				Scan(&last, &sent); err != nil {
+				t.Fatal(err)
+			}
+			if last != sent {
+				t.Errorf("chat dated %q, want its message's %q", last, sent)
+			}
 		})
 	}
 }

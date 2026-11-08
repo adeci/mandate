@@ -12,12 +12,16 @@ const (
 	kindSpace = "space"
 
 	// The spaces the owner joined list their rooms here, from m.space.child.
+	// Sync sends those only when they change, so a store synced before they
+	// were kept gets them from one sync with every room's full state, which
+	// leaves a row in matrix_full_state.
 	spacesSchema = `
 CREATE TABLE IF NOT EXISTS matrix_space_children (
     space_id TEXT NOT NULL,
     child_id TEXT NOT NULL,
     PRIMARY KEY (space_id, child_id)
-)`
+);
+CREATE TABLE IF NOT EXISTS matrix_full_state (done INTEGER NOT NULL)`
 
 	// Space, subspace, room.
 	maxDepth = 3

@@ -37,6 +37,7 @@ type ingester struct {
 	phoneSyncing   bool
 	dmsFilled      bool
 	listed         bool
+	caughtUp       bool
 }
 
 func newIngester(st *store.Store, log *slog.Logger) *ingester {
@@ -111,9 +112,19 @@ func (in *ingester) sim(conv *gmproto.Conversation) *gmproto.SIMPayload {
 
 func (in *ingester) conversationEvent(ctx context.Context, conv *gmproto.Conversation) {
 	in.remember(conv)
-	if err := in.st.UpsertContainer(ctx, container(conv)); err != nil {
+	if err := in.st.UpsertContainer(ctx, unfetched(conv)); err != nil {
 		in.log.Error("store conversation", "conversation", conv.GetConversationID(), "err", err)
 	}
+}
+
+// unfetched is conv's chat without its activity: a sync compares the stored
+// activity with the phone's to know what to fetch, so it is recorded only
+// once the messages are in. An event may announce activity whose messages
+// never come as events, as while the connector was down.
+func unfetched(conv *gmproto.Conversation) store.Container {
+	c := container(conv)
+	c.LastMessageAt = time.Time{}
+	return c
 }
 
 // message stores m. libgm calls the event handler synchronously and asks that
@@ -153,7 +164,7 @@ func (in *ingester) resolve(ctx context.Context, cli gmClient, id string) {
 		in.log.Warn("look up conversation", "conversation", id, "err", err)
 		return
 	}
-	if err := in.st.UpsertContainer(ctx, container(conv)); err != nil {
+	if err := in.st.UpsertContainer(ctx, unfetched(conv)); err != nil {
 		in.log.Error("store conversation", "conversation", id, "err", err)
 		return
 	}
@@ -214,46 +225,40 @@ func (in *ingester) syncOnce(ctx context.Context, cli gmClient) error {
 	if err != nil {
 		return fmt.Errorf("list conversations: %w", err)
 	}
+	for _, conv := range resp.GetConversations() {
+		in.remember(conv)
+	}
+	in.mu.Lock()
+	filled, listed, caughtUp := in.dmsFilled, in.listed, in.caughtUp
+	in.mu.Unlock()
+	if !caughtUp {
+		if err := in.catchUp(ctx, cli); err != nil {
+			return err
+		}
+	}
 	stored, err := in.lastActivity(ctx)
 	if err != nil {
 		return err
 	}
 	var fetched, msgs int
 	for _, conv := range resp.GetConversations() {
-		in.remember(conv)
 		c := container(conv)
-		last := c.LastMessageAt
-		if !last.Truncate(time.Millisecond).After(stored[c.ID]) {
+		if !c.LastMessageAt.Truncate(time.Millisecond).After(stored[c.ID]) {
 			if err := in.st.UpsertContainer(ctx, c); err != nil {
 				return err
 			}
 			continue
 		}
-		// The activity is recorded once its messages are in, so a failed
-		// fetch is retried by the next sync.
-		c.LastMessageAt = time.Time{}
-		if err := in.st.UpsertContainer(ctx, c); err != nil {
-			return err
-		}
-		n, err := in.backfill(ctx, cli, conv)
-		if errors.Is(err, libgm.ErrPhoneNotResponding) || errors.Is(err, libgm.ErrConnectionClosed) || ctx.Err() != nil {
-			return err
-		}
+		n, ok, err := in.fetch(ctx, cli, conv)
 		if err != nil {
-			in.log.Warn("fetch messages", "conversation", c.ID, "err", err)
-			continue
-		}
-		c.LastMessageAt = last
-		if err := in.st.UpsertContainer(ctx, c); err != nil {
 			return err
 		}
-		fetched++
-		msgs += n
+		if ok {
+			fetched++
+			msgs += n
+		}
 	}
 	in.log.Info("synced", "conversations", len(resp.GetConversations()), "fetched", fetched, "messages", msgs)
-	in.mu.Lock()
-	filled, listed := in.dmsFilled, in.listed
-	in.mu.Unlock()
 	if !listed {
 		if err := in.listAll(ctx, cli, resp); err != nil {
 			return err
@@ -262,6 +267,65 @@ func (in *ingester) syncOnce(ctx context.Context, cli gmClient) error {
 	if !filled {
 		return in.fillDMs(ctx, cli)
 	}
+	return nil
+}
+
+// fetch stores conv's latest messages, then its activity, so a failed fetch
+// is retried by the next sync. Only a phone gone away is an error; ok says
+// whether the messages are in.
+func (in *ingester) fetch(ctx context.Context, cli gmClient, conv *gmproto.Conversation) (n int, ok bool, err error) {
+	if err := in.st.UpsertContainer(ctx, unfetched(conv)); err != nil {
+		return 0, false, err
+	}
+	n, err = in.backfill(ctx, cli, conv)
+	if errors.Is(err, libgm.ErrPhoneNotResponding) || errors.Is(err, libgm.ErrConnectionClosed) || ctx.Err() != nil {
+		return 0, false, err
+	}
+	if err != nil {
+		in.log.Warn("fetch messages", "conversation", conv.GetConversationID(), "err", err)
+		return 0, false, nil
+	}
+	return n, true, in.st.UpsertContainer(ctx, container(conv))
+}
+
+// catchUp fetches, once per process, the conversations whose stored activity
+// is newer than their newest stored message: until conversation events no
+// longer recorded activity, an event could claim messages no sync fetched.
+func (in *ingester) catchUp(ctx context.Context, cli gmClient) error {
+	rows, err := in.st.DB().QueryContext(ctx, `SELECT id FROM containers
+WHERE last_message_at > COALESCE((SELECT max(sent_at) FROM messages WHERE container_id = containers.id), '')`)
+	if err != nil {
+		return fmt.Errorf("read stored conversations: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		conv, err := in.lookup(ctx, cli, id)
+		if errors.Is(err, libgm.ErrPhoneNotResponding) || errors.Is(err, libgm.ErrConnectionClosed) || ctx.Err() != nil {
+			return err
+		}
+		if err != nil {
+			in.log.Warn("look up conversation", "conversation", id, "err", err)
+			continue
+		}
+		if _, _, err := in.fetch(ctx, cli, conv); err != nil {
+			return err
+		}
+	}
+	in.mu.Lock()
+	in.caughtUp = true
+	in.mu.Unlock()
 	return nil
 }
 

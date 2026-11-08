@@ -28,19 +28,24 @@ type ingester struct {
 	cli *whatsmeow.Client
 	st  *store.Store
 	log *slog.Logger
+	// groupInfo is cli.GetGroupInfo, unless a test answers for WhatsApp.
+	groupInfo func(context.Context, types.JID) (*types.GroupInfo, error)
 
 	mu    sync.Mutex
 	seen  map[types.JID]bool      // containers upserted by this process
+	dated map[types.JID]time.Time // the newest activity this process stored for each
 	lidPN map[types.JID]types.JID // LID -> PN learned from history sync
 }
 
 func newIngester(cli *whatsmeow.Client, st *store.Store, log *slog.Logger) *ingester {
 	return &ingester{
-		cli:   cli,
-		st:    st,
-		log:   log,
-		seen:  make(map[types.JID]bool),
-		lidPN: make(map[types.JID]types.JID),
+		cli:       cli,
+		st:        st,
+		log:       log,
+		groupInfo: cli.GetGroupInfo,
+		seen:      make(map[types.JID]bool),
+		dated:     make(map[types.JID]time.Time),
+		lidPN:     make(map[types.JID]types.JID),
 	}
 }
 
@@ -53,7 +58,7 @@ func (in *ingester) handle(ctx context.Context, evt any) bool {
 		if !ok {
 			return true
 		}
-		if err := in.apply(ctx, o, ""); err != nil {
+		if err := in.apply(ctx, o); err != nil {
 			in.log.Error("store message", "id", e.Info.ID, "chat", e.Info.Chat.String(), "err", err)
 			return false
 		}
@@ -89,7 +94,7 @@ func (in *ingester) handle(ctx context.Context, evt any) bool {
 	return true
 }
 
-func (in *ingester) apply(ctx context.Context, o op, nameHint string) error {
+func (in *ingester) apply(ctx context.Context, o op) error {
 	switch o.kind {
 	case opUpsert:
 		// A stanza ID is unique per author only, so a redelivery may update
@@ -97,7 +102,7 @@ func (in *ingester) apply(ctx context.Context, o op, nameHint string) error {
 		if s, found, err := in.stored(ctx, o.msg.ID); err != nil || found && !in.sameAuthor(s, o) {
 			return err
 		}
-		if err := in.ensureContainer(ctx, o.chat, store.Container{Name: nameHint}); err != nil {
+		if err := in.ensureContainer(ctx, o.chat, store.Container{LastMessageAt: o.msg.SentAt}); err != nil {
 			return err
 		}
 		in.enrichSender(ctx, &o)
@@ -218,7 +223,8 @@ func (in *ingester) contactName(ctx context.Context, ids ...types.JID) string {
 const messageYourself = "Message yourself"
 
 // chatName names the direct chat with the user under ids: the owner's own
-// chat as WhatsApp does, any other as contactName.
+// chat as WhatsApp does, any other as contactName under the user's phone
+// number and LID, as whatsmeow keeps a name under the ID it came with.
 func (in *ingester) chatName(ctx context.Context, ids ...types.JID) string {
 	for _, own := range []types.JID{in.cli.Store.GetJID(), in.cli.Store.GetLID()} {
 		for _, j := range ids {
@@ -227,7 +233,23 @@ func (in *ingester) chatName(ctx context.Context, ids ...types.JID) string {
 			}
 		}
 	}
-	return in.contactName(ctx, ids...)
+	all := make([]types.JID, 0, 2*len(ids))
+	for _, j := range ids {
+		all = append(all, j)
+		if alt, err := in.cli.Store.GetAltJID(ctx, j); err == nil && !alt.IsEmpty() {
+			all = append(all, alt)
+		}
+	}
+	return in.contactName(ctx, all...)
+}
+
+// number names the chat with the user j by their phone number, which unlike
+// a chosen name nobody can spoof; a LID has none.
+func number(j types.JID) string {
+	if j.Server != types.DefaultUserServer {
+		return ""
+	}
+	return "+" + j.User
 }
 
 func (in *ingester) nameFunc(ctx context.Context) func(types.JID) string {
@@ -253,48 +275,72 @@ func (in *ingester) enrichSender(ctx context.Context, o *op) {
 	}
 }
 
-// Once per process, except that later calls still record a date from
-// history. Groups without a name hint are looked up with GetGroupInfo, a
-// read-only query.
-func (in *ingester) ensureContainer(ctx context.Context, chat types.JID, base store.Container) error {
+// ensureContainer stores chat the first time this process sees it, looking
+// up a group base doesn't name. Later calls store only newer activity, and a
+// name if the chat was stored without one, as when its lookup failed.
+func (in *ingester) ensureContainer(ctx context.Context, chat types.JID, base store.Container) (err error) {
 	in.mu.Lock()
-	if in.seen[chat] {
-		in.mu.Unlock()
-		if base.LastMessageAt.IsZero() {
-			return nil
+	seen := in.seen[chat]
+	newer := base.LastMessageAt.After(in.dated[chat])
+	in.seen[chat] = true
+	if newer {
+		in.dated[chat] = base.LastMessageAt
+	}
+	in.mu.Unlock()
+	defer func() {
+		if err != nil {
+			in.mu.Lock()
+			delete(in.seen, chat)
+			delete(in.dated, chat)
+			in.mu.Unlock()
+		}
+	}()
+
+	if seen {
+		if err := in.nameIfNone(ctx, chat, base.Name); err != nil || !newer {
+			return err
 		}
 		return in.st.UpsertContainer(ctx, store.Container{
 			ID: chat.String(), Kind: kindFor(chat), IsGroup: chat.Server == types.GroupServer, LastMessageAt: base.LastMessageAt,
 		})
 	}
-	in.seen[chat] = true
-	in.mu.Unlock()
 
 	c := base
 	c.ID, c.Kind, c.IsGroup = chat.String(), kindFor(chat), chat.Server == types.GroupServer
 	if c.IsGroup && c.Name == "" {
-		qctx, cancel := context.WithTimeout(ctx, queryTimeout)
-		info, err := in.cli.GetGroupInfo(qctx, chat)
-		cancel()
-		if err != nil {
-			in.log.Warn("group info query failed", "chat", chat.String(), "err", err)
-		} else {
+		if info, err := in.lookupGroup(ctx, chat); err == nil {
 			c = groupContainer(info, in.pn, in.nameFunc(ctx))
 			c.LastMessageAt = base.LastMessageAt
 		}
 	} else if !c.IsGroup {
-		if n := in.chatName(ctx, chat); n != "" {
-			c.Name = n
-		}
+		c.Name = cmp.Or(in.chatName(ctx, chat), c.Name)
 		c.Participants = in.dmParticipants(chat, c.Name)
 	}
-	if err := in.st.UpsertContainer(ctx, c); err != nil {
-		in.mu.Lock()
-		delete(in.seen, chat)
-		in.mu.Unlock()
+	if err := in.st.UpsertContainer(ctx, c); err != nil || c.IsGroup || c.Name != "" {
 		return err
 	}
-	return nil
+	return in.nameIfNone(ctx, chat, number(chat))
+}
+
+// nameIfNone names chat only if it has no name, unlike UpsertContainer.
+func (in *ingester) nameIfNone(ctx context.Context, chat types.JID, name string) error {
+	if name == "" {
+		return nil
+	}
+	_, err := in.st.DB().ExecContext(ctx, `UPDATE containers SET name = ?2 WHERE id = ?1 AND name IS NULL`, chat.String(), name)
+	return err
+}
+
+// lookupGroup asks WhatsApp about a group with GetGroupInfo, a read-only
+// query it answers for members only.
+func (in *ingester) lookupGroup(ctx context.Context, chat types.JID) (*types.GroupInfo, error) {
+	qctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+	info, err := in.groupInfo(qctx, chat)
+	if err != nil && !errors.Is(err, whatsmeow.ErrNotInGroup) && !errors.Is(err, whatsmeow.ErrGroupNotFound) {
+		in.log.Warn("group info query failed", "chat", chat.String(), "err", err)
+	}
+	return info, err
 }
 
 // storeContacts stores a DM for the owner's own chat and every contact in
@@ -330,7 +376,7 @@ func (in *ingester) storeDM(ctx context.Context, j types.JID) {
 }
 
 // syncGroups stores every group the account is in, as storeContacts does
-// contacts.
+// contacts, then names the other groups it can.
 func (in *ingester) syncGroups(ctx context.Context) {
 	qctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	groups, err := in.cli.GetJoinedGroups(qctx)
@@ -340,6 +386,40 @@ func (in *ingester) syncGroups(ctx context.Context) {
 		return
 	}
 	in.storeGroups(ctx, groups)
+	in.nameGroups(ctx)
+}
+
+// nameGroups looks up the groups stored without a name, as when their
+// lookup failed. WhatsApp describes a group to its members only, so one the
+// owner left keeps none.
+func (in *ingester) nameGroups(ctx context.Context) {
+	rows, err := in.st.DB().QueryContext(ctx, `SELECT id FROM containers WHERE kind = 'group' AND name IS NULL`)
+	if err != nil {
+		in.log.Error("list unnamed groups", "err", err)
+		return
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	var groups []*types.GroupInfo
+	for _, id := range ids {
+		j, err := types.ParseJID(id)
+		if err != nil {
+			continue
+		}
+		if info, err := in.lookupGroup(ctx, j); err == nil {
+			groups = append(groups, info)
+		}
+	}
+	in.storeGroups(ctx, groups)
+	if len(ids) > 0 {
+		in.log.Info("looked up unnamed groups", "count", len(ids), "found", len(groups))
+	}
 }
 
 func (in *ingester) storeGroups(ctx context.Context, groups []*types.GroupInfo) {
@@ -382,7 +462,8 @@ func (in *ingester) dmParticipants(chat types.JID, name string) []store.Particip
 	return nil
 }
 
-// nameDMs names every stored DM from the contact store.
+// nameDMs names every stored DM from the contact store, and one that has no
+// name by phone number.
 func (in *ingester) nameDMs(ctx context.Context) {
 	rows, err := in.st.DB().QueryContext(ctx, `SELECT id, COALESCE(name, ''), participants_json FROM containers WHERE kind = 'dm'`)
 	if err != nil {
@@ -404,7 +485,8 @@ func (in *ingester) nameDMs(ctx context.Context) {
 		if err != nil {
 			continue
 		}
-		name := cmp.Or(in.chatName(ctx, in.pn(j), j), d.name)
+		pn := in.pn(j)
+		name := cmp.Or(in.chatName(ctx, pn, j), d.name, number(pn))
 		parts := in.dmParticipants(j, name)
 		if b, err := json.Marshal(parts); name == d.name && (parts == nil || err == nil && string(b) == d.participants) {
 			continue
@@ -485,7 +567,7 @@ func (in *ingester) historySync(ctx context.Context, hs *waHistorySync.HistorySy
 			if !ok {
 				continue
 			}
-			if err := in.apply(ctx, o, base.Name); err != nil {
+			if err := in.apply(ctx, o); err != nil {
 				failed++
 				in.log.Error("store history message", "id", evt.Info.ID, "chat", chat.String(), "err", err)
 				continue

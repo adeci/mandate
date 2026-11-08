@@ -101,14 +101,15 @@ func convert(e *events.ChatEvent, chat string, own uuid.UUID, name func(uuid.UUI
 		return op{kind: opUpsert, sender: sender, msg: msg}, true
 	case *signalpb.EditMessage:
 		body, _, ok := content(m.GetDataMessage(), name)
-		if !ok || m.GetTargetSentTimestamp() == 0 {
+		ts := m.GetDataMessage().GetTimestamp()
+		if !ok || m.GetTargetSentTimestamp() == 0 || ts == 0 {
 			return op{}, false
 		}
 		return op{
 			kind:   opEdit,
 			target: messageID(chat, sender, m.GetTargetSentTimestamp()),
 			body:   body,
-			at:     time.UnixMilli(int64(m.GetDataMessage().GetTimestamp())).UTC(),
+			at:     time.UnixMilli(int64(ts)).UTC(),
 		}, true
 	}
 	return op{}, false

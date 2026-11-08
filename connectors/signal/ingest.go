@@ -98,6 +98,9 @@ func (in *ingester) chatEvent(ctx context.Context, e *events.ChatEvent) bool {
 		}
 		err = in.st.UpsertMessage(ctx, o.msg)
 	case opEdit:
+		if err = in.ensureContainer(ctx, chat, e.Info.GroupRevision, o.at); err != nil {
+			break
+		}
 		err = in.st.EditMessage(ctx, o.target, o.body, o.at)
 	case opDelete:
 		err = in.st.DeleteMessage(ctx, o.target)

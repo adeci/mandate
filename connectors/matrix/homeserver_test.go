@@ -65,6 +65,7 @@ type homeserver struct {
 	backupKeys    mautrix.RespRoomKeys[sessionData]
 
 	batches  []map[string]any // sync responses; since=N returns batches[N]
+	full     map[string]any   // if set, answers full_state=true without moving since
 	since    int              // the newest since a sync asked with
 	inbox    map[id.DeviceID][]map[string]any
 	holdMail bool // keep to-device messages back
@@ -377,12 +378,15 @@ func (h *homeserver) push(batch map[string]any) int {
 func (h *homeserver) sync(w http.ResponseWriter, r *http.Request, dev device) {
 	since, _ := strconv.Atoi(r.URL.Query().Get("since"))
 	timeout, _ := strconv.Atoi(r.URL.Query().Get("timeout"))
+	full := r.URL.Query().Get("full_state") == "true"
 	deadline := time.After(time.Duration(timeout) * time.Millisecond)
 	for {
 		h.mu.Lock()
 		h.since = max(h.since, since)
 		var resp map[string]any
 		switch {
+		case full && h.full != nil:
+			resp = maps.Clone(h.full)
 		case since < len(h.batches):
 			resp = maps.Clone(h.batches[since])
 			since++

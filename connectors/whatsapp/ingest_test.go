@@ -13,6 +13,8 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
@@ -109,6 +111,137 @@ func TestStoreChatsWithoutMessages(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("chats\n got %q\nwant %q", got, want)
 	}
+}
+
+// storedChat reads the name and last activity stored for id.
+func storedChat(t *testing.T, st *store.Store, id types.JID) (name, last string) {
+	t.Helper()
+	if err := st.DB().QueryRowContext(t.Context(), `SELECT COALESCE(name, ''), COALESCE(last_message_at, '') FROM containers WHERE id = ?`,
+		id.String()).Scan(&name, &last); err != nil {
+		t.Fatal(err)
+	}
+	return name, last
+}
+
+// A chat stored without a name gets one: a DM the push name kept under the
+// person's other ID, else their number, and a group whose lookup failed its
+// subject on the next connect. WhatsApp describes groups to members only,
+// so one the owner left keeps none.
+func TestNamelessChats(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	f := newFixture(t)
+	dev, err := f.container.GetFirstDevice(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pat, patL := types.NewJID("15550005555", types.DefaultUserServer), types.NewJID("222333444", types.HiddenUserServer)
+	if err := dev.LIDs.PutLIDMapping(ctx, patL, pat); err != nil {
+		t.Fatal(err)
+	}
+	// As the history sync's push names are, under the LID only.
+	if _, _, err := dev.Contacts.PutPushName(ctx, patL, "Pat"); err != nil {
+		t.Fatal(err)
+	}
+	nobody := types.NewJID("15550003333", types.DefaultUserServer)
+	left := types.NewJID("120363000000000666", types.GroupServer)
+	for _, c := range []store.Container{
+		{ID: pat.String(), Kind: "dm"},
+		{ID: nobody.String(), Kind: "dm"},
+		{ID: left.String(), Kind: "group", IsGroup: true},
+	} {
+		if err := f.st.UpsertContainer(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	names := func(want map[types.JID]string) {
+		t.Helper()
+		for id, w := range want {
+			if got, _ := storedChat(t, f.st, id); got != w {
+				t.Errorf("%s named %q, want %q", id, got, w)
+			}
+		}
+	}
+
+	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	in.groupInfo = func(context.Context, types.JID) (*types.GroupInfo, error) { return nil, whatsmeow.ErrIQRateOverLimit }
+	plumber := types.NewJID("15550004444", types.DefaultUserServer)
+	running := types.NewJID("120363000000000555", types.GroupServer)
+	for _, src := range []types.MessageSource{
+		{Chat: plumber, Sender: me, IsFromMe: true}, // written from the phone
+		{Chat: running, Sender: farid, IsGroup: true},
+	} {
+		in.handle(ctx, &events.Message{
+			Info:    types.MessageInfo{MessageSource: src, ID: "M" + src.Chat.User, Timestamp: time.Now()},
+			Message: &waE2E.Message{Conversation: proto.String("hi")},
+		})
+	}
+	names(map[types.JID]string{plumber: "+15550004444", running: ""})
+
+	in.groupInfo = func(_ context.Context, j types.JID) (*types.GroupInfo, error) {
+		if j != running {
+			return nil, whatsmeow.ErrNotInGroup
+		}
+		return &types.GroupInfo{JID: running, GroupName: types.GroupName{Name: "Running club"}}, nil
+	}
+	in.nameDMs(ctx)
+	in.nameGroups(ctx)
+	names(map[types.JID]string{pat: "~Pat", nobody: "+15550003333", running: "Running club", left: ""})
+}
+
+// A chat is dated by its history conversation, which WhatsApp may date after
+// its last message, and by every newer message, so chats sort by recency
+// before any is fetched.
+func TestChatActivity(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	f := newFixture(t)
+	dev, err := f.container.GetFirstDevice(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	day := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	unix := func(at time.Time) *uint64 { return proto.Uint64(uint64(at.Unix())) }
+	sent := func(chat types.JID, id string, at time.Time) *waHistorySync.HistorySyncMsg {
+		return &waHistorySync.HistorySyncMsg{Message: &waWeb.WebMessageInfo{
+			Key:              &waCommon.MessageKey{RemoteJID: proto.String(chat.String()), FromMe: proto.Bool(true), ID: proto.String(id)},
+			MessageTimestamp: unix(at),
+			Message:          &waE2E.Message{Conversation: proto.String("hi")},
+		}}
+	}
+	dated := func(want map[types.JID]time.Time) {
+		t.Helper()
+		for id, w := range want {
+			if _, got := storedChat(t, f.st, id); got != w.Format("2006-01-02T15:04:05.000Z") {
+				t.Errorf("%s last active %q, want %s", id, got, w)
+			}
+		}
+	}
+
+	in.historySync(ctx, &waHistorySync.HistorySync{
+		SyncType: waHistorySync.HistorySync_INITIAL_BOOTSTRAP.Enum(),
+		Conversations: []*waHistorySync.Conversation{
+			{
+				ID: proto.String(climbing.String()), Name: proto.String("Climbing crew"), ConversationTimestamp: unix(day),
+				Messages: []*waHistorySync.HistorySyncMsg{sent(climbing, "H1", day.Add(-time.Hour))},
+			},
+			// Undated by WhatsApp: dated by its newest message.
+			{ID: proto.String(farid.String()), Messages: []*waHistorySync.HistorySyncMsg{
+				sent(farid, "H3", day.Add(-time.Hour)), sent(farid, "H2", day.Add(-2*time.Hour)),
+			}},
+		},
+	})
+	dated(map[types.JID]time.Time{climbing: day, farid: day.Add(-time.Hour)})
+
+	in.handle(ctx, &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: farid, Sender: farid},
+			ID:            "L1", Timestamp: day.Add(time.Hour),
+		},
+		Message: &waE2E.Message{Conversation: proto.String("still on for tonight?")},
+	})
+	dated(map[types.JID]time.Time{climbing: day, farid: day.Add(time.Hour)})
 }
 
 // Any group member can name any message ID in an edit or delete; only the

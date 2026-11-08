@@ -326,6 +326,7 @@ var routes = []struct {
 	{"POST", "/execute", false, true},
 	{"PUT", "/keys", false, true},
 	{"GET", "/containers", false, true},
+	{"GET", "/icon", false, true},
 }
 
 // refusesCaller wants a 403 on every route allowed reports false for.

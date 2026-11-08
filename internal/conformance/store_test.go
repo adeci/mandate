@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adeci/mandate/store"
+	"github.com/adeci/mandate/store/storetest"
 )
 
 func TestStoreRules(t *testing.T) {
@@ -19,6 +20,7 @@ func TestStoreRules(t *testing.T) {
 	}{
 		{"times", `UPDATE messages SET edited_at = '2026-11-02T14:05:09Z'`, checkTimes},
 		{"nesting", `UPDATE containers SET parent_id = 'c3' WHERE id = 'c0'`, checkNesting},
+		{"self parent", `UPDATE containers SET parent_id = id WHERE id = 'c0'`, checkNesting},
 		{"depth", `INSERT INTO containers (id, kind, parent_id, updated_at) VALUES ('c4', 'thread', 'c3', '')`, checkNesting},
 		{"names", `UPDATE containers SET name = '~ Sam' WHERE id = 'c1'`, checkNames},
 		{"participants", `UPDATE containers SET participants_json = '[{"id":"p","name":"~~Sam"}]' WHERE id = 'c1'`, checkNames},
@@ -54,5 +56,27 @@ func TestStoreRules(t *testing.T) {
 				t.Fatalf("passes after %s", tc.sql)
 			}
 		})
+	}
+}
+
+// The chats each connector's own code stores, as its fixture keeps them,
+// pass the store rules.
+func TestConnectorFixtures(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("..", "..", "connectors", "*", "testdata", "chats.json"))
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("no fixtures: %v", err)
+	}
+	for _, p := range paths {
+		st, err := store.Open(t.Context(), filepath.Join(t.TempDir(), "data.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		storetest.Load(t, st, p)
+		for _, check := range []func(context.Context, *sql.DB) error{checkNesting, checkNames} {
+			if err := check(t.Context(), st.DB()); err != nil {
+				t.Errorf("%s: %v", p, err)
+			}
+		}
+		st.Close()
 	}
 }

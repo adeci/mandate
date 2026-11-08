@@ -9,8 +9,9 @@ import (
 )
 
 // The chats a typical account stores, kept in testdata/chats.json for the
-// gateway's tests of agents' terms: two servers with a #general each, a
-// thread, a category, a DM and a group DM.
+// gateway's tests of agents' terms: two servers with a #general each, one
+// with the server's own ID as old servers have, a thread, a category, a
+// channel the account may not view, a DM and a group DM.
 func TestChatsFixture(t *testing.T) {
 	st, err := store.Open(t.Context(), filepath.Join(t.TempDir(), "data.db"))
 	if err != nil {
@@ -24,8 +25,9 @@ func TestChatsFixture(t *testing.T) {
 	}{
 		{apiGuild{ID: "1100000000000000001", Name: "main"}, []apiChannel{
 			{ID: "1100000000000000010", Type: channelGuildCategory, Name: "Text Channels"},
-			{ID: "1100000000000000011", Type: 0, Name: "general", ParentID: "1100000000000000010"},
+			{ID: "1100000000000000001", Type: 0, Name: "general", ParentID: "1100000000000000010"},
 			{ID: "1100000000000000012", Type: 0, Name: "releases"},
+			{ID: "1100000000000000014", Type: 0, Name: hiddenName},
 			{ID: "1100000000000000013", Type: channelPublicThread, Name: "v2 rollout", ParentID: "1100000000000000012"},
 		}},
 		{apiGuild{ID: "1200000000000000001", Name: "other"}, []apiChannel{

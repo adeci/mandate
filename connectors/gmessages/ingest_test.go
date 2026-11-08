@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"maps"
 	"slices"
 	"strconv"
@@ -113,6 +114,44 @@ func TestSync(t *testing.T) {
 	}
 }
 
+// A conversation event announces activity whose messages may never come as
+// events; the next sync fetches them. A store where an event recorded such
+// activity, as before, is caught up after a restart, archived conversations
+// included.
+func TestSyncFetchesAnnouncedActivity(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, true)
+	ctx := context.Background()
+	f.phone.setConvs(faridDM())
+	f.phone.setMessages("1", message("m1", "1", "11", incoming, ts(2), "dinner?"))
+	f.c.in.sync(ctx, f.cli())
+
+	newer := faridDM()
+	newer.LastMessageTimestamp = ts(5)
+	f.phone.setConvs(newer)
+	f.phone.setMessages("1", message("m5", "1", "11", incoming, ts(5), "7pm"), message("m1", "1", "11", incoming, ts(2), "dinner?"))
+	f.c.in.conversationEvent(ctx, newer)
+	f.c.in.sync(ctx, f.cli())
+
+	// What an event stored before: activity without its messages.
+	old := strangerDM()
+	old.LastMessageTimestamp = ts(4)
+	f.phone.set(func(p *phone) { p.archived = []*gmproto.Conversation{old} })
+	f.phone.setMessages("2", message("m2", "2", "12", incoming, ts(4), "you won"))
+	if err := f.st.UpsertContainer(ctx, container(old)); err != nil {
+		t.Fatal(err)
+	}
+	newIngester(f.st, slog.New(slog.DiscardHandler)).sync(ctx, f.cli())
+
+	var ids []string
+	for _, m := range messages(t, f) {
+		ids = append(ids, m.ID)
+	}
+	if !slices.Equal(ids, []string{"m1", "m2", "m5"}) {
+		t.Errorf("messages %v, want m1, m2 and m5", ids)
+	}
+}
+
 // A sync stores every conversation, past the first page and archived; only
 // the recent ones get their messages and activity.
 func TestSyncListsAllConversations(t *testing.T) {
@@ -181,7 +220,9 @@ func TestLiveEvents(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Fatalf("messages\n got %+v\nwant %+v", got, want)
 	}
-	if got := chats(t, f); got["1"] != "dm Farid Haddad 2026-10-01T12:02:00.000Z" || got["3"] != "group Family 2026-10-01T12:03:00.000Z" {
+	// Events name the chats; their activity is recorded by the sync that
+	// fetches their messages.
+	if got := chats(t, f); got["1"] != "dm Farid Haddad -" || got["3"] != "group Family -" {
 		t.Fatalf("chats %v", got)
 	}
 }

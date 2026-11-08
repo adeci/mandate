@@ -11,7 +11,8 @@ import (
 )
 
 // The chats a sync stores, kept in testdata/chats.json for the gateway's
-// tests of agents' terms: a contact, a stranger named by number, a group.
+// tests of agents' terms: a contact, a stranger named by number, a group and
+// a big group nobody named.
 func TestChatsFixture(t *testing.T) {
 	t.Parallel()
 	st, err := store.Open(t.Context(), filepath.Join(t.TempDir(), "data.db"))
@@ -19,7 +20,7 @@ func TestChatsFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	for _, conv := range []*gmproto.Conversation{faridDM(), strangerDM(), family()} {
+	for _, conv := range []*gmproto.Conversation{faridDM(), strangerDM(), family(), neighbours()} {
 		if err := st.UpsertContainer(t.Context(), container(conv)); err != nil {
 			t.Fatal(err)
 		}

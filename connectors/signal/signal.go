@@ -40,9 +40,9 @@ func start(ctx context.Context, env *connector.Env, _ struct{}) (connector.Conne
 	signalmeow.SetLogger(zl)
 	web.SignalHTTPClient.Transport = capMedia{web.SignalHTTPClient.Transport}
 
-	st, err := store.Open(ctx, env.DataPath())
+	st, err := openStore(ctx, env.DataPath())
 	if err != nil {
-		return nil, fmt.Errorf("open store: %w", err)
+		return nil, err
 	}
 	sess, err := openSession(ctx, filepath.Join(env.PrivateDir(), "session.db"), dbutil.ZeroLogger(zl))
 	if err != nil {
@@ -95,6 +95,22 @@ func (p *program) Close() error {
 		errs = append(errs, c.Close())
 	}
 	return errors.Join(errs...)
+}
+
+// openStore opens the store and dates each chat by its newest stored
+// message, unless it was active later. Running it again changes nothing.
+func openStore(ctx context.Context, path string) (*store.Store, error) {
+	st, err := store.Open(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("open store: %w", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `
+UPDATE containers SET last_message_at = (SELECT max(sent_at) FROM messages WHERE container_id = containers.id)
+WHERE (SELECT max(sent_at) FROM messages WHERE container_id = containers.id) > COALESCE(last_message_at, '')`); err != nil {
+		st.Close()
+		return nil, fmt.Errorf("date chats: %w", err)
+	}
+	return st, nil
 }
 
 type session struct {

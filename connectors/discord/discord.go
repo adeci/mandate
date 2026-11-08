@@ -219,6 +219,9 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 	if _, err := cfg.store.DB().ExecContext(ctx, handlesSchema); err != nil {
 		return nil, fmt.Errorf("create handles table: %w", err)
 	}
+	if err := migrate(ctx, cfg.store.DB()); err != nil {
+		return nil, fmt.Errorf("migrate store: %w", err)
+	}
 	// The worker stops when ctx is done or on Close, which the SDK calls
 	// once the socket has shut down; its ctx outlives the signal.
 	ctx, cancel := context.WithCancel(ctx)
@@ -537,20 +540,20 @@ func (w *worker) Unlink(ctx context.Context) error {
 var spec = connector.Spec{
 	Doc: "sync, fetch and guild-search ask Discord and store what they get; chats, messages and search answer from what is stored.\n" +
 		"send proposes a message; it goes out from the owner's account once they approve it.\n" +
-		"Discord calls are paced like a person and may take a while. Start with sync, then sync guild_id=ID for a server's channels.",
+		"Discord calls are paced like a person and may take a while. Start with sync, then sync guild_id=guild:ID (a server's chat ID) for its channels.",
 	Ops: []connector.Op{
 		{
 			Name: "sync", Kind: connector.Read,
 			Summary: "Store the server and DM lists; with guild_id, also that server's channels and threads. Cached for a day.",
 			Params: []connector.Param{
-				{Name: "guild_id", Doc: "server ID", Container: true},
+				{Name: "guild_id", Doc: "server chat ID, guild:…", Container: true},
 			},
 		},
 		{
 			Name: "guild-search", Kind: connector.Read,
 			Summary: "Search a server on Discord, newest first, 25 per page. Needs content, author_id, channel_id or has. Cached for an hour.",
 			Params: []connector.Param{
-				{Name: "guild_id", Doc: "server ID", Required: true, Container: true},
+				{Name: "guild_id", Doc: "server chat ID, guild:…", Required: true, Container: true},
 				{Name: "content", Doc: "text to match, up to 512 characters"},
 				{Name: "author_id", Doc: "the author's sender_id"},
 				{Name: "channel_id", Doc: "channel or thread ID", Container: true},

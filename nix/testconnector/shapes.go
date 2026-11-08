@@ -27,8 +27,8 @@ func basic(now time.Time) ([]store.Container, []store.Message) {
 	old := now.AddDate(0, -1, 0)
 	return []store.Container{
 		{ID: "fam", Kind: "group", Name: "Family", IsGroup: true},
-		{ID: "club", Kind: "group", Name: "Book club", IsGroup: true},
-		{ID: "sam", Kind: "dm", Name: "~Sam", Participants: []store.Participant{sam}},
+		{ID: "club", Kind: "group", Name: "Book club", IsGroup: true, Icon: "club-1"},
+		{ID: "sam", Kind: "dm", Name: "~Sam", Participants: []store.Participant{sam}, Icon: "sam-1"},
 	}, []store.Message{
 		{ID: "fam/1", ContainerID: "fam", SenderID: "+15550001", SenderName: "Mum", SentAt: old, Body: "dinner at 7?"},
 		{ID: "fam/2", ContainerID: "fam", SenderID: "+15550001", SenderName: "Mum", SentAt: now.Add(-2 * time.Minute), Body: "fresh family"},
@@ -40,22 +40,24 @@ func basic(now time.Time) ([]store.Container, []store.Message) {
 
 // discord has guilds "main" and "other", each with #general and #random, a
 // thread under main's #general, and enough of main's #general to page.
+// Guilds are guild:ID, as the connector stores them, and main's #general
+// has main's own ID, as the first channel of an old server does.
 func discord(now time.Time) ([]store.Container, []store.Message) {
 	kai := store.Participant{ID: "u-kai", Name: "~kai"}
 	cs := []store.Container{
-		{ID: "main", Kind: "guild", Name: "main"},
-		{ID: "other", Kind: "guild", Name: "other"},
-		{ID: "main-general", Kind: "channel", ParentID: "main", Name: "#general"},
-		{ID: "main-random", Kind: "channel", ParentID: "main", Name: "#random"},
-		{ID: "other-general", Kind: "channel", ParentID: "other", Name: "#general"},
-		{ID: "other-random", Kind: "channel", ParentID: "other", Name: "#random"},
-		{ID: "main-rollout", Kind: "thread", ParentID: "main-general", Name: "rollout plan"},
+		{ID: "guild:main", Kind: "guild", Name: "main", Icon: "main-1"},
+		{ID: "guild:other", Kind: "guild", Name: "other", Icon: "other-1"},
+		{ID: "main", Kind: "channel", ParentID: "guild:main", Name: "#general"},
+		{ID: "main-random", Kind: "channel", ParentID: "guild:main", Name: "#random"},
+		{ID: "other-general", Kind: "channel", ParentID: "guild:other", Name: "#general"},
+		{ID: "other-random", Kind: "channel", ParentID: "guild:other", Name: "#random"},
+		{ID: "main-rollout", Kind: "thread", ParentID: "main", Name: "rollout plan"},
 		{ID: "dm-kai", Kind: "dm", Name: "~kai", Participants: []store.Participant{kai}},
 	}
 	var ms []store.Message
 	for i := range 80 {
 		ms = append(ms, store.Message{
-			ID: fmt.Sprintf("main-general/%d", i), ContainerID: "main-general", SenderID: "u-ada", SenderName: "ada",
+			ID: fmt.Sprintf("main-general/%d", i), ContainerID: "main", SenderID: "u-ada", SenderName: "ada",
 			SentAt: now.Add(-time.Duration(80-i) * time.Minute), Body: fmt.Sprintf("main general %d", i),
 		})
 	}

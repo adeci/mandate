@@ -90,12 +90,16 @@ func (c *mxConnector) syncOnce(ctx context.Context, a *account) error {
 			a.crypto.AccountID).Scan(&since); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
+		if err := c.st.DB().QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM matrix_full_state)`).Scan(&a.full); err != nil {
+			return err
+		}
 		a.since = &since
 	}
 	resp, err := a.cli.FullSyncRequest(ctx, mautrix.ReqSync{
 		Since:       *a.since,
 		Timeout:     int(syncTimeout / time.Millisecond),
 		FilterID:    syncFilter,
+		FullState:   !a.full,
 		SetPresence: event.PresenceOffline,
 	})
 	if err != nil {
@@ -103,6 +107,12 @@ func (c *mxConnector) syncOnce(ctx context.Context, a *account) error {
 	}
 	if err := c.ingest(ctx, a, resp, *a.since); err != nil {
 		return err
+	}
+	if !a.full {
+		if _, err := c.st.DB().ExecContext(ctx, `INSERT INTO matrix_full_state VALUES (1)`); err != nil {
+			return err
+		}
+		a.full = true
 	}
 	if err := a.crypto.PutNextBatch(ctx, resp.NextBatch); err != nil {
 		return err

@@ -422,6 +422,9 @@ func TestExecute(t *testing.T) {
 			if !reflect.DeepEqual(msgs, want) {
 				t.Fatalf("stored\n got %+v\nwant %+v", msgs, want)
 			}
+			if _, last := storedChat(t, f.st, farid); last != "2026-10-31T09:00:00.000Z" {
+				t.Fatalf("chat last active %q, want the send's time", last)
+			}
 		})
 	}
 }

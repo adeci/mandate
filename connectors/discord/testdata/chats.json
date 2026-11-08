@@ -1,19 +1,14 @@
 [
   {
     "id": "1100000000000000001",
-    "kind": "guild",
-    "name": "main"
-  },
-  {
-    "id": "1100000000000000011",
     "kind": "channel",
-    "parent_id": "1100000000000000001",
+    "parent_id": "guild:1100000000000000001",
     "name": "#general"
   },
   {
     "id": "1100000000000000012",
     "kind": "channel",
-    "parent_id": "1100000000000000001",
+    "parent_id": "guild:1100000000000000001",
     "name": "#releases"
   },
   {
@@ -23,14 +18,9 @@
     "name": "v2 rollout"
   },
   {
-    "id": "1200000000000000001",
-    "kind": "guild",
-    "name": "other"
-  },
-  {
     "id": "1200000000000000011",
     "kind": "channel",
-    "parent_id": "1200000000000000001",
+    "parent_id": "guild:1200000000000000001",
     "name": "#general"
   },
   {
@@ -58,5 +48,15 @@
         "name": "~kim"
       }
     ]
+  },
+  {
+    "id": "guild:1100000000000000001",
+    "kind": "guild",
+    "name": "main"
+  },
+  {
+    "id": "guild:1200000000000000001",
+    "kind": "guild",
+    "name": "other"
   }
 ]

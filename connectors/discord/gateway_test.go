@@ -523,7 +523,7 @@ func TestGatewayStoresLiveMessages(t *testing.T) {
 		row[2] != snowflakeTimeString(msg1) {
 		t.Errorf("DM row %v", row)
 	}
-	if row := h.queryRow(`SELECT kind, parent_id FROM containers WHERE id = ?`, chanGeneral); row[0] != kindChannel || row[1] != guildID {
+	if row := h.queryRow(`SELECT kind, parent_id FROM containers WHERE id = ?`, chanGeneral); row[0] != kindChannel || row[1] != "guild:"+guildID {
 		t.Errorf("channel row %v", row)
 	}
 	if row := h.queryRow(`SELECT is_from_me FROM messages WHERE id = ?`, msg2); row[0] != int64(1) {
@@ -652,7 +652,7 @@ FROM containers AS c LEFT JOIN containers AS p ON p.id = c.parent_id WHERE c.id 
 	}
 	c.dispatch("MESSAGE_CREATE", message(msg3))
 	eventually(t, "thread message stored", messageStored(msg3))
-	if p := parent(orphan); p != newGuild {
+	if p := parent(orphan); p != "guild:"+newGuild {
 		t.Errorf("thread seen in a message has parent %v, want the guild", p)
 	}
 	c.dispatch("THREAD_UPDATE", map[string]any{"id": orphan, "type": 11, "guild_id": newGuild, "parent_id": newChan, "name": "later"})

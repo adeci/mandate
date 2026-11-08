@@ -129,6 +129,22 @@ func (f *fixture) link() id.DeviceID {
 	return a.sess.DeviceID
 }
 
+// restart stops the connector and starts it again on its state, as an
+// upgrade does.
+func (f *fixture) restart() {
+	f.t.Helper()
+	ctx := context.Background()
+	f.c.Close()
+	var err error
+	if f.st, err = openStore(ctx, f.env.DataPath()); err != nil {
+		f.t.Fatal(err)
+	}
+	f.c = newConnector(ctx, f.st, f.env, zerolog.Nop(), f.hs.srv.Client())
+	if err := f.c.resume(); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
 // encrypt encrypts text as the owner's device el would in room, in a new
 // room key that it shares with the owner's devices.
 func (f *fixture) encrypt(el *account, room id.RoomID, eventID, text string, ts int64) (map[string]any, *event.EncryptedEventContent) {
@@ -811,4 +827,36 @@ func TestSpaces(t *testing.T) {
 	if parent != "" {
 		t.Fatalf("team still under %q", parent)
 	}
+}
+
+// A store synced before spaces were kept has none of their children, and may
+// have a space as a group, so every room sits at the top. The first sync
+// after the upgrade asks for every room's full state, which brings them.
+func TestSpacesAfterUpgrade(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	f.link()
+	const space = id.RoomID("!space:example.org")
+	state := joined(map[id.RoomID]map[string]any{
+		space: room([]map[string]any{
+			stateEvent("m.room.create", "", bob, map[string]any{"type": "m.space"}),
+			stateEvent("m.space.child", teamRoom.String(), bob, map[string]any{"via": []string{"example.org"}}),
+		}, nil),
+		teamRoom: room([]map[string]any{stateEvent("m.room.name", "", bob, map[string]any{"name": "Team"})}, nil),
+	})
+	f.hs.waitSynced(f.hs.push(state))
+	// What the version before spaces left behind.
+	if _, err := f.st.DB().Exec(`DELETE FROM matrix_space_children; DELETE FROM matrix_full_state;
+UPDATE containers SET parent_id = NULL, kind = 'group', is_group = 1`); err != nil {
+		t.Fatal(err)
+	}
+	f.hs.mu.Lock()
+	f.hs.full = state
+	f.hs.mu.Unlock()
+	f.restart()
+	eventually(t, "the team room is in the space", func() bool {
+		var parent string
+		err := f.st.DB().QueryRow(`SELECT COALESCE(parent_id, '') FROM containers WHERE id = ?1`, teamRoom.String()).Scan(&parent)
+		return err == nil && parent == space.String()
+	})
 }

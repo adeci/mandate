@@ -217,13 +217,13 @@ func (c *waConnector) Execute(ctx context.Context, w record.Write) connector.Res
 }
 
 func (c *waConnector) record(ctx context.Context, dev *wastore.Device, to types.JID, text string, resp whatsmeow.SendResponse) error {
-	ct := store.Container{ID: to.String(), Kind: kindFor(to), IsGroup: to.Server == types.GroupServer}
-	if err := c.st.UpsertContainer(ctx, ct); err != nil {
-		return err
-	}
 	at := resp.Timestamp
 	if at.IsZero() {
 		at = time.Now()
+	}
+	ct := store.Container{ID: to.String(), Kind: kindFor(to), IsGroup: to.Server == types.GroupServer, LastMessageAt: at}
+	if err := c.st.UpsertContainer(ctx, ct); err != nil {
+		return err
 	}
 	msg := store.Message{
 		ID:          messageID(to, resp.ID),

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -106,7 +107,22 @@ func parseSync(m map[string]string) (syncRequest, error) {
 	if err := a.done(); err != nil {
 		return r, err
 	}
-	return r, checkID("guild_id", r.GuildID, false)
+	if r.GuildID == "" {
+		return r, nil
+	}
+	var err error
+	r.GuildID, err = guildParam(r.GuildID)
+	return r, err
+}
+
+// guildParam is the guild a guild_id arg names by its chat ID, guild:ID: the
+// gateway checks that chat against the grants.
+func guildParam(v string) (string, error) {
+	id, ok := strings.CutPrefix(v, "guild:")
+	if !ok || !isSnowflake(id) {
+		return "", badRequest("guild_id must be a server's chat ID, guild: and its snowflake")
+	}
+	return id, nil
 }
 
 func parseSearch(m map[string]string) (searchRequest, error) {
@@ -116,6 +132,10 @@ func parseSearch(m map[string]string) (searchRequest, error) {
 		ChannelID: a.str("channel_id"), Has: a.str("has"), Offset: a.int("offset"),
 	}
 	if err := a.done(); err != nil {
+		return r, err
+	}
+	var err error
+	if r.GuildID, err = guildParam(r.GuildID); err != nil {
 		return r, err
 	}
 	return r, validateSearch(&r)
@@ -604,11 +624,9 @@ func (s *service) storedContainer(ctx context.Context, id string) (store.Contain
 // guildOf is the guild a channel or thread is in. A thread hangs under its
 // channel, or under the guild while its channel is unknown.
 func (s *service) guildOf(ctx context.Context, c store.Container) (string, error) {
-	switch c.Kind {
-	case kindChannel:
-		return c.ParentID, nil
-	case kindThread:
-		var kind, parent string
+	parent := c.ParentID
+	if c.Kind == kindThread {
+		var kind string
 		err := s.st.DB().QueryRowContext(ctx, `SELECT kind, COALESCE(parent_id, '') FROM containers WHERE id = ?1`, c.ParentID).
 			Scan(&kind, &parent)
 		switch {
@@ -617,11 +635,13 @@ func (s *service) guildOf(ctx context.Context, c store.Container) (string, error
 		case err != nil:
 			return "", err
 		case kind == kindGuild:
-			return c.ParentID, nil
+			parent = c.ParentID
 		}
-		return parent, nil
+	} else if c.Kind != kindChannel {
+		return "", nil
 	}
-	return "", nil
+	id, _ := strings.CutPrefix(parent, "guild:")
+	return id, nil
 }
 
 // adopt files a stored chat that has no parent under guildID, for threads
@@ -630,7 +650,7 @@ func adopt(ctx context.Context, db *sql.DB, id, guildID string) error {
 	if guildID == "" {
 		return nil
 	}
-	_, err := db.ExecContext(ctx, `UPDATE containers SET parent_id = ?2 WHERE id = ?1 AND parent_id IS NULL`, id, guildID)
+	_, err := db.ExecContext(ctx, `UPDATE containers SET parent_id = ?2 WHERE id = ?1 AND parent_id IS NULL`, id, guildChat(guildID))
 	return err
 }
 

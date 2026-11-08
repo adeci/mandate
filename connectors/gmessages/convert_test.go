@@ -75,6 +75,29 @@ func family() *gmproto.Conversation {
 	}
 }
 
+// neighbours is a group nobody named, so the phone sends all its members as
+// its name, contacts first.
+func neighbours() *gmproto.Conversation {
+	return &gmproto.Conversation{
+		ConversationID:       "4",
+		Name:                 "Ana Lima, Ben Ito, Cy Moreau, Farid Haddad, Mina, (555) 777-0041, (555) 777-0042, (555) 777-0043",
+		IsGroupChat:          true,
+		LastMessageTimestamp: ts(4),
+		DefaultOutgoingID:    "4",
+		Participants: []*gmproto.Participant{
+			self("4"),
+			participant("41", "+15557770041", "(555) 777-0041"),
+			contact(participant("42", "+15551230001", "(555) 123-0001"), "Farid Haddad"),
+			contact(participant("43", "+15551230005", "(555) 123-0005"), "Cy Moreau"),
+			participant("44", "+15557770042", "(555) 777-0042"),
+			contact(participant("45", "+15551230006", "(555) 123-0006"), "Ana Lima"),
+			contact(participant("46", "+15551230003", "(555) 123-0003"), "Mina"),
+			contact(participant("47", "+15551230007", "(555) 123-0007"), "Ben Ito"),
+			participant("48", "+15557770043", "(555) 777-0043"),
+		},
+	}
+}
+
 func message(id, conv, pid string, status gmproto.MessageStatusType, at int64, text string) *gmproto.Message {
 	m := &gmproto.Message{
 		MessageID:      id,
@@ -168,6 +191,18 @@ func TestContainer(t *testing.T) {
 	t.Parallel()
 	unnamed := family()
 	unnamed.Name = ""
+	party := neighbours()
+	party.Name = "Street party"
+	neighbourhood := []store.Participant{
+		{ID: "+15557770041", Name: "(555) 777-0041"},
+		{ID: "+15551230001", Name: "Farid Haddad"},
+		{ID: "+15551230005", Name: "Cy Moreau"},
+		{ID: "+15557770042", Name: "(555) 777-0042"},
+		{ID: "+15551230006", Name: "Ana Lima"},
+		{ID: "+15551230003", Name: "Mina"},
+		{ID: "+15551230007", Name: "Ben Ito"},
+		{ID: "+15557770043", Name: "(555) 777-0043"},
+	}
 	for _, tc := range []struct {
 		conv *gmproto.Conversation
 		want store.Container
@@ -188,6 +223,14 @@ func TestContainer(t *testing.T) {
 		{unnamed, store.Container{
 			ID: "3", Kind: "group", IsGroup: true, Name: "Farid Haddad, Mina", LastMessageAt: t0.Add(3 * time.Minute),
 			Participants: []store.Participant{{ID: "+15551230001", Name: "Farid Haddad"}, {ID: "+15551230003", Name: "Mina"}},
+		}},
+		{neighbours(), store.Container{
+			ID: "4", Kind: "group", IsGroup: true, Name: "Ana Lima, Ben Ito, Cy Moreau +5", LastMessageAt: t0.Add(4 * time.Minute),
+			Participants: neighbourhood,
+		}},
+		{party, store.Container{
+			ID: "4", Kind: "group", IsGroup: true, Name: "Street party", LastMessageAt: t0.Add(4 * time.Minute),
+			Participants: neighbourhood,
 		}},
 	} {
 		if got := container(tc.conv); !reflect.DeepEqual(got, tc.want) {

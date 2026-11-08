@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -92,10 +94,27 @@ func container(conv *gmproto.Conversation) store.Container {
 	switch {
 	case !c.IsGroup && len(ps) == 1 && names[0] != "":
 		c.Name = names[0]
-	case c.IsGroup && c.Name == "":
-		c.Name = strings.Join(names, ", ")
+	case c.IsGroup:
+		c.Name = groupName(c.Name, names)
 	}
 	return c
+}
+
+// groupName is the name a group was given, else its first three members.
+// For a group nobody named, the phone sends all its members' names as the
+// name, in its own order: contacts first.
+func groupName(name string, members []string) string {
+	if name != "" {
+		listed := strings.Split(name, ", ")
+		if len(listed) != len(members) || !slices.Equal(slices.Sorted(slices.Values(listed)), slices.Sorted(slices.Values(members))) {
+			return name
+		}
+		members = listed
+	}
+	if len(members) <= 3 {
+		return strings.Join(members, ", ")
+	}
+	return fmt.Sprintf("%s +%d", strings.Join(members[:3], ", "), len(members)-3)
 }
 
 // sender finds the participant behind id. Google Messages sometimes sends

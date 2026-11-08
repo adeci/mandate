@@ -23,7 +23,7 @@ var specTables = map[string][]string{
 	"containers": {
 		"id TEXT key", "kind TEXT NOT NULL", "parent_id TEXT", "name TEXT",
 		"is_group INTEGER NOT NULL", "participants_json TEXT NOT NULL",
-		"updated_at TEXT NOT NULL", "last_message_at TEXT",
+		"updated_at TEXT NOT NULL", "last_message_at TEXT", "icon TEXT",
 	},
 	"messages": {
 		"seq INTEGER key", "id TEXT NOT NULL", "container_id TEXT NOT NULL",

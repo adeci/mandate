@@ -418,7 +418,7 @@ with subtest("a term that matched nothing is fixed in one place on its card"):
     tap("30 min")
     finger()
     server.wait_until_succeeds("mandate discord chats")
-    assert chat_ids("discord") == ["main-general"], chat_ids("discord")
+    assert chat_ids("discord") == ["main"], chat_ids("discord")
     gone("30 min")
 
 with subtest("a term naming a server and a channel finds that one channel"):
@@ -433,10 +433,10 @@ with subtest("a term naming a server and a channel finds that one channel"):
     tap("30 min")
     finger()
     server.wait_until_succeeds("mandate discord chats")
-    assert chat_ids("discord") == ["main-general"], chat_ids("discord")
+    assert chat_ids("discord") == ["main"], chat_ids("discord")
     gone("30 min")
     # main's #general holds more than a page.
-    status, out = agent("discord messages main-general")
+    status, out = agent("discord messages main")
     assert status == 0 and "next: --before" in out, (status, out)
 
 # The demo's fastmail files a 130-character subject and a 126-character one

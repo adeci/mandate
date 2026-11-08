@@ -218,7 +218,7 @@ func TestChannelContainer(t *testing.T) {
 		{
 			name: "text channel",
 			in:   &apiChannel{ID: "c", GuildID: "g", Name: "general", Type: 0},
-			want: store.Container{ID: "c", Kind: "channel", ParentID: "g", Name: "#general"}, wantOK: true,
+			want: store.Container{ID: "c", Kind: "channel", ParentID: "guild:g", Name: "#general"}, wantOK: true,
 		},
 		{
 			name: "public thread parents to its channel",
@@ -274,7 +274,7 @@ func TestChannelContainer(t *testing.T) {
 func TestGuildContainers(t *testing.T) {
 	g := &apiGuild{ID: "g", Name: "Club"}
 	gc, ok := guildContainer(g)
-	if want := (store.Container{ID: "g", Kind: "guild", Name: "Club"}); !ok || !reflect.DeepEqual(gc, want) {
+	if want := (store.Container{ID: "guild:g", Kind: "guild", Name: "Club"}); !ok || !reflect.DeepEqual(gc, want) {
 		t.Errorf("guild = %+v, %v; want %+v", gc, ok, want)
 	}
 	if _, ok := guildContainer(&apiGuild{ID: "g", Unavailable: true}); ok {
@@ -289,9 +289,9 @@ func TestGuildContainers(t *testing.T) {
 	// A thread's channel that was not listed is stored by ID, so the thread
 	// still hangs under the guild.
 	want := []store.Container{
-		{ID: "c", Kind: "channel", ParentID: "g", Name: "#general"},
+		{ID: "c", Kind: "channel", ParentID: "guild:g", Name: "#general"},
 		{ID: "t", Kind: "thread", ParentID: "c", Name: "topic"},
-		{ID: "c2", Kind: "channel", ParentID: "g"},
+		{ID: "c2", Kind: "channel", ParentID: "guild:g"},
 		{ID: "t2", Kind: "thread", ParentID: "c2", Name: "elsewhere"},
 	}
 	if got := guildChannelContainers("g", chans); !reflect.DeepEqual(got, want) {

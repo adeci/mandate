@@ -50,7 +50,7 @@ func openStore(ctx context.Context, path string) (*store.Store, error) {
 	}
 	if _, err := st.DB().ExecContext(ctx, spacesSchema); err != nil {
 		st.Close()
-		return nil, fmt.Errorf("create space table: %w", err)
+		return nil, fmt.Errorf("create space tables: %w", err)
 	}
 	return st, nil
 }
