@@ -847,6 +847,20 @@ impl Shell {
                 this.new_key(Next::Add, cx)
             }))
         });
+        // Android may end the stream in the background, and then nothing
+        // that waits reaches the owner: say so while it may.
+        #[cfg(target_os = "android")]
+        let background =
+            (!crate::android::KEPT.load(std::sync::atomic::Ordering::Relaxed)).then(|| {
+                column()
+                    .gap(lines(0.5))
+                    .child(div().text_color(t.danger).child("Requests may not reach you."))
+                    .child(div().flex().child(button(t, "keep", "Keep running", cx, |_, _| {
+                        crate::android::keep_running()
+                    })))
+            });
+        #[cfg(not(target_os = "android"))]
+        let background: Option<Div> = None;
         let lock = clickable("lock", cx, |this, cx| this.set_lock(!this.lock, cx))
             .flex()
             .items_center()
@@ -866,6 +880,7 @@ impl Shell {
             .child(t.heading("How you approve"))
             .child(column().border_2().border_color(t.text).children(methods))
             .children(add_method)
+            .children(background)
             .child(lock)
             .child(t.heading("Never share"))
             .child(if self.hidden.is_empty() {

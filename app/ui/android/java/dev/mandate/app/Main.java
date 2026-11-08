@@ -38,6 +38,9 @@ public final class Main extends NativeActivity {
     /** Whether the phone's clock reads 24-hour. */
     private static native void clock(boolean h24);
 
+    /** Whether Android lets what waits reach the owner while the app is away. */
+    private static native void kept(boolean kept);
+
     /** Whether gpui has started drawing. */
     private static native boolean started();
 
@@ -101,11 +104,15 @@ public final class Main extends NativeActivity {
         open(intent);
     }
 
-    /** Also after Settings, where the owner may have switched 12/24-hour time. */
+    /**
+     * Also after Settings, where the owner may have switched 12/24-hour time,
+     * notifications or battery optimisation.
+     */
     @Override
     protected void onResume() {
         super.onResume();
         clock(DateFormat.is24HourFormat(this));
+        kept(Stream.kept(this));
     }
 
     @Override
@@ -160,10 +167,14 @@ public final class Main extends NativeActivity {
         }
     }
 
-    /** Only Stream.start asks. Its notification, posted before the answer, did not show. */
+    /**
+     * Only Stream.start asks. Its notification, posted before the answer, did
+     * not show. The ask about the background waits for this one.
+     */
     @Override
     public void onRequestPermissionsResult(int code, String[] permissions, int[] results) {
         startForegroundService(new Intent(this, Stream.class));
+        Stream.askOnce(this);
     }
 
     private static void open(Intent intent) {

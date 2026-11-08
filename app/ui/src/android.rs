@@ -650,6 +650,36 @@ pub fn listen() {
     }
 }
 
+/// Whether Android lets what waits reach the owner while the app is away:
+/// notifications on, and no battery optimisation to end the stream. Main
+/// says on every resume.
+pub static KEPT: AtomicBool = AtomicBool::new(true);
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_dev_mandate_app_Main_kept(
+    _: EnvUnowned,
+    _: JClass,
+    kept: jni::sys::jboolean,
+) {
+    let kept = kept == jni::sys::JNI_TRUE;
+    if KEPT.swap(kept, Relaxed) != kept {
+        let _ = OPENED.0.unbounded_send(Opened::Redraw);
+    }
+}
+
+/// Asks Android for what KEPT lacks: notifications, then leave to run in
+/// the background.
+pub fn keep_running() {
+    let asked = java(|env, c| {
+        let activity = activity(env);
+        let sig = jni_sig!("(Landroid/app/Activity;)V");
+        env.call_static_method(&c.stream, jni_str!("keep"), sig, &[(&activity).into()])?.v()
+    });
+    if let Err(e) = asked {
+        log::error!("asking to keep running: {e}");
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "system" fn Java_dev_mandate_app_Stream_run<'a>(
     mut env: EnvUnowned<'a>,

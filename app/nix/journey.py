@@ -262,6 +262,8 @@ with subtest("the app pairs by the setup page's link"):
     # The emulator has a fingerprint, so the app asks how to approve.
     tap("Fingerprint or face")
     finger()
+    # Once paired, the app asks once to run in the background.
+    until("the background question", lambda: press("Allow", "ALLOW"), timeout=60)
     server.wait_until_succeeds("test $(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/setup) = 404")
     server.wait_until_succeeds(
         "setpriv --reuid=60999 --regid=$(getent group mandate-gateway | cut -d: -f3) --clear-groups "
@@ -505,6 +507,25 @@ with subtest("a second way to approve takes over, and the first goes"):
     credential()  # the screen lock's key retires the fingerprint's
     see("Removed")
     gone("Fingerprint or face")
+
+with subtest("an update restarts the stream, which notifies with the app closed"):
+    adb("shell", "input", "keyevent", "KEYCODE_HOME")
+    adb("install", "-r", "-g", apk)  # ends the app's processes
+
+    def streaming() -> bool:
+        services = adb("shell", "dumpsys", "activity", "services", "dev.mandate.app")
+        return "dev.mandate.app/.Stream" in services and "isForeground=true" in services
+
+    until("the stream service in the foreground", streaming, timeout=60)
+    assert adb("shell", "pidof dev.mandate.app || true").strip() == "", "the app itself runs"
+    status, out = agent("request test --chat Family --for 30m --reason 'after the update' --wait 0")
+    assert status == 75, (status, out)
+    until(
+        "the request's notification",
+        lambda: "wants to read" in adb("shell", "dumpsys", "notification", "--noredact"),
+        timeout=60,
+    )
+    assert "dev.mandate.app" not in focus(), focus()
 
 emulator.terminate()
 emulator.wait()

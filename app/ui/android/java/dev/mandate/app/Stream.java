@@ -7,9 +7,14 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.os.IBinder;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.service.notification.StatusBarNotification;
 import java.util.Arrays;
 
@@ -28,15 +33,60 @@ public final class Stream extends Service {
     /** Holds the stream of the device paired in dir, calling show and hide; never returns. */
     private native void run(String dir);
 
-    /** Starts the service, asking first for leave to post notifications. */
+    /**
+     * Starts the service, asking first for leave to post notifications, then
+     * once for leave to run in the background.
+     */
     static void start(Activity activity) {
         activity.runOnUiThread(
                 () -> {
                     String post = Manifest.permission.POST_NOTIFICATIONS;
-                    if (activity.checkSelfPermission(post) != PackageManager.PERMISSION_GRANTED) {
-                        activity.requestPermissions(new String[] {post}, 0);
-                    }
                     activity.startForegroundService(new Intent(activity, Stream.class));
+                    if (activity.checkSelfPermission(post) != PackageManager.PERMISSION_GRANTED) {
+                        // Main asks for the background once this is answered.
+                        activity.requestPermissions(new String[] {post}, 0);
+                    } else {
+                        askOnce(activity);
+                    }
+                });
+    }
+
+    /**
+     * Asks once to leave the stream out of battery optimisation, which some
+     * phones use to end it; Settings asks again while it applies.
+     */
+    static void askOnce(Activity activity) {
+        String asked = "asked-background";
+        SharedPreferences prefs = activity.getSharedPreferences("stream", MODE_PRIVATE);
+        if (!background(activity) && !prefs.getBoolean(asked, false)) {
+            prefs.edit().putBoolean(asked, true).apply();
+            keep(activity);
+        }
+    }
+
+    /** Whether battery optimisation leaves the app alone. */
+    private static boolean background(Context context) {
+        return context.getSystemService(PowerManager.class).isIgnoringBatteryOptimizations(context.getPackageName());
+    }
+
+    /** Whether Android lets what waits reach the owner: notifications on, no battery optimisation. */
+    static boolean kept(Context context) {
+        return context.getSystemService(NotificationManager.class).areNotificationsEnabled() && background(context);
+    }
+
+    /** Asks for what kept lacks: the app's notification settings first, then leave from battery optimisation. */
+    static void keep(Activity activity) {
+        activity.runOnUiThread(
+                () -> {
+                    String pkg = activity.getPackageName();
+                    Intent ask =
+                            activity.getSystemService(NotificationManager.class).areNotificationsEnabled()
+                                    ? new Intent(
+                                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                            Uri.parse("package:" + pkg))
+                                    : new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                                            .putExtra(Settings.EXTRA_APP_PACKAGE, pkg);
+                    activity.startActivity(ask);
                 });
     }
 
