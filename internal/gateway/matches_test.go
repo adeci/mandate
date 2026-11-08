@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/adeci/mandate/connector"
@@ -18,13 +19,13 @@ import (
 // their tests.
 func TestMatchesConnectorChats(t *testing.T) {
 	for name, terms := range map[string]map[string][]string{
-		"discord": {
-			"main general":    {"1100000000000000011"},
-			"main / general":  {"1100000000000000011"},
-			"main / #general": {"1100000000000000011"},
-			"main #general":   {"1100000000000000011"},
-			"general":         {"1100000000000000011", "1200000000000000011"},
-			"main":            {"1100000000000000011", "1100000000000000012"}, // its channels, not the guild
+		"discord": { // main's #general has main's own ID, as in old servers
+			"main general":    {"1100000000000000001"},
+			"main / general":  {"1100000000000000001"},
+			"main / #general": {"1100000000000000001"},
+			"main #general":   {"1100000000000000001"},
+			"general":         {"1100000000000000001", "1200000000000000011"},
+			"main":            {"1100000000000000001", "1100000000000000012"}, // its channels, not the guild
 			"other":           {"1200000000000000011"},
 			"rollout":         {"1100000000000000013"},
 			"sam":             {"1300000000000000001"},
@@ -49,6 +50,7 @@ func TestMatchesConnectorChats(t *testing.T) {
 			"Sam Lee":       {"15550001111@s.whatsapp.net"},
 			"Book club":     {"120363000000000999@g.us"},
 			"Climbing crew": {"120363000000000777@g.us", "120363000000000888@g.us"},
+			"+15550004444":  {"15550004444@s.whatsapp.net"},
 		},
 		"matrix": {
 			"Club / general": {"!general:example.org"},
@@ -60,6 +62,7 @@ func TestMatchesConnectorChats(t *testing.T) {
 			"Farid":  {"1"},
 			"Family": {"3"},
 			"999":    {"2"},
+			"Ana":    {"4"},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -120,6 +123,81 @@ func TestMatchesConnectorChats(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// fixtureView is a connector's fixture store as scope shows it.
+func fixtureView(t *testing.T, name string, scope []rule) *view {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "data.db")
+	st, err := store.Open(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	storetest.Load(t, st, filepath.Join("..", "..", "connectors", name, "testdata", "chats.json"))
+	c := &conn{store: path}
+	t.Cleanup(c.close)
+	db, err := c.storeDB(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := newView(db, neverShared{}, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+// Agents see the names the picker shows: full paths, parents included
+// when only the child is granted, and never a guild or space.
+func TestAgentChatNames(t *testing.T) {
+	listing := func(t *testing.T, v *view, search string) []string {
+		t.Helper()
+		tab, err := v.chats(t.Context(), search, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, r := range tab.Rows {
+			out = append(out, r[0].(string)+" "+r[2].(string))
+		}
+		slices.Sort(out)
+		return out
+	}
+	for _, tc := range []struct {
+		connector string
+		chats     []string // nil: every chat
+		search    string
+		want      []string
+	}{
+		{"discord", []string{"1100000000000000001", "1200000000000000011", "1100000000000000013"}, "", []string{
+			"1100000000000000001 main / #general", "1100000000000000013 main / #releases / v2 rollout", "1200000000000000011 other / #general",
+		}},
+		{"discord", nil, "", []string{
+			"1100000000000000001 main / #general", "1100000000000000012 main / #releases", "1100000000000000013 main / #releases / v2 rollout",
+			"1200000000000000011 other / #general", "1300000000000000001 ~Sam Park", "1300000000000000002 climbing",
+		}},
+		// Search finds what a request's term would.
+		{"discord", nil, "main general", []string{"1100000000000000001 main / #general"}},
+		{"discord", nil, "main", []string{"1100000000000000001 main / #general", "1100000000000000012 main / #releases"}},
+		{"discord", nil, "rollout", []string{"1100000000000000013 main / #releases / v2 rollout"}},
+		{"matrix", []string{"!general:example.org", "!lobby:example.org"}, "", []string{
+			"!general:example.org Club / general", "!lobby:example.org general",
+		}},
+		{"matrix", nil, "Club / general", []string{"!general:example.org Club / general"}},
+		{"fastmail", []string{"mailbox:mb-rec"}, "", []string{"mailbox:mb-rec Inbox / Receipts", "t9 Inbox / Receipts / Your order has shipped"}},
+	} {
+		v := fixtureView(t, tc.connector, []rule{{Chats: tc.chats}})
+		if got := listing(t, v, tc.search); !slices.Equal(got, tc.want) {
+			t.Errorf("%s %v chats %q:\n got %q\nwant %q", tc.connector, tc.chats, tc.search, got, tc.want)
+		}
+	}
+	// mandate access names granted chats the same way.
+	v := fixtureView(t, "discord", []rule{{Chats: []string{"1100000000000000013"}}})
+	names, err := v.names(t.Context(), []string{"1100000000000000013"})
+	if err != nil || names["1100000000000000013"] != "main / #releases / v2 rollout" {
+		t.Errorf("names = %v, %v", names, err)
 	}
 }
 

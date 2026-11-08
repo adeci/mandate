@@ -15,6 +15,10 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -1394,6 +1398,112 @@ func storeChats(t *testing.T, dir string) {
 		{ID: "g1-general", Kind: "channel", Name: "#general", ParentID: "g1"},
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// pictured serves a 96×128 JPEG for any chat with an icon, counting fetches.
+type pictured struct {
+	fakeConnector
+	fetches atomic.Int32
+}
+
+func (p *pictured) Icon(_ context.Context, chat, ref string) (connector.Icon, error) {
+	p.fetches.Add(1)
+	img := image.NewRGBA(image.Rect(0, 0, 96, 128))
+	for y := range 128 {
+		for x := range 96 {
+			img.Set(x, y, color.RGBA{uint8(x * 2), uint8(y), 200, 255})
+		}
+	}
+	var b bytes.Buffer
+	if err := jpeg.Encode(&b, img, nil); err != nil {
+		return connector.Icon{}, err
+	}
+	return connector.Icon{Type: "image/jpeg", Body: b.Bytes()}, nil
+}
+
+func TestChatPictures(t *testing.T) {
+	dir := t.TempDir()
+	storeChats(t, dir)
+	st, err := store.Open(t.Context(), filepath.Join(dir, "data.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertContainer(t.Context(), store.Container{ID: "c3", Kind: "group", Icon: "hash-1"}); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	p := &pictured{}
+	h := start(t, serveConnector(t, p, dir))
+	owner := h.pair()
+
+	// The listing gives a picture's version, which tells nothing of its ref.
+	var chats []connector.Container
+	h.do("GET", "/owner/v1/connectors/test/chats", owner.token, nil, &chats)
+	versions := map[string]string{}
+	for _, c := range chats {
+		versions[c.ID] = c.Icon
+	}
+	v := versions["c3"]
+	if len(v) != 12 || strings.Contains(v, "hash") || versions["d1"] != "" {
+		t.Fatalf("icon versions = %v", versions)
+	}
+	get := func(chat, version string) (int, http.Header, []byte) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, "http://owner/owner/v1/connectors/test/icon?chat="+chat+"&v="+version, nil)
+		req.Header.Set("Authorization", "Bearer "+owner.token)
+		resp, err := h.http.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header, b
+	}
+	for range 2 {
+		st, hd, b := get("c3", v)
+		img, err := png.Decode(bytes.NewReader(b))
+		if st != http.StatusOK || err != nil || img.Bounds() != image.Rect(0, 0, 64, 64) ||
+			hd.Get("Cache-Control") != "private, max-age=31536000, immutable" {
+			t.Fatalf("icon = %d %v %v %v", st, hd, err, img)
+		}
+	}
+	if n := p.fetches.Load(); n != 1 {
+		t.Errorf("fetched %d times; the second came from the cache", n)
+	}
+	// A listing older than the picture still gets it, though not for keeps.
+	if st, hd, _ := get("c3", "0123456789ab"); st != http.StatusOK || hd.Get("Cache-Control") != "no-store" {
+		t.Errorf("an old version = %d %v", st, hd)
+	}
+	if st, _, _ := get("d1", "0123456789ab"); st != http.StatusNotFound {
+		t.Errorf("a chat without a picture = %d", st)
+	}
+	if st, _, _ := get("c3", "../x"); st != http.StatusBadRequest {
+		t.Errorf("a bad version = %d", st)
+	}
+}
+
+func TestIconPNG(t *testing.T) {
+	var b bytes.Buffer
+	if err := png.Encode(&b, image.NewGray(image.Rect(0, 0, 4096, 10))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := iconPNG(b.Bytes()); err == nil {
+		t.Error("a 4096 px picture was decoded")
+	}
+	if _, err := iconPNG([]byte("<svg/>")); err == nil {
+		t.Error("an SVG was taken")
+	}
+	b.Reset()
+	if err := png.Encode(&b, image.NewGray(image.Rect(0, 0, 10, 20))); err != nil {
+		t.Fatal(err)
+	}
+	out, err := iconPNG(b.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if img, err := png.Decode(bytes.NewReader(out)); err != nil || img.Bounds() != image.Rect(0, 0, 64, 64) {
+		t.Errorf("a small picture made %v, %v", img, err)
 	}
 }
 

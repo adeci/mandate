@@ -396,6 +396,23 @@ in
         # Reads the gateway batched may land after it.
         assert [k for k in kinds if k != "read"][0] == "stop_all" and "request.asked" in kinds and "request.approved" in kinds and "read" in kinds, kinds
 
+    with subtest("chat pictures reach the app through the owner side, as 64 px PNGs, and never agents"):
+        chats = {c["id"]: c for c in call("GET", "/owner/v1/connectors/test/chats")["body"]}
+        v = chats["club"]["icon"]
+        assert re.fullmatch(r"[0-9a-f]{12}", v) and "icon" not in chats["fam"], chats
+        token = json.loads(server.succeed("cat /root/phone.json"))["token"]
+        status = server.succeed(
+            f"curl -sk -H 'Authorization: Bearer {token}' -o /tmp/icon.png -w '%{{http_code}} %{{content_type}}'"
+            f" 'https://localhost:8443/owner/v1/connectors/test/icon?chat=club&v={v}'"
+        )
+        assert status == "200 image/png", status
+        png = base64.b64decode(server.succeed("base64 -w0 /tmp/icon.png"))
+        assert png[:8] == b"\x89PNG\r\n\x1a\n" and png[16:24] == (64).to_bytes(4, "big") * 2, png[:24]
+        code, _ = as_group("mandate-gateway", "/run/mandate/connectors/test/socket", "GET", "/icon?chat=club")
+        assert code == 403, code
+        status, out = agent("test chats")
+        assert "icon" not in out and v not in out, out
+
     with subtest("callers are told apart by their group"):
         for path in ["/internal/live", "/internal/requests", "/index.html"]:
             code = server.succeed(f"curl -sk -o /dev/null -w '%{{http_code}}' https://localhost:8443{path}")

@@ -5,7 +5,7 @@ account). mandate talks to it over HTTP on a Unix socket and reads the
 messages it stores from a SQLite file. Any language works; Go connectors get
 all of this from `connector.Main`.
 
-Protocol version 1, store schema version 1.
+Protocol version 1, store schema version 2.
 
 ## Process
 
@@ -45,7 +45,7 @@ approvals. The connector reads the caller's primary group from the socket
 |---|---|---|
 | `GET /spec`, `GET /health`, `GET /keys`, `POST /prepare` | ✓ | ✓ |
 | `POST /read`, `POST /media` | ✓ | |
-| `POST /setup`, `POST /unlink`, `POST /execute`, `PUT /keys`, `GET /containers` | | ✓ |
+| `POST /setup`, `POST /unlink`, `POST /execute`, `PUT /keys`, `GET /containers`, `GET /icon` | | ✓ |
 
 Bodies are JSON, at most 1 MiB; times are RFC 3339 UTC. A refusal is a
 non-2xx status with `{"error": "…"}`, written for the agent and naming only
@@ -91,8 +91,10 @@ content.
 ## Store
 
 The connector alone writes `data.db`; mandate opens it read-only and filters
-every read. The connector sets `PRAGMA user_version = 1`, migrates its own
-store in place on upgrade, and mandate reads only the current version. A
+every read. The connector sets `PRAGMA user_version = 2`, migrates its own
+store in place on upgrade, and mandate reads only the current version.
+Version 2 added `containers.icon` (`ALTER TABLE containers ADD COLUMN icon
+TEXT`). A
 connector may add its own tables, prefixed with the program's name
 (`whatsapp_identity_changes`); mandate ignores them, but the gateway can
 read them, so they hold nothing secret.
@@ -106,7 +108,8 @@ CREATE TABLE containers (
     is_group          INTEGER NOT NULL DEFAULT 0,
     participants_json TEXT NOT NULL DEFAULT '[]',  -- [{"id": "…", "name": "…"}]
     updated_at        TEXT NOT NULL,
-    last_message_at   TEXT              -- last activity the service reported
+    last_message_at   TEXT,             -- last activity the service reported
+    icon              TEXT              -- the service's handle for the chat's picture; never leaves the connector
 );
 
 CREATE TABLE messages (
@@ -142,6 +145,8 @@ CREATE TABLE media (
 
 - Times are `2026-11-02T14:05:09.000Z`, so they compare as text.
 - IDs are the service's and stable; a chat ID is what `container` params take.
+  Where the service gives two chats one ID (a Discord server and its first
+  channel), one gets a prefix (`guild:`, `mailbox:`).
 - `parent_id` chains are acyclic and at most three deep; deeper chats are
   invisible to agents.
 - A grant covers exactly the chats it names, never chats under them, except
@@ -275,11 +280,22 @@ chat picker, so the owner side never opens the store:
 ```
 
 `participants` is set for `dm` chats only, from `participants_json`.
+`icon` is the version of the chat's picture, a short hash of `icon`'s ref
+that changes with it; absent when the chat has none.
 `parent_name` is the parent's path, the chat's own being `parent_name / name`.
 
 `q` finds chats as an agent's request term does
 ([agent-api.md](agent-api.md#access)), `parent` lists a chat's children,
 `limit` is at most 500.
+
+## Pictures
+
+`GET /icon?chat=ID` (owner only) answers the chat's picture, fetched from the
+service as its stored `icon` names it: PNG or JPEG of at most 64 KiB, about
+64 px, with its version in `Mandate-Icon`. A chat without a picture, or a
+connector without pictures, is `404`; past two at once, `429`. A DM's
+picture is its person's. Agents never get pictures. Go connectors implement
+`IconFetcher`.
 
 ## Conformance kit
 

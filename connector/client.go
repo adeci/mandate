@@ -99,6 +99,27 @@ func (c *Client) Media(ctx context.Context, message string, index int, limit int
 	return resp, nil
 }
 
+// Icon fetches a chat's picture and its version; a chat without one is a 404
+// *Error.
+func (c *Client) Icon(ctx context.Context, chat string) (Icon, string, error) {
+	resp, err := c.send(ctx, http.MethodGet, "/icon?"+url.Values{"chat": {chat}}.Encode(), nil)
+	if err != nil {
+		return Icon{}, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return Icon{}, "", refusal(resp)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, MaxIcon+1))
+	if err != nil {
+		return Icon{}, "", fmt.Errorf("connector %s: read the picture: %w", c.name, err)
+	}
+	if len(b) > MaxIcon {
+		return Icon{}, "", fmt.Errorf("connector %s: the picture is larger than %d bytes", c.name, MaxIcon)
+	}
+	return Icon{Type: resp.Header.Get("Content-Type"), Body: b}, resp.Header.Get("Mandate-Icon"), nil
+}
+
 func (c *Client) Setup(ctx context.Context, step string, values map[string]string) (Step, error) {
 	var s Step
 	err := c.do(ctx, http.MethodPost, "/setup", setupRequest{Step: step, Values: values}, &s)

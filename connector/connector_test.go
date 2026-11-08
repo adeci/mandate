@@ -120,6 +120,7 @@ func TestCallerClasses(t *testing.T) {
 		{"POST", "/execute", ow},
 		{"PUT", "/keys", ow},
 		{"GET", "/containers", ow},
+		{"GET", "/icon", ow},
 	}
 	for _, caller := range []struct {
 		name           string

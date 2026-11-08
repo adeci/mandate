@@ -19,8 +19,9 @@ import (
 	"github.com/ncruces/go-sqlite3/driver"
 )
 
-// Version is the schema version in PRAGMA user_version.
-const Version = 1
+// Version is the schema version in PRAGMA user_version. Version 2 added
+// containers.icon.
+const Version = 2
 
 //go:embed schema.sql
 var schema string
@@ -40,6 +41,10 @@ type Container struct {
 	// LastMessageAt is the newest activity the service reports, which may be
 	// newer than any stored message. Zero or an older time keeps the stored value.
 	LastMessageAt time.Time
+	// Icon is what the connector needs to fetch the chat's picture, such as
+	// a hash or a URI; a DM's is its person's. Agents never see it. Empty
+	// keeps the stored one.
+	Icon string
 }
 
 // Body holds raw text; the gateway, not the store, decides what clients may see.
@@ -101,6 +106,9 @@ func Open(ctx context.Context, path string) (*Store, error) {
 
 // migrate brings the store to Version. Stores from before versioning have
 // user_version 0 and already hold the version 1 tables.
+//
+// Each step adds columns at the end of their table, so a migrated store has
+// the columns of a new one, in the same order.
 func migrate(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -125,6 +133,18 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	if tables == 0 {
 		if _, err := tx.ExecContext(ctx, schema); err != nil {
 			return fmt.Errorf("create tables: %w", err)
+		}
+	} else if v < 2 {
+		// An unversioned store may be any version's; add icon unless it has it.
+		var has int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT count(*) FROM pragma_table_info('containers') WHERE name = 'icon'`).Scan(&has); err != nil {
+			return err
+		}
+		if has == 0 {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE containers ADD COLUMN icon TEXT`); err != nil {
+				return fmt.Errorf("add containers.icon: %w", err)
+			}
 		}
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, Version)); err != nil {
@@ -157,7 +177,7 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) DB() *sql.DB { return s.db }
 
-// Empty Name/ParentID and nil Participants do not overwrite existing values.
+// Empty Name/ParentID/Icon and nil Participants do not overwrite existing values.
 func (s *Store) UpsertContainer(ctx context.Context, c Container) error {
 	return upsertContainer(ctx, s.db, c)
 }
@@ -184,6 +204,9 @@ func upsertContainer(ctx context.Context, db interface {
 	if c.ID == "" || c.Kind == "" {
 		return errors.New("store: container id and kind are required")
 	}
+	if c.ParentID == c.ID {
+		return fmt.Errorf("store: chat %s cannot be its own parent", c.ID)
+	}
 	var participants any
 	if c.Participants != nil {
 		b, err := json.Marshal(c.Participants)
@@ -197,8 +220,8 @@ func upsertContainer(ctx context.Context, db interface {
 		lastMessageAt = formatTime(c.LastMessageAt)
 	}
 	_, err := db.ExecContext(ctx, `
-INSERT INTO containers (id, kind, parent_id, name, is_group, participants_json, updated_at, last_message_at)
-VALUES (?1, ?2, NULLIF(?3, ''), NULLIF(?4, ''), ?5, COALESCE(?6, '[]'), ?7, ?8)
+INSERT INTO containers (id, kind, parent_id, name, is_group, participants_json, updated_at, last_message_at, icon)
+VALUES (?1, ?2, NULLIF(?3, ''), NULLIF(?4, ''), ?5, COALESCE(?6, '[]'), ?7, ?8, NULLIF(?9, ''))
 ON CONFLICT(id) DO UPDATE SET
     kind              = excluded.kind,
     parent_id         = COALESCE(excluded.parent_id, containers.parent_id),
@@ -206,8 +229,9 @@ ON CONFLICT(id) DO UPDATE SET
     is_group          = excluded.is_group,
     participants_json = COALESCE(?6, containers.participants_json),
     updated_at        = excluded.updated_at,
-    last_message_at   = NULLIF(max(COALESCE(?8, ''), COALESCE(containers.last_message_at, '')), '')`,
-		c.ID, c.Kind, c.ParentID, c.Name, c.IsGroup, participants, now(), lastMessageAt)
+    last_message_at   = NULLIF(max(COALESCE(?8, ''), COALESCE(containers.last_message_at, '')), ''),
+    icon              = COALESCE(excluded.icon, containers.icon)`,
+		c.ID, c.Kind, c.ParentID, c.Name, c.IsGroup, participants, now(), lastMessageAt, c.Icon)
 	return err
 }
 

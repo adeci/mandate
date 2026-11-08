@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -91,16 +92,33 @@ func TestUpsertMessageLifecycle(t *testing.T) {
 	}
 }
 
-// A store written before versioning has user_version 0 and the same tables.
-// The gateway refuses it until the connector has migrated it, and the
-// connector keeps its messages.
+// A chat is never its own parent: the gateway would follow the cycle.
+func TestSelfParentRefused(t *testing.T) {
+	t.Parallel()
+	s := open(t)
+	if err := s.UpsertContainer(t.Context(), Container{ID: "c", Kind: "channel", ParentID: "c"}); err == nil {
+		t.Fatal("stored a chat as its own parent")
+	}
+}
+
+// schemaV1 is the tables of version 1, before containers.icon.
+var schemaV1 = func() string {
+	icon := strings.Index(schema, "\n    icon ")
+	comma := strings.LastIndex(schema[:icon], ",")
+	end := icon + strings.Index(schema[icon:], "\n);")
+	return schema[:comma] + schema[comma+1:icon] + schema[end:]
+}()
+
+// A store written before versioning has user_version 0 and the version 1
+// tables. The gateway refuses it until the connector has migrated it, and
+// the connector keeps its messages.
 func TestMigrateUnversionedStore(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "data.db")
 	old, err := sql.Open("sqlite3", "file:"+path)
 	must(t, err)
-	_, err = old.ExecContext(ctx, schema+`
+	_, err = old.ExecContext(ctx, schemaV1+`
 INSERT INTO containers (id, kind, updated_at) VALUES ('c1', 'dm', '2026-10-01T12:00:00.000Z');
 INSERT INTO messages (id, container_id, sent_at, body, ingested_at)
 VALUES ('m1', 'c1', '2026-10-01T12:00:00.000Z', 'hi', '2026-10-01T12:00:01.000Z');`)
@@ -133,5 +151,63 @@ VALUES ('m1', 'c1', '2026-10-01T12:00:00.000Z', 'hi', '2026-10-01T12:00:01.000Z'
 	must(t, db.QueryRowContext(ctx, `SELECT group_concat(body, ',') FROM (SELECT body FROM messages ORDER BY seq)`).Scan(&bodies))
 	if bodies != "hi,after" {
 		t.Fatalf("messages after migration = %q, want hi,after", bodies)
+	}
+}
+
+// An unversioned store made from the current tables migrates too.
+func TestMigrateUnversionedCurrent(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "data.db")
+	old, err := sql.Open("sqlite3", "file:"+path)
+	must(t, err)
+	_, err = old.ExecContext(ctx, schema)
+	must(t, err)
+	must(t, old.Close())
+	s, err := Open(ctx, path)
+	must(t, err)
+	must(t, s.Close())
+}
+
+// Version 1 gains containers.icon at the end, as a new store has it, and an
+// icon is kept until another replaces it.
+func TestMigrateIcon(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.db")
+	old, err := sql.Open("sqlite3", "file:"+path)
+	must(t, err)
+	_, err = old.ExecContext(ctx, schemaV1+`PRAGMA user_version = 1;
+INSERT INTO containers (id, kind, updated_at) VALUES ('c1', 'group', '2026-10-01T12:00:00.000Z');`)
+	must(t, err)
+	must(t, old.Close())
+	s, err := Open(ctx, path)
+	must(t, err)
+	defer s.Close()
+	fresh, err := Open(ctx, filepath.Join(dir, "fresh.db"))
+	must(t, err)
+	defer fresh.Close()
+	columns := func(db *sql.DB) string {
+		var c string
+		must(t, db.QueryRowContext(ctx, `SELECT group_concat(name || ' ' || type, ', ') FROM pragma_table_info('containers')`).Scan(&c))
+		return c
+	}
+	if got, want := columns(s.DB()), columns(fresh.DB()); got != want {
+		t.Fatalf("migrated columns %s, new %s", got, want)
+	}
+	icon := func() string {
+		var v sql.NullString
+		must(t, s.DB().QueryRowContext(ctx, `SELECT icon FROM containers WHERE id = 'c1'`).Scan(&v))
+		return v.String
+	}
+	must(t, s.UpsertContainer(ctx, Container{ID: "c1", Kind: "group", Icon: "a1b2"}))
+	must(t, s.UpsertContainer(ctx, Container{ID: "c1", Kind: "group", Name: "Club"}))
+	if got := icon(); got != "a1b2" {
+		t.Fatalf("icon after an upsert without one = %q", got)
+	}
+	must(t, s.UpsertContainer(ctx, Container{ID: "c1", Kind: "group", Icon: "c3d4"}))
+	if got := icon(); got != "c3d4" {
+		t.Fatalf("icon = %q", got)
 	}
 }

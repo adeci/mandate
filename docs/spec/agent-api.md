@@ -201,7 +201,11 @@ Reads answer a table:
 
 `{c}` is `/agent/v1/{connector}`; `*` marks required parameters.
 
-- `chats` lists chats with activity at or after their cutoff, newest first.
+- `chats` lists chats with activity at or after their cutoff, newest first,
+  never guilds, spaces or categories. `search` finds chats as a request's
+  term does (Access), in that order.
+- A chat's `name`, in `chats`, `search` and `access`, is its path,
+  `main / #general`, even where the grant covers only the chat.
 - `messages` and `search` page by `(sent_at, seq)`, newest first.
 - `media` streams the file with `Content-Type`, `Content-Length` and
   `Content-Disposition`.

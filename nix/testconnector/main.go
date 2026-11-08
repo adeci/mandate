@@ -8,9 +8,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -91,6 +96,23 @@ func seed(ctx context.Context, st *store.Store, shape string, now time.Time) err
 		}
 	}
 	return nil
+}
+
+// Icon draws the picture its ref names: a gradient whose colour comes from
+// the ref, 96×128, as a JPEG, as services send them.
+func (f *fake) Icon(_ context.Context, _, ref string) (connector.Icon, error) {
+	h := sha256.Sum256([]byte(ref))
+	img := image.NewRGBA(image.Rect(0, 0, 96, 128))
+	for y := range 128 {
+		for x := range 96 {
+			img.Set(x, y, color.RGBA{h[0] ^ uint8(x), h[1] ^ uint8(y), h[2], 255})
+		}
+	}
+	var b bytes.Buffer
+	if err := jpeg.Encode(&b, img, nil); err != nil {
+		return connector.Icon{}, err
+	}
+	return connector.Icon{Type: "image/jpeg", Body: b.Bytes()}, nil
 }
 
 func (f *fake) Spec() connector.Spec {

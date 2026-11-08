@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 
 	"github.com/adeci/mandate/store"
 )
@@ -25,8 +24,14 @@ import (
 // wrote in them. The unary + keeps SQLite driving both lookups from the
 // hidden people.
 //
-// Three ancestors are joined by primary key, far cheaper than a recursive
-// walk per query; a deeper chain is left out, so every ancestor is checked.
+// A chat's name is its path, its parents' names and its own ("main /
+// #general"), whatever the grant covers: names are not content, and the
+// path tells twins apart. Three ancestors are joined by primary key, far
+// cheaper than a recursive walk per query; a deeper chain is left out, so
+// every ancestor is checked.
+//
+// Discord guilds were stored under their bare snowflake before they became
+// guild:ID, so a never-share entry made then names the guild that way.
 //
 // The login-code check reads file names too, as senders name a file after
 // the code; deleted bodies stay in the store for restore and never show.
@@ -34,6 +39,7 @@ const filter = `WITH
 hidden_person(id) AS (SELECT value FROM json_each(?2)),
 hidden(id) AS (
   SELECT value FROM json_each(?1)
+  UNION SELECT 'guild:' || value FROM json_each(?1)
   UNION SELECT id FROM hidden_person
   UNION SELECT c.id FROM hidden_person AS s CROSS JOIN containers AS c CROSS JOIN json_each(c.participants_json) AS p
     WHERE +c.kind = 'dm' AND p.value ->> 'id' = s.id
@@ -41,15 +47,10 @@ hidden(id) AS (
     WHERE sender_id IN (SELECT id FROM hidden_person) AND NOT is_from_me
       AND +container_id IN (SELECT id FROM containers WHERE kind = 'dm')),
 rule(cutoff, until, chats) AS (SELECT value ->> 'cutoff', COALESCE(value ->> 'until', ''), value ->> 'chats' FROM json_each(?3)),
-granted(id) AS (SELECT k.value FROM rule AS g CROSS JOIN json_each(g.chats) AS k WHERE g.chats IS NOT NULL),
-every(yes) AS (SELECT EXISTS (SELECT 1 FROM rule WHERE chats IS NULL)),
 named AS (
   SELECT c.id, c.kind, c.parent_id, c.last_message_at, c.name AS own,
          iif(p1.kind = 'mailbox' AND c.kind != 'mailbox', p1.id, NULL) AS mailbox,
-         concat_ws(' / ',
-           iif(p3.id IN (SELECT id FROM granted) OR (SELECT yes FROM every), p3.name, NULL),
-           iif(p2.id IN (SELECT id FROM granted) OR (SELECT yes FROM every), p2.name, NULL),
-           iif(p1.id IN (SELECT id FROM granted) OR (SELECT yes FROM every), p1.name, NULL)) AS prefix
+         concat_ws(' / ', p3.name, p2.name, p1.name) AS prefix
   FROM containers AS c
   LEFT JOIN containers AS p1 ON p1.id = c.parent_id
   LEFT JOIN containers AS p2 ON p2.id = p1.parent_id
@@ -268,14 +269,28 @@ const listed = `, listed AS MATERIALIZED (
   WHERE cutoff = '' OR at >= cutoff)
 `
 
-// matching is whether chat l matches term t: its name, unless that reads as
-// a login code, or its ID, ignoring case.
-const matching = `(instr(lower(iif(l.name_code, '', COALESCE(l.name, ''))), lower(%[1]s)) OR instr(lower(l.id), lower(%[1]s)))`
-
+// chats lists the chats an agent may read, newest first, or those search
+// finds as a request's term would, in that order. Guilds, spaces and
+// categories hold nothing to read, so they are left out.
 func (v *view) chats(ctx context.Context, search string, limit int64) (*table, error) {
-	rows, err := v.query(ctx, listed+`SELECT id, kind, name, strftime('%Y-%m-%d %H:%M', at) FROM listed AS l
-WHERE ?4 = '' OR `+fmt.Sprintf(matching, "?4")+`
-ORDER BY at DESC NULLS LAST, id LIMIT ?5`, search, limit+1)
+	if search == "" {
+		rows, err := v.query(ctx, listed+`SELECT id, kind, name, strftime('%Y-%m-%d %H:%M', at) FROM listed
+WHERE kind NOT IN `+store.HolderKinds+`
+ORDER BY at DESC NULLS LAST, id LIMIT ?4`, limit+1)
+		if err != nil {
+			return nil, err
+		}
+		return page(&table{Columns: chatColumns}, rows, limit, -1), nil
+	}
+	ts, err := store.Terms([]string{search})
+	if err != nil {
+		return nil, err
+	}
+	rows, err := v.query(ctx, listed+`, candidates AS (
+  SELECT id, kind, parent_id, own, iif(name_code, '', name) AS path, at FROM listed),
+`+store.Matching("?4")+`
+SELECT l.id, l.kind, l.name, strftime('%Y-%m-%d %H:%M', l.at) FROM matched AS m JOIN listed AS l ON l.id = m.id
+ORDER BY m.n LIMIT ?5`, ts, limit+1)
 	if err != nil {
 		return nil, err
 	}

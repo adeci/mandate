@@ -20,7 +20,7 @@ Every process runs as a systemd dynamic user (`DynamicUser=yes`), so there are n
 |---|---|---|---|
 | front | `mandate-front` | `/var/lib/mandate/front` (own TLS key, ACME cache) | listens on the one TCP port |
 | gateway | `mandate-gateway` | `/var/lib/mandate/gateway` (live identities and grants, key log copy) | `/run/mandate/gateway/socket` |
-| owner | `mandate-owner` | `/var/lib/mandate/owner` (key log, records, device tokens, never-share, requests, proposals, activity) | `/run/mandate/owner/socket` |
+| owner | `mandate-owner` | `/var/lib/mandate/owner` (key log, records, device tokens, never-share, requests, proposals, activity, cached chat pictures) | `/run/mandate/owner/socket` |
 | connector NAME | dynamic, its own | `/var/lib/mandate/connectors/NAME` (`data.db`, `private/`) | `/run/mandate/connectors/NAME/socket` |
 
 So a server has three fixed groups and no fixed users.

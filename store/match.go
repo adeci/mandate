@@ -29,6 +29,11 @@ func Terms(terms []string) (string, error) {
 	return string(b), err
 }
 
+// HolderKinds, as a SQL list, are the kinds of chat that hold other chats
+// and no messages of their own: guilds, spaces and categories. A grant on
+// one covers nothing under it, and agents never see them listed.
+const HolderKinds = `('guild', 'space', 'category')`
+
 // Matching is how a search term finds chats, for an agent's request and
 // the owner's chat picker alike. It continues a WITH clause that defines
 // candidates(id, kind, parent_id, own, path, at): each chat with its own
@@ -75,5 +80,5 @@ picked AS (
   WHERE l.kind NOT IN %[2]s),
 matched(k, id, n) AS (
   SELECT k, id, row_number() OVER (PARTITION BY k ORDER BY same_id DESC, own DESC, at DESC NULLS LAST, id) FROM picked)`,
-		termsJSON, `('guild', 'space', 'category')`)
+		termsJSON, HolderKinds)
 }

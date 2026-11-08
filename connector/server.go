@@ -3,7 +3,9 @@ package connector
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,6 +45,7 @@ type Server struct {
 
 	executing sync.WaitGroup
 	fetching  atomic.Int32
+	icons     atomic.Int32 // pictures fetching
 }
 
 // NewServer serves c under name, with its state in dir, where dir/private
@@ -103,6 +106,7 @@ func (s *Server) handler() http.Handler {
 	route("POST /execute", []uint32{s.owner}, s.execute)
 	route("PUT /keys", []uint32{s.owner}, s.putKeys)
 	route("GET /containers", []uint32{s.owner}, s.containers)
+	route("GET /icon", []uint32{s.owner}, s.icon)
 	return mux
 }
 
@@ -337,6 +341,83 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// icon serves a chat's picture, fetched from the service as its stored icon
+// names: 404 for a chat without one. The answer names the picture's
+// version in Mandate-Icon, as the listing does.
+func (s *Server) icon(w http.ResponseWriter, r *http.Request) {
+	f, ok := s.c.(IconFetcher)
+	if !ok {
+		writeError(w, &Error{Status: http.StatusNotFound, Message: "this connector serves no pictures"})
+		return
+	}
+	chat := r.URL.Query().Get("chat")
+	if chat == "" {
+		writeError(w, Invalid("a chat is required"))
+		return
+	}
+	ref, err := s.iconRef(r.Context(), chat)
+	if err != nil {
+		writeError(w, fmt.Errorf("read the chat's icon: %w", err))
+		return
+	}
+	if ref == "" {
+		writeError(w, &Error{Status: http.StatusNotFound, Message: "the chat has no picture"})
+		return
+	}
+	if s.icons.Add(1) > maxFetches {
+		s.icons.Add(-1)
+		writeError(w, &Error{Status: http.StatusTooManyRequests, Message: "other pictures are downloading", RetryAfter: 1})
+		return
+	}
+	defer s.icons.Add(-1)
+	ic, err := f.Icon(r.Context(), chat, ref)
+	switch {
+	case err != nil:
+		writeError(w, err)
+		return
+	case ic.Type != "image/png" && ic.Type != "image/jpeg":
+		writeError(w, fmt.Errorf("the picture is %q, not PNG or JPEG", ic.Type))
+		return
+	case len(ic.Body) > MaxIcon:
+		writeError(w, fmt.Errorf("the picture is larger than %d bytes", MaxIcon))
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", ic.Type)
+	h.Set("Content-Length", strconv.Itoa(len(ic.Body)))
+	h.Set("Mandate-Icon", iconVersion(ref))
+	_, _ = w.Write(ic.Body)
+}
+
+// iconRef is the chat's stored icon, "" for none.
+func (s *Server) iconRef(ctx context.Context, chat string) (string, error) {
+	path := filepath.Join(s.dir, "data.db")
+	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	db, err := store.OpenReadOnly(ctx, path, nil)
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	var ref sql.NullString
+	err = db.QueryRowContext(ctx, `SELECT icon FROM containers WHERE id = ?1`, chat).Scan(&ref)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return ref.String, err
+}
+
+// iconVersion is a short hash of an icon ref: it changes with the picture
+// and tells nothing of the ref, which never leaves the connector.
+func iconVersion(ref string) string {
+	if ref == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(ref))
+	return hex.EncodeToString(h[:6])
+}
+
 // Container is a stored chat as GET /containers lists it.
 type Container struct {
 	ID       string `json:"id"`
@@ -349,6 +430,9 @@ type Container struct {
 	LastActivity time.Time `json:"last_activity,omitzero"`
 	// Participants is set for DMs only.
 	Participants []store.Participant `json:"participants,omitempty"`
+	// Icon is the version of the chat's picture, for GET /icon; absent when
+	// it has none.
+	Icon string `json:"icon,omitempty"`
 }
 
 const maxContainers = 500
@@ -398,7 +482,7 @@ func (s *Server) listContainers(ctx context.Context, q, parent string, limit int
 		return nil, err
 	}
 	defer db.Close()
-	const columns = `SELECT c.id, c.kind, COALESCE(c.parent_id, ''), COALESCE(c.name, ''), cand.parent_path, c.participants_json, cand.at`
+	const columns = `SELECT c.id, c.kind, COALESCE(c.parent_id, ''), COALESCE(c.name, ''), cand.parent_path, c.participants_json, cand.at, COALESCE(c.icon, '')`
 	query := pickerChats + `
 ` + columns + ` FROM candidates AS cand JOIN containers AS c ON c.id = cand.id
 WHERE ?2 = '' OR c.parent_id = ?2
@@ -423,10 +507,12 @@ ORDER BY m.n LIMIT ?3`
 			c      Container
 			parts  string
 			active sql.NullString
+			ref    string
 		)
-		if err := rs.Scan(&c.ID, &c.Kind, &c.ParentID, &c.Name, &c.ParentName, &parts, &active); err != nil {
+		if err := rs.Scan(&c.ID, &c.Kind, &c.ParentID, &c.Name, &c.ParentName, &parts, &active, &ref); err != nil {
 			return nil, err
 		}
+		c.Icon = iconVersion(ref)
 		if c.Kind == "dm" {
 			if err := json.Unmarshal([]byte(parts), &c.Participants); err != nil {
 				return nil, fmt.Errorf("participants of chat %s: %w", c.ID, err)

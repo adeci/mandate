@@ -459,6 +459,27 @@ func TestNeverShare(t *testing.T) {
 	}
 }
 
+// Never-share entries made while Discord stored a guild under its bare ID
+// still hide it as guild:ID, and its channels.
+func TestNeverShareOldGuildID(t *testing.T) {
+	e := newEnv(t, self(), self())
+	for _, c := range []store.Container{
+		{ID: "guild:9", Kind: "guild", Name: "Club"},
+		{ID: "c9", Kind: "channel", Name: "#general", ParentID: "guild:9"},
+	} {
+		if err := e.conn.st.UpsertContainer(t.Context(), c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.conn.st.UpsertMessage(t.Context(), store.Message{ID: "c9-m", ContainerID: "c9", SentAt: time.Now().Add(-time.Hour), Body: "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	e.push([]record.Envelope{e.grant(e.phone, nil, 0, -time.Hour, time.Hour)}, neverShare{Connector: "chat", Kind: "chat", ID: "9"})
+	if s, _ := e.rows("/agent/v1/chat/messages?chat=c9"); s != http.StatusNotFound {
+		t.Errorf("channel of a guild never shared by its old ID: %d", s)
+	}
+}
+
 func TestLoginCodesHidden(t *testing.T) {
 	e := newEnv(t, self(), self())
 	e.push([]record.Envelope{e.grant(e.phone, []string{"fam"}, 0, -time.Hour, time.Hour)})

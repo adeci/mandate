@@ -84,6 +84,7 @@ type Server struct {
 	stop     context.CancelFunc
 
 	names chatNames
+	icons icons
 
 	// certVerified: the TLS certificate chains to a CA (mode acme or cert),
 	// so the app checks it and people compare no key.
@@ -219,6 +220,7 @@ func (s *Server) handler(front, gateway uint32) http.Handler {
 	authed("POST /owner/v1/connectors/{name}/setup", s.connectorSetup)
 	authed("POST /owner/v1/connectors/{name}/unlink", s.connectorUnlink)
 	authed("GET /owner/v1/connectors/{name}/chats", s.connectorChats)
+	authed("GET /owner/v1/connectors/{name}/icon", s.connectorIcon)
 	authed("GET /owner/v1/never-share", s.listNeverShare)
 	authed("PUT /owner/v1/never-share/{connector}/{kind}/{id}", s.editNeverShare)
 	authed("DELETE /owner/v1/never-share/{connector}/{kind}/{id}", s.editNeverShare)

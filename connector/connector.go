@@ -43,6 +43,22 @@ type MediaFetcher interface {
 	Media(ctx context.Context, message string, index int, limit int64) (MediaFile, error)
 }
 
+// IconFetcher is a connector that serves chats' pictures: the one ref names,
+// as stored in the chat's icon, small, about 64 px, as PNG or JPEG of at
+// most MaxIcon bytes.
+type IconFetcher interface {
+	Icon(ctx context.Context, chat, ref string) (Icon, error)
+}
+
+// Icon is a chat's picture.
+type Icon struct {
+	Type string // image/png or image/jpeg
+	Body []byte
+}
+
+// MaxIcon bounds a picture's bytes.
+const MaxIcon = 64 << 10
+
 // Unlinker is a connector that can forget its session and credentials,
 // keeping stored messages; its health is then NeedsSetup.
 type Unlinker interface {
