@@ -25,6 +25,19 @@ const POLL: u64 = 60;
 const STREAM: Wait = Wait::Idle(Duration::from_secs(65));
 /// A stream event's data; the server's are far smaller.
 const MAX_EVENT: usize = 64 << 10;
+/// A chat's picture: a 64 px PNG is far smaller.
+const MAX_PICTURE: u64 = 256 << 10;
+
+/// A chat's picture from the owner API.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Picture {
+    /// The PNG, kept for good when it is the version the listing named.
+    Png { bytes: Vec<u8>, keep: bool },
+    /// The chat has none.
+    None,
+    /// The connector is busy fetching others; ask again after this long.
+    Busy(Duration),
+}
 
 /// The link the setup page shows as text and as a QR code:
 /// `mandate://pair?url=…&spki=…&secret=…`.
@@ -166,6 +179,25 @@ impl Client {
     /// GETs a route under /owner/v1/, given without that prefix.
     pub fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
         self.request("GET", path, None, CALL)?.json()
+    }
+
+    /// GETs a chat's picture at path, a route under /owner/v1/ (owner-api.md,
+    /// Chat pictures): its PNG, none, or ask again later.
+    pub fn picture(&self, path: &str) -> Result<Picture, Error> {
+        let res = self.request("GET", path, None, CALL)?;
+        match res.status {
+            200..=299 => {
+                let (mut bytes, keep) = (Vec::new(), res.cache.immutable);
+                std::io::Read::read_to_end(
+                    &mut std::io::Read::take(res.body, MAX_PICTURE),
+                    &mut bytes,
+                )?;
+                Ok(Picture::Png { bytes, keep })
+            }
+            404 => Ok(Picture::None),
+            503 => Ok(Picture::Busy(Duration::from_secs(res.cache.retry_after.unwrap_or(5)))),
+            _ => Err(res.error()),
+        }
     }
 
     /// POSTs, PUTs, PATCHes or DELETEs a route under /owner/v1/, given

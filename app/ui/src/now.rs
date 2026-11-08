@@ -109,30 +109,27 @@ impl Shell {
         let chat_cell: AnyElement = if !named {
             div().child("every chat").into_any_element()
         } else {
-            let unmatched =
-                r.terms.iter().flatten().filter(|t| t.chats.as_ref().is_none_or(Vec::is_empty));
-            // A term that matched nothing is one tap from the picker, its
-            // words already searched.
-            let unmatched = unmatched.enumerate().map(|(i, u)| {
+            // A term that matched nothing, or more than the card lists, is one
+            // tap from the picker, its words already searched.
+            let open = r.terms.iter().flatten().filter_map(|u| {
+                let term = words::chat_narrow(&u.term);
+                match u.chats.as_ref().is_none_or(Vec::is_empty) {
+                    true => Some((u, format!("Nothing matched \"{term}\""))),
+                    false => u.more.then(|| (u, format!("More matched \"{term}\""))),
+                }
+            });
+            let unmatched = open.enumerate().map(|(i, (u, said))| {
                 let (r, term) = (r.clone(), u.term.clone());
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_x(chars(1.))
-                    .child(
-                        t.alt(format!("Nothing matched \"{}\"", words::chat_narrow(&u.term)))
-                            .min_w_0(),
+                div().flex().flex_wrap().gap_x(chars(1.)).child(t.alt(said).min_w_0()).child(
+                    link(
+                        t,
+                        id_for("choose", &format!("{}/{i}", r.id)),
+                        "Choose",
+                        cx,
+                        move |this, cx| this.choose_for(&r, &term, cx),
                     )
-                    .child(
-                        link(
-                            t,
-                            id_for("choose", &format!("{}/{i}", r.id)),
-                            "Choose",
-                            cx,
-                            move |this, cx| this.choose_for(&r, &term, cx),
-                        )
-                        .font_weight(MEDIUM),
-                    )
+                    .font_weight(MEDIUM),
+                )
             });
             let unmatched: Vec<_> = unmatched.collect();
             column()

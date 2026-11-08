@@ -28,16 +28,25 @@ pub struct Picker {
     pub pick: Pick,
     pub connector: String,
     pub q: String,
-    /// The server or space whose chats show, by ID and name; None for all.
-    pub parent: Option<(String, String)>,
-    /// None until the first answer.
+    /// The rows opened, outermost first; empty at the top.
+    pub path: Vec<Container>,
+    /// What the search, or the place shown, holds; None until it comes.
     pub found: Option<Vec<Container>>,
+    /// At the top without a search: the newest chats anywhere.
+    pub recent: Option<Vec<Container>>,
+    /// The picked chats' own rows, for their pictures and ages.
+    pub picked: Vec<Container>,
 }
 
-/// Whether a chat only holds others, a Discord server or a Matrix space:
-/// it opens to its chats, as a grant on it would cover none of them.
+/// How many chats a list shows before `Search for more`; shelves are never
+/// cut. RECENT shows the newest few.
+const LIMIT: usize = 50;
+const RECENT: usize = 5;
+
+/// Whether a chat only holds others, a Discord server or forum, or a Matrix
+/// space: it opens to its chats, as a grant on it would cover none of them.
 fn holds_chats(c: &Container) -> bool {
-    matches!(c.kind.as_str(), "guild" | "space" | "category")
+    matches!(c.kind.as_str(), "guild" | "space" | "forum" | "media")
 }
 
 const LENGTHS: [u64; 5] = [1800, 3600, 7200, 14400, 28800];
@@ -81,7 +90,15 @@ impl NewGrant {
 impl Shell {
     pub(crate) fn open_picker(&mut self, pick: Pick, connector: String, cx: &mut Context<Self>) {
         self.search = None;
-        self.picker = Some(Picker { pick, connector, q: String::new(), parent: None, found: None });
+        self.picker = Some(Picker {
+            pick,
+            connector,
+            q: String::new(),
+            path: Vec::new(),
+            found: None,
+            recent: None,
+            picked: Vec::new(),
+        });
         self.find_chats(cx);
     }
 
@@ -91,93 +108,190 @@ impl Shell {
         cx.notify();
     }
 
-    /// Asks the connector for the chats matching the picker's search, under
-    /// the server or space it shows.
+    /// Asks the connector for what the picker shows (connector.md, Chats for
+    /// the owner): the search's matches, inside the opened row if one is;
+    /// else the opened row's chats; else the top level, and the newest chats
+    /// anywhere for RECENT.
     pub(crate) fn find_chats(&mut self, cx: &mut Context<Self>) {
         let Some(p) = &self.picker else { return };
-        let (q, conn, parent) = (p.q.clone(), p.connector.clone(), p.parent.clone());
-        let mut path = format!("connectors/{}/chats?limit=50&q={}", segment(&conn), segment(&q));
-        if let Some((id, _)) = &parent {
-            path += &format!("&parent={}", segment(id));
+        let (q, conn) = (p.q.clone(), p.connector.clone());
+        let parent = p.path.last().map(|c| c.id.clone());
+        let mut path = format!("connectors/{}/chats?limit={LIMIT}", segment(&conn));
+        if !q.is_empty() {
+            path += &format!("&q={}", segment(&q));
         }
+        match (&parent, q.is_empty()) {
+            (Some(id), _) => path += &format!("&parent={}", segment(id)),
+            (None, true) => path += "&parent=",
+            (None, false) => {}
+        }
+        let recent = (q.is_empty() && parent.is_none())
+            .then(|| format!("connectors/{}/chats?limit={RECENT}", segment(&conn)));
+        let picked: Vec<String> = match (&p.pick, &self.screen) {
+            (Pick::Request(id), _) => {
+                self.adjust.get(id).map(|a| a.names.keys().cloned().collect()).unwrap_or_default()
+            }
+            (Pick::Grant, Screen::Grant(g)) => {
+                g.chats.iter().flatten().map(|(id, _)| id.clone()).collect()
+            }
+            _ => Vec::new(),
+        };
+        let picked = (!picked.is_empty()).then(|| {
+            let ids: Vec<String> = picked.iter().map(|i| segment(i)).collect();
+            format!("connectors/{}/chats?ids={}", segment(&conn), ids.join(","))
+        });
         let client = self.device().client;
         self.call(
             cx,
-            move || client.get::<Vec<Container>>(&path),
-            move |this, found, _| {
+            move || {
+                let found = client.get::<Vec<Container>>(&path)?;
+                let recent = recent.map(|r| client.get::<Vec<Container>>(&r)).transpose()?;
+                let picked = picked.map(|r| client.get::<Vec<Container>>(&r)).transpose()?;
+                Ok((found, recent, picked.unwrap_or_default()))
+            },
+            move |this, (found, recent, picked), _| {
                 if let Some(p) = &mut this.picker
-                    && (&p.q, &p.connector, &p.parent) == (&q, &conn, &parent)
+                    && (&p.q, &p.connector, p.path.last().map(|c| &c.id))
+                        == (&q, &conn, parent.as_ref())
                 {
-                    p.found = Some(found);
+                    (p.found, p.recent, p.picked) = (Some(found), recent, picked);
                 }
             },
         );
     }
 
-    /// Shows the chats under a server or space, or all again with None.
-    pub(crate) fn open_parent(&mut self, parent: Option<(String, String)>, cx: &mut Context<Self>) {
+    /// Opens a row to what it holds, one level down.
+    pub(crate) fn open_row(&mut self, row: Container, cx: &mut Context<Self>) {
         if let Some(p) = &mut self.picker {
-            (p.parent, p.found) = (parent, None);
+            p.path.push(row);
+            (p.found, p.recent) = (None, None);
         }
         self.find_chats(cx);
         cx.notify();
     }
 
+    /// Goes up one level; false at the top.
+    pub(crate) fn up_row(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(p) = &mut self.picker else { return false };
+        if p.path.pop().is_none() {
+            return false;
+        }
+        (p.found, p.recent) = (None, None);
+        self.find_chats(cx);
+        cx.notify();
+        true
+    }
+
     /// One bordered element: the search over a scrollable list of the
-    /// connector's chats, which the server searches. pinned (the chats
-    /// already picked) come first; row draws each chat's control.
+    /// connector's chats. At the top: PICKED, RECENT, the shelves (servers,
+    /// spaces, mailboxes) and the chats outside them; flat connectors list
+    /// their chats alone. `›` opens a row; the back row goes up one level.
+    /// pinned (the chats already picked) stay on top; row draws a chat with
+    /// its control, around the line the picker makes for it.
     pub(crate) fn picker(
         &self,
         t: Theme,
         pinned: Vec<Container>,
         cx: &mut Context<Self>,
-        row: impl Fn(&Container, &mut Context<Self>) -> AnyElement,
+        row: impl Fn(&Container, Div, &mut Context<Self>) -> AnyElement,
     ) -> Div {
         let Some(p) = &self.picker else { return column() };
-        let mut rows: Vec<AnyElement> = pinned.iter().map(|c| row(c, cx)).collect();
-        // A server or space is a heading that opens to its chats; in the
-        // never-share list it can be hidden as a whole.
-        let heading = |c: &Container, cx: &mut Context<Self>| {
-            let parent = Some((c.id.clone(), display(c)));
-            clickable(id_for("open", &c.id), cx, move |this, cx| {
-                this.open_parent(parent.clone(), cx)
+        let inside = p.path.last();
+        let top = inside.is_none() && p.q.is_empty();
+        // Each part's chats, each chat once, in the first part that has it.
+        let mut shown: BTreeSet<String> = BTreeSet::new();
+        let mut part = |label: Option<String>, chats: Vec<Container>| {
+            let chats: Vec<Container> =
+                chats.into_iter().filter(|c| shown.insert(c.id.clone())).collect();
+            (label, chats)
+        };
+        let found = p.found.clone().unwrap_or_default();
+        let (shelves, chats): (Vec<Container>, Vec<Container>) =
+            found.into_iter().partition(is_shelf);
+        let labelled = top && !shelves.is_empty();
+        // The picked chats as their rows show them, once those come.
+        let known = |id: &str| {
+            let lists = [Some(&p.picked), p.found.as_ref(), p.recent.as_ref()];
+            lists.into_iter().flatten().flatten().find(|r| r.id == id).cloned()
+        };
+        let pinned: Vec<Container> =
+            pinned.into_iter().map(|c| known(&c.id).unwrap_or(c)).collect();
+        let pinned_ids: BTreeSet<String> = pinned.iter().map(|c| c.id.clone()).collect();
+        let mut parts = vec![part(labelled.then(|| "PICKED".into()), pinned)];
+        if labelled {
+            let recent = p.recent.clone().unwrap_or_default().into_iter().take(RECENT).collect();
+            parts.push(part(Some("RECENT".into()), recent));
+            let kind = shelves.first().map_or("", |s| s.kind.as_str());
+            parts.push(part(Some(shelf_label(kind).into()), shelves));
+            parts.push(part(Some("CHATS".into()), chats));
+        } else {
+            parts.push(part(None, shelves.into_iter().chain(chats).collect()));
+        }
+        // Picked chats keep their full names; the rest are named from where
+        // the list stands.
+        let place = |c: &Container| if pinned_ids.contains(&c.id) { None } else { inside };
+        // Rows named alike tell themselves apart by their IDs' ends.
+        let names: Vec<String> = parts
+            .iter()
+            .flat_map(|(_, cs)| cs.iter().map(|c| own_path(c, place(c)).join(" / ")))
+            .collect();
+        let twin = |c: &Container| {
+            let name = own_path(c, place(c)).join(" / ");
+            names.iter().filter(|n| **n == name).count() > 1
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (label, chats) in parts {
+            if chats.is_empty() {
+                continue;
+            }
+            rows.extend(
+                label.map(|l| t.alt(l).font_weight(MEDIUM).pt(lines(0.25)).into_any_element()),
+            );
+            for c in &chats {
+                let line = self.chat_line(t, c, place(c), twin(c), cx);
+                let heading = holds_chats(c) && p.pick != Pick::Hide;
+                rows.push(match heading {
+                    // A holder has no tick: the row opens.
+                    true => {
+                        let r = c.clone();
+                        clickable(id_for("open", &c.id), cx, move |this, cx| {
+                            this.open_row(r.clone(), cx)
+                        })
+                        .py(lines(0.25))
+                        .child(line)
+                        .into_any_element()
+                    }
+                    false => row(c, line, cx),
+                });
+            }
+        }
+        if rows.is_empty() {
+            let empty = match (&p.found, inside) {
+                (None, _) => "Loading chats…".to_string(),
+                _ if !p.q.is_empty() => format!("No chat matches \"{}\".", p.q),
+                (_, Some(c)) => format!("No chats in {}.", display(c)),
+                (_, None) => "No chats yet.".into(),
+            };
+            rows.push(t.alt(empty).py(lines(0.25)).into_any_element());
+        }
+        // The back row says where you are and goes up one level.
+        let back = inside.map(|c| {
+            let path = c.parents.iter().map(|p| p.name.as_str()).collect::<Vec<_>>();
+            let name = words::fit_path(&path, &display(c), words::chat_cols().saturating_sub(4));
+            clickable("close-parent", cx, |this, cx| {
+                this.up_row(cx);
             })
             .flex()
             .items_center()
             .gap(chars(1.))
             .py(lines(0.25))
-            .child(div().flex_1().min_w_0().font_weight(MEDIUM).child(words::chat(&display(c))))
-            .child(crate::screens::icon("chevron-right", t.alt))
-            .into_any_element()
-        };
-        let back = p.parent.as_ref().map(|(_, name)| {
-            clickable("close-parent", cx, |this, cx| this.open_parent(None, cx))
-                .flex()
-                .items_center()
-                .gap(chars(1.))
-                .py(lines(0.25))
-                .child(crate::screens::icon("chevron-left", t.alt))
-                .child(div().flex_1().min_w_0().font_weight(MEDIUM).child(words::chat(name)))
+            .child(crate::screens::icon("chevron-left", t.alt))
+            .children(self.row_picture(t, c, false, cx))
+            .child(div().flex_1().min_w_0().truncate().font_weight(MEDIUM).child(name))
         });
-        match &p.found {
-            None => rows.push(t.alt("Loading chats…").into_any_element()),
-            Some(f) => {
-                let inside = p.parent.as_ref().map(|(id, _)| id.as_str());
-                let fresh = named(f, inside)
-                    .into_iter()
-                    .filter(|c| !pinned.iter().any(|p| p.id == c.id))
-                    .collect::<Vec<_>>();
-                let opens = |c: &Container| p.pick != Pick::Hide && holds_chats(c);
-                rows.extend(
-                    fresh.iter().map(|c| if opens(c) { heading(c, cx) } else { row(c, cx) }),
-                );
-                if rows.is_empty() {
-                    rows.push(t.alt("No chat matches.").into_any_element());
-                }
-            }
-        }
-        // The list stops at 50; a search reaches the rest.
-        let more = p.found.as_ref().is_some_and(|f| f.len() >= 50);
+        // A list stops at its limit; a search reaches the rest.
+        let more =
+            p.found.as_ref().is_some_and(|f| f.iter().filter(|c| !is_shelf(c)).count() >= LIMIT);
         column()
             .border_2()
             .border_color(t.text)
@@ -208,6 +322,84 @@ impl Shell {
             ))
     }
 
+    /// A chat's line, after its tick: picture, name, the value that tells it
+    /// from its neighbours, its age, and `›` when it opens (picker-design.md
+    /// §2.3). Named by its path outside its parent, by its own name inside.
+    fn chat_line(
+        &self,
+        t: Theme,
+        c: &Container,
+        inside: Option<&Container>,
+        twin: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        // A DM's handle shows when its name is the person's own choosing,
+        // which anyone can copy, or when a neighbour shares it.
+        let named_by_them = c.name.starts_with('~') || twin;
+        let value = match c {
+            c if c.hidden => "[hidden]".to_string(),
+            c if matches!(c.kind.as_str(), "voice" | "stage") => c.kind.clone(),
+            Container { members: Some(n), .. } => format!("{n} members"),
+            Container { threads: Some(n), .. } if *n > 0 => format!("{n} threads"),
+            // A long handle gives way from its start, keeping its end.
+            Container { handle: Some(h), .. } if named_by_them && !h.is_empty() => {
+                let n = h.chars().count();
+                if n <= 16 {
+                    h.clone()
+                } else {
+                    format!("…{}", h.chars().skip(n - 15).collect::<String>())
+                }
+            }
+            c if twin => words::short_id(&c.id),
+            _ => String::new(),
+        };
+        let age = c.last_activity.as_deref().map(words::age).unwrap_or_default();
+        let mut path = own_path(c, inside);
+        let own = path.pop().unwrap_or_default();
+        let parents: Vec<&str> = path.iter().map(String::as_str).collect();
+        // The name gets what the tick, picture, value, age and `›` leave:
+        // `chat_cols` already keeps a card's padding and a tick's room.
+        let picture = self.row_picture(t, c, inside.is_some(), cx);
+        let reserve = 3
+            + if picture.is_some() { 4 } else { 0 }
+            + if value.is_empty() { 0 } else { value.chars().count() + 1 }
+            + if c.opens { 3 } else { 0 };
+        let room = words::chat_cols().saturating_sub(reserve);
+        let name = words::fit_path(&parents, &own, room);
+        let open = c.opens.then(|| {
+            let r = c.clone();
+            div()
+                .id(id_for("open-row", &c.id))
+                .cursor_pointer()
+                .px(chars(0.5))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    // The row's own tap ticks; this one only opens.
+                    cx.stop_propagation();
+                    this.open_row(r.clone(), cx)
+                }))
+                .child(crate::screens::shade())
+                .child(crate::screens::icon("chevron-right", t.alt))
+        });
+        div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap(chars(1.))
+            .children(picture)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .when(holds_chats(c), |d| d.font_weight(MEDIUM))
+                    .child(name),
+            )
+            .when(!value.is_empty(), |d| d.child(t.alt(value).flex_none()))
+            .child(t.alt(age).w(chars(4.)).flex_none().text_right())
+            .children(open)
+    }
+
     pub(crate) fn hide_screen(&self, t: Theme, cx: &mut Context<Self>) -> Div {
         let Screen::Hide { connector: current } = &self.screen else { return column() };
         let conns = self
@@ -233,7 +425,7 @@ impl Shell {
             .child(div().font_weight(MEDIUM).child("CONNECTOR"))
             .child(div().flex().flex_wrap().gap(chars(1.)).children(conns))
             .when(self.picker.is_some(), |d| {
-                d.child(self.picker(t, Vec::new(), cx, |c, cx| {
+                d.child(self.picker(t, Vec::new(), cx, |c, line, cx| {
                     let conn =
                         self.picker.as_ref().map(|p| p.connector.clone()).unwrap_or_default();
                     let is = |kind: &str, id: &str| {
@@ -247,28 +439,33 @@ impl Shell {
                         let name = if p.name.is_empty() { p.id.clone() } else { p.name.clone() };
                         (("person", p.id.clone()), format!("Hide {name}"), name)
                     });
+                    let links = std::iter::once(chat).chain(people).filter_map(
+                        |((kind, id), label, name)| {
+                            // A hidden chat already says so on its line.
+                            if is(kind, &id) {
+                                return (kind != "chat")
+                                    .then(|| t.alt(format!("[{name} hidden]")).into_any_element());
+                            }
+                            let key = id_for(kind, &format!("{}/{id}", c.id));
+                            let conn = conn.clone();
+                            Some(
+                                link(t, key, &label, cx, move |this, cx| {
+                                    this.hide(&conn, kind, &id, &name, cx)
+                                })
+                                .into_any_element(),
+                            )
+                        },
+                    );
+                    let links: Vec<AnyElement> =
+                        if c.hidden { Vec::new() } else { links.collect() };
                     div()
                         .flex()
                         .flex_wrap()
                         .items_center()
                         .gap_x(chars(1.))
                         .py(lines(0.25))
-                        .child(div().flex_1().min_w_0().child(words::chat(&display(c))))
-                        .child(t.alt(c.kind.clone()))
-                        .children(std::iter::once(chat).chain(people).map(
-                            |((kind, id), label, name)| {
-                                if is(kind, &id) {
-                                    let what = if kind == "chat" { noun } else { &name };
-                                    return t.alt(format!("[{what} hidden]")).into_any_element();
-                                }
-                                let key = id_for(kind, &format!("{}/{id}", c.id));
-                                let conn = conn.clone();
-                                link(t, key, &label, cx, move |this, cx| {
-                                    this.hide(&conn, kind, &id, &name, cx)
-                                })
-                                .into_any_element()
-                            },
-                        ))
+                        .child(line)
+                        .children(links)
                         .into_any_element()
                 }))
             })
@@ -460,9 +657,16 @@ impl Shell {
                             })
                             .collect();
                         d.when(!picking, |d| d.children(picked)).when(picking, |d| {
-                            d.child(self.picker(t, pinned, cx, |c, cx| {
+                            d.child(self.picker(t, pinned, cx, |c, line, cx| {
+                                if c.hidden {
+                                    return div()
+                                        .py(lines(0.25))
+                                        .pl(chars(3.))
+                                        .child(line)
+                                        .into_any_element();
+                                }
                                 let on = matches!(&ng.chats, Some(m) if m.contains_key(&c.id));
-                                let (id, name) = (c.id.clone(), display(c));
+                                let (id, name) = (c.id.clone(), full_name(c));
                                 clickable(id_for("pick", &c.id), cx, move |this, cx| {
                                     if let Screen::Grant(g) = &mut this.screen
                                         && let Some(m) = &mut g.chats
@@ -473,10 +677,11 @@ impl Shell {
                                     cx.notify();
                                 })
                                 .flex()
+                                .items_center()
                                 .gap(chars(1.))
                                 .py(lines(0.25))
                                 .child(checkbox(t, on))
-                                .child(chat_name(t, c))
+                                .child(line)
                                 .into_any_element()
                             }))
                         })
@@ -588,8 +793,11 @@ impl Shell {
                 ..Container::default()
             })
             .collect();
-        self.picker(t, pinned, cx, move |c, cx| {
-            let (rid, cid, name) = (id.clone(), c.id.clone(), display(c));
+        self.picker(t, pinned, cx, move |c, line, cx| {
+            if c.hidden {
+                return div().py(lines(0.25)).pl(chars(3.)).child(line).into_any_element();
+            }
+            let (rid, cid, name) = (id.clone(), c.id.clone(), full_name(c));
             clickable(id_for("pick", &c.id), cx, move |this, cx| {
                 if let Some(a) = this.adjust.get_mut(&rid) {
                     a.names.entry(cid.clone()).or_insert_with(|| name.clone());
@@ -600,42 +808,68 @@ impl Shell {
                 cx.notify();
             })
             .flex()
+            .items_center()
             .gap(chars(1.))
             .py(lines(0.25))
             .child(checkbox(t, ticked.contains(&c.id)))
-            .child(chat_name(t, c))
+            .child(line)
             .into_any_element()
         })
     }
-}
 
-/// A chat's name, or its ID when it has none.
-fn display(c: &Container) -> String {
-    if c.name.is_empty() { c.id.clone() } else { c.name.clone() }
-}
-
-/// An email connector's mailboxes before its threads, the server's order
-/// kept otherwise. A chat is named after the server, space or mailbox it
-/// is in, unless that is the one shown: "main / #general", "Inbox / Invoice".
-fn named(found: &[Container], inside: Option<&str>) -> Vec<Container> {
-    let (mut boxes, rest): (Vec<Container>, Vec<Container>) =
-        found.iter().cloned().partition(|c| c.kind == "mailbox");
-    boxes.extend(rest);
-    for c in &mut boxes {
-        if !c.parent_name.is_empty() && Some(c.parent_id.as_str()) != inside {
-            c.name = format!("{} / {}", c.parent_name, c.name);
+    /// A row's picture: its own, or its outermost parent's when it shows
+    /// outside it (a channel shows its server's). Mail has none; inside an
+    /// opened row only chats with pictures of their own show one, as the
+    /// back row shows the parent's.
+    fn row_picture(
+        &self,
+        t: Theme,
+        c: &Container,
+        inside: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let p = self.picker.as_ref()?;
+        if p.connector == "fastmail" || c.kind == "mailbox" || (inside && c.icon.is_none()) {
+            return None;
         }
+        let (id, icon, name) = match (c.icon.as_deref(), c.parents.first()) {
+            (None, Some(top)) => (top.id.as_str(), top.icon.as_deref(), top.name.as_str()),
+            (icon, _) => (c.id.as_str(), icon, c.name.as_str()),
+        };
+        Some(self.picture(t, &p.connector, id, icon, name, cx))
     }
-    boxes
 }
 
-/// A chat's name in a picker row, a mailbox marked quietly as one.
-fn chat_name(t: Theme, c: &Container) -> Div {
-    div()
-        .flex()
-        .flex_1()
-        .min_w_0()
-        .gap(chars(1.))
-        .child(div().flex_1().min_w_0().child(words::chat(&display(c))))
-        .when(c.kind == "mailbox", |d| d.child(t.alt("mailbox")))
+/// A chat's own name, else the end of its ID.
+fn display(c: &Container) -> String {
+    if c.name.is_empty() { words::short_id(&c.id) } else { c.name.clone() }
+}
+
+/// A chat's full path name, as a picked chat keeps it: "main / #general".
+fn full_name(c: &Container) -> String {
+    own_path(c, None).join(" / ")
+}
+
+/// A chat's path below the row opened, its own name last: "main", "#general"
+/// at the top, "#general" inside main.
+fn own_path(c: &Container, inside: Option<&Container>) -> Vec<String> {
+    let below = match inside.and_then(|i| c.parents.iter().position(|p| p.id == i.id)) {
+        Some(i) => &c.parents[i + 1..],
+        None => &c.parents[..],
+    };
+    below.iter().map(|p| p.name.clone()).chain([display(c)]).collect()
+}
+
+/// A shelf: a holder or a mailbox, listed apart at the top.
+fn is_shelf(c: &Container) -> bool {
+    holds_chats(c) || c.kind == "mailbox"
+}
+
+/// The top level's label for its shelves, after their kind.
+fn shelf_label(kind: &str) -> &'static str {
+    match kind {
+        "space" => "SPACES",
+        "mailbox" => "MAILBOXES",
+        _ => "SERVERS",
+    }
 }

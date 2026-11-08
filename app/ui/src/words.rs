@@ -143,23 +143,113 @@ pub fn chat_narrow(name: &str) -> String {
     fit(name, cols.saturating_sub(8).max(12))
 }
 
-/// name in at most n characters. A "Parent / Child" name, such as a
+/// How many columns a character takes: an emoji, drawn by Noto Emoji for
+/// what the monospace lacks, is about two; what joins or varies one, none.
+fn columns(c: char) -> usize {
+    match u32::from(c) {
+        0x200D | 0x20E3 | 0xFE00..=0xFE0F | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F => 0,
+        0x231A..=0x23FF | 0x25FB..=0x25FE | 0x2600..=0x27BF | 0x2B00..=0x2BFF => 2,
+        0x1F000..=0x1F1E5 | 0x1F200..=0x1FAFF => 2,
+        _ => 1,
+    }
+}
+
+/// How many columns s takes on screen.
+pub fn width(s: &str) -> usize {
+    s.chars().map(columns).sum()
+}
+
+/// s in at most k columns, ending in "…" when cut.
+fn cut(s: &str, k: usize) -> String {
+    if width(s) <= k {
+        return s.to_string();
+    }
+    let mut used = 0;
+    let kept: String = s
+        .chars()
+        .take_while(|&c| {
+            used += columns(c);
+            used < k
+        })
+        .collect();
+    format!("{kept}…")
+}
+
+/// name in at most n columns. A "Parent / Child" name, such as a
 /// Discord "server / channel" or a mailbox's thread, keeps both: the parent
-/// gives way first, to a few characters, and the child keeps the rest.
-/// What is cut ends in "…".
+/// gives way first, down to two columns if that keeps the child whole,
+/// else to six, and the child keeps the rest. What is cut ends in "…".
 pub fn fit(name: &str, n: usize) -> String {
-    let len = |s: &str| s.chars().count();
-    let cut = |s: &str, k: usize| match len(s) <= k {
-        true => s.to_string(),
-        false => format!("{}…", s.chars().take(k.saturating_sub(1)).collect::<String>()),
-    };
-    if len(name) <= n {
+    if width(name) <= n {
         return name.into();
     }
     let Some((parent, child)) = name.split_once(" / ") else { return cut(name, n) };
-    let child = cut(child, n.saturating_sub(3 + len(parent).min(6)));
-    let parent = cut(parent, n.saturating_sub(3 + len(&child)));
+    let keep = if width(child) + 5 <= n { 2 } else { 6 };
+    let child = cut(child, n.saturating_sub(3 + width(parent).min(keep)));
+    let parent = cut(parent, n.saturating_sub(3 + width(&child)));
     format!("{parent} / {child}")
+}
+
+/// The columns `chat` fits a name to on this screen.
+pub fn chat_cols() -> usize {
+    CHAT_COLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A path, its parents outermost first and then the chat's own name, in at
+/// most n columns. The outer parents give way first, each to "…", then
+/// the nearest, down to two columns if that keeps the own name whole,
+/// else to six, then the own name: "… / #releases / v2 rollout",
+/// "Recei… / Your order has ship…".
+pub fn fit_path(parents: &[&str], own: &str, n: usize) -> String {
+    let join = |ps: &[String], own: &str| {
+        ps.iter().map(String::as_str).chain([own]).collect::<Vec<_>>().join(" / ")
+    };
+    let mut ps: Vec<String> = parents.iter().map(|p| p.to_string()).collect();
+    for i in 0..ps.len().saturating_sub(1) {
+        if width(&join(&ps, own)) <= n {
+            break;
+        }
+        ps[i] = "…".into();
+    }
+    ps.dedup_by(|a, b| a == "…" && b == "…");
+    let whole = join(&ps, own);
+    let Some(nearest) = ps.pop() else { return cut(own, n) };
+    if width(&whole) <= n {
+        return whole;
+    }
+    let outer = ps.iter().map(|p| width(p) + 3).sum::<usize>();
+    let room = n.saturating_sub(outer + 3 + width(own));
+    let keep = if room >= 2 { 2 } else { 6 };
+    let nearest = cut(&nearest, room.max(keep.min(width(&nearest))));
+    let own = cut(own, n.saturating_sub(outer + 3 + width(&nearest)));
+    ps.push(nearest);
+    join(&ps, &own)
+}
+
+/// When a chat was last active, in four columns or fewer: `now`, `9m`,
+/// `5h`, `3d`, `2w`, `Sep` within a year, else `2024`.
+pub fn age(at: &str) -> String {
+    // The listing's times may carry fractions of a second, which `unix`
+    // doesn't take.
+    let whole = match at.find('.') {
+        Some(dot) => {
+            let end =
+                at[dot + 1..].find(|c: char| !c.is_ascii_digit()).map_or(at.len(), |e| dot + 1 + e);
+            format!("{}{}", &at[..dot], &at[end..])
+        }
+        None => at.to_string(),
+    };
+    let Some(then) = unix(&whole) else { return String::new() };
+    let ago = (Time::now().unix() - then).max(0);
+    match ago {
+        0..60 => "now".into(),
+        60..3600 => format!("{}m", ago / 60),
+        3600..86400 => format!("{}h", ago / 3600),
+        86400..604800 => format!("{}d", ago / 86400),
+        604800..2592000 => format!("{}w", ago / 604800),
+        2592000..31536000 => month_short(then),
+        _ => strftime(then, c"%Y"),
+    }
 }
 
 pub fn unix(t: &str) -> Option<i64> {
@@ -288,7 +378,7 @@ pub fn zone() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::fit;
+    use super::{fit, fit_path, width};
 
     #[test]
     fn fit_keeps_both_parts() {
@@ -301,5 +391,36 @@ mod tests {
         // A short parent stays whole; the child gives way.
         let both = fit(&format!("main / {}", "general".repeat(10)), 20);
         assert_eq!((both.chars().count(), &both[..7]), (20, "main / "));
+        // The parent gives way further if that keeps the child whole.
+        assert_eq!(fit("Inbox / Weekly update 5", 22), "Inb… / Weekly update 5");
+    }
+
+    #[test]
+    fn emoji_take_two_columns() {
+        assert_eq!(width("🎉 Party photos"), 15);
+        // The variation selector and the box drawing take none and one.
+        assert_eq!(width("🏔️ Hiking crew 🥾"), 17);
+        assert_eq!(width("#💬│general"), 11);
+        assert_eq!(fit("Mum ❤️ and the 🏔️ crew", 10), "Mum ❤️ an…");
+        // A wide emoji that would overrun is left out whole.
+        assert_eq!(fit("abcdefgh🎉", 9), "abcdefgh…");
+        assert_eq!(fit_path(&["Trash"], "🎉 Party photos", 20), "T… / 🎉 Party photos");
+    }
+
+    #[test]
+    fn fit_path_cuts_outer_parents_first() {
+        assert_eq!(fit_path(&["main"], "#general", 30), "main / #general");
+        assert_eq!(fit_path(&[], "Book club", 4), "Boo…");
+        // The outer parents become "…" before the nearest gives way.
+        assert_eq!(
+            fit_path(&["main", "#releases"], "v2 rollout", 26),
+            "… / #releases / v2 rollout"
+        );
+        // Then the nearest, down to six, then the own name.
+        let cut = fit_path(&["Receipts"], "Your order has shipped today", 26);
+        assert_eq!(cut.chars().count(), 26);
+        assert!(cut.starts_with("Recei… / Your order"), "{cut}");
+        // A subject with " / " in it stays the own name.
+        assert_eq!(fit_path(&["Inbox"], "a / b", 20), "Inbox / a / b");
     }
 }

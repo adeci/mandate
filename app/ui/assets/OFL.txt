@@ -1,4 +1,6 @@
 Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)
+Copyright 2013, 2022 Google Inc. All Rights Reserved. (Noto Emoji, https://github.com/googlefonts/noto-emoji;
+NotoEmoji-Medium.ttf is its variable font instanced at weight 500, with "m" mapped to its space glyph)
 
 This Font Software is licensed under the SIL Open Font License, Version 1.1.
 This license is copied below, and is also available with a FAQ at:

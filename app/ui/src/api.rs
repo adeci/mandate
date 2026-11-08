@@ -37,6 +37,8 @@ pub struct Request {
 pub struct Term {
     pub term: String,
     pub chats: Option<Vec<Chat>>,
+    /// It matched more chats than those listed.
+    pub more: bool,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -241,21 +243,42 @@ pub struct Hidden {
     pub name: String,
 }
 
-/// A chat from a connector's chat list, for the picker.
+/// A chat from a connector's chat list, for the picker (connector.md, Chats
+/// for the owner).
 #[derive(Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Container {
     pub id: String,
+    /// Its own name; the path adds its parents'.
     pub name: String,
     pub kind: String,
-    pub parent_id: String,
-    /// The parent's full name, "main" or "Inbox / Receipts"; empty at the
-    /// top.
-    pub parent_name: String,
+    /// What it sits in, outermost first; empty at the top.
+    pub parents: Vec<ParentRef>,
+    /// A shelf, or a chat with chats in it: it opens.
+    pub opens: bool,
+    /// A group's members, the owner counted.
+    pub members: Option<u32>,
+    /// A mailbox's threads, filed directly in it.
+    pub threads: Option<u32>,
+    /// Never shared: it, a parent or its person is hidden.
+    pub hidden: bool,
+    /// A DM's handle: "@sam_p", "+15551234567", "@bob:example.org".
+    pub handle: Option<String>,
+    /// The version of the chat's picture, absent when it has none.
+    pub icon: Option<String>,
     pub last_activity: Option<String>,
     /// The people in it, where the connector lists them (connector.md,
     /// Chats); a person is hidden by their own ID, not the chat's.
     pub participants: Vec<Person>,
+}
+
+/// A chat's parent, as a row names it.
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ParentRef {
+    pub id: String,
+    pub name: String,
+    pub icon: Option<String>,
 }
 
 /// One person in a chat.

@@ -10,7 +10,7 @@ mod jcs;
 mod log;
 mod record;
 
-pub use client::{Client, Event, Events, Join, JoinStatus, PairLink, Signed};
+pub use client::{Client, Event, Events, Join, JoinStatus, PairLink, Picture, Signed};
 #[cfg(test)]
 pub(crate) use envelope::SoftwareKey;
 pub use envelope::{DeviceKey, DeviceSignature, Envelope, der_signature};

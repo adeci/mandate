@@ -50,13 +50,16 @@ impl Render for Shell {
         }
         let sheet_bottom = self.nav_bottom;
         let pin = self.pin_prompt(t, cx);
-        let root = div()
+        let mut root = div()
             .size_full()
             .flex()
             .flex_col()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key))
-            .font_family(FONT)
+            .font_family(FONT);
+        root.text_style().font_fallbacks =
+            Some(gpui::FontFallbacks::from_fonts(vec![crate::theme::EMOJI.into()]));
+        let root = root
             .font_weight(NORMAL)
             .text_size(px(SIZE))
             .line_height(lines(1.))
@@ -631,8 +634,7 @@ impl Shell {
             cx.notify();
             return true;
         }
-        if self.picker.as_ref().is_some_and(|p| p.parent.is_some()) {
-            self.open_parent(None, cx);
+        if self.up_row(cx) {
             return true;
         }
         if self.picker.is_some() {

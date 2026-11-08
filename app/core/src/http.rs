@@ -80,6 +80,16 @@ pub(crate) struct Response {
     pub status: u16,
     pub peer: Peer,
     pub body: Box<dyn BufRead + Send>,
+    pub cache: Cache,
+}
+
+/// What a response says about keeping it and asking again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Cache {
+    /// `Cache-Control: immutable`: the body never changes.
+    pub immutable: bool,
+    /// `Retry-After`, in seconds.
+    pub retry_after: Option<u64>,
 }
 
 impl Server {
@@ -165,15 +175,16 @@ impl Server {
         let peer =
             verifier.peer.lock().unwrap().ok_or_else(|| invalid("TLS without a certificate"))?;
 
-        let (status, body) = read_head(BufReader::new(conn))?;
-        Ok(Response { status, peer, body })
+        let (status, body, cache) = read_head(BufReader::new(conn))?;
+        Ok(Response { status, peer, body, cache })
     }
 }
 
-/// Reads a response head and returns its status and the body it frames.
+/// Reads a response head and returns its status, the body it frames, and
+/// what it says about caching.
 fn read_head<R: BufRead + Send + 'static>(
     mut r: R,
-) -> Result<(u16, Box<dyn BufRead + Send>), Error> {
+) -> Result<(u16, Box<dyn BufRead + Send>, Cache), Error> {
     let (mut head, mut line) = (String::new(), String::new());
     while line != "\r\n" {
         if !read_line(&mut r, MAX_LINE, &mut line)? {
@@ -190,7 +201,7 @@ fn read_head<R: BufRead + Send + 'static>(
     let (Some(1), Some(status), true) = (res.version, res.code, complete) else {
         return Err(invalid("malformed HTTP/1.1 response head"));
     };
-    let (mut length, mut chunked) = (None, false);
+    let (mut length, mut chunked, mut cache) = (None, false, Cache::default());
     for h in res.headers.iter() {
         if h.name.eq_ignore_ascii_case("content-length") {
             let n = std::str::from_utf8(h.value)
@@ -202,6 +213,13 @@ fn read_head<R: BufRead + Send + 'static>(
                 return Err(invalid("bad, repeated or oversized Content-Length"));
             }
             length = n;
+        } else if h.name.eq_ignore_ascii_case("cache-control") {
+            cache.immutable = String::from_utf8_lossy(h.value)
+                .split(',')
+                .any(|d| d.trim().eq_ignore_ascii_case("immutable"));
+        } else if h.name.eq_ignore_ascii_case("retry-after") {
+            cache.retry_after =
+                std::str::from_utf8(h.value).ok().and_then(|v| v.trim().parse().ok());
         } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
             if chunked || !h.value.eq_ignore_ascii_case(b"chunked") {
                 return Err(invalid("Transfer-Encoding other than chunked"));
@@ -215,7 +233,7 @@ fn read_head<R: BufRead + Send + 'static>(
         (false, Some(n)) => Box::new(r.take(n)),
         (false, None) => Box::new(r),
     };
-    Ok((status, body))
+    Ok((status, body, cache))
 }
 
 impl Response {
@@ -446,13 +464,23 @@ pub(crate) mod tests {
 
     /// The status and the body read to its end, or past the client's limit.
     fn parse(r: impl BufRead + Send + 'static) -> Result<(u16, Vec<u8>), Error> {
-        let (status, body) = read_head(r)?;
+        let (status, body, _) = read_head(r)?;
         let mut out = Vec::new();
         body.take(MAX_BODY + 1).read_to_end(&mut out)?;
         Ok((status, out))
     }
 
     const CHUNKED: &[u8] = b"HTTP/1.1 200 X\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+    #[test]
+    fn caching_headers_read() {
+        let head = b"HTTP/1.1 503 X\r\nRetry-After: 7\r\nCache-Control: private, max-age=1, Immutable\r\nContent-Length: 0\r\n\r\n";
+        let (status, _, cache) = read_head(io::Cursor::new(head.to_vec())).unwrap();
+        assert_eq!((status, cache), (503, Cache { immutable: true, retry_after: Some(7) }));
+        let plain = b"HTTP/1.1 200 X\r\nCache-Control: no-store\r\nContent-Length: 0\r\n\r\n";
+        let (_, _, cache) = read_head(io::Cursor::new(plain.to_vec())).unwrap();
+        assert_eq!(cache, Cache::default());
+    }
 
     #[test]
     fn endless_answers_are_bounded() {

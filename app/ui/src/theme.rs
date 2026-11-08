@@ -7,10 +7,17 @@ use gpui::{
 };
 
 pub const FONT: &str = "JetBrains Mono NL";
-pub const FONTS: [&[u8]; 3] = [
+/// What draws the emoji the monospace lacks, as outlines in the text's colour.
+/// NotoEmoji-Medium.ttf is Noto Emoji 3.000's variable font instanced at
+/// weight 500 with fontTools, with "m" mapped to its space glyph: gpui's
+/// cosmic-text system drops any font without an "m". The monospace has
+/// one, so that glyph is never drawn.
+pub const EMOJI: &str = "Noto Emoji";
+pub const FONTS: [&[u8]; 4] = [
     include_bytes!("../assets/JetBrainsMonoNL-Medium.ttf"),
     include_bytes!("../assets/JetBrainsMonoNL-SemiBold.ttf"),
     include_bytes!("../assets/JetBrainsMonoNL-ExtraBold.ttf"),
+    include_bytes!("../assets/NotoEmoji-Medium.ttf"),
 ];
 pub const NORMAL: FontWeight = FontWeight(500.);
 pub const MEDIUM: FontWeight = FontWeight(600.);

@@ -10,6 +10,7 @@ mod fido;
 mod link;
 mod now;
 mod pick;
+mod picture;
 mod screens;
 mod scroll;
 mod tabs;
@@ -195,6 +196,8 @@ impl Adjust {
 
 pub struct Shell {
     dir: PathBuf,
+    /// Chats' pictures, as fetched or loading.
+    pictures: picture::Pictures,
     device: Option<Device>,
     screen: Screen,
     now: Now,
@@ -301,6 +304,7 @@ impl Shell {
         })
         .detach();
         let mut shell = Shell {
+            pictures: picture::Pictures::new(dir.join("pictures")),
             dir,
             device: None,
             screen,
@@ -1621,6 +1625,7 @@ impl gpui::AssetSource for Assets {
             "icons/search.svg" => include_bytes!("../assets/icons/search.svg"),
             "icons/settings.svg" => include_bytes!("../assets/icons/settings.svg"),
             "icons/x.svg" => include_bytes!("../assets/icons/x.svg"),
+            "icons/user.svg" => include_bytes!("../assets/icons/user.svg"),
             "icons/discord.svg" => include_bytes!("../assets/icons/discord.svg"),
             "icons/fastmail.svg" => include_bytes!("../assets/icons/fastmail.svg"),
             "icons/gmessages.svg" => include_bytes!("../assets/icons/gmessages.svg"),
