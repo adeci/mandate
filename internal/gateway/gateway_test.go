@@ -524,8 +524,13 @@ func TestNotFoundIsTheSame(t *testing.T) {
 func TestRequestAnswerIgnoresMatches(t *testing.T) {
 	e := newEnv(t, self(), self())
 	e.push(nil, neverShare{Connector: "chat", Kind: "chat", ID: "secret"})
+	for _, n := range []string{"1", "2", "3", "4", "5", "6"} {
+		if err := e.conn.st.UpsertContainer(t.Context(), store.Container{ID: "club" + n, Kind: "group", Name: "Club " + n, IsGroup: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var answers []string
-	for _, chats := range [][]string{{"fam"}, {"nothing like it"}, {"secret"}} {
+	for _, chats := range [][]string{{"fam"}, {"nothing like it"}, {"secret"}, {"club"}} {
 		s, body := e.call(http.MethodPost, "/agent/v1/access/requests", map[string]any{
 			"connector": "chat", "chats": chats, "reason": "summarize",
 		})
@@ -534,12 +539,14 @@ func TestRequestAnswerIgnoresMatches(t *testing.T) {
 		}
 		answers = append(answers, body)
 	}
-	if answers[0] != answers[1] || answers[1] != answers[2] {
+	if answers[0] != answers[1] || answers[1] != answers[2] || answers[2] != answers[3] {
 		t.Errorf("answers differ: %q", answers)
 	}
+	// The owner learns that a term matched more chats than it lists.
 	got := e.owner.got().requests
-	if len(got) != 3 || len(got[0].Terms[0].Chats) != 1 || got[0].Terms[0].Chats[0].ID != "fam" ||
-		len(got[1].Terms[0].Chats) != 0 || len(got[2].Terms[0].Chats) != 0 {
+	if len(got) != 4 || len(got[0].Terms[0].Chats) != 1 || got[0].Terms[0].Chats[0].ID != "fam" || got[0].Terms[0].More ||
+		len(got[1].Terms[0].Chats) != 0 || len(got[2].Terms[0].Chats) != 0 ||
+		len(got[3].Terms[0].Chats) != matchesPerTerm || !got[3].Terms[0].More {
 		t.Errorf("owner side got %+v", got)
 	}
 }

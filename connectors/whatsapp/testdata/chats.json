@@ -6,7 +6,8 @@
     "participants": [
       {
         "id": "447700900123@s.whatsapp.net",
-        "name": "Sam Park"
+        "name": "Sam Park",
+        "handle": "+447700900123"
       }
     ]
   },
@@ -35,33 +36,62 @@
     "participants": [
       {
         "id": "15550001111@s.whatsapp.net",
-        "name": "Sam Lee"
+        "name": "Sam Lee",
+        "handle": "+15550001111"
       },
       {
         "id": "15557654321@s.whatsapp.net",
-        "name": "~Mom"
+        "name": "~Mom",
+        "handle": "+15557654321"
       }
     ]
   },
   {
     "id": "15550001111@s.whatsapp.net",
     "kind": "dm",
-    "name": "Sam Lee"
+    "name": "Sam Lee",
+    "participants": [
+      {
+        "id": "15550001111@s.whatsapp.net",
+        "name": "Sam Lee",
+        "handle": "+15550001111"
+      }
+    ]
   },
   {
     "id": "15550004444@s.whatsapp.net",
     "kind": "dm",
-    "name": "+15550004444"
+    "name": "+15550004444",
+    "participants": [
+      {
+        "id": "15550004444@s.whatsapp.net",
+        "handle": "+15550004444"
+      }
+    ]
   },
   {
     "id": "15551234567@s.whatsapp.net",
     "kind": "dm",
-    "name": "Farid Haddad"
+    "name": "Farid Haddad",
+    "participants": [
+      {
+        "id": "15551234567@s.whatsapp.net",
+        "name": "Farid Haddad",
+        "handle": "+15551234567"
+      }
+    ]
   },
   {
     "id": "15557654321@s.whatsapp.net",
     "kind": "dm",
-    "name": "~Mom"
+    "name": "~Mom",
+    "participants": [
+      {
+        "id": "15557654321@s.whatsapp.net",
+        "name": "~Mom",
+        "handle": "+15557654321"
+      }
+    ]
   },
   {
     "id": "15559990000@s.whatsapp.net",
@@ -71,6 +101,13 @@
   {
     "id": "447700900123@s.whatsapp.net",
     "kind": "dm",
-    "name": "Sam Park"
+    "name": "Sam Park",
+    "participants": [
+      {
+        "id": "447700900123@s.whatsapp.net",
+        "name": "Sam Park",
+        "handle": "+447700900123"
+      }
+    ]
   }
 ]

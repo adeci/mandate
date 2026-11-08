@@ -2,8 +2,16 @@
 // docs/spec/connector.md describes it. The connector writes it through Store;
 // the gateway reads it through OpenReadOnly.
 //
-// Rollback-journal mode, not WAL: a WAL reader needs write access to the -shm
-// file, which the gateway's group lacks.
+// The store keeps SQLite's rollback journal: a reader's shared lock holds
+// off the connector's commits, which wait busy_timeout (10 s) for it, so
+// readers bound their queries by ReadTimeout.
+//
+// WAL would let commits pass readers, but the gateway may only read the
+// store's directory and files. ncruces's VFS opens a WAL store's -wal for
+// writing, without the read-only fallback of SQLite's os_unix.c, so such a
+// reader gets SQLITE_CANTOPEN; a read-only -shm alone would do. And once the
+// connector closes the store, SQLite deletes -wal and -shm, which that reader
+// can't create again: SQLITE_READONLY_DIRECTORY.
 package store
 
 import (
@@ -29,6 +37,9 @@ var schema string
 type Participant struct {
 	ID   string `json:"id"`
 	Name string `json:"name,omitempty"`
+	// Handle is the @name or number the service shows the person by:
+	// "@sam_p", "@bob:example.org", "+15551234567".
+	Handle string `json:"handle,omitempty"`
 }
 
 type Container struct {
@@ -153,9 +164,15 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	return tx.Commit()
 }
 
+// ReadTimeout bounds a reader's queries. A running query holds the shared
+// lock that the connector's commits wait for, at most busy_timeout (10 s);
+// the driver interrupts a query once its context is done, so a reader under
+// ReadTimeout gives way long before a write gives up.
+const ReadTimeout = 2 * time.Second
+
 // OpenReadOnly opens the store at path for reading only and refuses any
 // version but Version. init, if not nil, runs on each new connection, such
-// as to register functions.
+// as to register functions. Its queries run under ReadTimeout.
 func OpenReadOnly(ctx context.Context, path string, init func(*sqlite3.Conn) error) (*sql.DB, error) {
 	db, err := driver.Open("file:"+path+"?mode=ro&_pragma=busy_timeout(10000)", init)
 	if err != nil {

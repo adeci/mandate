@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/store"
@@ -20,16 +22,21 @@ import (
 func TestMatchesConnectorChats(t *testing.T) {
 	for name, terms := range map[string]map[string][]string{
 		"discord": { // main's #general has main's own ID, as in old servers
-			"main general":    {"1100000000000000001"},
-			"main / general":  {"1100000000000000001"},
-			"main / #general": {"1100000000000000001"},
-			"main #general":   {"1100000000000000001"},
-			"general":         {"1100000000000000001", "1200000000000000011"},
-			"main":            {"1100000000000000001", "1100000000000000012"}, // its channels, not the guild
-			"other":           {"1200000000000000011"},
-			"rollout":         {"1100000000000000013"},
-			"sam":             {"1300000000000000001"},
-			"climbing":        {"1300000000000000002"},
+			"main general":    {"1100000000000000001", "1100000000000000016"}, // then the voice channel's chat
+			"main / general":  {"1100000000000000001", "1100000000000000016"},
+			"main / #general": {"1100000000000000001", "1100000000000000016"},
+			"main #general":   {"1100000000000000001", "1100000000000000016"},
+			"general":         {"1100000000000000001", "1100000000000000016", "1200000000000000011"},
+			// Its channels, not the guild or its forum.
+			"main":     {"1100000000000000001", "1100000000000000012", "1100000000000000015", "1100000000000000016"},
+			"other":    {"1200000000000000011"},
+			"rollout":  {"1100000000000000013"},
+			"help":     {"1100000000000000019"}, // the forum's posts
+			"lounge":   nil,                     // a voice channel never used for text isn't stored
+			"sam":      {"1300000000000000001"},
+			"sam_p":    {"1300000000000000001"}, // by his @handle, not the group he is in
+			"@sam_p":   {"1300000000000000001"},
+			"climbing": {"1300000000000000002"},
 		},
 		"fastmail": {
 			"Inbox":            {"mailbox:mb-inbox"},
@@ -43,6 +50,7 @@ func TestMatchesConnectorChats(t *testing.T) {
 			"Farid":         {"00000000-0000-4000-8000-000000000002"},
 			"mom":           {"00000000-0000-4000-8000-000000000004"},
 			"+15557654321":  {"00000000-0000-4000-8000-000000000005"},
+			"+15551234567":  {"00000000-0000-4000-8000-000000000002"}, // Farid Haddad, by his number
 			"Climbing crew": {"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
 		},
 		"whatsapp": {
@@ -51,18 +59,29 @@ func TestMatchesConnectorChats(t *testing.T) {
 			"Book club":     {"120363000000000999@g.us"},
 			"Climbing crew": {"120363000000000777@g.us", "120363000000000888@g.us"},
 			"+15550004444":  {"15550004444@s.whatsapp.net"},
+			"+15551234567":  {"15551234567@s.whatsapp.net"}, // Farid Haddad, by the number in the ID
+			"555 123 4567":  {"15551234567@s.whatsapp.net"}, // without the country code
+			"555":           {"15550004444@s.whatsapp.net"}, // by its name, not inside IDs or numbers
+			"whatsapp":      nil,
+			"+447700900123": {"447700900123@s.whatsapp.net", "111222333@lid"}, // then the LID chat, by its person's number
 		},
 		"matrix": {
-			"Club / general": {"!general:example.org"},
-			"general":        {"!general:example.org", "!lobby:example.org"},
-			"Team":           {"!team:example.org"},
-			"Club":           {"!general:example.org", "!team:example.org"}, // its rooms, not the space
+			"Club / general":    {"!general:example.org"},
+			"general":           {"!general:example.org", "!lobby:example.org"},
+			"Team":              {"!team:example.org"},
+			"Club":              {"!general:example.org", "!team:example.org"}, // its rooms, not the space
+			"!team:example.org": {"!team:example.org"},
+			"@bob:example.org":  {"!dm:example.org"},
 		},
 		"gmessages": {
-			"Farid":  {"1"},
-			"Family": {"3"},
-			"999":    {"2"},
-			"Ana":    {"4"},
+			"Farid":           {"1"},
+			"Family":          {"3"},
+			"999":             {"2"},
+			"Ana":             {"4"},
+			"555 999 0002":    {"2"}, // named (555) 999-0002
+			"555-999-0002":    {"2"},
+			"+1 555 999 0002": {"2"},
+			"+15551230001":    {"1"}, // Farid Haddad, by his number
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -80,7 +99,7 @@ func TestMatchesConnectorChats(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			v, err := newView(db, neverShared{}, everything)
+			v, err := newView(db, neverShared{}, everything, time.Now())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -97,8 +116,9 @@ func TestMatchesConnectorChats(t *testing.T) {
 				if !eq(got, want) {
 					t.Errorf("%q matches %v, want %v", term, got, want)
 				}
-				// The owner's picker finds what the request did.
-				found, err := picker.Containers(t.Context(), term, "", matchesPerTerm)
+				// The owner's picker finds what the request did, after the
+				// shelves it offers as headings.
+				found, err := picker.Containers(t.Context(), connector.ContainerQuery{Q: term, Limit: matchesPerTerm})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -109,11 +129,15 @@ func TestMatchesConnectorChats(t *testing.T) {
 				}
 				got = nil
 				for _, f := range found {
-					got = append(got, f.ID)
-					if f.ParentName != "" {
-						f.Name = f.ParentName + " / " + f.Name
+					if holders := store.HolderKinds; strings.Contains(holders, "'"+f.Kind+"'") {
+						continue
 					}
-					pickerNames = append(pickerNames, f.Name)
+					got = append(got, f.ID)
+					path := []string{}
+					for _, p := range f.Parents {
+						path = append(path, p.Name)
+					}
+					pickerNames = append(pickerNames, strings.Join(append(path, f.Name), " / "))
 				}
 				if !eq(got, want) {
 					t.Errorf("picker search %q finds %v, want %v", term, got, want)
@@ -142,7 +166,7 @@ func fixtureView(t *testing.T, name string, scope []rule) *view {
 	if err != nil {
 		t.Fatal(err)
 	}
-	v, err := newView(db, neverShared{}, scope)
+	v, err := newView(db, neverShared{}, scope, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,11 +200,15 @@ func TestAgentChatNames(t *testing.T) {
 		}},
 		{"discord", nil, "", []string{
 			"1100000000000000001 main / #general", "1100000000000000012 main / #releases", "1100000000000000013 main / #releases / v2 rollout",
+			"1100000000000000015 main / #announcements", "1100000000000000016 main / General", "1100000000000000019 main / help / crash on start",
 			"1200000000000000011 other / #general", "1300000000000000001 ~Sam Park", "1300000000000000002 climbing",
 		}},
 		// Search finds what a request's term would.
-		{"discord", nil, "main general", []string{"1100000000000000001 main / #general"}},
-		{"discord", nil, "main", []string{"1100000000000000001 main / #general", "1100000000000000012 main / #releases"}},
+		{"discord", nil, "main general", []string{"1100000000000000001 main / #general", "1100000000000000016 main / General"}},
+		{"discord", nil, "main", []string{
+			"1100000000000000001 main / #general", "1100000000000000012 main / #releases",
+			"1100000000000000015 main / #announcements", "1100000000000000016 main / General",
+		}},
 		{"discord", nil, "rollout", []string{"1100000000000000013 main / #releases / v2 rollout"}},
 		{"matrix", []string{"!general:example.org", "!lobby:example.org"}, "", []string{
 			"!general:example.org Club / general", "!lobby:example.org general",
@@ -198,6 +226,54 @@ func TestAgentChatNames(t *testing.T) {
 	names, err := v.names(t.Context(), []string{"1100000000000000013"})
 	if err != nil || names["1100000000000000013"] != "main / #releases / v2 rollout" {
 		t.Errorf("names = %v, %v", names, err)
+	}
+}
+
+// A term's chats rank those idle for a year after every active one; then
+// the chat it names by ID, then those it names by their own name, then the
+// newest, a mailbox dated by its newest thread.
+func TestMatchRanking(t *testing.T) {
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "data.db")
+	st, err := store.Open(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	for _, c := range []store.Container{
+		{ID: "guild:1", Kind: "guild", Name: "rust-lang"},
+		{ID: "11", Kind: "channel", ParentID: "guild:1", Name: "#general", LastMessageAt: now.Add(-time.Hour)},
+		{ID: "guild:2", Kind: "guild", Name: "old"},
+		{ID: "21", Kind: "channel", ParentID: "guild:2", Name: "#rust", LastMessageAt: now.AddDate(-2, 0, 0)},
+		{ID: "22", Kind: "channel", ParentID: "guild:2", Name: "#rust-help"},
+		{ID: "rust", Kind: "dm", Name: "~Ferris", LastMessageAt: now.AddDate(0, 0, -2)},
+		{ID: "mailbox:r", Kind: "mailbox", Name: "Rustaceans"},
+		{ID: "t1", Kind: "thread", ParentID: "mailbox:r", Name: "weekly", LastMessageAt: now.AddDate(0, -11, 0)},
+	} {
+		if err := st.UpsertContainer(t.Context(), c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := &conn{store: path}
+	defer c.close()
+	db, err := c.storeDB(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := newView(db, neverShared{}, everything, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := v.matches(t.Context(), []string{"rust"}, matchesPerTerm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, r := range rows {
+		got = append(got, r[1].(string))
+	}
+	if want := []string{"rust", "mailbox:r", "11", "21", "22"}; !slices.Equal(got, want) {
+		t.Errorf("rust matches %v, want %v", got, want)
 	}
 }
 

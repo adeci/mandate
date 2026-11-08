@@ -181,7 +181,7 @@ func newBareFixture(t *testing.T) *fixture {
 
 func (f *fixture) start(t *testing.T, dev *sgstore.Device) {
 	t.Helper()
-	f.c = newConnector(context.Background(), f.st, discard, f.sess, dev,
+	f.c = newConnector(context.Background(), f.st, testQueue(), discard, f.sess, dev,
 		func(context.Context) <-chan signalmeow.ProvisioningResponse {
 			f.mu.Lock()
 			defer f.mu.Unlock()
@@ -198,7 +198,7 @@ func (f *fixture) start(t *testing.T, dev *sgstore.Device) {
 			f.mu.Lock()
 			f.clients = append(f.clients, cli)
 			f.mu.Unlock()
-			return cli, newIngester(cli, dev, f.st, f.sess, discard)
+			return cli, newIngester(cli, dev, f.st, f.sess, testQueue(), discard)
 		})
 	if err := f.c.connect(); err != nil {
 		t.Fatal(err)
@@ -299,6 +299,8 @@ func eventually(t *testing.T, ok func() bool) {
 	}
 }
 
+func testQueue() *store.Queue { return store.NewQueue(discard, "") }
+
 func TestPrepareKnownChat(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
@@ -347,7 +349,7 @@ func TestPrepareShowsIdentityChange(t *testing.T) {
 		return ""
 	}
 
-	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, discard)
+	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, testQueue(), discard)
 	in.handle(ctx, &events.IdentityChange{ServiceID: libsignalgo.NewPNIServiceID(strangerPNI)})
 	if got := security(stranger.String()); !strings.HasPrefix(got, "! safety number changed 20") {
 		t.Fatalf("stranger: %q", got)
@@ -484,7 +486,7 @@ func TestExecuteKeepsTimer(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
 	f.groups[climbing].DisappearingMessagesDuration = 86400
-	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, discard)
+	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, testQueue(), discard)
 	for _, m := range []*signalpb.DataMessage{
 		{Body: new("hi"), Timestamp: new(uint64(1)), ExpireTimer: new(uint32(3600)), ExpireTimerVersion: new(uint32(2))},
 		// A message from a client that has not seen the latest change.

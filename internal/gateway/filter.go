@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"time"
 
 	"github.com/adeci/mandate/store"
 )
@@ -49,6 +50,7 @@ hidden(id) AS (
 rule(cutoff, until, chats) AS (SELECT value ->> 'cutoff', COALESCE(value ->> 'until', ''), value ->> 'chats' FROM json_each(?3)),
 named AS (
   SELECT c.id, c.kind, c.parent_id, c.last_message_at, c.name AS own,
+         iif(c.kind = 'dm', c.participants_json ->> '$[0].handle') AS handle,
          iif(p1.kind = 'mailbox' AND c.kind != 'mailbox', p1.id, NULL) AS mailbox,
          concat_ws(' / ', p3.name, p2.name, p1.name) AS prefix
   FROM containers AS c
@@ -61,7 +63,7 @@ named AS (
     AND COALESCE(p1.parent_id, '') NOT IN (SELECT id FROM hidden)
     AND COALESCE(p2.parent_id, '') NOT IN (SELECT id FROM hidden)),
 covered AS (
-  SELECT n.id, n.kind, n.parent_id, n.last_message_at, n.mailbox, n.own,
+  SELECT n.id, n.kind, n.parent_id, n.last_message_at, n.mailbox, n.own, n.handle,
          iif(n.prefix = '', n.own, n.prefix || ' / ' || COALESCE(n.own, n.id)) AS name,
          (SELECT min(g.cutoff) FROM rule AS g
           WHERE g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value IN (n.id, n.mailbox))) AS cutoff,
@@ -70,7 +72,7 @@ covered AS (
   FROM named AS n),
 chats AS (
   SELECT id, kind, parent_id, last_message_at, mailbox, cutoff, bounded, iif(name_code, '[login code hidden]', name) AS name,
-         iif(name_code, NULL, own) AS own, name_code
+         iif(name_code, NULL, own) AS own, iif(name_code, NULL, handle) AS handle, name_code
   FROM (SELECT *, name IS NOT NULL AND login_code(name) AS name_code FROM covered WHERE cutoff IS NOT NULL)),
 stored AS (
   SELECT m.*, COALESCE(
@@ -125,15 +127,17 @@ var (
 	searchColumns  = []string{"seq", "sent_at", "chat_id", "chat", "sender_id", "sender", "reply_to", "body"}
 )
 
-// view is a connector's store as one scope shows it. A nil db is a store
-// the connector has not made yet, which holds nothing.
+// view is a connector's store as one scope shows it at one time. A nil db
+// is a store the connector has not made yet, which holds nothing.
 type view struct {
 	db                        *sql.DB
 	hideChats, hidePeople, sc string
+	// now dates chats for store.Matching, in RFC 3339.
+	now string
 }
 
-func newView(db *sql.DB, ns neverShared, scope []rule) (*view, error) {
-	v := &view{db: db}
+func newView(db *sql.DB, ns neverShared, scope []rule, now time.Time) (*view, error) {
+	v := &view{db: db, now: now.UTC().Format(time.RFC3339Nano)}
 	// A JSON null would be one NULL row in json_each, and NOT IN a list
 	// holding NULL is never true.
 	for _, p := range []struct {
@@ -260,7 +264,7 @@ const replyTo = `(SELECT r.seq FROM msgs AS r WHERE r.id = m.reply_to_id)`
 // message (mail threads).
 const listed = `, listed AS MATERIALIZED (
   SELECT * FROM (
-    SELECT c.id, c.kind, c.parent_id, c.name, c.own, c.name_code, c.cutoff, NULLIF(max(
+    SELECT c.id, c.kind, c.parent_id, c.name, c.own, c.handle, c.name_code, c.cutoff, NULLIF(max(
       COALESCE((SELECT max(sent_at) FROM msgs WHERE container_id = c.id), ''),
       COALESCE(c.last_message_at, '')), '') AS at
     FROM chats AS c
@@ -270,8 +274,8 @@ const listed = `, listed AS MATERIALIZED (
 `
 
 // chats lists the chats an agent may read, newest first, or those search
-// finds as a request's term would, in that order. Guilds, spaces and
-// categories hold nothing to read, so they are left out.
+// finds as a request's term would, in that order. Holders have nothing to
+// read, so they are left out.
 func (v *view) chats(ctx context.Context, search string, limit int64) (*table, error) {
 	if search == "" {
 		rows, err := v.query(ctx, listed+`SELECT id, kind, name, strftime('%Y-%m-%d %H:%M', at) FROM listed
@@ -287,10 +291,10 @@ ORDER BY at DESC NULLS LAST, id LIMIT ?4`, limit+1)
 		return nil, err
 	}
 	rows, err := v.query(ctx, listed+`, candidates AS (
-  SELECT id, kind, parent_id, own, iif(name_code, '', name) AS path, at FROM listed),
-`+store.Matching("?4")+`
+  SELECT id, kind, parent_id, own, iif(name_code, '', name) AS path, handle, at FROM listed),
+`+store.Matching("?4", "?6")+`
 SELECT l.id, l.kind, l.name, strftime('%Y-%m-%d %H:%M', l.at) FROM matched AS m JOIN listed AS l ON l.id = m.id
-ORDER BY m.n LIMIT ?5`, ts, limit+1)
+ORDER BY m.n LIMIT ?5`, ts, limit+1, v.now)
 	if err != nil {
 		return nil, err
 	}
@@ -306,10 +310,10 @@ func (v *view) matches(ctx context.Context, terms []string, per int64) ([][]any,
 		return nil, err
 	}
 	return v.query(ctx, listed+`, candidates AS (
-  SELECT id, kind, parent_id, own, iif(name_code, '', name) AS path, at FROM listed),
-`+store.Matching("?4")+`
+  SELECT id, kind, parent_id, own, iif(name_code, '', name) AS path, handle, at FROM listed),
+`+store.Matching("?4", "?6")+`
 SELECT m.k, m.id, l.name FROM matched AS m JOIN listed AS l ON l.id = m.id
-WHERE m.n <= ?5 ORDER BY m.k, m.n`, ts, per)
+WHERE m.n <= ?5 ORDER BY m.k, m.n`, ts, per, v.now)
 }
 
 // before is the seq of the last message seen; the page continues after it in

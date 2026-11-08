@@ -38,6 +38,8 @@ func openStore(ctx context.Context, path string) (*store.Store, error) {
 
 // identityChanged records a changed primary identity. An implicit change
 // on a companion device is a relinked device, which the apps do not report.
+// whatsmeow reports it once, on a goroutine of its own, so a busy store is
+// waited out.
 func (in *ingester) identityChanged(ctx context.Context, e *events.IdentityChange) {
 	if e.Implicit && e.JID.Device != 0 {
 		return
@@ -47,10 +49,13 @@ func (in *ingester) identityChanged(ctx context.Context, e *events.IdentityChang
 		at = time.Now()
 	}
 	j := in.pn(e.JID)
-	_, err := in.st.DB().ExecContext(ctx, `
+	err := store.Retry(ctx, func() error {
+		_, err := in.st.DB().ExecContext(ctx, `
 INSERT INTO whatsapp_identity_changes (jid, changed_at) VALUES (?1, ?2)
 ON CONFLICT(jid) DO UPDATE SET changed_at = max(changed_at, excluded.changed_at)`,
-		j.String(), at.Unix())
+			j.String(), at.Unix())
+		return err
+	})
 	if err != nil {
 		in.log.Error("store identity change", "jid", j.String(), "err", err)
 		return

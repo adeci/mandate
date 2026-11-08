@@ -16,14 +16,17 @@ import (
 	"go.mau.fi/mautrix-signal/pkg/signalmeow/protobuf/signalpb"
 	"go.mau.fi/mautrix-signal/pkg/signalmeow/types"
 
+	"github.com/adeci/mandate/connector"
+	"github.com/adeci/mandate/record"
 	"github.com/adeci/mandate/store"
+	"github.com/adeci/mandate/store/storetest"
 )
 
 func TestReceive(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	f := newFixture(t)
-	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, discard)
+	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, testQueue(), discard)
 	const t1, t2, t3, t4, t5, t6 = 1798000000000, 1798000001000, 1798000002000, 1798000003000, 1798000004000, 1798000005000
 	dm, group := farid.String(), string(climbing)
 	for _, e := range []*events.ChatEvent{
@@ -82,10 +85,11 @@ func TestReceive(t *testing.T) {
 		name, last   string
 		participants string
 	}
+	farids := `{"id":"` + farid.String() + `","name":"Farid Haddad","handle":"+15551234567"}`
 	for id, wantChat := range map[string]chat{
-		dm:                {name: "Farid Haddad", last: "2026-12-23T04:26:43.000Z", participants: "[]"}, // the edit
-		group:             {name: "Climbing crew", last: "2026-12-23T04:26:41.000Z", participants: `[{"id":"` + owner.String() + `","name":"Owner"},{"id":"` + farid.String() + `","name":"Farid Haddad"},{"id":"` + mallory.String() + `","name":"~Mom"}]`},
-		stranger.String(): {name: "+15557654321", last: "2026-12-23T04:26:42.000Z", participants: "[]"},
+		dm:                {name: "Farid Haddad", last: "2026-12-23T04:26:43.000Z", participants: "[" + farids + "]"}, // the edit
+		group:             {name: "Climbing crew", last: "2026-12-23T04:26:41.000Z", participants: "[" + farids + `,{"id":"` + mallory.String() + `","name":"~Mom"}]`},
+		stranger.String(): {name: "+15557654321", last: "2026-12-23T04:26:42.000Z", participants: `[{"id":"` + stranger.String() + `","name":"+15557654321","handle":"+15557654321"}]`},
 	} {
 		var got chat
 		if err := f.st.DB().QueryRow(`SELECT COALESCE(name, ''), COALESCE(last_message_at, ''), participants_json FROM containers WHERE id = ?`, id).
@@ -95,6 +99,53 @@ func TestReceive(t *testing.T) {
 		if got != wantChat {
 			t.Errorf("%s: %+v, want %+v", id, got, wantChat)
 		}
+	}
+}
+
+// A message the store refuses as busy is stored from the queue once the store
+// is free, and an edit that comes meanwhile after it. Both stay unacknowledged,
+// so a restart before then loses nothing; delivered again, they change
+// nothing. The owner's own send, which Signal never delivers back, waits too.
+func TestBusyStore(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t)
+	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, testQueue(), discard)
+	const t1, t2 = 1798000000000, 1798000001000
+	dm := farid.String()
+	msg := &events.ChatEvent{Info: events.MessageInfo{Sender: farid, ChatID: dm}, Event: &signalpb.DataMessage{
+		Body: new("dinner?"), Timestamp: new(uint64(t1)),
+	}}
+	edit := &events.ChatEvent{Info: events.MessageInfo{Sender: farid, ChatID: dm}, Event: &signalpb.EditMessage{
+		TargetSentTimestamp: new(uint64(t1)),
+		DataMessage:         &signalpb.DataMessage{Body: new("dinner at 7?"), Timestamp: new(uint64(t2))},
+	}}
+	body := func(id string) string {
+		for _, m := range messages(t, f.st) {
+			if m.ID == id {
+				return m.Body
+			}
+		}
+		return ""
+	}
+
+	unlock := storetest.Lock(t, f.st)
+	if in.handle(ctx, msg) {
+		t.Fatal("acknowledged a message the store refused")
+	}
+	res := f.c.Execute(ctx, record.Write{ID: "p1", Connector: "signal", Op: "send", Args: map[string]string{"chat": dm, "text": "on my way"}})
+	if res.Status != connector.Done || res.Detail != "" {
+		t.Errorf("send while the store is busy: %+v", res)
+	}
+	unlock()
+	if in.handle(ctx, edit) {
+		t.Fatal("acknowledged an edit of a message not stored yet")
+	}
+	eventually(t, func() bool {
+		return body(messageID(dm, farid, t1)) == "dinner at 7?" && body(dm+"/"+owner.String()+"/"+res.Ref) == "on my way"
+	})
+	if !in.handle(ctx, msg) || !in.handle(ctx, edit) || body(messageID(dm, farid, t1)) != "dinner at 7?" {
+		t.Fatal("the message and edit delivered again changed the store or were not acknowledged")
 	}
 }
 
@@ -167,7 +218,7 @@ func TestContactListNamesDMs(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	f := newFixture(t)
-	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, discard)
+	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, testQueue(), discard)
 	pniChat := "PNI:" + strangerPNI.String()
 	if err := f.st.UpsertContainer(ctx, store.Container{ID: pniChat, Kind: "dm"}); err != nil {
 		t.Fatal(err)
@@ -218,7 +269,7 @@ func TestOwnChatIsNoteToSelf(t *testing.T) {
 	if err := f.st.UpsertContainer(ctx, store.Container{ID: owner.String(), Kind: "dm", Name: "Owner"}); err != nil {
 		t.Fatal(err)
 	}
-	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, discard)
+	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, testQueue(), discard)
 	in.syncChats(ctx)
 	in.handle(ctx, &events.ContactList{Contacts: []*types.Recipient{{ACI: owner, Profile: types.Profile{Name: "Owner"}}}})
 	in.handle(ctx, &events.ChatEvent{Info: events.MessageInfo{Sender: owner, ChatID: owner.String()}, Event: &signalpb.DataMessage{
@@ -234,7 +285,8 @@ func TestOwnChatIsNoteToSelf(t *testing.T) {
 }
 
 // A sync stores a chat for every contact and every group the account is
-// in, without messages.
+// in, without messages. A DM lists its person and a group its members but
+// the owner, by number where known.
 func TestSyncChats(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -247,7 +299,7 @@ func TestSyncChats(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, discard)
+	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, testQueue(), discard)
 	in.syncChats(ctx)
 
 	rows, err := f.st.DB().Query(`SELECT id, kind, COALESCE(name, ''), COALESCE(last_message_at, ''), participants_json FROM containers`)
@@ -263,16 +315,21 @@ func TestSyncChats(t *testing.T) {
 		}
 		got[id] = strings.Join([]string{kind, name, last, parts}, "|")
 	}
-	member := func(id uuid.UUID, name string) string { return `{"id":"` + id.String() + `","name":"` + name + `"}` }
+	person := func(id uuid.UUID, name, number string) string {
+		if number != "" {
+			number = `,"handle":"` + number + `"`
+		}
+		return `{"id":"` + id.String() + `","name":"` + name + `"` + number + `}`
+	}
 	want := map[string]string{
-		string(quiet):      "group|Book club||[" + member(owner, "Owner") + "," + member(sam, "Sam") + "]",
-		string(climbing):   "group|Climbing crew||[" + member(owner, "Owner") + "," + member(farid, "Farid Haddad") + "," + member(mallory, "~Mom") + "]",
+		string(quiet):      "group|Book club||[" + person(sam, "Sam", "+15550001111") + "]",
+		string(climbing):   "group|Climbing crew||[" + person(farid, "Farid Haddad", "+15551234567") + "," + person(mallory, "~Mom", "") + "]",
 		string(bouldering): "group|Climbing crew||[]",
 		owner.String():     "dm|Note to Self||[]",
-		farid.String():     "dm|Farid Haddad||[]",
-		sam.String():       "dm|Sam||[]",
-		mallory.String():   "dm|~Mom||[]",
-		stranger.String():  "dm|+15557654321||[]", // no name but a number
+		farid.String():     "dm|Farid Haddad||[" + person(farid, "Farid Haddad", "+15551234567") + "]",
+		sam.String():       "dm|Sam||[" + person(sam, "Sam", "+15550001111") + "]",
+		mallory.String():   "dm|~Mom||[" + person(mallory, "~Mom", "") + "]",
+		stranger.String():  "dm|+15557654321||[" + person(stranger, "+15557654321", "+15557654321") + "]", // no name but a number
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("chats\n got %q\nwant %q", got, want)

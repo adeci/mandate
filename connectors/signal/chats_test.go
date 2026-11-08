@@ -23,6 +23,6 @@ func TestChatsFixture(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	newIngester(f.cli(), f.c.dev, f.st, f.sess, discard).syncChats(ctx)
+	newIngester(f.cli(), f.c.dev, f.st, f.sess, testQueue(), discard).syncChats(ctx)
 	storetest.Check(t, f.st.DB(), filepath.Join("testdata", "chats.json"))
 }

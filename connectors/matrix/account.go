@@ -256,3 +256,15 @@ func (a *account) retry() []*event.Event {
 	a.arrived = nil
 	return evts
 }
+
+// again keeps evts, taken by retry, for the next retry.
+func (a *account) again(evts []*event.Event) {
+	for _, evt := range evts {
+		a.keep(evt)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, evt := range evts {
+		a.arrived = append(a.arrived, evt.Content.AsEncrypted().SessionID)
+	}
+}

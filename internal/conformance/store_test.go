@@ -24,6 +24,7 @@ func TestStoreRules(t *testing.T) {
 		{"depth", `INSERT INTO containers (id, kind, parent_id, updated_at) VALUES ('c4', 'thread', 'c3', '')`, checkNesting},
 		{"names", `UPDATE containers SET name = '~ Sam' WHERE id = 'c1'`, checkNames},
 		{"participants", `UPDATE containers SET participants_json = '[{"id":"p","name":"~~Sam"}]' WHERE id = 'c1'`, checkNames},
+		{"handles", `UPDATE containers SET participants_json = '[{"id":"p","name":"~Sam","handle":"~sam_p"}]' WHERE id = 'c1'`, checkNames},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "data.db")

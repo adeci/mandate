@@ -89,20 +89,13 @@ FROM containers WHERE id = ?1`, chat).Scan(&kind, &name, &parent, &parts)
 			return record.Field{}, fmt.Errorf("chat %s participants: %w", chat, err)
 		}
 		id := chat
-		if len(ps) == 1 {
-			var h string
-			err := db.QueryRowContext(ctx, `SELECT handle FROM discord_handles WHERE user_id = ?1`, ps[0].ID).Scan(&h)
-			switch {
-			case err == nil:
-				id = "@" + h
-			case !errors.Is(err, sql.ErrNoRows):
-				return record.Field{}, fmt.Errorf("look up handle: %w", err)
-			}
+		if len(ps) == 1 && ps[0].Handle != "" {
+			id = ps[0].Handle
 		}
 		return record.Field{Label: "To", Value: withID(name, id)}, nil
 	case kindGroup:
 		return record.Field{Label: "Group", Value: withID(name, chat)}, nil
-	case kindChannel, kindThread:
+	case kindChannel, kindAnnouncement, kindVoice, kindStage, kindThread:
 		// The guild and, for a thread, its channel, as the gateway's chats
 		// verb prefixes them.
 		for range 2 {
@@ -214,10 +207,9 @@ func (s *service) send(ctx context.Context, dl time.Time, chat, text string) con
 		return res
 	}
 	msg.IsFromMe = true
-	if err := s.st.UpsertMessage(ctx, msg); err != nil {
-		s.up.log.Error("store sent message", "id", m.ID, "chat", chat, "err", err)
-		res.Detail = "sent, but not stored: " + err.Error()
-	}
+	s.gw.writes.Do("sent message "+m.ID+" in "+chat, func(ctx context.Context) error {
+		return s.st.UpsertMessage(ctx, msg)
+	})
 	return res
 }
 

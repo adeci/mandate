@@ -208,13 +208,9 @@ func (c *sgConnector) Execute(ctx context.Context, w record.Write) connector.Res
 		return res
 	}
 	res.Ref = strconv.FormatUint(ts, 10)
-	if err := c.record(ctx, dev.ACI, chat, text, ts); err != nil {
-		c.log.Error("store sent message", "chat", chat, "err", err)
-		if res.Detail != "" {
-			res.Detail += "; "
-		}
-		res.Detail += "sent, but not stored: " + err.Error()
-	}
+	c.writes.Do("sent message "+messageID(chat, dev.ACI, ts), func(ctx context.Context) error {
+		return c.record(ctx, dev.ACI, chat, text, ts)
+	})
 	return res
 }
 

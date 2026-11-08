@@ -230,7 +230,7 @@ const (
 	// A connector may pace reads and wait for a slot.
 	readTimeout  = 2 * time.Minute
 	mediaTimeout = 10 * time.Minute
-	queryTimeout = 10 * time.Second
+	queryTimeout = store.ReadTimeout
 )
 
 // getSpec caches only successes, so a connector that comes back is listed
@@ -298,7 +298,7 @@ func (g *gateway) view(ctx context.Context, cl *caller, c *conn, scope []rule) (
 	if err != nil {
 		return nil, err
 	}
-	return newView(db, cl.live.hidden[c.name], scope)
+	return newView(db, cl.live.hidden[c.name], scope, time.Now())
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

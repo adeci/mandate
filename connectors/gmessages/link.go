@@ -269,7 +269,7 @@ func (c *gmConnector) event(cli gmClient, evt any) {
 	case *gmproto.Settings:
 		c.in.settings(e)
 	case *gmproto.Conversation:
-		c.in.conversationEvent(c.ctx, e)
+		c.in.conversationEvent(e)
 	case *libgm.WrappedMessage:
 		c.in.message(c.ctx, cli, e.Message)
 	}

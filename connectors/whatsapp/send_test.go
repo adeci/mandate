@@ -208,6 +208,8 @@ type fixture struct {
 	clients []*fakeClient
 }
 
+func testQueue() *store.Queue { return store.NewQueue(slog.New(slog.DiscardHandler), "") }
+
 func newBareFixture(t *testing.T) *fixture {
 	t.Helper()
 	dir := t.TempDir()
@@ -225,7 +227,7 @@ func newBareFixture(t *testing.T) *fixture {
 }
 
 func (f *fixture) start(dev *wastore.Device) {
-	f.c = newConnector(context.Background(), f.st, slog.New(slog.NewTextHandler(io.Discard, nil)), dev, f.container.NewDevice,
+	f.c = newConnector(context.Background(), f.st, testQueue(), slog.New(slog.NewTextHandler(io.Discard, nil)), dev, f.container.NewDevice,
 		func(*wastore.Device, func(any)) waClient {
 			cli := &fakeClient{}
 			f.mu.Lock()
@@ -440,7 +442,7 @@ func TestIdentityChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, testQueue(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	security := func(chat types.JID) string {
 		t.Helper()
 		p, err := f.c.Prepare(ctx, "send", map[string]string{"chat": chat.String(), "text": "hi"})

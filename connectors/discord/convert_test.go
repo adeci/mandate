@@ -226,10 +226,10 @@ func TestChannelContainer(t *testing.T) {
 			want: store.Container{ID: "t", Kind: "thread", ParentID: "c", Name: "topic"}, wantOK: true,
 		},
 		{
-			name: "dm uses the recipient's name and is dated by its last message",
+			name: "dm uses the recipient's name and @handle and is dated by its last message",
 			in:   &apiChannel{ID: "d", Type: channelDM, Recipients: []apiUser{*alice}, LastMessageID: "175928847299117063"},
 			want: store.Container{
-				ID: "d", Kind: "dm", Name: "~Alice A", Participants: []store.Participant{{ID: "200", Name: "~Alice A"}},
+				ID: "d", Kind: "dm", Name: "~Alice A", Participants: []store.Participant{{ID: "200", Name: "~Alice A", Handle: "@alice"}},
 				LastMessageAt: time.Date(2016, 4, 30, 11, 18, 25, 796e6, time.UTC),
 			}, wantOK: true,
 		},
@@ -243,7 +243,7 @@ func TestChannelContainer(t *testing.T) {
 			in:   &apiChannel{ID: "gd", Name: "crew", Type: channelGroupDM, Recipients: []apiUser{*alice, *bob}},
 			want: store.Container{
 				ID: "gd", Kind: "group", Name: "crew", IsGroup: true,
-				Participants: []store.Participant{{ID: "200", Name: "~Alice A"}, {ID: "300", Name: "~bob"}},
+				Participants: []store.Participant{{ID: "200", Name: "~Alice A", Handle: "@alice"}, {ID: "300", Name: "~bob", Handle: "@bob#0042"}},
 			}, wantOK: true,
 		},
 		{
@@ -251,7 +251,7 @@ func TestChannelContainer(t *testing.T) {
 			in:   &apiChannel{ID: "gd", Type: channelGroupDM, Recipients: []apiUser{*alice, *bob}},
 			want: store.Container{
 				ID: "gd", Kind: "group", Name: "~Alice A, ~bob", IsGroup: true,
-				Participants: []store.Participant{{ID: "200", Name: "~Alice A"}, {ID: "300", Name: "~bob"}},
+				Participants: []store.Participant{{ID: "200", Name: "~Alice A", Handle: "@alice"}, {ID: "300", Name: "~bob", Handle: "@bob#0042"}},
 			}, wantOK: true,
 		},
 		{name: "category skipped", in: &apiChannel{ID: "cat", GuildID: "g", Type: channelGuildCategory}},
@@ -286,12 +286,12 @@ func TestGuildContainers(t *testing.T) {
 		{ID: "t", Type: channelPublicThread, ParentID: "c", Name: "topic"},
 		{ID: "t2", Type: channelPublicThread, ParentID: "c2", Name: "elsewhere"},
 	}
-	// A thread's channel that was not listed is stored by ID, so the thread
-	// still hangs under the guild.
+	// A thread's channel that was not listed comes by ID, with no kind, so
+	// the thread still hangs under the guild.
 	want := []store.Container{
 		{ID: "c", Kind: "channel", ParentID: "guild:g", Name: "#general"},
 		{ID: "t", Kind: "thread", ParentID: "c", Name: "topic"},
-		{ID: "c2", Kind: "channel", ParentID: "guild:g"},
+		{ID: "c2", ParentID: "guild:g"},
 		{ID: "t2", Kind: "thread", ParentID: "c2", Name: "elsewhere"},
 	}
 	if got := guildChannelContainers("g", chans); !reflect.DeepEqual(got, want) {
@@ -299,6 +299,50 @@ func TestGuildContainers(t *testing.T) {
 	}
 	if chans[1].GuildID != "" {
 		t.Error("input slice modified")
+	}
+}
+
+// Guild channels are stored by type, named as Discord shows them.
+func TestGuildChannelKinds(t *testing.T) {
+	for typ, want := range map[int][2]string{
+		0:                   {"channel", "#lobby"},
+		channelAnnouncement: {"announcement", "#lobby"},
+		channelVoice:        {"voice", "lobby"},
+		channelStage:        {"stage", "lobby"},
+		channelForum:        {"forum", "lobby"},
+		channelMedia:        {"media", "lobby"},
+		14:                  {"channel", "#lobby"}, // a hub's directory, a type of no kind of its own
+	} {
+		c, ok := channelContainer(&apiChannel{ID: "c", GuildID: "g", Type: typ, Name: "lobby"})
+		if !ok || c.Kind != want[0] || c.Name != want[1] || c.ParentID != "guild:g" {
+			t.Errorf("type %d: %+v, %v; want %v", typ, c, ok, want)
+		}
+	}
+}
+
+// A server keeps its icon, a group DM its own and a DM its person's avatar,
+// as the CDN paths of their hashes; anything else is no picture.
+func TestPictures(t *testing.T) {
+	const (
+		guild = "1100000000000000001"
+		user  = "1000000000000000002"
+		group = "1300000000000000002"
+	)
+	g, _ := guildContainer(&apiGuild{ID: guild, Name: "main", Icon: "a_" + pictureHash})
+	dm, _ := channelContainer(&apiChannel{ID: "1300000000000000001", Type: channelDM, Recipients: []apiUser{{ID: user, Avatar: pictureHash}}})
+	gd, _ := channelContainer(&apiChannel{ID: group, Type: channelGroupDM, Icon: pictureHash})
+	plain, _ := channelContainer(&apiChannel{ID: "1300000000000000003", Type: channelDM, Recipients: []apiUser{{ID: user}}})
+	odd, _ := guildContainer(&apiGuild{ID: guild, Icon: "../../users/@me"})
+	for _, tc := range []struct{ got, want string }{
+		{g.Icon, "icons/" + guild + "/a_" + pictureHash},
+		{dm.Icon, "avatars/" + user + "/" + pictureHash},
+		{gd.Icon, "channel-icons/" + group + "/" + pictureHash},
+		{plain.Icon, ""},
+		{odd.Icon, ""},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("picture %q, want %q", tc.got, tc.want)
+		}
 	}
 }
 

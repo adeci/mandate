@@ -38,20 +38,13 @@ func newSendHarness(t *testing.T, seed func(*state)) *harness {
 		{ID: guildID, Kind: kindGuild, Name: "Club"},
 		{ID: chanGeneral, Kind: kindChannel, ParentID: guildID, Name: "#general"},
 		{ID: threadID, Kind: kindThread, ParentID: chanGeneral, Name: "rig thread"},
-		{ID: dmID, Kind: kindDM, Name: "~Alice A", Participants: []store.Participant{{ID: aliceUser, Name: "~Alice A"}}},
-		{ID: dm2ID, Kind: kindDM, Name: "~Alice A", Participants: []store.Participant{{ID: "1000000000000000007", Name: "~Alice A"}}},
+		{ID: dmID, Kind: kindDM, Name: "~Alice A", Participants: []store.Participant{{ID: aliceUser, Name: "~Alice A", Handle: "@alice"}}},
+		{ID: dm2ID, Kind: kindDM, Name: "~Alice A", Participants: []store.Participant{{ID: "1000000000000000007", Name: "~Alice A", Handle: "@mallory"}}},
 		{ID: groupID, Kind: kindGroup, Name: "crew", IsGroup: true},
 	} {
 		if err := h.st.UpsertContainer(context.Background(), c); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if _, err := h.st.DB().Exec(handlesSchema); err != nil {
-		t.Fatal(err)
-	}
-	users := []apiUser{{ID: aliceUser, Username: "alice"}, {ID: "1000000000000000007", Username: "mallory"}}
-	if err := saveHandles(context.Background(), h.st.DB(), users); err != nil {
-		t.Fatal(err)
 	}
 	h.discord.handle(api("/channels/"+dmID+"/typing"), func(w http.ResponseWriter, _ *http.Request, _ int) {
 		w.WriteHeader(http.StatusNoContent)

@@ -56,6 +56,8 @@ type chat struct {
 type term struct {
 	Term  string `json:"term"`
 	Chats []chat `json:"chats"`
+	// More says the term matched more chats than it lists.
+	More bool `json:"more,omitempty"`
 }
 
 type schedule struct {

@@ -23,12 +23,14 @@ PROGRAM --check-config FILE
   a valid file, else non-zero with a message on stderr.
 - The socket is mode 0666: who may call what is decided per route, by the
   caller's group (see [Callers](#callers)).
-- `DIR/data.db` is the store, in SQLite's rollback-journal mode: a reader
-  without write access can't rely on WAL's shared-memory file. mandate gives
-  the gateway's group read access to `DIR` through a default ACL, so the
-  connector creates the store and its `-journal` group-readable.
-  `DIR/private/` (0700) holds the session, credentials, key log and spent
-  approvals.
+- `DIR/data.db` is the store, in SQLite's rollback-journal mode, not WAL:
+  the gateway reads it without write access, and its SQLite can't open a
+  WAL store's `-wal` read-only. mandate gives the gateway's group read
+  access to `DIR` through a default ACL, so the connector creates the store
+  and its `-journal` group-readable. Readers give up a query after 2 s, so a
+  write waiting for their lock needs a busy timeout well above that; the Go
+  SDK's is 10 s. `DIR/private/` (0700) holds the session, credentials, key
+  log and spent approvals.
 - It exits on SIGTERM after finishing in-flight writes. A fault only a
   restart clears ends the process non-zero; anything the owner must fix is
   reported through [health](#health).
@@ -102,11 +104,11 @@ read them, so they hold nothing secret.
 ```sql
 CREATE TABLE containers (
     id                TEXT PRIMARY KEY,
-    kind              TEXT NOT NULL,     -- dm, group, channel, thread, guild, mailbox, …
+    kind              TEXT NOT NULL,     -- dm, group, channel, announcement, voice, stage, thread, guild, forum, media, space, mailbox, …
     parent_id         TEXT,
     name              TEXT,
     is_group          INTEGER NOT NULL DEFAULT 0,
-    participants_json TEXT NOT NULL DEFAULT '[]',  -- [{"id": "…", "name": "…"}]
+    participants_json TEXT NOT NULL DEFAULT '[]',  -- [{"id": "…", "name": "…", "handle": "…"}]
     updated_at        TEXT NOT NULL,
     last_message_at   TEXT,             -- last activity the service reported
     icon              TEXT              -- the service's handle for the chat's picture; never leaves the connector
@@ -153,16 +155,26 @@ CREATE TABLE media (
   for mail: a mailbox is a chat of kind `mailbox`, a thread's `parent_id` is
   the mailbox it is filed in, and a grant on a mailbox also covers the chats
   filed directly in it that aren't mailboxes, as filed when read.
-- Chats that only hold others, of kind `guild`, `space` or `category`, hold no
-  messages; agents never get them by name, only the chats in them.
+- Chats that only hold others, of kind `guild`, `space`, `forum` or `media`,
+  hold no messages; agents never get them by name, only the chats in them.
 - A name the person chose (a profile or push name) starts with `~`;
   address-book names and the owner's own name don't. The owner's chat with
   themself gets the service's name for it.
-- A DM has `kind = 'dm'`. If its ID is not the other person's, it lists them
-  in `participants_json`, so hiding a person hides their DMs.
+- A DM has `kind = 'dm'` and lists its person in `participants_json`, so
+  hiding a person hides their DMs. Where known, the person has a `handle`,
+  the @name or number the service shows them by (`@sam_p`,
+  `@bob:example.org`, `+15551234567`), and terms find the DM by it.
+- A group lists its members in `participants_json` where the service tells
+  them, never the owner.
 - `is_from_me` marks the owner's messages; `reply_to_id` the message answered.
 - An edit updates `body` and sets `edited_at`; an identical redelivery changes
   nothing. A delete sets `deleted = 1`.
+- A reader holding the store past the connector's busy timeout makes its
+  writes fail with `SQLITE_BUSY`, and nothing may be lost to that: the write
+  waits in memory and is stored in order once the reader lets go, so an edit
+  never lands before its message. An event the service delivers again stays
+  unacknowledged until then; the record of a message the owner sent waits
+  the same way.
 - Files are `media` rows numbered from 0; a message whose files aren't stored
   keeps `media_type` (`image`, `video`, …).
 
@@ -270,23 +282,45 @@ session and credentials, keeps stored messages, and health becomes `setup`.
 
 ## Chats for the owner
 
-`GET /containers?q=fam&parent=&limit=50` lists stored chats for the app's
-chat picker, so the owner side never opens the store:
+`GET /containers` lists stored chats for the app's chat picker, so the owner
+side never opens the store:
+
+| Query | Answers |
+|---|---|
+| none | the newest chats anywhere, no shelves |
+| `parent=` (empty) | the top level: every shelf without a parent, then the chats without one |
+| `parent=ID` | the same in ID |
+| `q` | the shelves whose own name has every word of `q`, as headings, then the chats `q` finds as an agent's request term does ([agent-api.md](agent-api.md#access)); in `parent` at any depth if set |
+| `ids=a,b` | exactly those chats, in that order |
+
+A shelf is a holder or a mailbox. Each list is the newest first, a shelf
+being as recent as the newest chat in it. `limit` (default 50, at most 500)
+cuts the chats, never the shelves.
 
 ```json
-[{"id": "…", "name": "Family 🏡", "kind": "group", "parent_id": "", "last_activity": "2026-11-02T08:10:00Z"},
- {"id": "…", "name": "#general", "kind": "channel", "parent_id": "…", "parent_name": "main"},
- {"id": "…", "name": "Ana", "kind": "dm", "parent_id": "", "participants": [{"id": "…", "name": "Ana"}]}]
+[{"id": "guild:1100000000000000001", "kind": "guild", "name": "main", "parents": [],
+  "last_activity": "2026-11-07T10:01:00Z", "opens": true, "icon": "9f2c4a1b0e7d"},
+ {"id": "1100000000000000011", "kind": "channel", "name": "#general",
+  "parents": [{"id": "guild:1100000000000000001", "name": "main", "icon": "9f2c4a1b0e7d"}],
+  "last_activity": "2026-11-07T10:01:00Z"},
+ {"id": "1300000000000000002", "kind": "group", "name": "climbing", "parents": [], "members": 3},
+ {"id": "1300000000000000001", "kind": "dm", "name": "~Sam Park", "parents": [], "handle": "@sam_p",
+  "participants": [{"id": "1000000000000000002", "name": "~Sam Park", "handle": "@sam_p"}]},
+ {"id": "mailbox:mb-inbox", "kind": "mailbox", "name": "Inbox", "parents": [], "opens": true, "threads": 7}]
 ```
 
-`participants` is set for `dm` chats only, from `participants_json`.
-`icon` is the version of the chat's picture, a short hash of `icon`'s ref
-that changes with it; absent when the chat has none.
-`parent_name` is the parent's path, the chat's own being `parent_name / name`.
-
-`q` finds chats as an agent's request term does
-([agent-api.md](agent-api.md#access)), `parent` lists a chat's children,
-`limit` is at most 500.
+- `parents` are the chats it is in, the outermost first; its path is their
+  names and its own.
+- `opens`: a shelf, or a chat with chats in it, such as a channel's threads.
+- `members` counts a group's stored members and the owner; `threads` the
+  chats filed directly in a mailbox.
+- `handle`: a DM's person's handle.
+- `participants`: a DM's person; with `ids`, a group's members too.
+- `icon` is the version of the chat's picture, a short hash of `icon`'s ref
+  that changes with it; absent when the chat has none.
+- The owner side adds `"hidden": true` to a chat that never-share hides: it,
+  a chat it is in, or a DM's person is never shared. The connector doesn't
+  know never-share.
 
 ## Pictures
 

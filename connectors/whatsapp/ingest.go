@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -27,7 +28,10 @@ const queryTimeout = 30 * time.Second
 type ingester struct {
 	cli *whatsmeow.Client
 	st  *store.Store
-	log *slog.Logger
+	// writes keeps a message the store refuses as busy until it is free,
+	// with the edits and deletions after it.
+	writes *store.Queue
+	log    *slog.Logger
 	// groupInfo is cli.GetGroupInfo, unless a test answers for WhatsApp.
 	groupInfo func(context.Context, types.JID) (*types.GroupInfo, error)
 
@@ -37,10 +41,11 @@ type ingester struct {
 	lidPN map[types.JID]types.JID // LID -> PN learned from history sync
 }
 
-func newIngester(cli *whatsmeow.Client, st *store.Store, log *slog.Logger) *ingester {
+func newIngester(cli *whatsmeow.Client, st *store.Store, writes *store.Queue, log *slog.Logger) *ingester {
 	return &ingester{
 		cli:       cli,
 		st:        st,
+		writes:    writes,
 		log:       log,
 		groupInfo: cli.GetGroupInfo,
 		seen:      make(map[types.JID]bool),
@@ -50,7 +55,9 @@ func newIngester(cli *whatsmeow.Client, st *store.Store, log *slog.Logger) *inge
 }
 
 // Returning false for a message withholds its ack (SynchronousAck), so the
-// server redelivers it after reconnecting.
+// server redelivers it after reconnecting. One the store refuses as busy is
+// stored from the queue once the store is free; its ack is withheld still,
+// so a restart before then loses nothing.
 func (in *ingester) handle(ctx context.Context, evt any) bool {
 	switch e := evt.(type) {
 	case *events.Message:
@@ -58,10 +65,9 @@ func (in *ingester) handle(ctx context.Context, evt any) bool {
 		if !ok {
 			return true
 		}
-		if err := in.apply(ctx, o); err != nil {
-			in.log.Error("store message", "id", e.Info.ID, "chat", e.Info.Chat.String(), "err", err)
-			return false
-		}
+		return in.writes.Do("message "+e.Info.ID+" in "+e.Info.Chat.String(), func(ctx context.Context) error {
+			return in.apply(ctx, o)
+		})
 	case *events.HistorySync:
 		in.historySync(ctx, e.Data)
 	case *events.PushName:
@@ -226,12 +232,8 @@ const messageYourself = "Message yourself"
 // chat as WhatsApp does, any other as contactName under the user's phone
 // number and LID, as whatsmeow keeps a name under the ID it came with.
 func (in *ingester) chatName(ctx context.Context, ids ...types.JID) string {
-	for _, own := range []types.JID{in.cli.Store.GetJID(), in.cli.Store.GetLID()} {
-		for _, j := range ids {
-			if !own.IsEmpty() && j.User == own.User && j.Server == own.Server {
-				return messageYourself
-			}
-		}
+	if slices.ContainsFunc(ids, in.own) {
+		return messageYourself
 	}
 	all := make([]types.JID, 0, 2*len(ids))
 	for _, j := range ids {
@@ -243,8 +245,19 @@ func (in *ingester) chatName(ctx context.Context, ids ...types.JID) string {
 	return in.contactName(ctx, all...)
 }
 
-// number names the chat with the user j by their phone number, which unlike
-// a chosen name nobody can spoof; a LID has none.
+// own says whether j is the owner, under their phone number or LID.
+func (in *ingester) own(j types.JID) bool {
+	for _, o := range []types.JID{in.cli.Store.GetJID(), in.cli.Store.GetLID()} {
+		if !o.IsEmpty() && j.User == o.User && j.Server == o.Server {
+			return true
+		}
+	}
+	return false
+}
+
+// number is the phone number of the user j, their handle. Unlike a chosen
+// name nobody can spoof it, so it also names a chat with them that has no
+// other name. A LID has none.
 func number(j types.JID) string {
 	if j.Server != types.DefaultUserServer {
 		return ""
@@ -309,7 +322,7 @@ func (in *ingester) ensureContainer(ctx context.Context, chat types.JID, base st
 	c.ID, c.Kind, c.IsGroup = chat.String(), kindFor(chat), chat.Server == types.GroupServer
 	if c.IsGroup && c.Name == "" {
 		if info, err := in.lookupGroup(ctx, chat); err == nil {
-			c = groupContainer(info, in.pn, in.nameFunc(ctx))
+			c = groupContainer(info, in.pn, in.nameFunc(ctx), in.own)
 			c.LastMessageAt = base.LastMessageAt
 		}
 	} else if !c.IsGroup {
@@ -427,7 +440,7 @@ func (in *ingester) storeGroups(ctx context.Context, groups []*types.GroupInfo) 
 		in.mu.Lock()
 		in.seen[g.JID.ToNonAD()] = true
 		in.mu.Unlock()
-		if err := in.st.UpsertContainer(ctx, groupContainer(g, in.pn, in.nameFunc(ctx))); err != nil {
+		if err := in.st.UpsertContainer(ctx, groupContainer(g, in.pn, in.nameFunc(ctx), in.own)); err != nil {
 			in.log.Error("store group", "chat", g.JID.String(), "err", err)
 		}
 	}
@@ -452,14 +465,15 @@ func (in *ingester) renameDM(ctx context.Context, j types.JID) {
 	}
 }
 
-// dmParticipants lists the person of a DM stored under their LID by phone
-// number, the ID their messages carry once it is known, so that hiding
-// them hides the DM too.
+// dmParticipants lists the person of the DM chat by phone number where it is
+// known, the ID their messages carry, so that hiding them hides the DM too;
+// the number is their handle. The owner's own chat lists nobody.
 func (in *ingester) dmParticipants(chat types.JID, name string) []store.Participant {
-	if pn := in.pn(chat); pn != chat {
-		return []store.Participant{{ID: pn.String(), Name: name}}
+	j := in.pn(chat)
+	if in.own(j) {
+		return nil
 	}
-	return nil
+	return []store.Participant{{ID: j.String(), Name: name, Handle: number(j)}}
 }
 
 // nameDMs names every stored DM from the contact store, and one that has no
@@ -538,6 +552,7 @@ func (in *ingester) historySync(ctx context.Context, hs *waHistorySync.HistorySy
 	}
 	in.mu.Unlock()
 
+	// History comes once, so a busy store is waited out.
 	var convs, stored, failed int
 	for _, conv := range hs.GetConversations() {
 		raw, err := types.ParseJID(conv.GetID())
@@ -548,8 +563,8 @@ func (in *ingester) historySync(ctx context.Context, hs *waHistorySync.HistorySy
 		if !ok {
 			continue
 		}
-		base := historyContainer(chat, conv, in.pn)
-		if err := in.ensureContainer(ctx, chat, base); err != nil {
+		base := historyContainer(chat, conv, in.pn, in.own)
+		if err := store.Retry(ctx, func() error { return in.ensureContainer(ctx, chat, base) }); err != nil {
 			in.log.Error("store history container", "chat", chat.String(), "err", err)
 			continue
 		}
@@ -567,7 +582,7 @@ func (in *ingester) historySync(ctx context.Context, hs *waHistorySync.HistorySy
 			if !ok {
 				continue
 			}
-			if err := in.apply(ctx, o); err != nil {
+			if err := store.Retry(ctx, func() error { return in.apply(ctx, o) }); err != nil {
 				failed++
 				in.log.Error("store history message", "id", evt.Info.ID, "chat", chat.String(), "err", err)
 				continue

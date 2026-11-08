@@ -52,6 +52,13 @@ func openStore(ctx context.Context, path string) (*store.Store, error) {
 		st.Close()
 		return nil, fmt.Errorf("create space tables: %w", err)
 	}
+	// DMs stored before participants had handles get theirs: a Matrix ID is
+	// its own handle.
+	if _, err := st.DB().ExecContext(ctx, `UPDATE containers SET participants_json = json_set(participants_json, '$[0].handle', participants_json ->> '$[0].id')
+WHERE kind = 'dm' AND participants_json ->> '$[0].id' IS NOT NULL AND participants_json ->> '$[0].handle' IS NULL`); err != nil {
+		st.Close()
+		return nil, fmt.Errorf("fill handles: %w", err)
+	}
 	return st, nil
 }
 
@@ -59,6 +66,7 @@ type mxConnector struct {
 	// ctx outlives requests: the sync loop runs until shutdown.
 	ctx     context.Context
 	st      *store.Store
+	writes  *store.Queue     // the owner's sends, which the next sync brings back too
 	dir     string           // the private state directory
 	session connector.Secret // the session JSON, with the access token
 	log     *slog.Logger
@@ -78,8 +86,8 @@ type mxConnector struct {
 
 func newConnector(ctx context.Context, st *store.Store, env *connector.Env, zl zerolog.Logger, hc *http.Client) *mxConnector {
 	return &mxConnector{
-		ctx: ctx, st: st, dir: env.PrivateDir(), session: env.Secret("session.json"),
-		log: env.Log, zl: zl, http: hc,
+		ctx: ctx, st: st, writes: store.NewQueue(env.Log, "the next sync stores it again"),
+		dir: env.PrivateDir(), session: env.Secret("session.json"), log: env.Log, zl: zl, http: hc,
 		verifyTimeout: verifyTimeout, requestDelay: requestDelay, resendEvery: resendEvery, backupWait: backupWait,
 	}
 }
@@ -183,5 +191,6 @@ func (c *mxConnector) Close() error {
 		a.stop()
 		a.close()
 	}
+	c.writes.Close()
 	return c.st.Close()
 }

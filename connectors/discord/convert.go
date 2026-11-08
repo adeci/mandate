@@ -2,6 +2,7 @@ package main
 
 import (
 	"cmp"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -9,12 +10,18 @@ import (
 	"github.com/adeci/mandate/store"
 )
 
+// Forum and media channels hold only posts, which are threads.
 const (
-	kindDM      = "dm"
-	kindGroup   = "group"
-	kindGuild   = "guild"
-	kindChannel = "channel"
-	kindThread  = "thread"
+	kindDM           = "dm"
+	kindGroup        = "group"
+	kindGuild        = "guild"
+	kindChannel      = "channel"
+	kindAnnouncement = "announcement"
+	kindVoice        = "voice"
+	kindStage        = "stage"
+	kindForum        = "forum"
+	kindMedia        = "media"
+	kindThread       = "thread"
 )
 
 // Embed-only messages (bot or webhook cards) are stored with an empty body.
@@ -23,12 +30,27 @@ const mediaEmbed = "embed"
 // Discord channel types (https://docs.discord.food/resources/channel).
 const (
 	channelDM            = 1
+	channelVoice         = 2
 	channelGroupDM       = 3
 	channelGuildCategory = 4
+	channelAnnouncement  = 5
 	channelNewsThread    = 10
 	channelPublicThread  = 11
 	channelPrivateThread = 12
+	channelStage         = 13
+	channelForum         = 15
+	channelMedia         = 16
 )
+
+// guildKinds are the kinds of guild channels other than text channels and
+// threads; types without one are stored as text channels.
+var guildKinds = map[int]string{
+	channelAnnouncement: kindAnnouncement,
+	channelVoice:        kindVoice,
+	channelStage:        kindStage,
+	channelForum:        kindForum,
+	channelMedia:        kindMedia,
+}
 
 const (
 	messageDefault            = 0
@@ -55,11 +77,13 @@ type apiUser struct {
 	Username      string `json:"username"`
 	Discriminator string `json:"discriminator"`
 	GlobalName    string `json:"global_name"`
+	Avatar        string `json:"avatar"`
 }
 
 type apiGuild struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
+	Icon        string `json:"icon"`
 	Unavailable bool   `json:"unavailable"`
 }
 
@@ -69,6 +93,7 @@ type apiChannel struct {
 	GuildID       string    `json:"guild_id"`
 	ParentID      string    `json:"parent_id"`
 	Name          string    `json:"name"`
+	Icon          string    `json:"icon"` // a group DM's
 	Position      int       `json:"position"`
 	Recipients    []apiUser `json:"recipients"`
 	LastMessageID string    `json:"last_message_id"`
@@ -153,9 +178,14 @@ func handle(u *apiUser) string {
 		return ""
 	}
 	if u.Discriminator != "" && u.Discriminator != "0" {
-		return u.Username + "#" + u.Discriminator
+		return "@" + u.Username + "#" + u.Discriminator
 	}
-	return u.Username
+	return "@" + u.Username
+}
+
+// participant is u as a chat lists them.
+func participant(u *apiUser) store.Participant {
+	return store.Participant{ID: u.ID, Name: displayName(u), Handle: handle(u)}
 }
 
 // guildChat is a guild's chat ID. A guild's first channel may have the
@@ -170,16 +200,33 @@ func guildChat(id string) string {
 // hiddenName is what Discord names a channel the account may not view.
 const hiddenName = "___hidden___"
 
+// pictureRef is the shape of a stored picture, the CDN path of a guild's
+// icon, a group DM's or a person's avatar by its hash, a_ marking an
+// animated one. Icon fetches nothing else.
+var pictureRef = regexp.MustCompile(`^(?:icons|channel-icons|avatars)/\d{15,21}/(?:a_)?[0-9a-f]{32}$`)
+
+// picture is the reference to store for id's picture hash under dir, "" for none.
+func picture(dir, id, hash string) string {
+	if ref := dir + "/" + id + "/" + hash; pictureRef.MatchString(ref) {
+		return ref
+	}
+	return ""
+}
+
+// avatar is u's picture, "" while u has Discord's default one.
+func avatar(u *apiUser) string { return picture("avatars", u.ID, u.Avatar) }
+
 func guildContainer(g *apiGuild) (store.Container, bool) {
 	if g == nil || g.ID == "" || g.Unavailable {
 		return store.Container{}, false
 	}
-	return store.Container{ID: guildChat(g.ID), Kind: kindGuild, Name: g.Name}, true
+	return store.Container{ID: guildChat(g.ID), Kind: kindGuild, Name: g.Name, Icon: picture("icons", g.ID, g.Icon)}, true
 }
 
-// guildChannelContainers converts chans, which default to guildID. A
-// thread's parent channel is stored too, if only by ID, so that hiding the
-// guild hides the thread through it.
+// guildChannelContainers converts chans, which default to guildID. The
+// channel of a thread that chans leave out comes too, by ID alone and with
+// no kind, so that hiding the guild hides the thread through it;
+// storeListed never stores it over what is known of the channel.
 func guildChannelContainers(guildID string, chans []apiChannel) []store.Container {
 	out := make([]store.Container, 0, len(chans))
 	listed := make(map[string]bool, len(chans))
@@ -197,7 +244,7 @@ func guildChannelContainers(guildID string, chans []apiChannel) []store.Containe
 		}
 		if c.isThread() && cc.ParentID != "" && !listed[cc.ParentID] {
 			listed[cc.ParentID] = true
-			out = append(out, store.Container{ID: cc.ParentID, Kind: kindChannel, ParentID: guildChat(c.GuildID)})
+			out = append(out, store.Container{ID: cc.ParentID, ParentID: guildChat(c.GuildID)})
 		}
 		out = append(out, cc)
 	}
@@ -207,7 +254,9 @@ func guildChannelContainers(guildID string, chans []apiChannel) []store.Containe
 // A thread's parent is its channel, whose parent is the guild, so hiding
 // either hides the thread. Discord leaves parent_id out of some thread
 // payloads; an empty ParentID keeps the stored one.
-// Channels are named "#name" as in Discord; the gateway adds the guild's name.
+// Channels are named as Discord shows them: "#name" for text and
+// announcement channels, the name alone for the others. The gateway adds
+// the guild's name. A DM's picture is its person's.
 // last_message_id dates the chat for the chats list before any message is fetched.
 func channelContainer(c *apiChannel) (store.Container, bool) {
 	if c == nil || c.ID == "" {
@@ -222,7 +271,11 @@ func channelContainer(c *apiChannel) (store.Container, bool) {
 			name = ps[0].Name
 		}
 		name = chosen(name)
-		return store.Container{ID: c.ID, Kind: kindDM, Name: name, Participants: ps, LastMessageAt: last}, true
+		var icon string
+		if len(c.Recipients) > 0 {
+			icon = avatar(&c.Recipients[0])
+		}
+		return store.Container{ID: c.ID, Kind: kindDM, Name: name, Participants: ps, LastMessageAt: last, Icon: icon}, true
 	case c.Type == channelGroupDM:
 		ps := participants(c)
 		name := c.Name
@@ -235,17 +288,20 @@ func channelContainer(c *apiChannel) (store.Container, bool) {
 			}
 			name = strings.Join(names, ", ")
 		}
-		return store.Container{ID: c.ID, Kind: kindGroup, Name: name, IsGroup: true, Participants: ps, LastMessageAt: last}, true
+		return store.Container{
+			ID: c.ID, Kind: kindGroup, Name: name, IsGroup: true, Participants: ps, LastMessageAt: last,
+			Icon: picture("channel-icons", c.ID, c.Icon),
+		}, true
 	case c.Type == channelGuildCategory, c.GuildID == "", c.Name == hiddenName:
 		return store.Container{}, false
 	case c.isThread():
 		return store.Container{ID: c.ID, Kind: kindThread, ParentID: c.ParentID, Name: c.Name, LastMessageAt: last}, true
 	default:
-		name := c.Name
-		if name != "" {
+		kind, name := cmp.Or(guildKinds[c.Type], kindChannel), c.Name
+		if name != "" && (kind == kindChannel || kind == kindAnnouncement) {
 			name = "#" + name
 		}
-		return store.Container{ID: c.ID, Kind: kindChannel, ParentID: guildChat(c.GuildID), Name: name, LastMessageAt: last}, true
+		return store.Container{ID: c.ID, Kind: kind, ParentID: guildChat(c.GuildID), Name: name, LastMessageAt: last}, true
 	}
 }
 
@@ -255,7 +311,7 @@ func participants(c *apiChannel) []store.Participant {
 	var ps []store.Participant
 	for i := range c.Recipients {
 		if u := &c.Recipients[i]; u.ID != "" {
-			ps = append(ps, store.Participant{ID: u.ID, Name: displayName(u)})
+			ps = append(ps, participant(u))
 		}
 	}
 	return ps

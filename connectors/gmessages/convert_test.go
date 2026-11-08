@@ -187,21 +187,26 @@ func TestConvert(t *testing.T) {
 	}
 }
 
+// Participants are everyone but the owner, each by number, which is also
+// their handle.
 func TestContainer(t *testing.T) {
 	t.Parallel()
 	unnamed := family()
 	unnamed.Name = ""
 	party := neighbours()
 	party.Name = "Street party"
+	p := func(number, name string) store.Participant {
+		return store.Participant{ID: number, Name: name, Handle: number}
+	}
 	neighbourhood := []store.Participant{
-		{ID: "+15557770041", Name: "(555) 777-0041"},
-		{ID: "+15551230001", Name: "Farid Haddad"},
-		{ID: "+15551230005", Name: "Cy Moreau"},
-		{ID: "+15557770042", Name: "(555) 777-0042"},
-		{ID: "+15551230006", Name: "Ana Lima"},
-		{ID: "+15551230003", Name: "Mina"},
-		{ID: "+15551230007", Name: "Ben Ito"},
-		{ID: "+15557770043", Name: "(555) 777-0043"},
+		p("+15557770041", "(555) 777-0041"),
+		p("+15551230001", "Farid Haddad"),
+		p("+15551230005", "Cy Moreau"),
+		p("+15557770042", "(555) 777-0042"),
+		p("+15551230006", "Ana Lima"),
+		p("+15551230003", "Mina"),
+		p("+15551230007", "Ben Ito"),
+		p("+15557770043", "(555) 777-0043"),
 	}
 	for _, tc := range []struct {
 		conv *gmproto.Conversation
@@ -209,20 +214,20 @@ func TestContainer(t *testing.T) {
 	}{
 		{faridDM(), store.Container{
 			ID: "1", Kind: "dm", Name: "Farid Haddad", LastMessageAt: t0.Add(2 * time.Minute),
-			Participants: []store.Participant{{ID: "+15551230001", Name: "Farid Haddad"}},
+			Participants: []store.Participant{p("+15551230001", "Farid Haddad")},
 		}},
 		// The name a stranger's RCS profile gives is not the chat's name.
 		{strangerDM(), store.Container{
 			ID: "2", Kind: "dm", Name: "(555) 999-0002", LastMessageAt: t0.Add(time.Minute),
-			Participants: []store.Participant{{ID: "+15559990002", Name: "(555) 999-0002"}},
+			Participants: []store.Participant{p("+15559990002", "(555) 999-0002")},
 		}},
 		{family(), store.Container{
 			ID: "3", Kind: "group", IsGroup: true, Name: "Family", LastMessageAt: t0.Add(3 * time.Minute),
-			Participants: []store.Participant{{ID: "+15551230001", Name: "Farid Haddad"}, {ID: "+15551230003", Name: "Mina"}},
+			Participants: []store.Participant{p("+15551230001", "Farid Haddad"), p("+15551230003", "Mina")},
 		}},
 		{unnamed, store.Container{
 			ID: "3", Kind: "group", IsGroup: true, Name: "Farid Haddad, Mina", LastMessageAt: t0.Add(3 * time.Minute),
-			Participants: []store.Participant{{ID: "+15551230001", Name: "Farid Haddad"}, {ID: "+15551230003", Name: "Mina"}},
+			Participants: []store.Participant{p("+15551230001", "Farid Haddad"), p("+15551230003", "Mina")},
 		}},
 		{neighbours(), store.Container{
 			ID: "4", Kind: "group", IsGroup: true, Name: "Ana Lima, Ben Ito, Cy Moreau +5", LastMessageAt: t0.Add(4 * time.Minute),

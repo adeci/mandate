@@ -150,7 +150,7 @@ func (c *mxConnector) Execute(ctx context.Context, w record.Write) connector.Res
 		return connector.Result{Status: connector.Unknown, Detail: err.Error()}
 	}
 	res := connector.Result{Status: connector.Done, Ref: resp.EventID.String()}
-	err = c.st.UpsertMessage(ctx, store.Message{
+	msg := store.Message{
 		ID:          resp.EventID.String(),
 		ContainerID: room.String(),
 		SenderID:    a.sess.UserID.String(),
@@ -158,11 +158,10 @@ func (c *mxConnector) Execute(ctx context.Context, w record.Write) connector.Res
 		SentAt:      time.Now(),
 		IsFromMe:    true,
 		Body:        text,
-	})
-	if err != nil {
-		c.log.Error("store sent message", "id", resp.EventID, "room", room, "err", err)
-		res.Detail = "sent, but not stored: " + err.Error()
 	}
+	c.writes.Do("sent message "+msg.ID+" in "+msg.ContainerID, func(ctx context.Context) error {
+		return c.st.UpsertMessage(ctx, msg)
+	})
 	return res
 }
 

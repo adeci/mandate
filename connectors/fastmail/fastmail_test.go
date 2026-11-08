@@ -17,6 +17,7 @@ import (
 	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/record"
 	"github.com/adeci/mandate/store"
+	"github.com/adeci/mandate/store/storetest"
 )
 
 type fixture struct {
@@ -805,5 +806,22 @@ func TestBackfill(t *testing.T) {
 	restart()
 	if _, err := f.c.st.Media(ctx, "e1", 0); !errors.Is(err, store.ErrNoMedia) {
 		t.Fatalf("backfill ran twice: %v", err)
+	}
+}
+
+// A store busy past its timeout fails the sync before it saves Fastmail's
+// state, so the next one asks for the same changes again.
+func TestSyncRetriesWhileStoreBusy(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	f.link()
+	f.jm.add(textEmail("e9", "t9", alice, []address{owner}, "Dinner", "at 7?", now, "mb-inbox"))
+	unlock := storetest.Lock(t, f.c.st)
+	f.c.current().poke()
+	eventually(t, "a failed sync", func() bool { return f.c.Health(context.Background()).State == connector.Connecting })
+	unlock()
+	f.synced()
+	if got := f.message("e9"); got.Chat != "t9" || !strings.HasSuffix(got.Body, "\n\nat 7?") {
+		t.Fatalf("e9 after the busy store: %+v", got)
 	}
 }

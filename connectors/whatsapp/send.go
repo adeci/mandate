@@ -209,10 +209,9 @@ func (c *waConnector) Execute(ctx context.Context, w record.Write) connector.Res
 		return connector.Result{Status: connector.Unknown, Detail: err.Error()}
 	}
 	res := connector.Result{Status: connector.Done, Ref: resp.ID}
-	if err := c.record(ctx, dev, to, text, resp); err != nil {
-		c.log.Error("store sent message", "id", resp.ID, "chat", to.String(), "err", err)
-		res.Detail = "sent, but not stored: " + err.Error()
-	}
+	c.writes.Do("sent message "+resp.ID+" in "+to.String(), func(ctx context.Context) error {
+		return c.record(ctx, dev, to, text, resp)
+	})
 	return res
 }
 

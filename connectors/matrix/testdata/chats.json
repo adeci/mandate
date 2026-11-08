@@ -1,5 +1,17 @@
 [
   {
+    "id": "!dm:example.org",
+    "kind": "dm",
+    "name": "~Bob",
+    "participants": [
+      {
+        "id": "@bob:example.org",
+        "name": "~Bob",
+        "handle": "@bob:example.org"
+      }
+    ]
+  },
+  {
     "id": "!general:example.org",
     "kind": "group",
     "parent_id": "!space:example.org",

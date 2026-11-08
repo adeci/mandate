@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/adeci/mandate/connector"
+	"github.com/adeci/mandate/store"
 )
 
 func (s *Server) listConnectors(w http.ResponseWriter, r *http.Request) {
@@ -107,19 +108,26 @@ func (s *Server) connectorChats(w http.ResponseWriter, r *http.Request) {
 	if c == nil {
 		return
 	}
-	q := r.URL.Query()
-	limit := 100
-	if v := q.Get("limit"); v != "" {
-		n, err := strconv.Atoi(v)
+	v := r.URL.Query()
+	q := connector.ContainerQuery{Q: v.Get("q"), Limit: 100}
+	if l := v.Get("limit"); l != "" {
+		n, err := strconv.Atoi(l)
 		if err != nil || n < 1 || n > 500 {
 			fail(w, http.StatusBadRequest, "limit is 1 to 500")
 			return
 		}
-		limit = n
+		q.Limit = n
+	}
+	if v.Has("parent") {
+		p := v.Get("parent")
+		q.Parent = &p
+	}
+	if ids := v.Get("ids"); ids != "" {
+		q.IDs = strings.Split(ids, ",")
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	chats, err := c.Containers(ctx, q.Get("q"), q.Get("parent"), limit)
+	chats, err := c.Containers(ctx, q)
 	if err != nil {
 		failErr(w, connectorError(err))
 		return
@@ -127,7 +135,34 @@ func (s *Server) connectorChats(w http.ResponseWriter, r *http.Request) {
 	if chats == nil {
 		chats = []connector.Container{}
 	}
+	s.markHidden(r.PathValue("name"), chats)
 	reply(w, http.StatusOK, chats)
+}
+
+// markHidden marks the chats never-share hides: one named, one in a chat
+// named, and a DM whose person is named. An entry from before Discord
+// stored a guild as guild:ID names it by its bare ID, as the gateway reads
+// it.
+func (s *Server) markHidden(conn string, chats []connector.Container) {
+	hidden := map[string]bool{}
+	people := map[string]bool{}
+	s.mu.Lock()
+	for _, n := range s.st.NeverShare {
+		switch {
+		case n.Connector != conn:
+		case n.Kind == "chat":
+			hidden[n.ID], hidden["guild:"+n.ID] = true, true
+		case n.Kind == "person":
+			people[n.ID] = true
+		}
+	}
+	s.mu.Unlock()
+	for i := range chats {
+		c := &chats[i]
+		c.Hidden = hidden[c.ID] ||
+			slices.ContainsFunc(c.Parents, func(p connector.Parent) bool { return hidden[p.ID] }) ||
+			c.Kind == "dm" && slices.ContainsFunc(c.Participants, func(p store.Participant) bool { return people[p.ID] })
+	}
 }
 
 func (s *Server) listNeverShare(w http.ResponseWriter, _ *http.Request) {
@@ -154,6 +189,15 @@ func (s *Server) editNeverShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n.Name = body.Name
+	// A chat picked inside its parent may come named by its own name only;
+	// it is listed by its path.
+	if r.Method == http.MethodPut && n.Kind == "chat" {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		if path := s.lookUpNames(ctx, n.Connector, []string{n.ID})[n.ID]; path != "" {
+			n.Name = path
+		}
+		cancel()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	had := false

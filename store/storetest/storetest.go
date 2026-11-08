@@ -1,12 +1,14 @@
 // Package storetest keeps fixtures of the chats each connector stores, made
 // by the connector's own code, so the gateway's tests match agents' terms
-// against the names and paths a real store holds.
+// against the names and paths a real store holds. Lock makes a store busy,
+// as the gateway's slow queries can.
 package storetest
 
 import (
 	"database/sql"
 	"encoding/json"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/adeci/mandate/store"
@@ -83,4 +85,36 @@ func Load(t *testing.T, st *store.Store, path string) {
 			t.Fatal(err)
 		}
 	}
+}
+
+// Lock holds a read transaction on st's file, as a slow query of the
+// gateway's does, until unlock is called. Meanwhile a write to st fails with
+// SQLITE_BUSY once its busy timeout is out, which Lock cuts to 10 ms: Open
+// keeps one connection, so the pragma holds for all of st's writes.
+func Lock(t *testing.T, st *store.Store) (unlock func()) {
+	t.Helper()
+	ctx := t.Context()
+	var path string
+	if err := st.DB().QueryRowContext(ctx, `SELECT file FROM pragma_database_list WHERE name = 'main'`).Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `PRAGMA busy_timeout = 10`); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.OpenReadOnly(ctx, path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock = sync.OnceFunc(func() { _ = tx.Rollback() })
+	t.Cleanup(unlock)
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM messages`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return unlock
 }

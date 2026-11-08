@@ -18,6 +18,30 @@
     "name": "v2 rollout"
   },
   {
+    "id": "1100000000000000015",
+    "kind": "announcement",
+    "parent_id": "guild:1100000000000000001",
+    "name": "#announcements"
+  },
+  {
+    "id": "1100000000000000016",
+    "kind": "voice",
+    "parent_id": "guild:1100000000000000001",
+    "name": "General"
+  },
+  {
+    "id": "1100000000000000018",
+    "kind": "forum",
+    "parent_id": "guild:1100000000000000001",
+    "name": "help"
+  },
+  {
+    "id": "1100000000000000019",
+    "kind": "thread",
+    "parent_id": "1100000000000000018",
+    "name": "crash on start"
+  },
+  {
     "id": "1200000000000000011",
     "kind": "channel",
     "parent_id": "guild:1200000000000000001",
@@ -30,7 +54,8 @@
     "participants": [
       {
         "id": "1000000000000000002",
-        "name": "~Sam Park"
+        "name": "~Sam Park",
+        "handle": "@sam_p"
       }
     ]
   },
@@ -41,11 +66,13 @@
     "participants": [
       {
         "id": "1000000000000000002",
-        "name": "~Sam Park"
+        "name": "~Sam Park",
+        "handle": "@sam_p"
       },
       {
         "id": "1000000000000000003",
-        "name": "~kim"
+        "name": "~kim",
+        "handle": "@kim"
       }
     ]
   },

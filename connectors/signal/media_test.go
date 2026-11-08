@@ -41,7 +41,7 @@ func TestMediaFetchesWhatIngestRecorded(t *testing.T) {
 
 	const ts = 1798000000000
 	dm := farid.String()
-	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, discard)
+	in := newIngester(f.cli(), f.c.dev, f.st, f.sess, testQueue(), discard)
 	if !in.handle(ctx, &events.ChatEvent{Info: events.MessageInfo{Sender: farid, ChatID: dm}, Event: &signalpb.DataMessage{
 		Body: new("route"), Timestamp: new(uint64(ts)),
 		Attachments: []*signalpb.AttachmentPointer{{

@@ -24,6 +24,7 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/adeci/mandate/connector"
+	"github.com/adeci/mandate/store"
 )
 
 func main() {
@@ -42,6 +43,8 @@ func start(ctx context.Context, env *connector.Env, _ struct{}) (connector.Conne
 		return nil, err
 	}
 
+	// A write the store refuses as busy waits here until the store is free.
+	writes := store.NewQueue(env.Log, "WhatsApp delivers a received message, edit or deletion again after reconnecting; a message this device sent stays unstored")
 	// Shown under Linked devices on the phone.
 	wastore.SetOSInfo("mandate", [3]uint32{0, 1, 0})
 	newClient := func(dev *wastore.Device, onEvent func(any)) waClient {
@@ -54,20 +57,20 @@ func start(ctx context.Context, env *connector.Env, _ struct{}) (connector.Conne
 		// Unlinked, pairing needs the connection's error rather than a
 		// reconnect in the background, which ends the QR codes as expired.
 		cli.InitialAutoReconnect = dev.ID != nil
-		in := newIngester(cli, st, env.Log)
+		in := newIngester(cli, st, writes, env.Log)
 		cli.AddEventHandlerWithSuccessStatus(func(evt any) bool {
 			onEvent(evt)
 			return in.handle(ctx, evt)
 		})
 		return cli
 	}
-	c := newConnector(ctx, st, env.Log, device, container.NewDevice, newClient)
+	c := newConnector(ctx, st, writes, env.Log, device, container.NewDevice, newClient)
 	if err := c.connect(); err != nil {
 		container.Close()
 		st.Close()
 		return nil, err
 	}
-	return &program{waConnector: c, closers: []io.Closer{container, st}}, nil
+	return &program{waConnector: c, closers: []io.Closer{writes, container, st}}, nil
 }
 
 // program disconnects once serving has stopped, so an in-flight send can

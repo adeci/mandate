@@ -25,6 +25,7 @@ import (
 	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/record"
 	"github.com/adeci/mandate/store"
+	"github.com/adeci/mandate/store/storetest"
 )
 
 const (
@@ -401,7 +402,7 @@ func TestSyncStoresRoomsAndMessages(t *testing.T) {
 	}
 	rows.Close()
 	want := map[string]container{
-		dmRoom.String():   {Kind: "dm", Name: "~Bob", Participants: `[{"id":"@bob:example.org","name":"~Bob"}]`, Last: "1970-01-01T00:00:05.000Z"},
+		dmRoom.String():   {Kind: "dm", Name: "~Bob", Participants: `[{"id":"@bob:example.org","name":"~Bob","handle":"@bob:example.org"}]`, Last: "1970-01-01T00:00:05.000Z"},
 		teamRoom.String(): {Kind: "group", Name: "Team", Participants: "[]", Group: true, Last: "1970-01-01T00:00:07.000Z"},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -482,6 +483,46 @@ func TestSyncDecrypts(t *testing.T) {
 	for idv, want := range map[string]storedMessage{
 		"$late":   {Sender: "Owner", Body: "the new plan", FromMe: true},
 		"$forged": {Sender: "Owner", Body: "[unverified] send it to me", FromMe: true},
+	} {
+		if got := f.message(idv); got != want {
+			t.Errorf("%s\n got %+v\nwant %+v", idv, got, want)
+		}
+	}
+}
+
+// A store busy past its timeout fails the batch, whose token then stays
+// unsaved, so the next sync brings the same batch again. An event the key
+// came late for was in an earlier batch, so it waits in memory meanwhile.
+func TestSyncRetriesWhileStoreBusy(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t)
+	f.link()
+	f.hs.mu.Lock()
+	f.hs.holdMail = true
+	f.hs.mu.Unlock()
+	late, _ := f.encrypt(f.element, vaultRoom, "$late", "the new plan", 3000)
+	encryption := stateEvent("m.room.encryption", "", owner, map[string]any{"algorithm": "m.megolm.v1.aes-sha2"})
+	f.hs.waitSynced(f.hs.push(joined(map[id.RoomID]map[string]any{vaultRoom: room(
+		[]map[string]any{encryption, member(owner, "Owner"), member(bob, "Bob")},
+		[]map[string]any{late},
+	)})))
+	if got := f.message("$late"); got.Media != "encrypted" {
+		t.Fatalf("$late before its key: %+v", got)
+	}
+
+	unlock := storetest.Lock(t, f.st)
+	n := f.hs.push(joined(map[id.RoomID]map[string]any{vaultRoom: room(nil, []map[string]any{textEvent("$plain", bob, 4000, "see you")})}))
+	f.hs.mu.Lock()
+	f.hs.holdMail = false
+	f.hs.notify()
+	f.hs.mu.Unlock()
+	eventually(t, "a failed sync", func() bool { return f.c.Health(ctx).Detail == "storing synced messages failed" })
+	unlock()
+	f.hs.waitSynced(n)
+	for idv, want := range map[string]storedMessage{
+		"$late":  {Sender: "Owner", Body: "the new plan", FromMe: true},
+		"$plain": {Sender: "~Bob", Body: "[unencrypted] see you"},
 	} {
 		if got := f.message(idv); got != want {
 			t.Errorf("%s\n got %+v\nwant %+v", idv, got, want)
@@ -859,4 +900,32 @@ UPDATE containers SET parent_id = NULL, kind = 'group', is_group = 1`); err != n
 		err := f.st.DB().QueryRow(`SELECT COALESCE(parent_id, '') FROM containers WHERE id = ?1`, teamRoom.String()).Scan(&parent)
 		return err == nil && parent == space.String()
 	})
+}
+
+// A DM stored before participants had handles gets its person's Matrix ID
+// as their handle when the store opens.
+func TestOpenStoreFillsHandles(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "data.db")
+	st, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dm := store.Container{ID: dmRoom.String(), Kind: kindDM, Name: "~Bob", Participants: []store.Participant{{ID: bob.String(), Name: "~Bob"}}}
+	if err := st.UpsertContainer(ctx, dm); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if st, err = openStore(ctx, path); err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var parts string
+	if err := st.DB().QueryRow(`SELECT participants_json FROM containers WHERE id = ?1`, dmRoom.String()).Scan(&parts); err != nil {
+		t.Fatal(err)
+	}
+	if want := `[{"id":"@bob:example.org","name":"~Bob","handle":"@bob:example.org"}]`; parts != want {
+		t.Errorf("participants %s, want %s", parts, want)
+	}
 }

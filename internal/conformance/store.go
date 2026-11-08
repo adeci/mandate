@@ -188,7 +188,7 @@ func checkNesting(ctx context.Context, db *sql.DB) error {
 
 // checkNames wants a name after every ~ marker: not none, a space or a
 // second marker. Whether a name was chosen by its person is the service's
-// to know.
+// to know. A handle is the service's own, so it is never marked.
 func checkNames(ctx context.Context, db *sql.DB) error {
 	rows, err := query(ctx, db, `SELECT 'chat ' || id, name FROM containers
 		UNION ALL SELECT 'sender of ' || id, sender_name FROM messages`)
@@ -199,6 +199,7 @@ func checkNames(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, r := range parts {
 		var ps []store.Participant
 		if err := json.Unmarshal([]byte(r[1]), &ps); err != nil {
@@ -206,9 +207,11 @@ func checkNames(ctx context.Context, db *sql.DB) error {
 		}
 		for _, p := range ps {
 			rows = append(rows, []string{"participant " + p.ID + " of chat " + r[0], p.Name})
+			if strings.HasPrefix(p.Handle, "~") {
+				errs = append(errs, fmt.Errorf("participant %s of chat %s has the handle %q", p.ID, r[0], p.Handle))
+			}
 		}
 	}
-	var errs []error
 	for _, r := range rows {
 		rest, marked := strings.CutPrefix(r[1], "~")
 		if marked && (rest == "" || strings.HasPrefix(rest, "~") || unicode.IsSpace([]rune(rest)[0])) {

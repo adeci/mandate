@@ -264,6 +264,8 @@ func (g *gateway) media(w http.ResponseWriter, r *http.Request, cl *caller, c *c
 		writeError(w, http.StatusRequestEntityTooLarge, tooLarge(f.size))
 		return
 	}
+	// Before the download, which may outlast queryTimeout.
+	names := g.chatNames(ctx, cl, v, []string{chat})
 	spec, err := c.getSpec(r.Context())
 	if err != nil {
 		unavailable(w, cl, "connector spec", err)
@@ -301,7 +303,7 @@ func (g *gateway) media(w http.ResponseWriter, r *http.Request, cl *caller, c *c
 		cl.log.Warn("media", "connector", c.name, "err", err)
 		return
 	}
-	g.record(cl, c, "media", g.chatNames(ctx, cl, v, []string{chat}), 1)
+	g.record(cl, c, "media", names, 1)
 }
 
 func tooLarge(size int64) string {

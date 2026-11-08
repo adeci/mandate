@@ -20,6 +20,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/adeci/mandate/store"
+	"github.com/adeci/mandate/store/storetest"
 )
 
 // A full contact sync fills the contact store without per-contact events, so
@@ -37,7 +38,7 @@ func TestNameDMs(t *testing.T) {
 	if err := f.st.UpsertContainer(ctx, store.Container{ID: self.String(), Kind: "dm", Name: "Owner"}); err != nil {
 		t.Fatal(err)
 	}
-	newIngester(whatsmeow.NewClient(dev, nil), f.st, slog.New(slog.NewTextHandler(io.Discard, nil))).nameDMs(ctx)
+	newIngester(whatsmeow.NewClient(dev, nil), f.st, testQueue(), slog.New(slog.NewTextHandler(io.Discard, nil))).nameDMs(ctx)
 	for id, want := range map[string]string{
 		farid.String():    "Farid Haddad", // replaces the push name stored earlier
 		samParkL.String(): "Sam Park",     // listed in the address book under its LID
@@ -52,13 +53,21 @@ func TestNameDMs(t *testing.T) {
 			t.Errorf("%s named %q, want %q", id, got, want)
 		}
 	}
-	// The DM stored under Sam's LID lists him by the number his messages carry.
-	var parts string
-	if err := f.st.DB().QueryRowContext(ctx, `SELECT participants_json FROM containers WHERE id = ?`, samParkL.String()).Scan(&parts); err != nil {
-		t.Fatal(err)
-	}
-	if want := `[{"id":"447700900123@s.whatsapp.net","name":"Sam Park"}]`; parts != want {
-		t.Errorf("participants of the LID DM: %s, want %s", parts, want)
+	// Each DM lists its person by the number their messages carry, the DM
+	// stored under Sam's LID too, with the number as their handle; the
+	// owner's own chat lists nobody.
+	for id, want := range map[string]string{
+		farid.String():    `[{"id":"15551234567@s.whatsapp.net","name":"Farid Haddad","handle":"+15551234567"}]`,
+		samParkL.String(): `[{"id":"447700900123@s.whatsapp.net","name":"Sam Park","handle":"+447700900123"}]`,
+		self.String():     `[]`,
+	} {
+		var parts string
+		if err := f.st.DB().QueryRowContext(ctx, `SELECT participants_json FROM containers WHERE id = ?`, id).Scan(&parts); err != nil {
+			t.Fatal(err)
+		}
+		if parts != want {
+			t.Errorf("participants of %s: %s, want %s", id, parts, want)
+		}
 	}
 }
 
@@ -76,7 +85,7 @@ func TestStoreChatsWithoutMessages(t *testing.T) {
 	if _, _, err := dev.Contacts.PutPushName(ctx, pushOnly, "Pat"); err != nil {
 		t.Fatal(err)
 	}
-	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, testQueue(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	in.storeContacts(ctx)
 	quiet := types.NewJID("120363000000000999", types.GroupServer)
 	in.storeGroups(ctx, []*types.GroupInfo{{
@@ -98,13 +107,13 @@ func TestStoreChatsWithoutMessages(t *testing.T) {
 		got[id] = strings.Join([]string{kind, name, last, parts}, "|")
 	}
 	want := map[string]string{
-		quiet.String():           `group|Book club||[{"id":"15550001111@s.whatsapp.net","name":"Sam Lee"},{"id":"15550002222@s.whatsapp.net","name":"~Pat"}]`,
+		quiet.String():           `group|Book club||[{"id":"15550001111@s.whatsapp.net","name":"Sam Lee","handle":"+15550001111"},{"id":"15550002222@s.whatsapp.net","name":"~Pat","handle":"+15550002222"}]`,
 		climbing.String():        `group|Climbing crew||[{"id":"15551234567@s.whatsapp.net"},{"id":"447700900123@s.whatsapp.net"}]`,
 		climbing2.String():       "group|Climbing crew||[]",
 		owner.ToNonAD().String(): "dm|" + messageYourself + "||[]",
-		farid.String():           "dm|Farid Haddad||[]",
-		samLee.String():          "dm|Sam Lee||[]",
-		samPark.String():         "dm|Sam Park||[]",
+		farid.String():           `dm|Farid Haddad||[{"id":"15551234567@s.whatsapp.net","name":"Farid Haddad","handle":"+15551234567"}]`,
+		samLee.String():          `dm|Sam Lee||[{"id":"15550001111@s.whatsapp.net","name":"Sam Lee","handle":"+15550001111"}]`,
+		samPark.String():         `dm|Sam Park||[{"id":"447700900123@s.whatsapp.net","name":"Sam Park","handle":"+447700900123"}]`,
 		samParkL.String():        "dm|||[]",
 		stranger.String():        "dm|Mom||[]",
 	}
@@ -163,7 +172,7 @@ func TestNamelessChats(t *testing.T) {
 		}
 	}
 
-	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, testQueue(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	in.groupInfo = func(context.Context, types.JID) (*types.GroupInfo, error) { return nil, whatsmeow.ErrIQRateOverLimit }
 	plumber := types.NewJID("15550004444", types.DefaultUserServer)
 	running := types.NewJID("120363000000000555", types.GroupServer)
@@ -200,7 +209,7 @@ func TestChatActivity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, testQueue(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	day := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 	unix := func(at time.Time) *uint64 { return proto.Uint64(uint64(at.Unix())) }
 	sent := func(chat types.JID, id string, at time.Time) *waHistorySync.HistorySyncMsg {
@@ -254,7 +263,7 @@ func TestEditsAndDeletesFromAuthor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, testQueue(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	sent := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 	for id, from := range map[string]types.JID{"F1": farid, "F2": farid, "S1": samPark} {
 		if err := f.st.UpsertMessage(ctx, store.Message{
@@ -319,7 +328,7 @@ func TestReusedIDFromOtherAuthor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, testQueue(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	sent := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 	for id, from := range map[string]types.JID{"O1": me, "F1": farid, "S1": samPark} {
 		if err := f.st.UpsertMessage(ctx, store.Message{
@@ -353,5 +362,73 @@ func TestReusedIDFromOtherAuthor(t *testing.T) {
 		if body != want {
 			t.Errorf("%s: body %q, want %q", id, body, want)
 		}
+	}
+}
+
+// A message the store refuses as busy is stored from the queue once the store
+// is free, and an edit that comes meanwhile after it. Both stay unacked, so
+// a restart before then loses nothing; delivered again, they change nothing.
+// History comes once, so it waits out the store.
+func TestBusyStore(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	f := newFixture(t)
+	dev, err := f.container.GetFirstDevice(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, testQueue(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sent := time.Date(2026, 11, 7, 21, 37, 0, 0, time.UTC)
+	from := types.MessageSource{Chat: farid, Sender: farid}
+	msg := &events.Message{
+		Info:    types.MessageInfo{MessageSource: from, ID: "M1", Timestamp: sent},
+		Message: &waE2E.Message{Conversation: proto.String("dinner?")},
+	}
+	edit := &events.Message{
+		Info: types.MessageInfo{MessageSource: from, ID: "E1", Timestamp: sent.Add(time.Minute)},
+		Message: &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+			Key: &waCommon.MessageKey{ID: proto.String("M1")}, Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+			EditedMessage: &waE2E.Message{Conversation: proto.String("dinner at 7?")},
+		}},
+	}
+	body := func(id string) string {
+		var b sql.NullString
+		if err := f.st.DB().QueryRowContext(ctx, `SELECT max(body) FROM messages WHERE id = ?`, messageID(farid, id)).Scan(&b); err != nil {
+			t.Fatal(err)
+		}
+		return b.String
+	}
+
+	unlock := storetest.Lock(t, f.st)
+	if in.handle(ctx, msg) {
+		t.Fatal("acked a message the store refused")
+	}
+	unlock()
+	if in.handle(ctx, edit) {
+		t.Fatal("acked an edit of a message not stored yet")
+	}
+	for deadline := time.Now().Add(10 * time.Second); body("M1") != "dinner at 7?"; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("M1 is %q, want it stored and then edited", body("M1"))
+		}
+	}
+	if !in.handle(ctx, msg) || !in.handle(ctx, edit) || body("M1") != "dinner at 7?" {
+		t.Fatalf("delivered again: M1 is %q", body("M1"))
+	}
+
+	unlock = storetest.Lock(t, f.st)
+	time.AfterFunc(50*time.Millisecond, unlock)
+	in.historySync(ctx, &waHistorySync.HistorySync{
+		SyncType: waHistorySync.HistorySync_RECENT.Enum(),
+		Conversations: []*waHistorySync.Conversation{{ID: proto.String(farid.String()), Messages: []*waHistorySync.HistorySyncMsg{{
+			Message: &waWeb.WebMessageInfo{
+				Key:              &waCommon.MessageKey{RemoteJID: proto.String(farid.String()), FromMe: proto.Bool(true), ID: proto.String("H1")},
+				MessageTimestamp: proto.Uint64(uint64(sent.Add(-time.Hour).Unix())),
+				Message:          &waE2E.Message{Conversation: proto.String("on my way")},
+			},
+		}}}},
+	})
+	if got := body("H1"); got != "on my way" {
+		t.Errorf("history message H1 is %q after the store was busy", got)
 	}
 }

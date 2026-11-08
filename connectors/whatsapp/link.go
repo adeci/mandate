@@ -44,8 +44,10 @@ type waClient interface {
 }
 
 type waConnector struct {
-	st  *store.Store
-	log *slog.Logger
+	st *store.Store
+	// writes is shared with ingest; sends store the owner's message through it.
+	writes *store.Queue
+	log    *slog.Logger
 	// ctx outlives requests: the connection and pairing run until shutdown.
 	ctx       context.Context
 	newDevice func() *wastore.Device
@@ -64,10 +66,10 @@ type waConnector struct {
 	pairing   *pairing
 }
 
-func newConnector(ctx context.Context, st *store.Store, log *slog.Logger, dev *wastore.Device,
+func newConnector(ctx context.Context, st *store.Store, writes *store.Queue, log *slog.Logger, dev *wastore.Device,
 	newDevice func() *wastore.Device, newClient func(*wastore.Device, func(any)) waClient,
 ) *waConnector {
-	c := &waConnector{st: st, log: log, ctx: ctx, newDevice: newDevice, newClient: newClient}
+	c := &waConnector{st: st, writes: writes, log: log, ctx: ctx, newDevice: newDevice, newClient: newClient}
 	c.use(dev)
 	c.linked = dev.ID != nil
 	return c

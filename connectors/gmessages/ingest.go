@@ -25,8 +25,10 @@ const (
 // ingester stores what the phone reports. Its caches are filled by events,
 // syncs and lookups, from libgm's goroutine and from our own.
 type ingester struct {
-	st  *store.Store
-	log *slog.Logger
+	st *store.Store
+	// writes stores events, which libgm acknowledges before handing over.
+	writes *store.Queue
+	log    *slog.Logger
 
 	mu      sync.Mutex
 	convs   map[string]*gmproto.Conversation
@@ -41,7 +43,10 @@ type ingester struct {
 }
 
 func newIngester(st *store.Store, log *slog.Logger) *ingester {
-	in := &ingester{st: st, log: log}
+	in := &ingester{
+		st: st, log: log,
+		writes: store.NewQueue(log, "the next sync, after a reconnect or restart, fetches its conversation's latest messages again"),
+	}
 	in.reset()
 	return in
 }
@@ -110,11 +115,14 @@ func (in *ingester) sim(conv *gmproto.Conversation) *gmproto.SIMPayload {
 	return conv.GetSimCard().GetSIMData().GetSIMPayload()
 }
 
-func (in *ingester) conversationEvent(ctx context.Context, conv *gmproto.Conversation) {
+func (in *ingester) conversationEvent(conv *gmproto.Conversation) {
 	in.remember(conv)
-	if err := in.st.UpsertContainer(ctx, unfetched(conv)); err != nil {
-		in.log.Error("store conversation", "conversation", conv.GetConversationID(), "err", err)
-	}
+	in.storeConversation(conv)
+}
+
+func (in *ingester) storeConversation(conv *gmproto.Conversation) {
+	c := unfetched(conv)
+	in.writes.Do("conversation "+c.ID, func(ctx context.Context) error { return in.st.UpsertContainer(ctx, c) })
 }
 
 // unfetched is conv's chat without its activity: a sync compares the stored
@@ -147,7 +155,7 @@ func (in *ingester) message(ctx context.Context, cli gmClient, m *gmproto.Messag
 	in.mu.Unlock()
 	switch {
 	case known:
-		in.store(ctx, m, conv)
+		in.store(m, conv)
 	case !waiting:
 		go in.resolve(ctx, cli, id)
 	}
@@ -164,23 +172,20 @@ func (in *ingester) resolve(ctx context.Context, cli gmClient, id string) {
 		in.log.Warn("look up conversation", "conversation", id, "err", err)
 		return
 	}
-	if err := in.st.UpsertContainer(ctx, unfetched(conv)); err != nil {
-		in.log.Error("store conversation", "conversation", id, "err", err)
-		return
-	}
+	in.storeConversation(conv)
 	for _, m := range msgs {
-		in.store(ctx, m, conv)
+		in.store(m, conv)
 	}
 }
 
-func (in *ingester) store(ctx context.Context, m *gmproto.Message, conv *gmproto.Conversation) {
+func (in *ingester) store(m *gmproto.Message, conv *gmproto.Conversation) {
 	o, ok := convert(m, conv)
 	if !ok {
 		return
 	}
-	if err := in.apply(ctx, o); err != nil {
-		in.log.Error("store message", "id", m.GetMessageID(), "conversation", m.GetConversationID(), "err", err)
-	}
+	in.writes.Do("message "+m.GetMessageID()+" in "+m.GetConversationID(), func(ctx context.Context) error {
+		return in.apply(ctx, o)
+	})
 }
 
 func (in *ingester) apply(ctx context.Context, o op) error {

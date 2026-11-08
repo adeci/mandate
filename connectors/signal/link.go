@@ -49,7 +49,9 @@ type devices interface {
 }
 
 type sgConnector struct {
-	st         *store.Store
+	st *store.Store
+	// writes is shared with ingest; sends store the owner's message through it.
+	writes     *store.Queue
 	log        *slog.Logger
 	devices    devices
 	timers     *timers
@@ -73,12 +75,12 @@ type sgConnector struct {
 	pairing       *pairing
 }
 
-func newConnector(ctx context.Context, st *store.Store, log *slog.Logger, sess *session, dev *sgstore.Device,
+func newConnector(ctx context.Context, st *store.Store, writes *store.Queue, log *slog.Logger, sess *session, dev *sgstore.Device,
 	provision func(context.Context) <-chan signalmeow.ProvisioningResponse,
 	newClient func(*sgstore.Device, func(events.SignalEvent)) (sgClient, *ingester),
 ) *sgConnector {
 	c := &sgConnector{
-		st: st, log: log, devices: sess.devices, timers: sess.timers, identities: sess.identities,
+		st: st, writes: writes, log: log, devices: sess.devices, timers: sess.timers, identities: sess.identities,
 		ctx: ctx, provision: provision, newClient: newClient, download: download,
 	}
 	if dev != nil {

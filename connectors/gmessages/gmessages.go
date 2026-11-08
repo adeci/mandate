@@ -56,7 +56,7 @@ func start(ctx context.Context, env *connector.Env, _ struct{}) (connector.Conne
 }
 
 // program disconnects once serving has stopped, so an in-flight send can
-// finish, then closes the store.
+// finish, then stops the writes waiting for the store and closes it.
 type program struct {
 	*gmConnector
 	st *store.Store
@@ -64,6 +64,7 @@ type program struct {
 
 func (p *program) Close() error {
 	p.disconnect()
+	p.in.writes.Close()
 	return p.st.Close()
 }
 

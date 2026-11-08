@@ -1,11 +1,16 @@
 package store
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/ncruces/go-sqlite3"
 )
 
 func open(t *testing.T) *Store {
@@ -209,5 +214,47 @@ INSERT INTO containers (id, kind, updated_at) VALUES ('c1', 'group', '2026-10-01
 	must(t, s.UpsertContainer(ctx, Container{ID: "c1", Kind: "group", Icon: "c3d4"}))
 	if got := icon(); got != "c3d4" {
 		t.Fatalf("icon = %q", got)
+	}
+}
+
+// A reader whose context ends lets go of the store mid-query, so the
+// connector's commit waiting for it goes through instead of failing after
+// busy_timeout.
+func TestSlowReaderGivesWay(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "data.db")
+	s, err := Open(ctx, path)
+	must(t, err)
+	defer s.Close()
+	must(t, s.UpsertContainer(ctx, Container{ID: "c1", Kind: "dm"}))
+	reading := make(chan struct{})
+	var once sync.Once
+	db, err := OpenReadOnly(ctx, path, func(c *sqlite3.Conn) error {
+		return c.CreateFunction("reading", 0, 0, func(sqlite3.Context, ...sqlite3.Value) {
+			once.Do(func() { close(reading) })
+		})
+	})
+	must(t, err)
+	defer db.Close()
+
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		// Counts without end, holding the store's shared lock.
+		var n int
+		done <- db.QueryRowContext(rctx, `WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i)
+SELECT count(*) FROM i WHERE n > (SELECT count(*) FROM containers) AND reading() IS NULL`).Scan(&n)
+	}()
+	select {
+	case <-reading:
+	case err := <-done:
+		t.Fatalf("the query ended before the write: %v", err)
+	}
+	time.AfterFunc(100*time.Millisecond, cancel)
+	must(t, s.UpsertContainer(ctx, Container{ID: "c2", Kind: "dm"}))
+	if err := <-done; !errors.Is(err, context.Canceled) && !errors.Is(err, sqlite3.INTERRUPT) {
+		t.Fatalf("the query ended with %v, want it interrupted", err)
 	}
 }

@@ -145,8 +145,13 @@ func (c *mxConnector) ingest(ctx context.Context, a *account, resp *mautrix.Resp
 	}
 	late := a.retry()
 	slices.SortFunc(late, func(x, y *event.Event) int { return cmp.Compare(x.Timestamp, y.Timestamp) })
-	for _, evt := range late {
+	for i, evt := range late {
 		if _, err := c.apply(ctx, a, evt, nil); err != nil {
+			if store.Busy(err) {
+				// They came in an earlier batch, which the retry of
+				// this one does not bring again.
+				a.again(late[i:])
+			}
 			return err
 		}
 	}
@@ -228,9 +233,9 @@ func joinedFromInvite(evt *event.Event) bool {
 	return prev.AsMember().Membership == event.MembershipInvite
 }
 
-// container describes room: a DM by the other person's name, a group or
-// space by its name or alias. name and alias are set when this batch changed
-// them. Matrix has no name for the
+// container describes room: a DM by the other person's name, with their
+// Matrix ID as their handle, a group or space by its name or alias. name and
+// alias are set when this batch changed them. Matrix has no name for the
 // owner's own DM, so it is named after them, unmarked.
 func (c *mxConnector) container(ctx context.Context, a *account, room id.RoomID, name, alias *string, heroes []id.UserID) (store.Container, error) {
 	if other, ok := a.direct[room]; ok {
@@ -240,7 +245,7 @@ func (c *mxConnector) container(ctx context.Context, a *account, room id.RoomID,
 		}
 		return store.Container{
 			ID: room.String(), Kind: kindDM, Name: n,
-			Participants: []store.Participant{{ID: other.String(), Name: n}},
+			Participants: []store.Participant{{ID: other.String(), Name: n, Handle: other.String()}},
 		}, nil
 	}
 	ct := store.Container{ID: room.String(), Kind: kindGroup, IsGroup: true}

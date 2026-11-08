@@ -13,6 +13,7 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
 	"github.com/adeci/mandate/store"
+	"github.com/adeci/mandate/store/storetest"
 )
 
 type row struct {
@@ -130,7 +131,7 @@ func TestSyncFetchesAnnouncedActivity(t *testing.T) {
 	newer.LastMessageTimestamp = ts(5)
 	f.phone.setConvs(newer)
 	f.phone.setMessages("1", message("m5", "1", "11", incoming, ts(5), "7pm"), message("m1", "1", "11", incoming, ts(2), "dinner?"))
-	f.c.in.conversationEvent(ctx, newer)
+	f.c.in.conversationEvent(newer)
 	f.c.in.sync(ctx, f.cli())
 
 	// What an event stored before: activity without its messages.
@@ -225,6 +226,29 @@ func TestLiveEvents(t *testing.T) {
 	if got := chats(t, f); got["1"] != "dm Farid Haddad -" || got["3"] != "group Family -" {
 		t.Fatalf("chats %v", got)
 	}
+}
+
+// libgm acknowledges an event before handing it over, so a write the store
+// refuses as busy waits in memory: the message lands once the reader lets go,
+// and an update that comes meanwhile lands after it.
+func TestLiveEventsWaitOutBusyStore(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, true)
+	cli := f.cli()
+	cli.emit(faridDM())
+	unlock := storetest.Lock(t, f.st)
+	cli.emit(&libgm.WrappedMessage{Message: message("m1", "1", "11", incoming, ts(1), "dinner?")})
+	if got := messages(t, f); len(got) != 0 {
+		t.Fatalf("stored %+v while locked", got)
+	}
+	unlock()
+	cli.emit(&libgm.WrappedMessage{Message: message("m1", "1", "11", incoming, ts(1), "dinner at 7?")})
+	// Only the update landing second marks the message edited.
+	eventually(t, "the message and its update", func() bool {
+		var body string
+		_ = f.st.DB().QueryRow(`SELECT body FROM messages WHERE id = 'm1' AND edited_at IS NOT NULL`).Scan(&body)
+		return body == "dinner at 7?"
+	})
 }
 
 // A DM with only the owner's messages names no sender, so hide_senders

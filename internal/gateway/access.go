@@ -149,6 +149,8 @@ type accessRequest struct {
 type term struct {
 	Term  string    `json:"term"`
 	Chats []chatRef `json:"chats"`
+	// More says the term matched more chats than it lists.
+	More bool `json:"more,omitempty"`
 }
 
 // ownerRequest is an access request as the owner side takes it.
@@ -283,9 +285,9 @@ func (g *gateway) requestAccess(w http.ResponseWriter, r *http.Request, cl *call
 	writeJSON(w, http.StatusAccepted, map[string]string{"id": created.ID})
 }
 
-// matchTerms fills in the visible chats each term finds, the most recently
-// active first. Grants do not limit the search: the agent asks for chats it
-// may not read yet.
+// matchTerms fills in the visible chats each term finds, ranked as
+// store.Matching ranks them, and marks the terms that found more. Grants do
+// not limit the search: the agent asks for chats it may not read yet.
 func (g *gateway) matchTerms(ctx context.Context, w http.ResponseWriter, cl *caller, c *conn, terms []term) bool {
 	if len(terms) == 0 {
 		return true
@@ -301,7 +303,7 @@ func (g *gateway) matchTerms(ctx context.Context, w http.ResponseWriter, cl *cal
 	for i, t := range terms {
 		words[i] = t.Term
 	}
-	rows, err := v.matches(ctx, words, matchesPerTerm)
+	rows, err := v.matches(ctx, words, matchesPerTerm+1)
 	if err != nil {
 		unavailable(w, cl, "match chats", err)
 		return false
@@ -310,7 +312,11 @@ func (g *gateway) matchTerms(ctx context.Context, w http.ResponseWriter, cl *cal
 		k, _ := row[0].(int64)
 		id, _ := row[1].(string)
 		name, _ := row[2].(string)
-		terms[k].Chats = append(terms[k].Chats, chatRef{id, name})
+		if t := &terms[k]; len(t.Chats) < matchesPerTerm {
+			t.Chats = append(t.Chats, chatRef{id, name})
+		} else {
+			t.More = true
+		}
 	}
 	return true
 }

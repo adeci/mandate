@@ -117,7 +117,7 @@ Chat names that start with `~` were chosen by other people. The app shows chat I
 | `GET /owner/v1/connectors/{name}/setup` | Setup steps as data (`connector.md`). |
 | `POST /owner/v1/connectors/{name}/setup` | `{step, values}` |
 | `POST /owner/v1/connectors/{name}/unlink` | |
-| `GET /owner/v1/connectors/{name}/chats` | `?q=` or `?parent=`: chats for the picker, with ID, name, kind, parent, the parent's name, last activity and the version of its picture (`icon`). `q` finds chats as an agent's request terms do. |
+| `GET /owner/v1/connectors/{name}/chats` | `?q=`, `?parent=` or `?ids=`: chats for the picker, as `GET /containers` in `connector.md` lists them. |
 | `GET /owner/v1/connectors/{name}/icon` | `?chat=ID&v=<icon>`: the chat's picture as a 64 px square PNG made here, cached on disk (20 MiB, least recently served dropped). At the listing's version it is `Cache-Control: private, max-age=31536000, immutable`; a picture changed since is served `no-store`. `404` without a picture; `503` with `Retry-After` while the connector fetches others. |
 | `GET /owner/v1/never-share` | `[{connector, kind, id, name}]`, `kind` being `chat` or `person` |
 | `PUT /owner/v1/never-share/{connector}/{kind}/{id}` | `{name?}`. Hides the chat, or the person's messages and DMs, from every read and chat list, whatever the grants say. |
@@ -156,14 +156,15 @@ A proposal, as `GET /owner/v1/proposals/{id}` and `now` show it; `editable` list
 
 ```json
 {"requests": [{"id": "B5TQ…", "identity": "QX3M…", "identity_name": "laptop", "connector": "signal", "kind": "once",
-               "terms": [{"term": "fam", "chats": [{"id": "group.6f1b2c", "name": "~Family"}]}, {"term": "climbing", "chats": []}],
+               "terms": [{"term": "fam", "chats": [{"id": "group.6f1b2c", "name": "~Family"}]}, {"term": "climbing", "chats": []},
+                         {"term": "club", "chats": [{"id": "group.9c0d1e", "name": "Book club"}, …], "more": true}],
                "for": 1800, "horizon": 604800, "reason": "summarize the weekend plans",
                "created_at": "2026-11-03T09:14:00Z", "status": "pending"}],
  "proposals": [<proposal>],
  "grants": [<grant>], "routines": [<grant>], "stopped": [<grant>]}
 ```
 
-- A request without `terms` asks for every chat; a term with no chats matched nothing. A routine has `schedule` (`days`, `start`, `length`) instead of `for`; `extend` has only `for`.
+- A request without `terms` asks for every chat; a term with no chats matched nothing, and one with `more` matched more than the 5 chats it lists. A routine has `schedule` (`days`, `start`, `length`) instead of `for`; `extend` has only `for`.
 
 `GET /owner/v1/activity`:
 

@@ -202,8 +202,9 @@ Reads answer a table:
 `{c}` is `/agent/v1/{connector}`; `*` marks required parameters.
 
 - `chats` lists chats with activity at or after their cutoff, newest first,
-  never guilds, spaces or categories. `search` finds chats as a request's
-  term does (Access), in that order.
+  never a `guild`, `space`, `forum` or `media` chat, which only holds
+  others. `search` finds chats as a request's term does (Access), in that
+  order.
 - A chat's `name`, in `chats`, `search` and `access`, is its path,
   `main / #general`, even where the grant covers only the chat.
 - `messages` and `search` page by `(sent_at, seq)`, newest first.
@@ -238,12 +239,23 @@ A one-off grant has `from` and `until` instead of `schedule`.
 | extend | `{"connector", "extend": true, "for", "reason"}` |
 
 - `chats` are 1–10 search terms of 1–200 characters. Each finds at most 5
-  visible chats; terms that match nothing reach the owner as such. The
-  answer does not depend on what matched.
+  visible chats, and the owner sees when it matched more; terms that match
+  nothing reach the owner as such. The answer does not depend on what
+  matched.
 - A term's words (split on spaces and `/`, a leading `#` or `~` ignored) must
-  all be in a chat's path, `Server / #channel`, or the term in its ID. A
-  mailbox's exact name finds that mailbox alone; a server's or space's
-  finds the chats in it.
+  all be in a chat's path, `Server / #channel`, a DM's handle counting as
+  part of it for words that aren't all digits (`sam_p`, `@sam_p` and
+  `@bob:example.org` find the DM with that person), or the term must be its
+  ID or the part of it before `@`. A term written as a phone number, at
+  least 5 digits with only `+`, spaces, dashes, dots and parentheses besides
+  them, compares digits only: `+1 555 999 0002` finds a chat named
+  `(555) 999-0002`, a DM whose person's handle is `+15559990002`, or the
+  chat with the ID `15559990002@s.whatsapp.net`, a country code of up to 3
+  digits being optional. A mailbox's exact name finds that mailbox alone; a
+  server's, space's or forum's finds the chats directly in it.
+- Chats idle for over a year, or never active, rank last. Apart from that,
+  the chat the term names by ID comes first, then those it names by their
+  own name, then the newest.
 - `for` defaults to 1800, at most 43200. `horizon` defaults to 604800; 0 is
   all history.
 - A routine's `days` are 0 (Sunday) to 6, empty for every day; `start` is

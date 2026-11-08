@@ -90,7 +90,9 @@ func historyChat(raw types.JID, pn pnResolver) (types.JID, bool) {
 	return types.EmptyJID, false
 }
 
-func historyContainer(chat types.JID, conv *waHistorySync.Conversation, pn pnResolver) store.Container {
+// historyContainer is chat as history describes it, with a group's members
+// but the owner, whom own tells apart, by ID and number alone.
+func historyContainer(chat types.JID, conv *waHistorySync.Conversation, pn pnResolver, own func(types.JID) bool) store.Container {
 	c := store.Container{
 		ID:      chat.String(),
 		Kind:    kindFor(chat),
@@ -111,13 +113,18 @@ func historyContainer(chat types.JID, conv *waHistorySync.Conversation, pn pnRes
 			if err != nil {
 				continue
 			}
-			c.Participants = append(c.Participants, store.Participant{ID: preferPN(j, types.EmptyJID, pn).String()})
+			if j = preferPN(j, types.EmptyJID, pn); !own(j) {
+				c.Participants = append(c.Participants, store.Participant{ID: j.String(), Handle: number(j)})
+			}
 		}
 	}
 	return c
 }
 
-func groupContainer(info *types.GroupInfo, pn pnResolver, name func(types.JID) string) store.Container {
+// groupContainer is the group info describes, with its members but the
+// owner, whom own tells apart, named from the address book or by the name
+// they chose.
+func groupContainer(info *types.GroupInfo, pn pnResolver, name func(types.JID) string, own func(types.JID) bool) store.Container {
 	c := store.Container{
 		ID:           info.JID.ToNonAD().String(),
 		Kind:         "group",
@@ -127,7 +134,10 @@ func groupContainer(info *types.GroupInfo, pn pnResolver, name func(types.JID) s
 	}
 	for _, p := range info.Participants {
 		j := preferPN(p.JID, p.PhoneNumber, pn)
-		part := store.Participant{ID: j.String(), Name: name(j)}
+		if own(j) {
+			continue
+		}
+		part := store.Participant{ID: j.String(), Name: name(j), Handle: number(j)}
 		if part.Name == "" && p.DisplayName != "" {
 			part.Name = "~" + p.DisplayName
 		}

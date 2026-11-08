@@ -27,6 +27,7 @@ import (
 
 	"github.com/adeci/mandate/connector"
 	"github.com/adeci/mandate/store"
+	"github.com/adeci/mandate/store/storetest"
 )
 
 const (
@@ -504,7 +505,7 @@ func TestGatewayStoresLiveMessages(t *testing.T) {
 	c.dispatch("MESSAGE_CREATE", map[string]any{
 		"id": msg1, "channel_id": dmID, "channel_type": channelDM, "type": 0, "content": secretBody,
 		"timestamp": "2026-10-29T15:59:00.000000+00:00", "edited_timestamp": nil, "nonce": "1",
-		"author": map[string]any{"id": aliceUser, "username": "alice", "global_name": "Alice A"},
+		"author": map[string]any{"id": aliceUser, "username": "alice", "global_name": "Alice A", "avatar": pictureHash},
 	})
 	c.dispatch("MESSAGE_CREATE", map[string]any{
 		"id": msg2, "channel_id": chanGeneral, "guild_id": guildID, "channel_type": 0, "type": 0, "content": "in a server",
@@ -519,8 +520,8 @@ func TestGatewayStoresLiveMessages(t *testing.T) {
 		row[1] != msg1 || row[2] != secretBody || row[3] != "~Alice A" || row[4] != int64(0) {
 		t.Fatalf("DM messages %v", row)
 	}
-	if row := h.queryRow(`SELECT kind, name, last_message_at FROM containers WHERE id = ?`, dmID); row[0] != kindDM || row[1] != "~Alice A" ||
-		row[2] != snowflakeTimeString(msg1) {
+	if row := h.queryRow(`SELECT kind, name, last_message_at, icon FROM containers WHERE id = ?`, dmID); row[0] != kindDM || row[1] != "~Alice A" ||
+		row[2] != snowflakeTimeString(msg1) || row[3] != "avatars/"+aliceUser+"/"+pictureHash {
 		t.Errorf("DM row %v", row)
 	}
 	if row := h.queryRow(`SELECT kind, parent_id FROM containers WHERE id = ?`, chanGeneral); row[0] != kindChannel || row[1] != "guild:"+guildID {
@@ -554,6 +555,37 @@ func TestGatewayStoresLiveMessages(t *testing.T) {
 	}
 	if n := len(h.discord.all()); n != 0 {
 		t.Errorf("%d REST requests", n)
+	}
+}
+
+// A reader holding the store past its busy timeout fails the writes, as one
+// did on the owner's server. Discord never sends an event again, so the
+// gateway keeps the message, with its chat, until the reader lets go; an
+// edit that comes meanwhile lands after it.
+func TestGatewayKeepsUpdatesWhileStoreBusy(t *testing.T) {
+	h := newHarness(t, nil)
+	h.start()
+	c := h.gw.conn(t)
+	c.ops(t, 5)
+	unlock := storetest.Lock(t, h.st)
+	c.dispatch("MESSAGE_CREATE", map[string]any{
+		"id": msg1, "channel_id": chanGeneral, "guild_id": guildID, "channel_type": 0, "type": 0, "content": "dinner?",
+		"timestamp": "2026-11-07T21:37:37.000000+00:00", "author": map[string]any{"id": aliceUser, "username": "alice"},
+	})
+	eventually(t, "the store busy", func() bool {
+		return strings.Contains(h.logs.String(), `store busy; keeping writes until it is free" write="message `+msg1)
+	})
+	unlock()
+	c.dispatch("MESSAGE_UPDATE", map[string]any{
+		"id": msg1, "channel_id": chanGeneral, "content": "dinner at 7?", "edited_timestamp": "2026-11-07T21:38:00.000000+00:00",
+	})
+	eventually(t, "the message and its edit", func() bool {
+		var body string
+		_ = h.st.DB().QueryRow(`SELECT body FROM messages WHERE id = ? AND edited_at IS NOT NULL`, msg1).Scan(&body)
+		return body == "dinner at 7?"
+	})
+	if row := h.queryRow(`SELECT kind, parent_id FROM containers WHERE id = ?`, chanGeneral); row[0] != kindChannel || row[1] != "guild:"+guildID {
+		t.Errorf("channel row %v", row)
 	}
 }
 
@@ -667,7 +699,8 @@ FROM containers AS c LEFT JOIN containers AS p ON p.id = c.parent_id WHERE c.id 
 }
 
 // READY lists every DM and group DM, so the owner finds them without a
-// sync; recipients come as IDs into READY's users.
+// sync; recipients come as IDs into READY's users, with their avatars and
+// @handles.
 func TestGatewayReadyStoresDMs(t *testing.T) {
 	const (
 		bobUser = "1000000000000000003"
@@ -677,10 +710,10 @@ func TestGatewayReadyStoresDMs(t *testing.T) {
 	ready := h.gw.ready
 	h.gw.ready = func() map[string]any {
 		r := ready()
-		r["users"] = []map[string]any{{"id": aliceUser, "username": "alice", "global_name": "Alice A"}}
+		r["users"] = []map[string]any{{"id": aliceUser, "username": "alice", "global_name": "Alice A", "avatar": pictureHash}}
 		r["private_channels"] = []map[string]any{
 			{"id": dmID, "type": 1, "recipient_ids": []string{aliceUser}},
-			{"id": groupDM, "type": 3, "last_message_id": msg3, "recipients": []map[string]any{
+			{"id": groupDM, "type": 3, "last_message_id": msg3, "icon": pictureHash, "recipients": []map[string]any{
 				{"id": aliceUser, "username": "alice", "global_name": "Alice A"}, {"id": bobUser, "username": "bob"},
 			}},
 		}
@@ -689,19 +722,96 @@ func TestGatewayReadyStoresDMs(t *testing.T) {
 	h.start()
 	h.gw.conn(t).ops(t, 5)
 	chat := func(id string) []any {
-		return h.queryRow(`SELECT kind, name, participants_json, last_message_at FROM containers WHERE id = ?`, id)
+		return h.queryRow(`SELECT kind, name, participants_json, last_message_at, icon FROM containers WHERE id = ?`, id)
 	}
 	eventually(t, "READY DMs stored", func() bool {
 		var n int
 		_ = h.st.DB().QueryRow(`SELECT count(*) FROM containers WHERE id = ?`, groupDM).Scan(&n)
 		return n == 1
 	})
-	if row := chat(dmID); !reflect.DeepEqual(row, []any{kindDM, "~Alice A", `[{"id":"` + aliceUser + `","name":"~Alice A"}]`, nil}) {
+	want := []any{kindDM, "~Alice A", `[{"id":"` + aliceUser + `","name":"~Alice A","handle":"@alice"}]`, nil, "avatars/" + aliceUser + "/" + pictureHash}
+	if row := chat(dmID); !reflect.DeepEqual(row, want) {
 		t.Errorf("dm %v", row)
 	}
-	want := []any{kindGroup, "~Alice A, ~bob", `[{"id":"` + aliceUser + `","name":"~Alice A"},{"id":"` + bobUser + `","name":"~bob"}]`, snowflakeTimeString(msg3)}
+	want = []any{
+		kindGroup, "~Alice A, ~bob", `[{"id":"` + aliceUser + `","name":"~Alice A","handle":"@alice"},{"id":"` + bobUser + `","name":"~bob","handle":"@bob"}]`,
+		snowflakeTimeString(msg3), "channel-icons/" + groupDM + "/" + pictureHash,
+	}
 	if row := chat(groupDM); !reflect.DeepEqual(row, want) {
 		t.Errorf("group dm %v", row)
+	}
+}
+
+// A voice or stage channel comes in only with text. READY stores one it
+// dates a message in, leaves out the others and drops their rows from
+// before kinds; a first message brings one in, named from READY's list. A
+// new post never turns its forum into a channel.
+func TestGatewayVoiceChannelsNeedText(t *testing.T) {
+	const (
+		voice = "1100000000000000016" // its text chat used in 2024
+		quiet = "1100000000000000017" // never used for text
+		stage = "1100000000000000018" // the same, stored before kinds
+		forum = "1100000000000000019"
+		post  = "1100000000000000020"
+	)
+	h := newHarness(t, nil)
+	ctx := context.Background()
+	for _, c := range []store.Container{
+		{ID: voice, Kind: kindChannel, ParentID: "guild:" + guildID, Name: "#General"},
+		{ID: stage, Kind: kindChannel, ParentID: "guild:" + guildID, Name: "#Town Hall"},
+		{ID: forum, Kind: kindChannel, ParentID: "guild:" + guildID, Name: "#help"},
+	} {
+		if err := h.st.UpsertContainer(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ready := h.gw.ready
+	h.gw.ready = func() map[string]any {
+		r := ready()
+		r["guilds"] = []map[string]any{{
+			"id": guildID, "data_mode": "full", "properties": map[string]any{"id": guildID, "name": "Club", "icon": pictureHash},
+			"channels": []map[string]any{
+				{"id": voice, "type": channelVoice, "name": "General", "last_message_id": msg3},
+				{"id": quiet, "type": channelVoice, "name": "Lounge"},
+				{"id": stage, "type": channelStage, "name": "Town Hall"},
+				{"id": forum, "type": channelForum, "name": "help"},
+			},
+		}}
+		return r
+	}
+	h.start()
+	c := h.gw.conn(t)
+	c.ops(t, 5)
+	chat := func(id string) []any {
+		return h.queryRow(`SELECT count(*), COALESCE(max(kind), ''), COALESCE(max(name), ''), COALESCE(max(parent_id), ''), COALESCE(max(icon), '')
+FROM containers WHERE id = ?`, id)
+	}
+	eventually(t, "READY stored", func() bool { return chat(forum)[1] == kindForum })
+	for id, want := range map[string][]any{
+		"guild:" + guildID: {int64(1), kindGuild, "Club", "", "icons/" + guildID + "/" + pictureHash},
+		voice:              {int64(1), kindVoice, "General", "guild:" + guildID, ""},
+		quiet:              {int64(0), "", "", "", ""},
+		stage:              {int64(0), "", "", "", ""},
+	} {
+		if row := chat(id); !reflect.DeepEqual(row, want) {
+			t.Errorf("after READY, chat %s is %v, want %v", id, row, want)
+		}
+	}
+
+	c.dispatch("THREAD_CREATE", map[string]any{"id": post, "type": channelPublicThread, "guild_id": guildID, "parent_id": forum, "name": "crash on start"})
+	c.dispatch("MESSAGE_CREATE", map[string]any{
+		"id": msg4, "channel_id": quiet, "guild_id": guildID, "channel_type": channelVoice, "type": 0, "content": "hi",
+		"timestamp": "2026-10-29T16:00:00.000000+00:00", "author": map[string]any{"id": aliceUser, "username": "alice"},
+	})
+	eventually(t, "message stored", func() bool { return chat(quiet)[0] == int64(1) })
+	for id, want := range map[string][]any{
+		quiet: {int64(1), kindVoice, "Lounge", "guild:" + guildID, ""},
+		forum: {int64(1), kindForum, "help", "guild:" + guildID, ""},
+		post:  {int64(1), kindThread, "crash on start", forum, ""},
+	} {
+		if row := chat(id); !reflect.DeepEqual(row, want) {
+			t.Errorf("after a post and a message, chat %s is %v, want %v", id, row, want)
+		}
 	}
 }
 

@@ -18,7 +18,8 @@ import (
 
 // The chats a connection stores, kept in testdata/chats.json for the
 // gateway's tests of agents' terms: contacts by address-book and push name,
-// the owner's own chat, groups, and a number nobody named.
+// the owner's own chat, groups, one with the owner among its members, and a
+// number nobody named.
 func TestChatsFixture(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
@@ -27,12 +28,12 @@ func TestChatsFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	in := newIngester(whatsmeow.NewClient(dev, nil), f.st, testQueue(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	in.storeContacts(ctx)
 	in.nameDMs(ctx)
 	in.storeGroups(ctx, []*types.GroupInfo{{
 		JID: types.NewJID("120363000000000999", types.GroupServer), GroupName: types.GroupName{Name: "Book club"},
-		Participants: []types.GroupParticipant{{JID: samLee}, {JID: stranger}},
+		Participants: []types.GroupParticipant{{JID: samLee}, {JID: stranger}, {JID: owner}},
 	}})
 	// Written from the phone to a number in no address book.
 	in.handle(ctx, &events.Message{

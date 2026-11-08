@@ -406,7 +406,7 @@ func (h *harness) agent(owner device) string {
 func requestBody(identity string) map[string]any {
 	return map[string]any{
 		"identity": identity, "connector": "test", "kind": "once", "for": 1800, "horizon": 86400, "reason": "summary",
-		"terms": []term{{Term: "fam", Chats: []chat{{"c1", "Family"}, {"c2", "~Fam"}}}},
+		"terms": []term{{Term: "fam", Chats: []chat{{"c1", "Family"}, {"c2", "~Fam"}}, More: true}},
 	}
 }
 
@@ -742,7 +742,7 @@ func TestActivitySearch(t *testing.T) {
 	if got := kinds(page); !slices.Equal(got, []string{"request.denied", "request.asked"}) {
 		t.Fatalf("q=FAMILY: %v", got)
 	}
-	if d := page.Entries[0]; d.Reason != "summary" || d.Device != "Pixel 9" || len(d.Terms) != 1 || d.Terms[0].Term != "fam" {
+	if d := page.Entries[0]; d.Reason != "summary" || d.Device != "Pixel 9" || len(d.Terms) != 1 || d.Terms[0].Term != "fam" || !d.Terms[0].More {
 		t.Errorf("denied = %+v", d)
 	}
 	if got := kinds(search("book CLUB", 100, "")); !slices.Equal(got, []string{"read"}) {
@@ -1530,21 +1530,49 @@ func TestPickedChatNamed(t *testing.T) {
 	}
 }
 
-func TestChatsListDMParticipants(t *testing.T) {
+// The picker's listing passes through as asked: the top level, and chats by
+// ID with a group's members.
+func TestChatsPassThrough(t *testing.T) {
 	dir := t.TempDir()
 	storeChats(t, dir)
 	h := start(t, serveConnector(t, &fakeConnector{}, dir))
 	owner := h.pair()
-	var chats []connector.Container
-	if st := h.do("GET", "/owner/v1/connectors/test/chats", owner.token, nil, &chats); st != http.StatusOK {
-		t.Fatalf("chats = %d", st)
+	ids := func(path string) ([]string, []connector.Container) {
+		t.Helper()
+		var chats []connector.Container
+		if st := h.do("GET", path, owner.token, nil, &chats); st != http.StatusOK {
+			t.Fatalf("%s = %d", path, st)
+		}
+		var out []string
+		for _, c := range chats {
+			out = append(out, c.ID)
+		}
+		return out, chats
 	}
-	got := map[string][]store.Participant{}
-	for _, c := range chats {
-		got[c.ID] = c.Participants
+	if got, _ := ids("/owner/v1/connectors/test/chats?parent="); !slices.Equal(got, []string{"g1", "c3", "d1"}) {
+		t.Errorf("top level %v", got)
 	}
-	if len(chats) != 4 || got["c3"] != nil || !slices.Equal(got["d1"], []store.Participant{{ID: "u1", Name: "Ana"}}) {
-		t.Errorf("chats = %+v", chats)
+	got, chats := ids("/owner/v1/connectors/test/chats?ids=g1-general,c3")
+	if !slices.Equal(got, []string{"g1-general", "c3"}) || chats[0].Parents[0].Name != "main" ||
+		!slices.Equal(chats[1].Participants, []store.Participant{{ID: "u1", Name: "Ana"}, {ID: "u2", Name: "Bo"}}) {
+		t.Errorf("by ID %+v", chats)
+	}
+
+	// Never-share marks what it hides: a server's channels, a person's DM.
+	// A chat hidden from inside its server is named by its path.
+	for path, name := range map[string]string{"chat/g1": "main", "person/u1": "Ana", "chat/g1-general": "#general"} {
+		if st := h.do("PUT", "/owner/v1/never-share/test/"+path, owner.token, map[string]string{"name": name}, nil); st != http.StatusOK {
+			t.Fatalf("never-share %s = %d", path, st)
+		}
+	}
+	_, chats = ids("/owner/v1/connectors/test/chats?ids=g1-general,c3,d1")
+	if !chats[0].Hidden || chats[1].Hidden || !chats[2].Hidden {
+		t.Errorf("hidden %+v", chats)
+	}
+	var never []neverShare
+	h.do("GET", "/owner/v1/never-share", owner.token, nil, &never)
+	if i := slices.IndexFunc(never, func(n neverShare) bool { return n.ID == "g1-general" }); i < 0 || never[i].Name != "main / #general" {
+		t.Errorf("never-share %+v", never)
 	}
 }
 

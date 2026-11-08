@@ -254,6 +254,25 @@ func attachmentHeaders() []header {
 	}
 }
 
+// An image on the app's page: a no-cors load from the CDN, which gets only
+// discord.com's origin as referrer.
+func imageHeaders() []header {
+	return []header{
+		{"sec-ch-ua-platform", `"Linux"`},
+		{"user-agent", userAgent},
+		{"sec-ch-ua", secChUA},
+		{"sec-ch-ua-mobile", "?0"},
+		{"accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"},
+		{"sec-fetch-site", "cross-site"},
+		{"sec-fetch-mode", "no-cors"},
+		{"sec-fetch-dest", "image"},
+		{"referer", defaultWebBase + "/"},
+		{"accept-encoding", "gzip, deflate, br, zstd"},
+		{"accept-language", "en-US,en;q=0.9"},
+		{"priority", "i"},
+	}
+}
+
 func scriptHeaders(referer string) []header {
 	return []header{
 		{"sec-ch-ua-platform", `"Linux"`},

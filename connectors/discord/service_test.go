@@ -43,6 +43,7 @@ const (
 	msg3        = "1300000000000000003"
 	msg4        = "1300000000000000004"
 	secretBody  = "rig build log"
+	pictureHash = "0123456789abcdef0123456789abcdef"
 )
 
 type hit struct {

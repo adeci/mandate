@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"slices"
 	"strings"
@@ -69,6 +70,11 @@ func participantName(p *gmproto.Participant) string {
 	return ""
 }
 
+// handle is the participant's number, in E.164 where the phone gives one.
+func handle(p *gmproto.Participant) string {
+	return cmp.Or(p.GetID().GetNumber(), p.GetFormattedNumber())
+}
+
 func container(conv *gmproto.Conversation) store.Container {
 	c := store.Container{
 		ID:      conv.GetConversationID(),
@@ -87,7 +93,7 @@ func container(conv *gmproto.Conversation) store.Container {
 		c.Participants = make([]store.Participant, 0, len(ps))
 	}
 	for _, p := range ps {
-		part := store.Participant{ID: participantID(p), Name: participantName(p)}
+		part := store.Participant{ID: participantID(p), Name: participantName(p), Handle: handle(p)}
 		c.Participants = append(c.Participants, part)
 		names = append(names, part.Name)
 	}

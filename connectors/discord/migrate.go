@@ -10,7 +10,10 @@ import (
 // row overwrote the guild's with itself as parent. A channel's parent is
 // always a guild, so the guilds are the guild rows and the channels'
 // parents; a thread's parent is its channel, if there is one by that ID.
-// It also drops the channels the account may not view, which hold nothing.
+// It also drops the channels the account may not view, which hold nothing,
+// and voice and stage channels without text. Rows from before chats had
+// kinds don't say which those are; READY's lists drop them. And it moves
+// the @handles kept apart in discord_handles into the DMs' participants.
 // Every step finds nothing to do once done.
 func migrate(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
@@ -32,6 +35,14 @@ WHERE parent_id IN (SELECT id FROM old_guilds)
 		`DROP TABLE old_guilds`,
 		`DELETE FROM containers WHERE kind = 'channel' AND name = '#` + hiddenName + `'
   AND NOT EXISTS (SELECT 1 FROM messages WHERE container_id = containers.id)`,
+		`DELETE FROM containers WHERE kind IN ('voice', 'stage') AND last_message_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM messages WHERE container_id = containers.id)`,
+		`CREATE TABLE IF NOT EXISTS discord_handles (user_id TEXT PRIMARY KEY, handle TEXT NOT NULL)`,
+		`UPDATE containers SET participants_json = json_set(participants_json, '$[0].handle', '@' || h.handle)
+FROM discord_handles AS h
+WHERE containers.kind = 'dm' AND h.user_id = containers.participants_json ->> '$[0].id'
+  AND containers.participants_json ->> '$[0].handle' IS NULL`,
+		`DROP TABLE discord_handles`,
 	} {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return err

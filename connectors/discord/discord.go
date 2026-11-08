@@ -5,7 +5,8 @@
 // Account integrity comes first: every request looks like Chrome on Linux and
 // is paced like a person. Reads are GETs, a send is a typing indicator and one
 // POST, a file is a refreshed link and its download, and at startup it loads
-// the app page and connects, as a browser restoring the tab does.
+// the app page and connects, as a browser restoring the tab does. Chats'
+// pictures load from the CDN as the app's images do, without the token.
 package main
 
 import (
@@ -216,9 +217,6 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 	if st.CooldownUntil.After(cfg.clock.Now()) {
 		cfg.log.Warn("in rate-limit cooldown", "until", st.CooldownUntil.Format(time.RFC3339))
 	}
-	if _, err := cfg.store.DB().ExecContext(ctx, handlesSchema); err != nil {
-		return nil, fmt.Errorf("create handles table: %w", err)
-	}
 	if err := migrate(ctx, cfg.store.DB()); err != nil {
 		return nil, fmt.Errorf("migrate store: %w", err)
 	}
@@ -227,15 +225,17 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	gw := newGateway(cfg.gatewayURL, cfg.dialGateway, cfg.clock, cfg.rng, cfg.store, cfg.log)
 	w := &worker{
-		svc:   newService(cfg.store, up, gw, cfg.clock),
-		token: cfg.token,
-		clock: cfg.clock,
-		ctx:   ctx,
-		stop:  cancel,
-		jobs:  make(chan *job),
-		fail:  cfg.fail,
-		done:  make(chan struct{}),
-		log:   cfg.log,
+		svc:     newService(cfg.store, up, gw, cfg.clock),
+		token:   cfg.token,
+		clock:   cfg.clock,
+		ctx:     ctx,
+		stop:    cancel,
+		jobs:    make(chan *job),
+		fail:    cfg.fail,
+		done:    make(chan struct{}),
+		log:     cfg.log,
+		cdn:     cfg.cdn,
+		cdnBase: cfg.cdnBase,
 	}
 	w.snapshot()
 	if token != "" {
@@ -252,6 +252,7 @@ func start(ctx context.Context, cfg config) (*worker, error) {
 func (w *worker) Close() error {
 	w.stop()
 	<-w.done
+	w.svc.gw.writes.Close()
 	return nil
 }
 
@@ -270,8 +271,8 @@ type jobResult struct {
 	err error
 }
 
-// worker runs calls one at a time, so every upstream request is strictly
-// serialized on its goroutine.
+// worker runs calls one at a time, so every upstream request but a
+// picture's is strictly serialized on its goroutine.
 type worker struct {
 	svc      *service
 	token    connector.Secret
@@ -284,6 +285,10 @@ type worker struct {
 	rejected *ownerStop  // why Discord refused the last token
 	done     chan struct{}
 	log      *slog.Logger
+	// Pictures load beside the calls, as a page's images load beside its
+	// requests, with the client that downloads files.
+	cdn     transport
+	cdnBase string
 
 	// What Health reads; the pacer and state belong to the worker goroutine.
 	mu     sync.Mutex

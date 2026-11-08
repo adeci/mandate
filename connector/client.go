@@ -137,10 +137,21 @@ func (c *Client) Execute(ctx context.Context, approval record.Envelope) (Result,
 	return r, err
 }
 
-// Containers lists up to limit stored chats matching q, under parent if it
-// is set.
-func (c *Client) Containers(ctx context.Context, q, parent string, limit int) ([]Container, error) {
-	v := url.Values{"q": {q}, "parent": {parent}, "limit": {strconv.Itoa(limit)}}
+// Containers lists stored chats as q asks.
+func (c *Client) Containers(ctx context.Context, q ContainerQuery) ([]Container, error) {
+	v := url.Values{}
+	if q.Q != "" {
+		v.Set("q", q.Q)
+	}
+	if q.Parent != nil {
+		v.Set("parent", *q.Parent)
+	}
+	if q.IDs != nil {
+		v.Set("ids", strings.Join(q.IDs, ","))
+	}
+	if q.Limit > 0 {
+		v.Set("limit", strconv.Itoa(q.Limit))
+	}
 	var out []Container
 	err := c.do(ctx, http.MethodGet, "/containers?"+v.Encode(), nil, &out)
 	return out, err

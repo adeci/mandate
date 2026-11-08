@@ -298,11 +298,6 @@ func (s *service) loadDMs(ctx context.Context, dl time.Time) ([]apiChannel, erro
 	if err := s.up.get(ctx, dl, r, &cs); err != nil {
 		return nil, err
 	}
-	for i := range cs {
-		if err := saveHandles(ctx, s.st.DB(), cs[i].Recipients); err != nil {
-			return nil, err
-		}
-	}
 	s.dms = cachedList[apiChannel]{at: s.clock.Now(), v: cs}
 	return cs, nil
 }
@@ -364,17 +359,12 @@ func (s *service) joinedGuild(ctx context.Context, dl time.Time, guildID string)
 }
 
 func (s *service) upsertGuild(ctx context.Context, g *apiGuild, chans []apiChannel) error {
+	cs := guildChannelContainers(g.ID, chans)
 	if c, ok := guildContainer(g); ok {
-		if err := s.st.UpsertContainer(ctx, c); err != nil {
-			return err
-		}
+		cs = append(cs, c)
 	}
-	for _, c := range guildChannelContainers(g.ID, chans) {
-		if err := s.st.UpsertContainer(ctx, c); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err := storeListed(ctx, s.st, cs)
+	return err
 }
 
 func (s *service) sync(ctx context.Context, dl time.Time, req syncRequest) (connector.ReadResult, error) {
@@ -419,10 +409,12 @@ func (s *service) sync(ctx context.Context, dl time.Time, req syncRequest) (conn
 	if err != nil {
 		return resp, err
 	}
-	for _, c := range guildChannelContainers(g.ID, chans) {
-		if err := upsert(c); err != nil {
-			return resp, err
-		}
+	stored, err := storeListed(ctx, s.st, guildChannelContainers(g.ID, chans))
+	if err != nil {
+		return resp, err
+	}
+	for _, c := range stored {
+		resp.ContainerIDs = append(resp.ContainerIDs, c.ID)
 	}
 	return resp, nil
 }
@@ -497,11 +489,10 @@ func (s *service) search(ctx context.Context, dl time.Time, req searchRequest) (
 	}
 
 	known := make(map[string]store.Container)
-	for _, c := range guildChannelContainers(g.ID, chans) {
-		known[c.ID] = c
-	}
-	for _, c := range guildChannelContainers(g.ID, res.Threads) {
-		known[c.ID] = c
+	for _, c := range guildChannelContainers(g.ID, slices.Concat(chans, res.Threads)) {
+		if c.Kind != "" { // a thread's channel known by ID alone isn't described
+			known[c.ID] = c
+		}
 	}
 	stored := make(map[string]bool)
 	ids := make([]string, 0, len(res.Messages))
@@ -637,8 +628,6 @@ func (s *service) guildOf(ctx context.Context, c store.Container) (string, error
 		case kind == kindGuild:
 			parent = c.ParentID
 		}
-	} else if c.Kind != kindChannel {
-		return "", nil
 	}
 	id, _ := strings.CutPrefix(parent, "guild:")
 	return id, nil
@@ -654,25 +643,44 @@ func adopt(ctx context.Context, db *sql.DB, id, guildID string) error {
 	return err
 }
 
-// discord_handles keeps each DM partner's @handle, which approvals show
-// beside the display name anyone may copy.
-const handlesSchema = `CREATE TABLE IF NOT EXISTS discord_handles (
-    user_id TEXT PRIMARY KEY,
-    handle  TEXT NOT NULL
-)`
-
-func saveHandles(ctx context.Context, db *sql.DB, users []apiUser) error {
-	for i := range users {
-		h := handle(&users[i])
-		if users[i].ID == "" || h == "" {
+// storeListed stores the chats a list names, such as READY's or a guild's
+// channels, and returns those it stored. A channel named by ID alone, with
+// no kind, is stored where nothing is, or filed under its guild where it
+// has no parent. A voice or stage channel is stored once it has text, which
+// the list dates or the store holds; a row of one without, from before
+// chats had kinds, is dropped.
+func storeListed(ctx context.Context, st *store.Store, cs []store.Container) ([]store.Container, error) {
+	db := st.DB()
+	stored := make([]store.Container, 0, len(cs))
+	for _, c := range cs {
+		switch {
+		case c.Kind == "":
+			if _, err := db.ExecContext(ctx, `INSERT INTO containers (id, kind, parent_id, updated_at)
+VALUES (?1, ?2, NULLIF(?3, ''), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+ON CONFLICT (id) DO UPDATE SET parent_id = excluded.parent_id WHERE containers.parent_id IS NULL`, c.ID, kindChannel, c.ParentID); err != nil {
+				return nil, err
+			}
 			continue
+		case (c.Kind == kindVoice || c.Kind == kindStage) && c.LastMessageAt.IsZero():
+			var text bool
+			if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM messages WHERE container_id = ?1)`, c.ID).Scan(&text); err != nil {
+				return nil, err
+			}
+			if !text {
+				// A message stores its chat, typed, before itself, so
+				// this never drops one whose first message is on its way.
+				if _, err := db.ExecContext(ctx, `DELETE FROM containers WHERE id = ?1 AND kind = ?2`, c.ID, kindChannel); err != nil {
+					return nil, err
+				}
+				continue
+			}
 		}
-		if _, err := db.ExecContext(ctx, `INSERT INTO discord_handles (user_id, handle) VALUES (?1, ?2)
-ON CONFLICT (user_id) DO UPDATE SET handle = excluded.handle`, users[i].ID, h); err != nil {
-			return fmt.Errorf("store handle: %w", err)
-		}
+		stored = append(stored, c)
 	}
-	return nil
+	if err := st.UpsertContainers(ctx, stored); err != nil {
+		return nil, err
+	}
+	return stored, nil
 }
 
 func (s *service) fetch(ctx context.Context, dl time.Time, req fetchRequest) (connector.ReadResult, error) {

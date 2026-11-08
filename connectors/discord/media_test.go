@@ -220,3 +220,52 @@ func TestMediaOverTheLimitIsRefused(t *testing.T) {
 		}
 	}
 }
+
+// A chat's picture loads from the CDN as an image on the app's page does: a
+// 64 px PNG, without the token and outside the reads' budget. A stored
+// reference of another shape never becomes a URL.
+func TestIconFromTheCDN(t *testing.T) {
+	const png = "\x89PNG\r\n\x1a\n a server icon"
+	path := "/icons/" + guildID + "/" + pictureHash + ".png"
+	h := newHarness(t, nil)
+	h.discord.handle(path, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		w.Header().Set("Content-Type", "image/png")
+		io.WriteString(w, png)
+	})
+	ctx := context.Background()
+	for _, c := range []store.Container{
+		{ID: "guild:" + guildID, Kind: kindGuild, Name: "Club", Icon: "icons/" + guildID + "/" + pictureHash},
+		{ID: dmID, Kind: kindDM, Name: "~Alice A", Icon: "avatars/" + aliceUser + "/" + pictureHash}, // gone from the CDN
+		{ID: chanGeneral, Kind: kindChannel, ParentID: "guild:" + guildID, Icon: "../api/v9/users/@me"},
+	} {
+		if err := h.st.UpsertContainer(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.start()
+	before := len(h.state().Requests)
+	ic, _, err := h.client.Icon(ctx, "guild:"+guildID)
+	if err != nil || ic.Type != "image/png" || string(ic.Body) != png {
+		t.Fatalf("picture %q %q, %v", ic.Type, ic.Body, err)
+	}
+	hits := h.discord.all()
+	if len(hits) != 1 || hits[0].path != path || hits[0].query.Get("size") != "64" {
+		t.Fatalf("upstream requests %v", h.discord.paths())
+	}
+	if hd := hits[0].header; hd.Get("Authorization") != "" || hd.Get("Sec-Fetch-Dest") != "image" || hd.Get("User-Agent") != userAgent {
+		t.Errorf("picture headers %v", hd)
+	}
+	if n := len(h.state().Requests) - before; n != 0 {
+		t.Errorf("%d requests counted", n)
+	}
+	// The avatar is gone from the CDN; the odd reference never reaches it.
+	for _, chat := range []string{dmID, chanGeneral} {
+		var e *connector.Error
+		if _, _, err := h.client.Icon(ctx, chat); !errors.As(err, &e) || e.Status != http.StatusNotFound {
+			t.Errorf("picture of %s: got %v, want 404", chat, err)
+		}
+	}
+	if n := len(h.discord.all()); n != 2 {
+		t.Errorf("%d upstream requests, want the icon's and the avatar's", n)
+	}
+}

@@ -10,8 +10,8 @@ import (
 )
 
 // The chats a sync stores, kept in testdata/chats.json for the gateway's
-// tests of agents' terms: a space with its rooms and a room named like one
-// of them outside it.
+// tests of agents' terms: a space with its rooms, a room named like one
+// of them outside it, and a DM.
 func TestChatsFixture(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
@@ -21,7 +21,7 @@ func TestChatsFixture(t *testing.T) {
 		general = id.RoomID("!general:example.org")
 		lobby   = id.RoomID("!lobby:example.org")
 	)
-	n := f.hs.push(joined(map[id.RoomID]map[string]any{
+	batch := joined(map[id.RoomID]map[string]any{
 		space: room([]map[string]any{
 			stateEvent("m.room.create", "", bob, map[string]any{"type": "m.space"}),
 			stateEvent("m.room.name", "", bob, map[string]any{"name": "Club"}),
@@ -31,7 +31,12 @@ func TestChatsFixture(t *testing.T) {
 		teamRoom: room([]map[string]any{stateEvent("m.room.name", "", bob, map[string]any{"name": "Team"})}, nil),
 		general:  room([]map[string]any{stateEvent("m.room.name", "", bob, map[string]any{"name": "general"})}, nil),
 		lobby:    room([]map[string]any{stateEvent("m.room.name", "", bob, map[string]any{"name": "general"})}, nil),
-	}))
+		dmRoom:   room([]map[string]any{member(owner, "Owner"), member(bob, "Bob")}, nil),
+	})
+	batch["account_data"] = map[string]any{"events": []map[string]any{
+		{"type": "m.direct", "content": map[string]any{bob.String(): []id.RoomID{dmRoom}}},
+	}}
+	n := f.hs.push(batch)
 	f.hs.waitSynced(n)
 	storetest.Check(t, f.st.DB(), filepath.Join("testdata", "chats.json"))
 }

@@ -88,7 +88,9 @@ type gateway struct {
 	clock clock
 	rng   rng
 	store *store.Store
-	log   *slog.Logger
+	// writes stores what Discord pushes, which it never sends again.
+	writes *store.Queue
+	log    *slog.Logger
 	// rejected carries a token Discord refused with 4004 to the worker.
 	rejected chan string
 
@@ -111,6 +113,7 @@ type callReq struct {
 func newGateway(gwURL string, dial dialFunc, c clock, r rng, st *store.Store, log *slog.Logger) *gateway {
 	return &gateway{
 		url: gwURL, dial: dial, clock: c, rng: r, store: st, log: log,
+		writes:   store.NewQueue(log, "a fetch of its channel stores a message or edit again, and the next connection a chat; a deletion is lost"),
 		rejected: make(chan string, 1),
 	}
 }
@@ -231,6 +234,10 @@ type session struct {
 	// fastLaunch is the launch ID of the page's fast-connect script; it
 	// identifies the first connection after a page load.
 	fastLaunch string
+	// voice names the voice and stage channels lists showed: one stored
+	// only with its first message is named from here, as a message gives
+	// only its channel's ID.
+	voice map[string]string
 }
 
 func (s *session) resumable(now time.Time) bool {
@@ -259,7 +266,7 @@ var errReconnect = errors.New("reconnect requested")
 
 func (g *gateway) run(ctx context.Context, done chan struct{}) {
 	defer close(done)
-	s := &session{fastLaunch: newUUID()}
+	s := &session{fastLaunch: newUUID(), voice: make(map[string]string)}
 	bo := backoff{current: backoffMin}
 	for {
 		err := g.connect(ctx, s, &bo)
@@ -602,7 +609,7 @@ func (c *conn) handle(ctx context.Context, p payload, bo *backoff) error {
 			return err
 		}
 	case opDispatch:
-		if err := c.dispatch(ctx, p, bo); err != nil {
+		if err := c.dispatch(p, bo); err != nil {
 			return err
 		}
 	}
@@ -620,7 +627,7 @@ func (c *conn) established(bo *backoff) {
 	c.g.setStatus("")
 }
 
-func (c *conn) dispatch(ctx context.Context, p payload, bo *backoff) error {
+func (c *conn) dispatch(p payload, bo *backoff) error {
 	g, s := c.g, c.s
 	switch p.T {
 	case "READY":
@@ -652,10 +659,7 @@ func (c *conn) dispatch(ctx context.Context, p payload, bo *backoff) error {
 			cs = append(cs, r.Guilds[i].containers()...)
 		}
 		cs = append(cs, dmContainers(r.PrivateChannels, r.Users)...)
-		if err := saveHandles(ctx, g.store.DB(), r.Users); err != nil {
-			g.log.Error("store handles", "err", err)
-		}
-		g.storeContainers(ctx, cs)
+		g.storeContainers(s, "chats from READY", cs)
 		return nil
 	case "RESUMED":
 		c.established(bo)
@@ -663,24 +667,25 @@ func (c *conn) dispatch(ctx context.Context, p payload, bo *backoff) error {
 	case "USER_SETTINGS_PROTO_UPDATE":
 		return c.settingsUpdate(p.D)
 	case "MESSAGE_CREATE":
-		g.storeCreated(ctx, p.D, s.selfID)
+		g.storeCreated(p.D, s)
 	case "MESSAGE_UPDATE":
-		g.storeEdit(ctx, p.D)
+		g.storeEdit(p.D)
 	case "MESSAGE_DELETE":
 		var m struct {
-			ID string `json:"id"`
+			ID        string `json:"id"`
+			ChannelID string `json:"channel_id"`
 		}
 		if json.Unmarshal(p.D, &m) == nil && isSnowflake(m.ID) {
-			if err := g.store.DeleteMessage(ctx, m.ID); err != nil {
-				g.log.Error("store deleted message", "id", m.ID, "err", err)
-			}
+			g.writes.Do("deletion of "+m.ID+" in "+m.ChannelID, func(ctx context.Context) error {
+				return g.store.DeleteMessage(ctx, m.ID)
+			})
 		}
 	case "CHANNEL_CREATE", "CHANNEL_UPDATE", "THREAD_CREATE", "THREAD_UPDATE":
-		g.storeChannel(ctx, p.D)
+		g.storeChannel(s, p.D)
 	case "GUILD_CREATE", "GUILD_UPDATE":
 		var gg gwGuild
 		if json.Unmarshal(p.D, &gg) == nil {
-			g.storeContainers(ctx, gg.containers())
+			g.storeContainers(s, "chats of guild "+gg.ID, gg.containers())
 		}
 	}
 	return nil
@@ -704,26 +709,31 @@ func (c *conn) settingsUpdate(d json.RawMessage) error {
 
 // storeChannel keeps a DM, channel or thread current; categories are skipped
 // as sync skips them.
-func (g *gateway) storeChannel(ctx context.Context, d json.RawMessage) {
+func (g *gateway) storeChannel(s *session, d json.RawMessage) {
 	var ch apiChannel
 	if json.Unmarshal(d, &ch) != nil || !isSnowflake(ch.ID) {
 		return
 	}
-	g.storeContainers(ctx, guildChannelContainers(ch.GuildID, []apiChannel{ch}))
+	g.storeContainers(s, "chat "+ch.ID, guildChannelContainers(ch.GuildID, []apiChannel{ch}))
 	if ch.isThread() {
-		if err := adopt(ctx, g.store.DB(), ch.ID, ch.GuildID); err != nil {
-			g.log.Error("store thread", "id", ch.ID, "err", err)
-		}
+		g.writes.Do("guild of thread "+ch.ID, func(ctx context.Context) error {
+			return adopt(ctx, g.store.DB(), ch.ID, ch.GuildID)
+		})
 	}
 }
 
-func (g *gateway) storeContainers(ctx context.Context, cs []store.Container) {
-	if len(cs) == 0 {
-		return
+// storeContainers stores what a list names, keeping the names of its voice
+// and stage channels for their first messages.
+func (g *gateway) storeContainers(s *session, what string, cs []store.Container) {
+	for _, c := range cs {
+		if c.Kind == kindVoice || c.Kind == kindStage {
+			s.voice[c.ID] = c.Name
+		}
 	}
-	if err := g.store.UpsertContainers(ctx, cs); err != nil {
-		g.log.Error("store chats", "count", len(cs), "err", err)
-	}
+	g.writes.Do(what, func(ctx context.Context) error {
+		_, err := storeListed(ctx, g.store, cs)
+		return err
+	})
 }
 
 // gwPrivateChannel is a DM or group DM in READY. With deduplicated user
@@ -757,13 +767,15 @@ func dmContainers(chans []gwPrivateChannel, users []apiUser) []store.Container {
 }
 
 // gwGuild is a guild in READY, GUILD_CREATE or GUILD_UPDATE. The user
-// gateway puts the name under properties; a partial guild carries only what
-// changed since the versions the client sent, which are none.
+// gateway puts the name and icon under properties; a partial guild carries
+// only what changed since the versions the client sent, which are none.
 type gwGuild struct {
 	ID         string `json:"id"`
 	Name       string `json:"name"`
+	Icon       string `json:"icon"`
 	Properties struct {
 		Name string `json:"name"`
+		Icon string `json:"icon"`
 	} `json:"properties"`
 	Unavailable    bool         `json:"unavailable"`
 	DataMode       string       `json:"data_mode"`
@@ -780,7 +792,11 @@ func (gg *gwGuild) containers() []store.Container {
 		return nil
 	}
 	var out []store.Container
-	if c, ok := guildContainer(&apiGuild{ID: gg.ID, Name: cmp.Or(gg.Properties.Name, gg.Name), Unavailable: gg.Unavailable}); ok {
+	g := apiGuild{
+		ID: gg.ID, Name: cmp.Or(gg.Properties.Name, gg.Name), Icon: cmp.Or(gg.Properties.Icon, gg.Icon),
+		Unavailable: gg.Unavailable,
+	}
+	if c, ok := guildContainer(&g); ok {
 		out = append(out, c)
 	}
 	chans := gg.Channels
@@ -879,7 +895,7 @@ type gwMessage struct {
 	EditedTimestamp *time.Time `json:"edited_timestamp"`
 }
 
-func (g *gateway) storeCreated(ctx context.Context, d json.RawMessage, selfID string) {
+func (g *gateway) storeCreated(d json.RawMessage, s *session) {
 	var m gwMessage
 	if json.Unmarshal(d, &m) != nil || !isSnowflake(m.ID) || !isSnowflake(m.ChannelID) {
 		return
@@ -889,36 +905,34 @@ func (g *gateway) storeCreated(ctx context.Context, d json.RawMessage, selfID st
 	if !ok {
 		return
 	}
-	if c.Kind == kindDM && m.Author != nil && m.Author.ID != selfID && isSnowflake(m.Author.ID) {
-		c.Participants = []store.Participant{{ID: m.Author.ID, Name: displayName(m.Author)}}
-		c.Name = c.Participants[0].Name
-		if err := saveHandles(ctx, g.store.DB(), []apiUser{*m.Author}); err != nil {
-			g.log.Error("store handle", "chat", c.ID, "err", err)
+	if c.Kind == kindDM && m.Author != nil && m.Author.ID != s.selfID && isSnowflake(m.Author.ID) {
+		c.Participants = []store.Participant{participant(m.Author)}
+		c.Name, c.Icon = c.Participants[0].Name, avatar(m.Author)
+	}
+	if c.Kind == kindVoice || c.Kind == kindStage {
+		c.Name = s.voice[c.ID] // "" keeps a stored name
+	}
+	msg, ok := toMessage(&m.apiMessage, s.selfID)
+	g.writes.Do("message "+m.ID+" in "+c.ID, func(ctx context.Context) error {
+		if err := g.store.UpsertContainer(ctx, c); err != nil {
+			return err
 		}
-	}
-	if err := g.store.UpsertContainer(ctx, c); err != nil {
-		g.log.Error("store chat", "id", c.ID, "err", err)
-		return
-	}
-	// A message names its thread but not the thread's channel.
-	if c.Kind == kindThread {
-		if err := adopt(ctx, g.store.DB(), c.ID, m.GuildID); err != nil {
-			g.log.Error("store chat", "id", c.ID, "err", err)
-			return
+		// A message names its thread but not the thread's channel.
+		if c.Kind == kindThread {
+			if err := adopt(ctx, g.store.DB(), c.ID, m.GuildID); err != nil {
+				return err
+			}
 		}
-	}
-	msg, ok := toMessage(&m.apiMessage, selfID)
-	if !ok {
-		return
-	}
-	if err := g.store.UpsertMessage(ctx, msg); err != nil {
-		g.log.Error("store message", "id", msg.ID, "err", err)
-	}
+		if !ok {
+			return nil
+		}
+		return g.store.UpsertMessage(ctx, msg)
+	})
 }
 
 // storeEdit applies edits to stored messages; updates that only resolve an
 // embed carry no edited_timestamp.
-func (g *gateway) storeEdit(ctx context.Context, d json.RawMessage) {
+func (g *gateway) storeEdit(d json.RawMessage) {
 	var m gwMessage
 	var has struct {
 		Content *string `json:"content"`
@@ -927,9 +941,9 @@ func (g *gateway) storeEdit(ctx context.Context, d json.RawMessage) {
 		has.Content == nil || m.EditedTimestamp == nil || !isSnowflake(m.ID) {
 		return
 	}
-	if err := g.store.EditMessage(ctx, m.ID, m.Content, *m.EditedTimestamp); err != nil {
-		g.log.Error("store edit", "id", m.ID, "err", err)
-	}
+	g.writes.Do("edit of "+m.ID+" in "+m.ChannelID, func(ctx context.Context) error {
+		return g.store.EditMessage(ctx, m.ID, m.Content, *m.EditedTimestamp)
+	})
 }
 
 // settingsStatus reads the status setting from a base64 PreloadedUserSettings

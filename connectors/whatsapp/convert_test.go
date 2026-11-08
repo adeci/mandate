@@ -360,8 +360,11 @@ func TestHistoryChat(t *testing.T) {
 	}
 }
 
+// Groups list their members by phone number where known, with the number
+// as their handle, and never the owner.
 func TestContainers(t *testing.T) {
 	pn := resolver(map[types.JID]types.JID{aliceL: alice})
+	own := func(j types.JID) bool { return j == me }
 	tests := []struct {
 		name string
 		got  store.Container
@@ -372,18 +375,18 @@ func TestContainers(t *testing.T) {
 			got: historyContainer(group, &waHistorySync.Conversation{
 				ID:          proto.String(group.String()),
 				Name:        proto.String("Family"),
-				Participant: []*waHistorySync.GroupParticipant{{UserJID: proto.String(aliceL.String())}},
-			}, pn),
+				Participant: []*waHistorySync.GroupParticipant{{UserJID: proto.String(aliceL.String())}, {UserJID: proto.String(me.String())}},
+			}, pn, own),
 			want: store.Container{
 				ID: "120363000000000001@g.us", Kind: "group", IsGroup: true, Name: "Family",
-				Participants: []store.Participant{{ID: "15550001111@s.whatsapp.net"}},
+				Participants: []store.Participant{{ID: "15550001111@s.whatsapp.net", Handle: "+15550001111"}},
 			},
 		},
 		{
 			name: "history dm dated by its conversation, not named by it",
 			got: historyContainer(alice, &waHistorySync.Conversation{
 				ID: proto.String(alice.String()), DisplayName: proto.String("Alice"), ConversationTimestamp: proto.Uint64(1793385600),
-			}, pn),
+			}, pn, own),
 			want: store.Container{ID: "15550001111@s.whatsapp.net", Kind: "dm", LastMessageAt: time.Unix(1793385600, 0).UTC()},
 		},
 		{
@@ -401,12 +404,11 @@ func TestContainers(t *testing.T) {
 					return "Alice A."
 				}
 				return ""
-			}),
+			}, own),
 			want: store.Container{
 				ID: "120363000000000001@g.us", Kind: "group", IsGroup: true, Name: "Family",
 				Participants: []store.Participant{
-					{ID: "15550001111@s.whatsapp.net", Name: "Alice A."},
-					{ID: "15559990000@s.whatsapp.net"},
+					{ID: "15550001111@s.whatsapp.net", Name: "Alice A.", Handle: "+15550001111"},
 					{ID: bobL.String(), Name: "~Bob"},
 				},
 			},

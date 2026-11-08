@@ -6,7 +6,8 @@
     "participants": [
       {
         "id": "+15551230001",
-        "name": "Farid Haddad"
+        "name": "Farid Haddad",
+        "handle": "+15551230001"
       }
     ]
   },
@@ -17,7 +18,8 @@
     "participants": [
       {
         "id": "+15559990002",
-        "name": "(555) 999-0002"
+        "name": "(555) 999-0002",
+        "handle": "+15559990002"
       }
     ]
   },
@@ -28,11 +30,13 @@
     "participants": [
       {
         "id": "+15551230001",
-        "name": "Farid Haddad"
+        "name": "Farid Haddad",
+        "handle": "+15551230001"
       },
       {
         "id": "+15551230003",
-        "name": "Mina"
+        "name": "Mina",
+        "handle": "+15551230003"
       }
     ]
   },
@@ -43,35 +47,43 @@
     "participants": [
       {
         "id": "+15557770041",
-        "name": "(555) 777-0041"
+        "name": "(555) 777-0041",
+        "handle": "+15557770041"
       },
       {
         "id": "+15551230001",
-        "name": "Farid Haddad"
+        "name": "Farid Haddad",
+        "handle": "+15551230001"
       },
       {
         "id": "+15551230005",
-        "name": "Cy Moreau"
+        "name": "Cy Moreau",
+        "handle": "+15551230005"
       },
       {
         "id": "+15557770042",
-        "name": "(555) 777-0042"
+        "name": "(555) 777-0042",
+        "handle": "+15557770042"
       },
       {
         "id": "+15551230006",
-        "name": "Ana Lima"
+        "name": "Ana Lima",
+        "handle": "+15551230006"
       },
       {
         "id": "+15551230003",
-        "name": "Mina"
+        "name": "Mina",
+        "handle": "+15551230003"
       },
       {
         "id": "+15551230007",
-        "name": "Ben Ito"
+        "name": "Ben Ito",
+        "handle": "+15551230007"
       },
       {
         "id": "+15557770043",
-        "name": "(555) 777-0043"
+        "name": "(555) 777-0043",
+        "handle": "+15557770043"
       }
     ]
   }

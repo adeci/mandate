@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -420,35 +421,83 @@ func iconVersion(ref string) string {
 
 // Container is a stored chat as GET /containers lists it.
 type Container struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Kind     string `json:"kind"`
-	ParentID string `json:"parent_id"`
-	// ParentName is the parent's path, "Inbox / Receipts", for showing the
-	// chat as "Inbox / Receipts / Your order"; empty at the top.
-	ParentName   string    `json:"parent_name,omitempty"`
+	ID   string `json:"id"`
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+	// Parents are the chats it is in, the outermost first.
+	Parents []Parent `json:"parents"`
+	// LastActivity is a shelf's newest chat's: a guild's, space's, forum's
+	// or mailbox's.
 	LastActivity time.Time `json:"last_activity,omitzero"`
-	// Participants is set for DMs only.
-	Participants []store.Participant `json:"participants,omitempty"`
+	// Opens says it holds chats: a shelf, or a chat with threads.
+	Opens bool `json:"opens,omitempty"`
+	// Members counts a group's stored members and the owner.
+	Members int `json:"members,omitempty"`
+	// Threads counts the chats filed directly in a mailbox.
+	Threads int `json:"threads,omitempty"`
 	// Icon is the version of the chat's picture, for GET /icon; absent when
 	// it has none.
 	Icon string `json:"icon,omitempty"`
+	// Handle is a DM's person's @name or number, as the service shows it.
+	Handle string `json:"handle,omitempty"`
+	// Participants are a DM's person, and a group's members when listed by
+	// ID.
+	Participants []store.Participant `json:"participants,omitempty"`
+	// Hidden is set by the owner side, which knows never-share: the chat,
+	// a chat it is in, or a DM's person is never shared.
+	Hidden bool `json:"hidden,omitempty"`
+}
+
+type Parent struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Icon string `json:"icon,omitempty"`
+}
+
+// ContainerQuery is what GET /containers lists:
+//   - IDs: exactly those chats, in that order;
+//   - Q: the shelves whose own name has every word, as headings, then the
+//     chats Q finds as an agent's request term would, all under Parent at
+//     any depth if it is set;
+//   - Parent: the shelves in it, then up to Limit of its other chats; "" is
+//     the top level;
+//   - nothing: up to Limit chats anywhere, the newest first, no shelves.
+//
+// Shelves, the guilds, spaces, forums and mailboxes a chat is filed in, are
+// never cut by Limit, up to the 500 a call returns. Each list is the newest
+// first.
+type ContainerQuery struct {
+	Q      string
+	Parent *string
+	IDs    []string
+	Limit  int
 }
 
 const maxContainers = 500
 
 func (s *Server) containers(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	limit := 50
-	if v := q.Get("limit"); v != "" {
-		n, err := strconv.Atoi(v)
+	v := r.URL.Query()
+	q := ContainerQuery{Q: v.Get("q"), Limit: 50}
+	if v.Has("parent") {
+		p := v.Get("parent")
+		q.Parent = &p
+	}
+	if ids := v.Get("ids"); ids != "" {
+		q.IDs = strings.Split(ids, ",")
+	}
+	if l := v.Get("limit"); l != "" {
+		n, err := strconv.Atoi(l)
 		if err != nil || n < 1 || n > maxContainers {
 			writeError(w, Invalid("limit must be from 1 to %d", maxContainers))
 			return
 		}
-		limit = n
+		q.Limit = n
 	}
-	out, err := s.listContainers(r.Context(), q.Get("q"), q.Get("parent"), limit)
+	if len(q.IDs) > maxContainers {
+		writeError(w, Invalid("ids lists at most %d chats", maxContainers))
+		return
+	}
+	out, err := s.listContainers(r.Context(), q)
 	if err != nil {
 		writeError(w, fmt.Errorf("list chats: %w", err))
 		return
@@ -456,66 +505,159 @@ func (s *Server) containers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// pickerChats is every chat with its path and last activity, for
-// store.Matching.
-const pickerChats = `WITH candidates AS (
-  SELECT c.id, c.kind, c.parent_id, c.name AS own,
+// pickerChats is every chat with its path, a DM's handle, parents, last
+// activity and counts, as candidates for store.Matching. A shelf is as
+// recent as the newest chat in it, at any depth.
+const pickerChats = `WITH tree AS (
+  SELECT c.id, c.kind, c.parent_id, c.name AS own, c.is_group, c.participants_json, COALESCE(c.icon, '') AS icon,
+         p1.id AS p1, COALESCE(p1.name, '') AS p1_name, COALESCE(p1.icon, '') AS p1_icon,
+         p2.id AS p2, COALESCE(p2.name, '') AS p2_name, COALESCE(p2.icon, '') AS p2_icon,
+         p3.id AS p3, COALESCE(p3.name, '') AS p3_name, COALESCE(p3.icon, '') AS p3_icon,
          concat_ws(' / ', p3.name, p2.name, p1.name, c.name) AS path,
-         concat_ws(' / ', p3.name, p2.name, p1.name) AS parent_path,
-         NULLIF(max(COALESCE(c.last_message_at, ''), COALESCE((SELECT max(sent_at) FROM messages WHERE container_id = c.id), '')), '') AS at
+         NULLIF(max(COALESCE(c.last_message_at, ''), COALESCE((SELECT max(sent_at) FROM messages WHERE container_id = c.id), '')), '') AS own_at
   FROM containers AS c
   LEFT JOIN containers AS p1 ON p1.id = c.parent_id
   LEFT JOIN containers AS p2 ON p2.id = p1.parent_id
-  LEFT JOIN containers AS p3 ON p3.id = p2.parent_id)`
+  LEFT JOIN containers AS p3 ON p3.id = p2.parent_id),
+inside(id, at) AS (
+  SELECT id, max(at) FROM (
+    SELECT p1 AS id, own_at AS at FROM tree WHERE p1 IS NOT NULL
+    UNION ALL SELECT p2, own_at FROM tree WHERE p2 IS NOT NULL
+    UNION ALL SELECT p3, own_at FROM tree WHERE p3 IS NOT NULL)
+  GROUP BY id),
+kids(id, n, threads) AS (
+  SELECT parent_id, count(*), sum(kind != 'mailbox') FROM containers WHERE parent_id IS NOT NULL GROUP BY parent_id),
+candidates AS (
+  SELECT t.*, t.kind IN ` + store.HolderKinds + ` OR t.kind = 'mailbox' AS shelf,
+         t.kind IN ` + store.HolderKinds + ` OR t.kind = 'mailbox' OR k.n IS NOT NULL AS opens,
+         iif(t.kind = 'mailbox', COALESCE(k.threads, 0), 0) AS threads,
+         iif(t.kind = 'dm', t.participants_json ->> '$[0].handle') AS handle,
+         iif(t.kind IN ` + store.HolderKinds + ` OR t.kind = 'mailbox',
+           NULLIF(max(COALESCE(t.own_at, ''), COALESCE(i.at, '')), ''), t.own_at) AS at
+  FROM tree AS t LEFT JOIN inside AS i ON i.id = t.id LEFT JOIN kids AS k ON k.id = t.id)`
 
-// listContainers lists the chats under parent if it is set: all of them,
-// the most recently active first, or those q finds as an agent's request
-// term would.
-func (s *Server) listContainers(ctx context.Context, q, parent string, limit int) ([]Container, error) {
+const pickerColumns = `SELECT c.id, c.kind, COALESCE(c.own, ''), c.at, c.opens, c.threads, c.kind = 'group' OR c.is_group, c.participants_json, c.icon,
+  c.p1, c.p1_name, c.p1_icon, c.p2, c.p2_name, c.p2_icon, c.p3, c.p3_name, c.p3_icon`
+
+// under keeps the chats in ?2 at any depth.
+const under = `(c.p1 = ?2 OR c.p2 = ?2 OR c.p3 = ?2)`
+
+func (s *Server) listContainers(ctx context.Context, q ContainerQuery) ([]Container, error) {
 	out := []Container{}
 	path := filepath.Join(s.dir, "data.db")
 	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 		return out, nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, store.ReadTimeout)
+	defer cancel()
 	db, err := store.OpenReadOnly(ctx, path, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer db.Close()
-	const columns = `SELECT c.id, c.kind, COALESCE(c.parent_id, ''), COALESCE(c.name, ''), cand.parent_path, c.participants_json, cand.at, COALESCE(c.icon, '')`
-	query := pickerChats + `
-` + columns + ` FROM candidates AS cand JOIN containers AS c ON c.id = cand.id
-WHERE ?2 = '' OR c.parent_id = ?2
-ORDER BY cand.at DESC NULLS LAST, c.id LIMIT ?3`
-	var terms string
-	if q != "" {
-		if terms, err = store.Terms([]string{q}); err != nil {
+	list := func(query string, args ...any) error {
+		cs, err := scanContainers(ctx, db, q.IDs != nil, pickerChats+query, args...)
+		out = append(out, cs...)
+		return err
+	}
+	switch {
+	case q.IDs != nil:
+		b, err := json.Marshal(q.IDs)
+		if err != nil {
 			return nil, err
 		}
-		query = pickerChats + `, ` + store.Matching("?1") + `
-` + columns + ` FROM matched AS m JOIN containers AS c ON c.id = m.id JOIN candidates AS cand ON cand.id = m.id
-WHERE ?2 = '' OR c.parent_id = ?2
-ORDER BY m.n LIMIT ?3`
+		if err := list("\n"+pickerColumns+` FROM candidates AS c WHERE c.id IN (SELECT value FROM json_each(?1))`, string(b)); err != nil {
+			return nil, err
+		}
+		pos := make(map[string]int, len(q.IDs))
+		for i, id := range q.IDs {
+			pos[id] = i
+		}
+		slices.SortFunc(out, func(a, b Container) int { return pos[a.ID] - pos[b.ID] })
+		return out, nil
+	case q.Q != "":
+		parent := ""
+		if q.Parent != nil {
+			parent = *q.Parent
+		}
+		words, err := json.Marshal(store.Words(q.Q))
+		if err != nil {
+			return nil, err
+		}
+		if err := list("\n"+pickerColumns+` FROM candidates AS c
+WHERE c.kind IN `+store.HolderKinds+` AND (?2 = '' OR `+under+`) AND json_array_length(?1) > 0
+  AND NOT EXISTS (SELECT 1 FROM json_each(?1) AS w WHERE instr(lower(COALESCE(c.own, '')), w.value) = 0)
+ORDER BY c.at DESC NULLS LAST, c.id LIMIT ?3`, string(words), parent, maxContainers); err != nil {
+			return nil, err
+		}
+		terms, err := store.Terms([]string{q.Q})
+		if err != nil {
+			return nil, err
+		}
+		err = list(", "+store.Matching("?1", "?4")+"\n"+pickerColumns+` FROM matched AS m JOIN candidates AS c ON c.id = m.id
+WHERE ?2 = '' OR `+under+`
+ORDER BY m.n LIMIT ?3`, terms, parent, q.Limit, time.Now().UTC().Format(time.RFC3339Nano))
+		return out, err
+	case q.Parent != nil:
+		in := `COALESCE(c.parent_id, '') = ?1`
+		if err := list("\n"+pickerColumns+` FROM candidates AS c WHERE c.shelf AND `+in+`
+ORDER BY c.at DESC NULLS LAST, c.id LIMIT ?2`, *q.Parent, maxContainers); err != nil {
+			return nil, err
+		}
+		err := list("\n"+pickerColumns+` FROM candidates AS c WHERE NOT c.shelf AND `+in+`
+ORDER BY c.at DESC NULLS LAST, c.id LIMIT ?2`, *q.Parent, q.Limit)
+		return out, err
 	}
-	rs, err := db.QueryContext(ctx, query, terms, parent, limit)
+	err = list("\n"+pickerColumns+` FROM candidates AS c WHERE NOT c.shelf
+ORDER BY c.at DESC NULLS LAST, c.id LIMIT ?1`, q.Limit)
+	return out, err
+}
+
+// scanContainers reads pickerColumns rows; members keeps groups'
+// participants.
+func scanContainers(ctx context.Context, db *sql.DB, members bool, query string, args ...any) ([]Container, error) {
+	rs, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rs.Close()
+	var out []Container
 	for rs.Next() {
 		var (
-			c      Container
-			parts  string
-			active sql.NullString
-			ref    string
+			c        Container
+			active   sql.NullString
+			group    bool
+			parts    string
+			icon     string
+			ps       [3]Parent
+			parentID [3]sql.NullString
 		)
-		if err := rs.Scan(&c.ID, &c.Kind, &c.ParentID, &c.Name, &c.ParentName, &parts, &active, &ref); err != nil {
+		if err := rs.Scan(&c.ID, &c.Kind, &c.Name, &active, &c.Opens, &c.Threads, &group, &parts, &icon,
+			&parentID[0], &ps[0].Name, &ps[0].Icon, &parentID[1], &ps[1].Name, &ps[1].Icon, &parentID[2], &ps[2].Name, &ps[2].Icon); err != nil {
 			return nil, err
 		}
-		c.Icon = iconVersion(ref)
-		if c.Kind == "dm" {
+		c.Icon = iconVersion(icon)
+		c.Parents = []Parent{}
+		for i := 2; i >= 0; i-- {
+			if parentID[i].Valid {
+				ps[i].ID, ps[i].Icon = parentID[i].String, iconVersion(ps[i].Icon)
+				c.Parents = append(c.Parents, ps[i])
+			}
+		}
+		if c.Kind == "dm" || group {
 			if err := json.Unmarshal([]byte(parts), &c.Participants); err != nil {
 				return nil, fmt.Errorf("participants of chat %s: %w", c.ID, err)
+			}
+		}
+		if c.Kind == "dm" && len(c.Participants) > 0 {
+			c.Handle = c.Participants[0].Handle
+		}
+		if group {
+			if n := len(c.Participants); n > 0 {
+				c.Members = n + 1
+			}
+			if !members {
+				c.Participants = nil
 			}
 		}
 		if active.String != "" {

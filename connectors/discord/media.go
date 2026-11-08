@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -314,4 +315,50 @@ func (f *fileBody) Close() error {
 	err := f.body.Close()
 	f.cancel()
 	return err
+}
+
+// Icon loads a chat's picture from the CDN as the app's page loads an
+// image: without the token, and beside the calls rather than through the
+// pacer, so pictures spend nothing of the reads' budget. The SDK loads two
+// at a time and the owner side keeps each, so a picture loads about once.
+func (w *worker) Icon(ctx context.Context, _, ref string) (connector.Icon, error) {
+	if !pictureRef.MatchString(ref) {
+		return connector.Icon{}, notFound("no picture stored for the chat")
+	}
+	dir, _, _ := strings.Cut(ref, "/")
+	route := "/" + dir + "/{id}/{hash}.png"
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	req, err := fhttp.NewRequestWithContext(ctx, fhttp.MethodGet, w.cdnBase+"/"+ref+".png?size=64", nil)
+	if err != nil {
+		return connector.Icon{}, err
+	}
+	applyHeaders(req, imageHeaders())
+	sent := w.clock.Now()
+	resp, err := w.cdn.Do(req)
+	w.log.Info("upstream", "method", fhttp.MethodGet, "route", route, "status", statusOf(resp),
+		"duration", w.clock.Now().Sub(sent).Round(time.Millisecond))
+	if err != nil {
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		return connector.Icon{}, toConnectorError(&upstreamError{msg: route + ": " + err.Error()})
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case fhttp.StatusOK:
+	case fhttp.StatusForbidden, fhttp.StatusNotFound, fhttp.StatusGone:
+		return connector.Icon{}, notFound("the picture is gone from Discord")
+	default:
+		return connector.Icon{}, toConnectorError(&upstreamError{status: resp.StatusCode, msg: " for the picture"})
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, connector.MaxIcon+1))
+	if err != nil {
+		return connector.Icon{}, toConnectorError(&upstreamError{msg: route + ": " + err.Error()})
+	}
+	if len(b) > connector.MaxIcon || http.DetectContentType(b) != "image/png" {
+		return connector.Icon{}, toConnectorError(&upstreamError{status: resp.StatusCode, msg: " with something other than a small PNG"})
+	}
+	return connector.Icon{Type: "image/png", Body: b}, nil
 }

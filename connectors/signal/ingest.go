@@ -35,18 +35,23 @@ type ingester struct {
 	dev  *sgstore.Device
 	st   *store.Store
 	sess *session
-	log  *slog.Logger
+	// writes keeps a message the store refuses as busy until it is free,
+	// with the edits and deletions after it.
+	writes *store.Queue
+	log    *slog.Logger
 
 	mu   sync.Mutex
 	seen map[string]uint32 // chats upserted by this process, with the group revision
 }
 
-func newIngester(cli lookup, dev *sgstore.Device, st *store.Store, sess *session, log *slog.Logger) *ingester {
-	return &ingester{cli: cli, dev: dev, st: st, sess: sess, log: log, seen: make(map[string]uint32)}
+func newIngester(cli lookup, dev *sgstore.Device, st *store.Store, sess *session, writes *store.Queue, log *slog.Logger) *ingester {
+	return &ingester{cli: cli, dev: dev, st: st, sess: sess, writes: writes, log: log, seen: make(map[string]uint32)}
 }
 
 // Returning false for a message leaves it unacknowledged, so the server
-// delivers it again.
+// delivers it again. One the store refuses as busy is stored from the queue
+// once the store is free; it stays unacknowledged still, so a restart before
+// then loses nothing.
 func (in *ingester) handle(ctx context.Context, evt events.SignalEvent) bool {
 	switch e := evt.(type) {
 	case *events.ChatEvent:
@@ -87,29 +92,30 @@ func (in *ingester) chatEvent(ctx context.Context, e *events.ChatEvent) bool {
 	if !ok {
 		return true
 	}
-	var err error
-	switch o.kind {
-	case opUpsert:
-		if err = in.ensureContainer(ctx, chat, e.Info.GroupRevision, o.msg.SentAt); err != nil {
-			break
-		}
-		if !o.msg.IsFromMe {
-			o.msg.SenderName = in.contactName(ctx, o.sender)
-		}
-		err = in.st.UpsertMessage(ctx, o.msg)
-	case opEdit:
-		if err = in.ensureContainer(ctx, chat, e.Info.GroupRevision, o.at); err != nil {
-			break
-		}
-		err = in.st.EditMessage(ctx, o.target, o.body, o.at)
-	case opDelete:
-		err = in.st.DeleteMessage(ctx, o.target)
+	what := "message " + o.msg.ID
+	if o.kind != opUpsert {
+		what = "change of " + o.target
 	}
-	if err != nil {
-		in.log.Error("store message", "chat", chat, "err", err)
-		return false
-	}
-	return true
+	return in.writes.Do(what, func(ctx context.Context) error {
+		switch o.kind {
+		case opUpsert:
+			if err := in.ensureContainer(ctx, chat, e.Info.GroupRevision, o.msg.SentAt); err != nil {
+				return err
+			}
+			if !o.msg.IsFromMe {
+				o.msg.SenderName = in.contactName(ctx, o.sender)
+			}
+			return in.st.UpsertMessage(ctx, o.msg)
+		case opEdit:
+			if err := in.ensureContainer(ctx, chat, e.Info.GroupRevision, o.at); err != nil {
+				return err
+			}
+			return in.st.EditMessage(ctx, o.target, o.body, o.at)
+		case opDelete:
+			return in.st.DeleteMessage(ctx, o.target)
+		}
+		return nil
+	})
 }
 
 // chatID names a DM by the user's ACI where known; messages the owner sent
@@ -157,24 +163,34 @@ func chatName(r *types.Recipient, own uuid.UUID) string {
 	return r.E164
 }
 
-// contactName may fetch the profile, at most hourly per user.
-func (in *ingester) contactName(ctx context.Context, aci uuid.UUID) string {
+// contact may fetch the profile, at most hourly per user; nil if the lookup
+// fails.
+func (in *ingester) contact(ctx context.Context, aci uuid.UUID) *types.Recipient {
 	qctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 	r, err := in.cli.ContactByACI(qctx, aci)
 	if err != nil {
 		in.log.Warn("contact lookup failed", "aci", aci.String(), "err", err)
-		return ""
+		return nil
 	}
-	return chatName(r, in.dev.ACI)
+	return r
+}
+
+func (in *ingester) contactName(ctx context.Context, aci uuid.UUID) string {
+	return chatName(in.contact(ctx, aci), in.dev.ACI)
+}
+
+// member is aci as the local contact store knows them, with their number.
+func (in *ingester) member(ctx context.Context, aci uuid.UUID) store.Participant {
+	p := store.Participant{ID: aci.String()}
+	if r, err := in.dev.RecipientStore.LoadAndUpdateRecipient(ctx, aci, uuid.Nil, nil); err == nil {
+		p.Name, p.Handle = displayName(r, in.dev.ACI), r.E164
+	}
+	return p
 }
 
 func (in *ingester) localName(ctx context.Context, aci uuid.UUID) string {
-	r, err := in.dev.RecipientStore.LoadAndUpdateRecipient(ctx, aci, uuid.Nil, nil)
-	if err != nil {
-		return ""
-	}
-	return displayName(r, in.dev.ACI)
+	return in.member(ctx, aci).Name
 }
 
 // Once per process and group revision, except that later calls still
@@ -213,13 +229,19 @@ func (in *ingester) ensureContainer(ctx context.Context, chat string, revision u
 			c.Name = g.Title
 			c.Participants = make([]store.Participant, 0, len(g.Members))
 			for _, m := range g.Members {
-				c.Participants = append(c.Participants, store.Participant{ID: m.ACI.String(), Name: in.localName(ctx, m.ACI)})
+				if !in.own(m.ACI) {
+					c.Participants = append(c.Participants, in.member(ctx, m.ACI))
+				}
 			}
 		}
 	} else if sid, err := libsignalgo.ServiceIDFromString(chat); err == nil && sid.Type == libsignalgo.ServiceIDTypeACI {
 		c.Name = noteToSelf
 		if !in.own(sid.UUID) {
-			c.Name = in.contactName(ctx, sid.UUID)
+			r := in.contact(ctx, sid.UUID)
+			c.Name = chatName(r, in.dev.ACI)
+			if r != nil {
+				c.Participants = []store.Participant{{ID: chat, Name: c.Name, Handle: r.E164}}
+			}
 		}
 	}
 	if err := in.st.UpsertContainer(ctx, c); err != nil {
@@ -261,8 +283,9 @@ func (in *ingester) syncChats(ctx context.Context) {
 
 // storeContacts stores a DM for each contact: someone in the address book,
 // given a nickname, or whose messages the owner accepted. Others' stored
-// DMs are renamed. A DM stored under a phone number identity (PNI) lists
-// the person's ACI, the ID their messages carry.
+// DMs are renamed. A DM lists its person by ACI, the ID their messages
+// carry, also when stored under their phone number identity (PNI), with
+// their number where known.
 func (in *ingester) storeContacts(ctx context.Context, contacts []*types.Recipient) {
 	for _, r := range contacts {
 		if r.ACI == uuid.Nil {
@@ -270,15 +293,13 @@ func (in *ingester) storeContacts(ctx context.Context, contacts []*types.Recipie
 		}
 		name := chatName(r, in.dev.ACI)
 		contact := !r.Blocked && (r.ContactName != "" || r.Nickname != "" || r.Whitelisted != nil && *r.Whitelisted)
+		ps := []store.Participant{{ID: r.ACI.String(), Name: name, Handle: r.E164}}
 		if in.own(r.ACI) {
-			name, contact = noteToSelf, true
+			name, contact, ps = noteToSelf, true, nil
 		}
-		in.storeDM(ctx, store.Container{ID: r.ACI.String(), Kind: "dm", Name: name}, contact)
+		in.storeDM(ctx, store.Container{ID: r.ACI.String(), Kind: "dm", Name: name, Participants: ps}, contact)
 		if r.PNI != uuid.Nil {
-			in.storeDM(ctx, store.Container{
-				ID: libsignalgo.NewPNIServiceID(r.PNI).String(), Kind: "dm", Name: name,
-				Participants: []store.Participant{{ID: r.ACI.String(), Name: name}},
-			}, false)
+			in.storeDM(ctx, store.Container{ID: libsignalgo.NewPNIServiceID(r.PNI).String(), Kind: "dm", Name: name, Participants: ps}, false)
 		}
 	}
 }
