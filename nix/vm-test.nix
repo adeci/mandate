@@ -395,6 +395,9 @@ in
         kinds = [e["kind"] for e in call("GET", "/owner/v1/activity?limit=500")["body"]["entries"]]
         # Reads the gateway batched may land after it.
         assert [k for k in kinds if k != "read"][0] == "stop_all" and "request.asked" in kinds and "request.approved" in kinds and "read" in kinds, kinds
+        # The laptop's run of reads is one entry, not one per call.
+        reads = call("GET", "/owner/v1/activity?kinds=reads&limit=500")["body"]["entries"]
+        assert any("until" in e for e in reads) and all(e["verbs"] for e in reads), reads
 
     with subtest("chat pictures reach the app through the owner side, as 64 px PNGs, and never agents"):
         chats = {c["id"]: c for c in call("GET", "/owner/v1/connectors/test/chats")["body"]}

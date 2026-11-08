@@ -192,11 +192,9 @@ func (s *Server) editNeverShare(w http.ResponseWriter, r *http.Request) {
 	// A chat picked inside its parent may come named by its own name only;
 	// it is listed by its path.
 	if r.Method == http.MethodPut && n.Kind == "chat" {
-		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-		if path := s.lookUpNames(ctx, n.Connector, []string{n.ID})[n.ID]; path != "" {
-			n.Name = path
+		if pl := s.place(r.Context(), chatRefs{n.Connector: {n.ID}})[[2]string{n.Connector, n.ID}]; pl.path != "" {
+			n.Name = pl.path
 		}
-		cancel()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -219,7 +217,7 @@ func (s *Server) editNeverShare(w http.ResponseWriter, r *http.Request) {
 	// What is hidden: a chat, or a person by name.
 	a := activity{Kind: "never_share.added", Connector: n.Connector, Detail: n.Kind + " " + cmp.Or(n.Name, n.ID)}
 	if n.Kind == "chat" {
-		a.Chats = []chat{{n.ID, n.Name}}
+		a.Chats = []chat{{ID: n.ID, Name: n.Name}}
 	}
 	if r.Method == http.MethodDelete {
 		a.Kind = "never_share.removed"

@@ -123,6 +123,9 @@ func query(identity string, wait int) string {
 type chatRef struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	// Kind is set on a request term's chats: a holder's grant covers all
+	// of it.
+	Kind string `json:"kind,omitempty"`
 }
 
 // entry is one read, as the owner shows it in the day's activity.

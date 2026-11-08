@@ -27,12 +27,13 @@ func TestMatchesConnectorChats(t *testing.T) {
 			"main / #general": {"1100000000000000001", "1100000000000000016"},
 			"main #general":   {"1100000000000000001", "1100000000000000016"},
 			"general":         {"1100000000000000001", "1100000000000000016", "1200000000000000011"},
-			// Its channels, not the guild or its forum.
-			"main":     {"1100000000000000001", "1100000000000000012", "1100000000000000015", "1100000000000000016"},
-			"other":    {"1200000000000000011"},
+			// A holder's own name asks for all of it.
+			"main":     {"guild:1100000000000000001"},
+			"other":    {"guild:1200000000000000001"},
 			"rollout":  {"1100000000000000013"},
-			"help":     {"1100000000000000019"}, // the forum's posts
-			"lounge":   nil,                     // a voice channel never used for text isn't stored
+			"help":     {"1100000000000000018"},
+			"crash":    {"1100000000000000019"},
+			"lounge":   nil, // a voice channel never used for text isn't stored
 			"sam":      {"1300000000000000001"},
 			"sam_p":    {"1300000000000000001"}, // by his @handle, not the group he is in
 			"@sam_p":   {"1300000000000000001"},
@@ -69,7 +70,7 @@ func TestMatchesConnectorChats(t *testing.T) {
 			"Club / general":    {"!general:example.org"},
 			"general":           {"!general:example.org", "!lobby:example.org"},
 			"Team":              {"!team:example.org"},
-			"Club":              {"!general:example.org", "!team:example.org"}, // its rooms, not the space
+			"Club":              {"!space:example.org"},
 			"!team:example.org": {"!team:example.org"},
 			"@bob:example.org":  {"!dm:example.org"},
 		},
@@ -116,8 +117,8 @@ func TestMatchesConnectorChats(t *testing.T) {
 				if !eq(got, want) {
 					t.Errorf("%q matches %v, want %v", term, got, want)
 				}
-				// The owner's picker finds what the request did, after the
-				// shelves it offers as headings.
+				// The owner's picker finds what the request did, holders
+				// among the headings.
 				found, err := picker.Containers(t.Context(), connector.ContainerQuery{Q: term, Limit: matchesPerTerm})
 				if err != nil {
 					t.Fatal(err)
@@ -129,9 +130,6 @@ func TestMatchesConnectorChats(t *testing.T) {
 				}
 				got = nil
 				for _, f := range found {
-					if holders := store.HolderKinds; strings.Contains(holders, "'"+f.Kind+"'") {
-						continue
-					}
 					got = append(got, f.ID)
 					path := []string{}
 					for _, p := range f.Parents {
@@ -208,6 +206,12 @@ func TestAgentChatNames(t *testing.T) {
 		{"discord", nil, "main", []string{
 			"1100000000000000001 main / #general", "1100000000000000012 main / #releases",
 			"1100000000000000015 main / #announcements", "1100000000000000016 main / General",
+			"1100000000000000019 main / help / crash on start",
+		}},
+		// A grant on a server covers all of it, threads and forum posts too.
+		{"discord", []string{"guild:1100000000000000001"}, "", []string{
+			"1100000000000000001 main / #general", "1100000000000000012 main / #releases", "1100000000000000013 main / #releases / v2 rollout",
+			"1100000000000000015 main / #announcements", "1100000000000000016 main / General", "1100000000000000019 main / help / crash on start",
 		}},
 		{"discord", nil, "rollout", []string{"1100000000000000013 main / #releases / v2 rollout"}},
 		{"matrix", []string{"!general:example.org", "!lobby:example.org"}, "", []string{

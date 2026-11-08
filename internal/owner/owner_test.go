@@ -406,7 +406,7 @@ func (h *harness) agent(owner device) string {
 func requestBody(identity string) map[string]any {
 	return map[string]any{
 		"identity": identity, "connector": "test", "kind": "once", "for": 1800, "horizon": 86400, "reason": "summary",
-		"terms": []term{{Term: "fam", Chats: []chat{{"c1", "Family"}, {"c2", "~Fam"}}, More: true}},
+		"terms": []term{{Term: "fam", Chats: []chat{{ID: "c1", Name: "Family"}, {ID: "c2", Name: "~Fam"}}, More: true}},
 	}
 }
 
@@ -702,7 +702,7 @@ func TestDecisionInActivity(t *testing.T) {
 		t.Fatalf("kinds = %v, next %q, want %v", kinds, page.Next, want)
 	}
 	denied := page.Entries[0]
-	if denied.Identity != agent || denied.Connector != "test" || len(denied.Chats) != 2 || denied.Chats[0] != (chat{"c1", "Family"}) {
+	if denied.Identity != agent || denied.Connector != "test" || len(denied.Chats) != 2 || denied.Chats[0].ID != "c1" || denied.Chats[0].Name != "Family" {
 		t.Errorf("denied = %+v", denied)
 	}
 }
@@ -715,7 +715,7 @@ func TestActivitySearch(t *testing.T) {
 	if st := h.do("POST", "/owner/v1/requests/"+req+"/deny", owner.token, nil, nil); st != http.StatusOK {
 		t.Fatalf("deny = %d", st)
 	}
-	read := map[string]any{"at": time.Now().UTC(), "identity": agent, "connector": "test", "verb": "messages", "chats": []chat{{"c9", "Book club"}}, "count": 3}
+	read := map[string]any{"at": time.Now().UTC(), "identity": agent, "connector": "test", "verb": "messages", "chats": []chat{{ID: "c9", Name: "Book club"}}, "count": 3}
 	if st := h.do("POST", "/internal/activity", "", []any{read}, nil); st != http.StatusOK {
 		t.Fatalf("post activity = %d", st)
 	}
@@ -1576,6 +1576,65 @@ func TestChatsPassThrough(t *testing.T) {
 	}
 }
 
+// A grant on a server covers a reply in its channel, which the owner side
+// finds is in it by asking the connector; every chat the app is shown
+// carries its kind and parents, and a chat since gone keeps its stored name.
+func TestServerGrant(t *testing.T) {
+	dir := t.TempDir()
+	storeChats(t, dir)
+	f := &fakeConnector{}
+	h := start(t, serveConnector(t, f, dir))
+	owner := h.pair()
+	agent := h.agent(owner)
+	body := requestBody(agent)
+	body["terms"] = []term{{Term: "main", Chats: []chat{{ID: "g1", Name: "main", Kind: "guild"}, {ID: "gone", Name: "Old"}}}}
+	if st := h.do("POST", "/internal/requests", "", body, nil); st != http.StatusCreated {
+		t.Fatalf("request = %d", st)
+	}
+	env := h.challenge(owner, "/owner/v1/grants/challenge", map[string]any{"identity": agent, "connector": "test", "for": 600, "horizon": 0, "chats": []string{"g1"}})
+	if st, _ := h.sign(owner, env); st != http.StatusOK {
+		t.Fatalf("sign grant = %d", st)
+	}
+	send := func(chat string) int {
+		prepared, _ := f.Prepare(t.Context(), "send", map[string]string{"chat": chat, "text": "hi"})
+		return h.do("POST", "/internal/proposals", "", map[string]any{"identity": agent, "connector": "test", "op": "send", "prepared": prepared}, nil)
+	}
+	if st := send("c3"); st != http.StatusNotFound {
+		t.Errorf("proposal outside the server = %d", st)
+	}
+	if st := send("g1-general"); st != http.StatusCreated {
+		t.Fatalf("proposal in the server = %d", st)
+	}
+
+	var now struct {
+		Requests  []struct{ Terms []term }
+		Proposals []struct{ Chats []chat }
+		Grants    []struct {
+			ChatRefs []chat `json:"chat_refs"`
+		}
+	}
+	h.do("GET", "/owner/v1/now", owner.token, nil, &now)
+	main := []connector.Parent{{ID: "g1", Name: "main", Kind: "guild"}}
+	if len(now.Requests) != 1 || len(now.Proposals) != 1 || len(now.Grants) != 1 {
+		t.Fatalf("now %+v", now)
+	}
+	if got := now.Requests[0].Terms[0].Chats; got[0].Kind != "guild" || got[0].Parents != nil ||
+		got[1].Name != "Old" || got[1].Parents != nil {
+		t.Errorf("request chats %+v", got)
+	}
+	if got := now.Proposals[0].Chats; len(got) != 1 || got[0].Name != "main / #general" || got[0].Kind != "channel" || !slices.Equal(got[0].Parents, main) {
+		t.Errorf("proposal chats %+v", got)
+	}
+	if got := now.Grants[0].ChatRefs; len(got) != 1 || got[0].ID != "g1" || got[0].Name != "main" || got[0].Kind != "guild" || got[0].Parents != nil {
+		t.Errorf("grant chats %+v", got)
+	}
+	var page struct{ Entries []activity }
+	h.do("GET", "/owner/v1/activity?kinds=proposal", owner.token, nil, &page)
+	if len(page.Entries) == 0 || !slices.Equal(page.Entries[0].Chats[0].Parents, main) {
+		t.Errorf("activity %+v", page.Entries)
+	}
+}
+
 func TestWriteExecutedOnce(t *testing.T) {
 	f := &fakeConnector{}
 	h := start(t, serveConnector(t, f, t.TempDir()))
@@ -1620,5 +1679,158 @@ func TestWriteExecutedOnce(t *testing.T) {
 	}
 	if got := f.sent.Load(); got != "on my way, 10 min" {
 		t.Errorf("sent %q, not the owner's edit", got)
+	}
+}
+
+// postReads posts reads as the gateway does: at, identity, connector, verb
+// and chat for each.
+func (h *harness) postReads(reads ...map[string]any) {
+	h.t.Helper()
+	if st := h.do("POST", "/internal/activity", "", reads, nil); st != http.StatusOK {
+		h.t.Fatalf("post activity = %d", st)
+	}
+}
+
+func read(at time.Time, identity, connector, verb, chatID string, count int) map[string]any {
+	return map[string]any{
+		"at": at, "identity": identity, "connector": connector, "verb": verb,
+		"chats": []chat{{ID: chatID, Name: "chat " + chatID}}, "count": count,
+	}
+}
+
+// readsOf is the history's read entries, oldest first.
+func (h *harness) readsOf(owner device) []activity {
+	h.t.Helper()
+	var page activityPage
+	if st := h.do("GET", "/owner/v1/activity?kinds=reads&limit=500", owner.token, nil, &page); st != http.StatusOK {
+		h.t.Fatalf("activity = %d", st)
+	}
+	slices.Reverse(page.Entries)
+	return page.Entries
+}
+
+func TestReadsMerge(t *testing.T) {
+	h := start(t, nowhere())
+	owner := h.pair()
+	agent := h.agent(owner)
+	t0 := h.clock.now().Add(time.Minute)
+
+	// A burst of 20 reads on 3 chats, posted in batches, is one entry.
+	verbs := []string{"chats", "messages", "search", "messages"}
+	for batch := range 4 {
+		var rs []map[string]any
+		for i := range 5 {
+			n := batch*5 + i
+			rs = append(rs, read(t0.Add(time.Duration(n)*3*time.Second), agent, "test", verbs[n%4], fmt.Sprint("c", n%3), 2))
+		}
+		h.postReads(rs...)
+	}
+	got := h.readsOf(owner)
+	if len(got) != 1 {
+		t.Fatalf("20 reads made %d entries: %+v", len(got), got)
+	}
+	m := got[0]
+	if !m.At.Equal(t0) || !m.Until.Equal(t0.Add(57*time.Second)) || m.Count != 40 || len(m.Chats) != 3 ||
+		!slices.Equal(m.Verbs, []string{"chats", "messages", "search"}) || m.Detail != "chats" {
+		t.Errorf("merged = %+v", m)
+	}
+
+	// Anything else written between ends the run; t1 is past the burst's
+	// 10 minutes.
+	t1 := t0.Add(11 * time.Minute)
+	h.postReads(read(t1, agent, "test", "messages", "c0", 1))
+	h.request(agent)
+	h.postReads(read(t1.Add(time.Second), agent, "test", "messages", "c0", 1))
+	// So do another connector, another identity, and 10 minutes from the
+	// run's first read.
+	t2 := t1.Add(time.Minute)
+	h.postReads(
+		read(t2, agent, "test", "messages", "c0", 1),
+		read(t2.Add(time.Second), agent, "other", "messages", "c0", 1),
+		read(t2.Add(2*time.Second), "someone", "other", "messages", "c0", 1),
+		read(t2.Add(3*time.Second), agent, "test", "messages", "c0", 1),
+		read(t2.Add(5*time.Minute), agent, "test", "messages", "c0", 1),
+		read(t2.Add(3*time.Second+11*time.Minute), agent, "test", "messages", "c0", 1),
+	)
+	var runs []string
+	for _, e := range h.readsOf(owner)[1:] {
+		runs = append(runs, fmt.Sprintf("%s %s %d", e.Identity, e.Connector, e.Count))
+	}
+	want := []string{
+		agent + " test 1", // 11 minutes after the burst, before the request
+		agent + " test 2", // after it, with t2
+		agent + " other 1",
+		"someone other 1",
+		agent + " test 2", // t2+3s and t2+5m
+		agent + " test 1", // 11 minutes after that run began
+	}
+	if !slices.Equal(runs, want) {
+		t.Errorf("runs:\n%q\nwant\n%q", runs, want)
+	}
+
+	// Reads in the same second merge with an until too.
+	t3 := t2.Add(time.Hour)
+	h.postReads(read(t3, agent, "test", "chats", "c0", 0), read(t3, agent, "test", "messages", "c1", 4))
+	same := h.readsOf(owner)
+	if n := same[len(same)-1]; !n.Until.Equal(t3) || n.Count != 4 || len(n.Chats) != 2 {
+		t.Errorf("reads in one second = %+v", n)
+	}
+
+	// The history read back from disk keeps merging where it left off.
+	h.s.acts = &activityLog{dir: h.s.dir}
+	h.postReads(read(t3.Add(time.Second), agent, "test", "media", "c9", 1))
+	last := h.readsOf(owner)
+	if n := last[len(last)-1]; n.Count != 5 || !slices.Equal(n.Verbs, []string{"chats", "messages", "media"}) || len(n.Chats) != 3 {
+		t.Errorf("after a restart = %+v", n)
+	}
+}
+
+func TestCompactActivity(t *testing.T) {
+	dir := t.TempDir()
+	at := time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC)
+	var lines []string
+	for i, e := range []activity{
+		{Kind: "read", Identity: "a", Connector: "c", Count: 1, Detail: "chats", Chats: []chat{{ID: "x"}}},
+		{Kind: "read", Identity: "a", Connector: "c", Count: 2, Detail: "messages", Chats: []chat{{ID: "y"}}},
+		{Kind: "request.asked", Identity: "a", Connector: "c"},
+		{Kind: "read", Identity: "a", Connector: "c", Count: 3, Detail: "messages", Chats: []chat{{ID: "y"}}},
+		{Kind: "read", Identity: "a", Connector: "c", Count: 4, Detail: "messages", Chats: []chat{{ID: "y"}}},
+	} {
+		e.At = at.Add(time.Duration(i) * time.Minute)
+		b, _ := json.Marshal(e)
+		lines = append(lines, string(b))
+	}
+	// A read from before entries had kinds, as old files hold them.
+	lines = append(lines, `{"at":"2026-01-05T09:06:00Z","identity":"a","connector":"c","verb":"messages","chats":[],"count":5}`)
+	if err := os.MkdirAll(activityDir(dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := activityFile(dir, at)
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := compactActivity(dir); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := os.ReadFile(path)
+	es, err := readDay(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range es {
+		got = append(got, fmt.Sprintf("%s %d %v", e.Kind, e.Count, e.Verbs))
+	}
+	want := []string{"read 3 [chats messages]", "request.asked 0 []", "read 12 [messages]"}
+	if !slices.Equal(got, want) {
+		t.Errorf("compacted %q, want %q", got, want)
+	}
+	// Again, with or without its marker, changes nothing.
+	os.Remove(filepath.Join(activityDir(dir), compactMarker))
+	if err := compactActivity(dir); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := os.ReadFile(path); !bytes.Equal(again, first) {
+		t.Errorf("a second compaction changed the file:\n%s\n%s", first, again)
 	}
 }

@@ -51,6 +51,11 @@ type grant struct {
 type chat struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	// Kind is stored for a request term's chats; responses fill it, Icon
+	// and Parents from the connector.
+	Kind    string             `json:"kind,omitempty"`
+	Icon    string             `json:"icon,omitempty"`
+	Parents []connector.Parent `json:"parents,omitempty"`
 }
 
 type term struct {

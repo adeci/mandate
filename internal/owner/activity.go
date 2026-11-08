@@ -13,16 +13,20 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/adeci/mandate/record"
 )
 
-// activity is one entry of the owner's history: a read the gateway
-// reports (kind read, the verb as detail), or a step the owner side took.
-// The kinds are listed in owner-api.md.
+// activity is one entry of the owner's history: reads the gateway reports
+// (kind read), or a step the owner side took. The kinds are listed in
+// owner-api.md.
 type activity struct {
-	At        time.Time `json:"at"`
+	At time.Time `json:"at"`
+	// Until is the last read of a run of reads merged into one entry; set
+	// only on merged entries, and equal to At when they share a second.
+	Until     time.Time `json:"until,omitzero"`
 	Kind      string    `json:"kind"`
 	Identity  string    `json:"identity,omitempty"`
 	Connector string    `json:"connector,omitempty"`
@@ -37,6 +41,9 @@ type activity struct {
 	Device string `json:"device,omitempty"`
 	// Address is where a login or a joining device came from.
 	Address string `json:"address,omitempty"`
+	// Verbs are a read's: chats, messages, search, media or a read op, in
+	// the order first done. Detail is the first.
+	Verbs []string `json:"verbs,omitempty"`
 }
 
 // gatewayRead is a read as the gateway posts it.
@@ -57,33 +64,228 @@ func activityFile(dir string, day time.Time) string {
 	return filepath.Join(activityDir(dir), day.UTC().Format(time.DateOnly)+".jsonl")
 }
 
-func appendActivity(dir string, entries []activity) error {
-	if err := os.MkdirAll(activityDir(dir), 0o700); err != nil {
+// mergeWindow is how long after its first read a run of reads stays one
+// entry.
+const mergeWindow = 10 * time.Minute
+
+// activityLog appends to the history, merging a run of reads into one
+// entry: a read joins the entry written last when that is a read of the
+// same identity on the same connector that began at most mergeWindow
+// before. Anything else written between ends the run.
+type activityLog struct {
+	dir string
+
+	mu     sync.Mutex
+	loaded bool
+	last   *written // nil when unknown or empty
+}
+
+// written is an entry as it stands in its day's file.
+type written struct {
+	path string
+	off  int64
+	a    activity
+}
+
+// mergeable reports whether read e joins the run of reads l.
+func mergeable(l, e activity) bool {
+	return l.Kind == "read" && e.Kind == "read" && l.Identity == e.Identity && l.Connector == e.Connector &&
+		e.At.Sub(l.At) <= mergeWindow && l.At.Sub(e.At) <= mergeWindow
+}
+
+// merge is the run l with read e: every chat once, the counts summed, the
+// verbs collected, from the first time until the last.
+func merge(l, e activity) activity {
+	m := l
+	m.Chats = slices.Clone(l.Chats)
+	for _, c := range e.Chats {
+		if !slices.ContainsFunc(m.Chats, func(d chat) bool { return d.ID == c.ID }) {
+			m.Chats = append(m.Chats, c)
+		}
+	}
+	m.Count += e.Count
+	m.Verbs = slices.Clone(l.Verbs)
+	for _, v := range e.Verbs {
+		if !slices.Contains(m.Verbs, v) {
+			m.Verbs = append(m.Verbs, v)
+		}
+	}
+	end := slices.MaxFunc([]time.Time{l.At, l.Until, e.At, e.Until}, time.Time.Compare)
+	if e.At.Before(m.At) {
+		m.At = e.At
+	}
+	// Set on every merged entry, even when its reads share a second.
+	m.Until = end
+	return m
+}
+
+// withVerbs gives a read entry written before verbs were kept its verb.
+func withVerbs(a *activity) {
+	if a.Kind == "read" && a.Verbs == nil && a.Detail != "" {
+		a.Verbs = []string{a.Detail}
+	}
+}
+
+func (l *activityLog) append(entries []activity) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := os.MkdirAll(activityDir(l.dir), 0o700); err != nil {
 		return err
 	}
-	files := map[string][]byte{}
-	for _, a := range entries {
-		b, err := json.Marshal(a)
-		if err != nil {
+	if !l.loaded {
+		if err := l.load(); err != nil {
 			return err
 		}
-		name := activityFile(dir, a.At)
-		files[name] = append(append(files[name], b...), '\n')
+		l.loaded = true
 	}
-	for name, b := range files {
-		f, err := os.OpenFile(name, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	for _, e := range entries {
+		withVerbs(&e)
+		if l.last != nil && mergeable(l.last.a, e) {
+			m := merge(l.last.a, e)
+			if err := rewrite(l.last.path, l.last.off, m); err != nil {
+				l.last = nil // its file is in doubt; start a new run
+				return err
+			}
+			l.last.a = m
+			continue
+		}
+		path := activityFile(l.dir, e.At)
+		off, err := appendLine(path, e)
 		if err != nil {
 			return err
 		}
-		_, err = f.Write(b)
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
-		if err != nil {
-			return fmt.Errorf("append activity: %w", err)
-		}
+		l.last = &written{path, off, e}
 	}
 	return nil
+}
+
+// load finds the entry written last: the last whole line of the newest
+// day's file.
+func (l *activityLog) load() error {
+	des, err := os.ReadDir(activityDir(l.dir))
+	if err != nil {
+		return err
+	}
+	var newest string
+	for _, de := range des {
+		if name := de.Name(); strings.HasSuffix(name, ".jsonl") && name > newest {
+			newest = name
+		}
+	}
+	if newest == "" {
+		return nil
+	}
+	path := filepath.Join(activityDir(l.dir), newest)
+	es, err := readDay(path)
+	if err != nil || len(es) == 0 {
+		return err
+	}
+	e := es[len(es)-1]
+	l.last = &written{path, e.at.off, e.activity}
+	return nil
+}
+
+// appendLine appends e as a line to path, answering the line's offset.
+func appendLine(path string, e activity) (int64, error) {
+	b, err := json.Marshal(e)
+	if err != nil {
+		return 0, err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	fi, err := f.Stat()
+	if err == nil {
+		_, err = f.Write(append(b, '\n'))
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return 0, fmt.Errorf("append activity: %w", err)
+	}
+	return fi.Size(), nil
+}
+
+// rewrite replaces the last line of path, at off, with e. The line keeps
+// its offset, so cursors to it stay good; a crash midway leaves a torn
+// line, which readers skip.
+func rewrite(path string, off int64, e activity) error {
+	b, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	_, err = f.WriteAt(b, off)
+	if err == nil {
+		err = f.Truncate(off + int64(len(b)))
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return fmt.Errorf("merge activity: %w", err)
+	}
+	return nil
+}
+
+// compactMarker is left once the history written before reads merged has
+// been merged by the same rule.
+const compactMarker = ".reads-merged"
+
+// compactActivity merges the runs of reads in every day's file, as they
+// would merge when written, once. Merging merged entries again changes
+// nothing, so a crash midway only repeats the work.
+func compactActivity(dir string) error {
+	des, err := os.ReadDir(activityDir(dir))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	marker := filepath.Join(activityDir(dir), compactMarker)
+	if _, err := os.Stat(marker); err == nil {
+		return nil
+	}
+	for _, de := range des {
+		if !strings.HasSuffix(de.Name(), ".jsonl") {
+			continue
+		}
+		path := filepath.Join(activityDir(dir), de.Name())
+		es, err := readDay(path)
+		if err != nil {
+			return err
+		}
+		var out []activity
+		for _, e := range es {
+			if n := len(out); n > 0 && mergeable(out[n-1], e.activity) {
+				out[n-1] = merge(out[n-1], e.activity)
+				continue
+			}
+			out = append(out, e.activity)
+		}
+		if len(out) == len(es) {
+			continue
+		}
+		var b []byte
+		for _, a := range out {
+			line, err := json.Marshal(a)
+			if err != nil {
+				return err
+			}
+			b = append(append(b, line...), '\n')
+		}
+		if err := writeFile(path, b, 0o600); err != nil {
+			return fmt.Errorf("merge activity %s: %w", de.Name(), err)
+		}
+	}
+	return writeFile(marker, nil, 0o600)
 }
 
 // note appends what the owner side just did to the history, decided by the
@@ -96,7 +298,7 @@ func (s *Server) note(a activity, by string) {
 	if _, d := s.st.deviceOf(by); d != nil {
 		a.Device = s.deviceName(d)
 	}
-	if err := appendActivity(s.dir, []activity{a}); err != nil {
+	if err := s.acts.append([]activity{a}); err != nil {
 		s.log.Error("note activity", "kind", a.Kind, "err", err)
 	}
 }
@@ -108,9 +310,12 @@ func (s *Server) postActivity(w http.ResponseWriter, r *http.Request) {
 	}
 	entries := make([]activity, len(reads))
 	for i, e := range reads {
-		entries[i] = activity{At: e.At, Kind: "read", Identity: e.Identity, Connector: e.Connector, Chats: e.Chats, Count: e.Count, Detail: e.Verb}
+		entries[i] = activity{
+			At: e.At, Kind: "read", Identity: e.Identity, Connector: e.Connector, Chats: e.Chats, Count: e.Count,
+			Detail: e.Verb, Verbs: []string{e.Verb},
+		}
 	}
-	if err := appendActivity(s.dir, entries); err != nil {
+	if err := s.acts.append(entries); err != nil {
 		s.log.Error("append activity", "err", err)
 		failErr(w, err)
 		return
@@ -188,6 +393,20 @@ func (s *Server) getActivity(w http.ResponseWriter, r *http.Request) {
 		s.log.Error("read activity", "err", err)
 		failErr(w, err)
 		return
+	}
+	refs := chatRefs{}
+	for _, a := range entries {
+		refs.chats(a.Connector, a.Chats)
+		for _, t := range a.Terms {
+			refs.chats(a.Connector, t.Chats)
+		}
+	}
+	pl := s.place(r.Context(), refs)
+	for _, a := range entries {
+		pl.chats(a.Connector, a.Chats)
+		for _, t := range a.Terms {
+			pl.chats(a.Connector, t.Chats)
+		}
 	}
 	reply(w, http.StatusOK, struct {
 		Entries []activity `json:"entries"`
@@ -298,7 +517,7 @@ func kindFilter(list string) func(kind string) bool {
 // in its identity (by ID or as identity names it), connector, chats, terms,
 // detail, reason, note or device.
 func (a activity) matches(text, identity string) bool {
-	fields := []string{a.Identity, identity, a.Connector, a.Detail, a.Reason, a.Note, a.Device, a.Address}
+	fields := append([]string{a.Identity, identity, a.Connector, a.Detail, a.Reason, a.Note, a.Device, a.Address}, a.Verbs...)
 	for _, c := range a.Chats {
 		fields = append(fields, c.ID, c.Name)
 	}
@@ -389,6 +608,7 @@ func readDay(path string) ([]placed, error) {
 		if a.Kind == "" {
 			a.Kind, a.Detail = "read", a.Verb
 		}
+		withVerbs(&a.activity)
 		out = append(out, placed{a.activity, cursor{a.At, at}})
 	}
 	return out, sc.Err()
@@ -425,7 +645,7 @@ func grantDetail(g record.Grant) string {
 func grantActivity(kind string, g record.Grant, names map[string]string, detail string) activity {
 	a := activity{Kind: kind, Identity: g.Identity, Connector: g.Connector, Detail: detail}
 	for _, id := range g.Chats {
-		a.Chats = append(a.Chats, chat{id, names[id]})
+		a.Chats = append(a.Chats, chat{ID: id, Name: names[id]})
 	}
 	return a
 }

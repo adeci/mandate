@@ -60,8 +60,13 @@ func number(term string) string {
 // HolderKinds, as a SQL list, are the kinds of chat that hold other chats
 // and no messages of their own: Discord's servers and its forum and media
 // channels, whose posts are threads, and Matrix spaces. A grant on one
-// covers nothing under it, and agents never see them listed.
+// covers every chat under it, and agents never see them listed.
 const HolderKinds = `('guild', 'space', 'forum', 'media')`
+
+// Holder says whether chats of kind are holders.
+func Holder(kind string) bool {
+	return kind != "" && strings.Contains(HolderKinds, "'"+kind+"'")
+}
 
 // Matching is how a search term finds chats, for an agent's request and
 // the owner's chat picker alike. It continues a WITH clause that defines
@@ -88,13 +93,12 @@ const HolderKinds = `('guild', 'space', 'forum', 'media')`
 //
 // Chats idle for over a year, or never active, rank after all others.
 // Within both, the chat whose ID is the term comes first, then chats
-// matching by their own name, then the most recent, a mailbox being as
-// recent as the newest chat in it.
+// matching by their own name, then the most recent, a mailbox or holder
+// being as recent as the newest chat in it.
 //
-// A term naming a mailbox exactly finds it alone, as a grant on it covers
-// the mail filed later. Holders hold no messages and a grant on one covers
-// nothing under it, so they never match: a term naming one exactly finds
-// the chats directly in it instead.
+// A term naming a holder or a mailbox exactly finds it alone, as a grant on
+// it covers the chats filed under it later. Holders match no other way:
+// they hold no messages.
 func Matching(termsJSON, now string) string {
 	// hit is materialized: inlined, SQLite would run it again for each chat
 	// it checks for a match above it. Each check is an equality, which
@@ -114,30 +118,26 @@ newest(id, at) AS MATERIALIZED (
   WHERE id IS NOT NULL GROUP BY id),
 hit AS MATERIALIZED (
   SELECT term.k, l.id, l.p1, l.p2, l.p3,
-         iif(l.kind = 'mailbox', NULLIF(max(COALESCE(l.at, ''), COALESCE((SELECT n.at FROM newest AS n WHERE n.id = l.id), '')), ''), l.at) AS at,
+         iif(l.kind = 'mailbox' OR l.kind IN %[2]s,
+           NULLIF(max(COALESCE(l.at, ''), COALESCE((SELECT n.at FROM newest AS n WHERE n.id = l.id), '')), ''), l.at) AS at,
          term.raw IN (l.id_l, l.user_l) OR term.digits != '' AND term.digits = ltrim(l.user_l, '+') AS same_id,
-         l.kind = 'mailbox' AND ltrim(l.own_l, '#~') = term.name AS alone,
+         (l.kind = 'mailbox' OR l.kind IN %[2]s) AND ltrim(l.own_l, '#~') = term.name AS alone,
          iif(term.digits = '', NOT EXISTS (SELECT 1 FROM json_each(term.words) AS w WHERE instr(l.own_l, w.value) = 0),
            instr(l.own_d, term.digits) > 0 OR %[6]s) AS own
   FROM term JOIN pathed AS l
-    ON l.kind NOT IN %[2]s AND (
+    ON l.kind IN %[2]s AND term.name != '' AND ltrim(l.own_l, '#~') = term.name
+    OR l.kind NOT IN %[2]s AND (
       term.raw IN (l.id_l, l.user_l)
       OR term.digits = '' AND term.name != '' AND (l.path_l != '' OR l.handle_l != '') AND NOT EXISTS (SELECT 1 FROM json_each(term.words) AS w
         WHERE instr(l.path_l, w.value) = 0 AND (instr(l.handle_l, w.value) = 0 OR w.value NOT GLOB '*[^0-9]*'))
       OR term.digits != '' AND (instr(l.path_d, term.digits) > 0 OR instr(l.handle_d, term.digits) > 0 OR %[6]s OR %[7]s OR %[9]s))),
-holder(k, id) AS (
-  SELECT term.k, l.id FROM term JOIN pathed AS l
-  WHERE term.name != '' AND l.kind IN %[2]s AND ltrim(l.own_l, '#~') = term.name),
 single(k) AS (SELECT DISTINCT k FROM hit WHERE alone),
 picked AS (
   SELECT k, id, same_id, own, at FROM hit AS h
-  WHERE k NOT IN (SELECT k FROM holder) AND (alone OR k NOT IN (SELECT k FROM single))
+  WHERE (alone OR k NOT IN (SELECT k FROM single))
     AND NOT EXISTS (SELECT 1 FROM hit AS a WHERE a.k = h.k AND a.id = h.p1)
     AND NOT EXISTS (SELECT 1 FROM hit AS a WHERE a.k = h.k AND a.id = h.p2)
-    AND NOT EXISTS (SELECT 1 FROM hit AS a WHERE a.k = h.k AND a.id = h.p3)
-  UNION ALL
-  SELECT holder.k, l.id, 0, 1, l.at FROM holder JOIN pathed AS l ON l.p1 = holder.id
-  WHERE l.kind NOT IN %[2]s),
+    AND NOT EXISTS (SELECT 1 FROM hit AS a WHERE a.k = h.k AND a.id = h.p3)),
 matched(k, id, n) AS (
   SELECT k, id, row_number() OVER (PARTITION BY k ORDER BY COALESCE(julianday(at) < julianday(%[3]s, '-1 year'), 1),
     same_id DESC, own DESC, at DESC NULLS LAST, id) FROM picked)`,

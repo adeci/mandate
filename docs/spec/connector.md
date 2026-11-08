@@ -151,12 +151,16 @@ CREATE TABLE media (
   channel), one gets a prefix (`guild:`, `mailbox:`).
 - `parent_id` chains are acyclic and at most three deep; deeper chats are
   invisible to agents.
-- A grant covers exactly the chats it names, never chats under them, except
-  for mail: a mailbox is a chat of kind `mailbox`, a thread's `parent_id` is
-  the mailbox it is filed in, and a grant on a mailbox also covers the chats
-  filed directly in it that aren't mailboxes, as filed when read.
 - Chats that only hold others, of kind `guild`, `space`, `forum` or `media`,
-  hold no messages; agents never get them by name, only the chats in them.
+  are holders. They hold no messages and agents never see them listed.
+- A grant covers the chats it names. A grant on a holder also covers every
+  chat under it at any depth: channels, their threads, forum posts, those
+  added later included. A grant on a mailbox (a chat of kind `mailbox`, a
+  thread's `parent_id` being the mailbox it is filed in) covers only the
+  chats filed directly in it that aren't mailboxes: mail moves between
+  mailboxes, and a folder under the Inbox holds what was filed away from
+  it. Both are evaluated as stored when read, and never-share hides chats
+  under either.
 - A name the person chose (a profile or push name) starts with `~`;
   address-book names and the owner's own name don't. The owner's chat with
   themself gets the service's name for it.
@@ -295,13 +299,14 @@ side never opens the store:
 
 A shelf is a holder or a mailbox. Each list is the newest first, a shelf
 being as recent as the newest chat in it. `limit` (default 50, at most 500)
-cuts the chats, never the shelves.
+cuts the chats, never the shelves. The owner can pick any row that isn't
+`hidden`, shelves included.
 
 ```json
 [{"id": "guild:1100000000000000001", "kind": "guild", "name": "main", "parents": [],
   "last_activity": "2026-11-07T10:01:00Z", "opens": true, "icon": "9f2c4a1b0e7d"},
  {"id": "1100000000000000011", "kind": "channel", "name": "#general",
-  "parents": [{"id": "guild:1100000000000000001", "name": "main", "icon": "9f2c4a1b0e7d"}],
+  "parents": [{"id": "guild:1100000000000000001", "name": "main", "kind": "guild", "icon": "9f2c4a1b0e7d"}],
   "last_activity": "2026-11-07T10:01:00Z"},
  {"id": "1300000000000000002", "kind": "group", "name": "climbing", "parents": [], "members": 3},
  {"id": "1300000000000000001", "kind": "dm", "name": "~Sam Park", "parents": [], "handle": "@sam_p",

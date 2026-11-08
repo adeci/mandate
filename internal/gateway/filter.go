@@ -13,12 +13,13 @@ import (
 // and ?2 are the never-shared chat and person IDs, ?3 the scope (see rule),
 // all JSON arrays.
 //
-// A rule naming chats covers exactly those, nothing under them: the owner
-// signs the chats they picked. Mail is the one exception: a rule naming a
-// mailbox also covers the chats filed directly in it, which are not
-// mailboxes, as filed when read. A rule with an until, an ended grant,
-// shows only what it showed before its end; bounded spares reads, which
-// carry none, the per-rule check.
+// A rule naming a chat covers that chat. A rule naming a holder (a server,
+// space, forum) also covers every chat under it, so the owner can grant a
+// whole server, new channels included; one naming a mailbox covers the
+// chats filed directly in it, not its folders, as mail is filed into one
+// mailbox and folders are picked apart. Both as filed when read. A rule
+// with an until, an ended grant, shows only what it showed before its end;
+// bounded spares reads, which carry none, the per-rule check.
 //
 // A DM's ID is not always its other person's (Discord channels, Matrix
 // rooms), so hiding a person also matches DMs by participants and by who
@@ -51,7 +52,9 @@ rule(cutoff, until, chats) AS (SELECT value ->> 'cutoff', COALESCE(value ->> 'un
 named AS (
   SELECT c.id, c.kind, c.parent_id, c.last_message_at, c.name AS own,
          iif(c.kind = 'dm', c.participants_json ->> '$[0].handle') AS handle,
-         iif(p1.kind = 'mailbox' AND c.kind != 'mailbox', p1.id, NULL) AS mailbox,
+         iif(p1.kind = 'mailbox' AND c.kind != 'mailbox' OR p1.kind IN ` + store.HolderKinds + `, p1.id, NULL) AS via1,
+         iif(p2.kind IN ` + store.HolderKinds + `, p2.id, NULL) AS via2,
+         iif(p3.kind IN ` + store.HolderKinds + `, p3.id, NULL) AS via3,
          concat_ws(' / ', p3.name, p2.name, p1.name) AS prefix
   FROM containers AS c
   LEFT JOIN containers AS p1 ON p1.id = c.parent_id
@@ -63,15 +66,15 @@ named AS (
     AND COALESCE(p1.parent_id, '') NOT IN (SELECT id FROM hidden)
     AND COALESCE(p2.parent_id, '') NOT IN (SELECT id FROM hidden)),
 covered AS (
-  SELECT n.id, n.kind, n.parent_id, n.last_message_at, n.mailbox, n.own, n.handle,
+  SELECT n.id, n.kind, n.parent_id, n.last_message_at, n.via1, n.via2, n.via3, n.own, n.handle,
          iif(n.prefix = '', n.own, n.prefix || ' / ' || COALESCE(n.own, n.id)) AS name,
          (SELECT min(g.cutoff) FROM rule AS g
-          WHERE g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value IN (n.id, n.mailbox))) AS cutoff,
+          WHERE g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value IN (n.id, n.via1, n.via2, n.via3))) AS cutoff,
          EXISTS (SELECT 1 FROM rule AS g
-          WHERE g.until != '' AND (g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value IN (n.id, n.mailbox)))) AS bounded
+          WHERE g.until != '' AND (g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value IN (n.id, n.via1, n.via2, n.via3)))) AS bounded
   FROM named AS n),
 chats AS (
-  SELECT id, kind, parent_id, last_message_at, mailbox, cutoff, bounded, iif(name_code, '[login code hidden]', name) AS name,
+  SELECT id, kind, parent_id, last_message_at, via1, via2, via3, cutoff, bounded, iif(name_code, '[login code hidden]', name) AS name,
          iif(name_code, NULL, own) AS own, iif(name_code, NULL, handle) AS handle, name_code
   FROM (SELECT *, name IS NOT NULL AND login_code(name) AS name_code FROM covered WHERE cutoff IS NOT NULL)),
 stored AS (
@@ -83,7 +86,7 @@ stored AS (
   FROM messages AS m JOIN chats AS c ON c.id = m.container_id
   WHERE COALESCE(m.sender_id, '') NOT IN (SELECT id FROM hidden_person) AND m.sent_at >= c.cutoff
     AND (NOT c.bounded OR EXISTS (SELECT 1 FROM rule AS g
-      WHERE (g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value IN (c.id, c.mailbox)))
+      WHERE (g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value IN (c.id, c.via1, c.via2, c.via3)))
         AND m.sent_at >= g.cutoff AND (g.until = '' OR m.sent_at < g.until)))),
 visible AS (
   SELECT *, login_code(concat_ws(' ', files, body)) AS code FROM stored),
@@ -290,8 +293,9 @@ ORDER BY at DESC NULLS LAST, id LIMIT ?4`, limit+1)
 	if err != nil {
 		return nil, err
 	}
+	// Without holders, a server's name finds the chats in it by their path.
 	rows, err := v.query(ctx, listed+`, candidates AS (
-  SELECT id, kind, parent_id, own, iif(name_code, '', name) AS path, handle, at FROM listed),
+  SELECT id, kind, parent_id, own, iif(name_code, '', name) AS path, handle, at FROM listed WHERE kind NOT IN `+store.HolderKinds+`),
 `+store.Matching("?4", "?6")+`
 SELECT l.id, l.kind, l.name, strftime('%Y-%m-%d %H:%M', l.at) FROM matched AS m JOIN listed AS l ON l.id = m.id
 ORDER BY m.n LIMIT ?5`, ts, limit+1, v.now)
@@ -312,7 +316,7 @@ func (v *view) matches(ctx context.Context, terms []string, per int64) ([][]any,
 	return v.query(ctx, listed+`, candidates AS (
   SELECT id, kind, parent_id, own, iif(name_code, '', name) AS path, handle, at FROM listed),
 `+store.Matching("?4", "?6")+`
-SELECT m.k, m.id, l.name FROM matched AS m JOIN listed AS l ON l.id = m.id
+SELECT m.k, m.id, l.name, l.kind FROM matched AS m JOIN listed AS l ON l.id = m.id
 WHERE m.n <= ?5 ORDER BY m.k, m.n`, ts, per, v.now)
 }
 

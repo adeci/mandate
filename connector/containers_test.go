@@ -67,9 +67,10 @@ func TestContainers(t *testing.T) {
 		"top level":        {ContainerQuery{Parent: &top, Limit: 50}, []string{"guild:1", "guild:2", "32", "31", "30"}},
 		"top level, cut":   {ContainerQuery{Parent: &top, Limit: 1}, []string{"guild:1", "guild:2", "32"}},
 		"in main":          {ContainerQuery{Parent: &main, Limit: 50}, []string{"13", "10", "11"}},
-		"search":           {ContainerQuery{Q: "main", Limit: 50}, []string{"guild:1", "10", "11"}},
+		"search":           {ContainerQuery{Q: "main", Limit: 50}, []string{"guild:1"}}, // all of main
 		"search in main":   {ContainerQuery{Q: "general", Parent: &main, Limit: 50}, []string{"10", "14"}},
-		"search, headings": {ContainerQuery{Q: "help", Limit: 50}, []string{"13", "14"}},
+		"search, headings": {ContainerQuery{Q: "help", Limit: 50}, []string{"13"}},
+		"search, path":     {ContainerQuery{Q: "main general", Limit: 50}, []string{"10", "14"}},
 		"search, handle":   {ContainerQuery{Q: "@sam_p", Limit: 50}, []string{"30"}},
 		"by id":            {ContainerQuery{IDs: []string{"31", "12", "nosuch"}}, []string{"31", "12"}},
 	} {
@@ -85,7 +86,7 @@ func TestContainers(t *testing.T) {
 	icon := iconVersion("icons/1/a")
 	want := []Container{
 		{ID: "guild:1", Kind: "guild", Name: "main", Parents: []Parent{}, LastActivity: day(6), Opens: true, Icon: icon},
-		{ID: "12", Kind: "thread", Name: "v2 rollout", Parents: []Parent{{"guild:1", "main", icon}, {"11", "#releases", ""}}, LastActivity: day(6)},
+		{ID: "12", Kind: "thread", Name: "v2 rollout", Parents: []Parent{{"guild:1", "main", "guild", icon}, {"11", "#releases", "channel", ""}}, LastActivity: day(6)},
 		{
 			ID: "31", Kind: "group", Name: "climbing", Parents: []Parent{}, LastActivity: day(7), Members: 3,
 			Participants: []store.Participant{{ID: "u1"}, {ID: "u2"}},

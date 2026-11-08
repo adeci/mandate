@@ -171,11 +171,11 @@ time a grant opens.
 ## Reads
 
 A read needs a grant open now on the connector, else `403`. Within open
-grants, a message is readable if one of them names its chat, the mailbox its
-thread is filed in (mail only), or all chats, and it was sent at or after
-that grant's cutoff (now minus the horizon). The owner's never-share list
-hides chats and people on top, and messages that look like login codes read
-`[login code hidden]`.
+grants, a message is readable if one of them names its chat, a server,
+space or forum it is in, the mailbox its thread is filed in, or all chats,
+and it was sent at or after that grant's cutoff (now minus the horizon).
+The owner's never-share list hides chats and people on top, and messages
+that look like login codes read `[login code hidden]`.
 
 Reads answer a table:
 
@@ -251,8 +251,9 @@ A one-off grant has `from` and `until` instead of `schedule`.
   them, compares digits only: `+1 555 999 0002` finds a chat named
   `(555) 999-0002`, a DM whose person's handle is `+15559990002`, or the
   chat with the ID `15559990002@s.whatsapp.net`, a country code of up to 3
-  digits being optional. A mailbox's exact name finds that mailbox alone; a
-  server's, space's or forum's finds the chats directly in it.
+  digits being optional. The exact name of a server, space, forum or mailbox
+  finds it alone, which asks for all of it; `Server / channel` still finds
+  the channel.
 - Chats idle for over a year, or never active, rank last. Apart from that,
   the chat the term names by ID comes first, then those it names by their
   own name, then the newest.

@@ -36,6 +36,7 @@ mandate request signal --chat alice --for 30m --since 2d \
   the shortest time and the least history that will do.
 - Name chats precisely: `"Server / channel"`, a mailbox like `Inbox`, or
   `"Folder / Subject"`. A bare `general` matches #general on every server.
+  A server's name asks for all of it; prefer channels.
 - Tell the owner to approve on their phone.
 - Short on time mid-task? Use `--extend` instead of asking again.
 - Never request in a loop, and don't ask again after a denial unless the

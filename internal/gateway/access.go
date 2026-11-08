@@ -312,8 +312,9 @@ func (g *gateway) matchTerms(ctx context.Context, w http.ResponseWriter, cl *cal
 		k, _ := row[0].(int64)
 		id, _ := row[1].(string)
 		name, _ := row[2].(string)
+		kind, _ := row[3].(string)
 		if t := &terms[k]; len(t.Chats) < matchesPerTerm {
-			t.Chats = append(t.Chats, chatRef{id, name})
+			t.Chats = append(t.Chats, chatRef{id, name, kind})
 		} else {
 			t.More = true
 		}

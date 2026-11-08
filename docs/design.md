@@ -83,9 +83,9 @@ JSON over the two sockets, under `/internal/`, and caller-checked by group as in
 
 | Route | Body → answer |
 |---|---|
-| `POST /internal/requests` | `{identity, connector, kind: once\|routine\|extend, terms: [{term, chats: [{id, name}]}], for, horizon, schedule, reason}` → `{id}`. The gateway has already matched the terms against the visible chats; a term with no chats reaches the owner as "no visible chat matched". |
+| `POST /internal/requests` | `{identity, connector, kind: once\|routine\|extend, terms: [{term, chats: [{id, name, kind}]}], for, horizon, schedule, reason}` → `{id}`. The gateway has already matched the terms against the visible chats; a term with no chats reaches the owner as "no visible chat matched". |
 | `GET /internal/requests/{id}?identity=…&wait=` | `{status, grant_id, until}`. `404` for another identity's request. |
-| `POST /internal/proposals` | `{identity, connector, op, prepared: {args, display, container, message}, note}` → `{id}`. The gateway has already called `prepare` and checked the chat and message against the grants. |
+| `POST /internal/proposals` | `{identity, connector, op, prepared: {args, display, container, message}, note}` → `{id}`. The gateway has already called `prepare` and checked the chat and message against the grants. The owner side checks the chat again under its live grants, asking the connector which chats it is in for a grant on a server or mailbox; `503` if the connector can't say. |
 | `GET /internal/proposals/{id}?identity=…&wait=` | `{id, status, result}` |
 | `POST /internal/activity` | `[{at, identity, connector, verb, chats, count}]`, batched |
 | `POST /internal/join`, `GET /internal/join/{id}?wait=`, `POST /internal/join/{id}` | The agent side of the code exchange, relayed as-is from `/agent/v1/join…`. Exchanges live on the owner side, for agents and devices alike, and the gateway passes `X-Forwarded-For` and `Mandate-Spki-Sha256` on. |

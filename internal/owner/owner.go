@@ -85,6 +85,7 @@ type Server struct {
 
 	names chatNames
 	icons icons
+	acts  *activityLog
 
 	// certVerified: the TLS certificate chains to a CA (mode acme or cert),
 	// so the app checks it and people compare no key.
@@ -126,6 +127,10 @@ func newServer(dir string, conns map[string]*connector.Client, gatewaySock strin
 		keysDue:    make(chan struct{}, 1),
 	}
 	s.stopping, s.stop = context.WithCancel(context.Background())
+	s.acts = &activityLog{dir: dir}
+	if err := compactActivity(dir); err != nil {
+		return nil, fmt.Errorf("merge stored activity: %w", err)
+	}
 	// A write that was running when mandate stopped may have reached the
 	// service; it is never run again.
 	stale := false

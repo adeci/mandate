@@ -500,7 +500,9 @@ type grantView struct {
 	record.Grant
 	IdentityName string            `json:"identity_name"`
 	ChatNames    map[string]string `json:"chat_names,omitempty"`
-	ClosedAt     time.Time         `json:"closed_at,omitzero"`
+	// ChatRefs are Chats in order, with names, kinds and parents.
+	ChatRefs []chat    `json:"chat_refs"`
+	ClosedAt time.Time `json:"closed_at,omitzero"`
 }
 
 func (s *Server) grantView(g *grant) grantView {
@@ -508,12 +510,22 @@ func (s *Server) grantView(g *grant) grantView {
 	if i := s.st.Identities[g.Record.Identity]; i != nil {
 		name = i.Name
 	}
-	return grantView{g.Record, name, maps.Clone(g.ChatNames), g.ClosedAt}
+	return grantView{Grant: g.Record, IdentityName: name, ChatNames: maps.Clone(g.ChatNames), ClosedAt: g.ClosedAt}
 }
 
+// requestView is a copy of a request, whose chats a response places.
 type requestView struct {
-	*request
+	request
 	IdentityName string `json:"identity_name"`
+}
+
+func newRequestView(req *request, name string) requestView {
+	v := requestView{*req, name}
+	v.Terms = slices.Clone(v.Terms)
+	for i := range v.Terms {
+		v.Terms[i].Chats = slices.Clone(v.Terms[i].Chats)
+	}
+	return v
 }
 
 func (s *Server) getNow(w http.ResponseWriter, r *http.Request) {
@@ -531,7 +543,7 @@ func (s *Server) getNow(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, req := range s.st.Requests {
 		if s.waiting(req) {
-			out.Requests = append(out.Requests, requestView{req, s.st.Identities[req.Identity].Name})
+			out.Requests = append(out.Requests, newRequestView(req, s.st.Identities[req.Identity].Name))
 		}
 	}
 	for _, p := range s.st.Proposals {
@@ -550,7 +562,26 @@ func (s *Server) getNow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.mu.Unlock()
-	s.nameChats(r.Context(), out.Grants, out.Routines, out.Stopped)
+	refs := chatRefs{}
+	for _, v := range out.Requests {
+		for _, t := range v.Terms {
+			refs.chats(v.Connector, t.Chats)
+		}
+	}
+	for _, p := range out.Proposals {
+		refs.chats(p.Connector, p.Chats)
+	}
+	refs.grants(out.Grants, out.Routines, out.Stopped)
+	pl := s.place(r.Context(), refs)
+	for _, v := range out.Requests {
+		for _, t := range v.Terms {
+			pl.chats(v.Connector, t.Chats)
+		}
+	}
+	for _, p := range out.Proposals {
+		pl.chats(p.Connector, p.Chats)
+	}
+	pl.grants(out.Grants, out.Routines, out.Stopped)
 	reply(w, http.StatusOK, out)
 }
 
@@ -575,8 +606,13 @@ func (s *Server) listIdentities(w http.ResponseWriter, r *http.Request) {
 		out = append(out, v)
 	}
 	s.mu.Unlock()
+	refs := chatRefs{}
 	for _, v := range out {
-		s.nameChats(r.Context(), v.Grants)
+		refs.grants(v.Grants)
+	}
+	pl := s.place(r.Context(), refs)
+	for _, v := range out {
+		pl.grants(v.Grants)
 	}
 	slices.SortFunc(out, func(a, b identityView) int { return strings.Compare(a.Name, b.Name) })
 	reply(w, http.StatusOK, out)

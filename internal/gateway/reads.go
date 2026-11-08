@@ -174,7 +174,7 @@ func (g *gateway) chatNames(ctx context.Context, cl *caller, v *view, ids []stri
 	}
 	out := make([]chatRef, len(ids))
 	for i, id := range ids {
-		out[i] = chatRef{id, names[id]}
+		out[i] = chatRef{ID: id, Name: names[id]}
 	}
 	return out
 }
@@ -186,7 +186,7 @@ func rowChats(t *table) []chatRef {
 		id, _ := row[2].(string)
 		name, _ := row[3].(string)
 		if !slices.ContainsFunc(out, func(c chatRef) bool { return c.ID == id }) {
-			out = append(out, chatRef{id, name})
+			out = append(out, chatRef{ID: id, Name: name})
 		}
 	}
 	return out
@@ -544,21 +544,17 @@ func (g *gateway) propose(w http.ResponseWriter, r *http.Request, cl *caller, c 
 		unavailable(w, cl, "open store", err)
 		return
 	}
-	// A chat readable through its mailbox's grant names the mailbox, which
-	// the owner side finds in the grant.
-	var mailbox string
 	if prepared.Container != "" {
-		rows, err := v.query(ctx, `SELECT mailbox FROM chats WHERE id = ?4`, prepared.Container)
+		ok, err := v.chatVisible(ctx, prepared.Container)
 		if err != nil {
 			unavailable(w, cl, "chat lookup", err)
 			return
 		}
-		if len(rows) == 0 {
+		if !ok {
 			cl.log.Info("proposal refused", "connector", c.name, "why", "prepared chat")
 			noMessage(w, c, op, req.Args)
 			return
 		}
-		mailbox, _ = rows[0][0].(string)
 	}
 	if prepared.Message != "" {
 		ok, err := v.messageVisible(ctx, prepared.Message)
@@ -580,9 +576,8 @@ func (g *gateway) propose(w http.ResponseWriter, r *http.Request, cl *caller, c 
 		Connector string             `json:"connector"`
 		Op        string             `json:"op"`
 		Prepared  connector.Prepared `json:"prepared"`
-		Mailbox   string             `json:"mailbox,omitempty"`
 		Note      string             `json:"note,omitempty"`
-	}{cl.identity, c.name, op.Name, prepared, mailbox, req.Note}, &created)
+	}{cl.identity, c.name, op.Name, prepared, req.Note}, &created)
 	if err != nil {
 		relay(w, cl, "submit proposal", err)
 		return

@@ -25,6 +25,7 @@ import (
 	"github.com/adeci/mandate/internal/peer"
 	"github.com/adeci/mandate/record"
 	"github.com/adeci/mandate/store"
+	"github.com/adeci/mandate/store/storetest"
 )
 
 // fakeConn is a connector over a store the test fills.
@@ -669,7 +670,7 @@ func TestMailboxGrant(t *testing.T) {
 	if s, _ := e.call(http.MethodPost, "/agent/v1/chat/send", opRequest{Args: map[string]string{"chat": "t-in", "text": "yes"}}); s != http.StatusAccepted {
 		t.Errorf("reply in Inbox: %d", s)
 	}
-	if got := e.owner.got().proposals; len(got) != 1 || !strings.Contains(string(got[0]), `"mailbox":"mailbox:in"`) {
+	if got := e.owner.got().proposals; len(got) != 1 {
 		t.Errorf("owner side got %s", got)
 	}
 
@@ -682,6 +683,51 @@ func TestMailboxGrant(t *testing.T) {
 	}
 	if s, _ := e.call(http.MethodPost, "/agent/v1/chat/send", opRequest{Args: map[string]string{"chat": "t-in", "text": "x"}}); s != http.StatusNotFound {
 		t.Errorf("reply in Archive: %d", s)
+	}
+}
+
+// A server's name asks for the server alone, and a grant on it covers its
+// channels, their threads and forum posts as stored when read, except what
+// is never shared.
+func TestServerGrant(t *testing.T) {
+	e := newEnv(t, self(), self())
+	ctx := t.Context()
+	st := e.conn.st
+	storetest.Load(t, st, filepath.Join("..", "..", "connectors", "discord", "testdata", "chats.json"))
+	const general, rollout, post, news, others = "1100000000000000001", "1100000000000000013", "1100000000000000019", "1100000000000000015", "1200000000000000011"
+	for _, chat := range []string{general, rollout, post, news, others} {
+		if err := st.UpsertMessage(ctx, store.Message{ID: "m" + chat, ContainerID: chat, SenderID: "u1", SentAt: time.Now().Add(-time.Hour), Body: "in " + chat}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	e.push(nil)
+	if s, body := e.call(http.MethodPost, "/agent/v1/access/requests", map[string]any{
+		"connector": "chat", "chats": []string{"main"}, "reason": "triage",
+	}); s != http.StatusAccepted {
+		t.Fatalf("request: %d %s", s, body)
+	}
+	if got := e.owner.got().requests[0].Terms[0].Chats; len(got) != 1 || got[0] != (chatRef{"guild:1100000000000000001", "main", "guild"}) {
+		t.Errorf("main matches %+v", got)
+	}
+
+	e.push([]record.Envelope{e.grant(e.phone, []string{"guild:1100000000000000001"}, 0, -time.Hour, time.Hour)},
+		neverShare{Connector: "chat", Kind: "chat", ID: news})
+	for _, chat := range []string{general, rollout, post} {
+		if _, got := e.rows("/agent/v1/chat/messages?chat=" + chat); !eq(got, []string{"in " + chat}) {
+			t.Errorf("%s in the server: %v", chat, got)
+		}
+	}
+	for _, chat := range []string{news, others} {
+		if s, _ := e.rows("/agent/v1/chat/messages?chat=" + chat); s != http.StatusNotFound {
+			t.Errorf("%s under a grant on main: %d", chat, s)
+		}
+	}
+	if s, _ := e.call(http.MethodPost, "/agent/v1/chat/send", opRequest{Args: map[string]string{"chat": rollout, "text": "yes"}}); s != http.StatusAccepted {
+		t.Errorf("reply in the server: %d", s)
+	}
+	if got := e.owner.got().proposals; len(got) != 1 {
+		t.Errorf("owner side got %s", got)
 	}
 }
 

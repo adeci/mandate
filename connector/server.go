@@ -451,6 +451,7 @@ type Container struct {
 type Parent struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	Kind string `json:"kind"`
 	Icon string `json:"icon,omitempty"`
 }
 
@@ -510,9 +511,9 @@ func (s *Server) containers(w http.ResponseWriter, r *http.Request) {
 // recent as the newest chat in it, at any depth.
 const pickerChats = `WITH tree AS (
   SELECT c.id, c.kind, c.parent_id, c.name AS own, c.is_group, c.participants_json, COALESCE(c.icon, '') AS icon,
-         p1.id AS p1, COALESCE(p1.name, '') AS p1_name, COALESCE(p1.icon, '') AS p1_icon,
-         p2.id AS p2, COALESCE(p2.name, '') AS p2_name, COALESCE(p2.icon, '') AS p2_icon,
-         p3.id AS p3, COALESCE(p3.name, '') AS p3_name, COALESCE(p3.icon, '') AS p3_icon,
+         p1.id AS p1, COALESCE(p1.name, '') AS p1_name, COALESCE(p1.kind, '') AS p1_kind, COALESCE(p1.icon, '') AS p1_icon,
+         p2.id AS p2, COALESCE(p2.name, '') AS p2_name, COALESCE(p2.kind, '') AS p2_kind, COALESCE(p2.icon, '') AS p2_icon,
+         p3.id AS p3, COALESCE(p3.name, '') AS p3_name, COALESCE(p3.kind, '') AS p3_kind, COALESCE(p3.icon, '') AS p3_icon,
          concat_ws(' / ', p3.name, p2.name, p1.name, c.name) AS path,
          NULLIF(max(COALESCE(c.last_message_at, ''), COALESCE((SELECT max(sent_at) FROM messages WHERE container_id = c.id), '')), '') AS own_at
   FROM containers AS c
@@ -537,7 +538,7 @@ candidates AS (
   FROM tree AS t LEFT JOIN inside AS i ON i.id = t.id LEFT JOIN kids AS k ON k.id = t.id)`
 
 const pickerColumns = `SELECT c.id, c.kind, COALESCE(c.own, ''), c.at, c.opens, c.threads, c.kind = 'group' OR c.is_group, c.participants_json, c.icon,
-  c.p1, c.p1_name, c.p1_icon, c.p2, c.p2_name, c.p2_icon, c.p3, c.p3_name, c.p3_icon`
+  c.p1, c.p1_name, c.p1_kind, c.p1_icon, c.p2, c.p2_name, c.p2_kind, c.p2_icon, c.p3, c.p3_name, c.p3_kind, c.p3_icon`
 
 // under keeps the chats in ?2 at any depth.
 const under = `(c.p1 = ?2 OR c.p2 = ?2 OR c.p3 = ?2)`
@@ -594,8 +595,9 @@ ORDER BY c.at DESC NULLS LAST, c.id LIMIT ?3`, string(words), parent, maxContain
 		if err != nil {
 			return nil, err
 		}
+		// A holder the term names exactly is already among the headings.
 		err = list(", "+store.Matching("?1", "?4")+"\n"+pickerColumns+` FROM matched AS m JOIN candidates AS c ON c.id = m.id
-WHERE ?2 = '' OR `+under+`
+WHERE c.kind NOT IN `+store.HolderKinds+` AND (?2 = '' OR `+under+`)
 ORDER BY m.n LIMIT ?3`, terms, parent, q.Limit, time.Now().UTC().Format(time.RFC3339Nano))
 		return out, err
 	case q.Parent != nil:
@@ -633,7 +635,8 @@ func scanContainers(ctx context.Context, db *sql.DB, members bool, query string,
 			parentID [3]sql.NullString
 		)
 		if err := rs.Scan(&c.ID, &c.Kind, &c.Name, &active, &c.Opens, &c.Threads, &group, &parts, &icon,
-			&parentID[0], &ps[0].Name, &ps[0].Icon, &parentID[1], &ps[1].Name, &ps[1].Icon, &parentID[2], &ps[2].Name, &ps[2].Icon); err != nil {
+			&parentID[0], &ps[0].Name, &ps[0].Kind, &ps[0].Icon, &parentID[1], &ps[1].Name, &ps[1].Kind, &ps[1].Icon,
+			&parentID[2], &ps[2].Name, &ps[2].Kind, &ps[2].Icon); err != nil {
 			return nil, err
 		}
 		c.Icon = iconVersion(icon)

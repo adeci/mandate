@@ -17,9 +17,7 @@ type newProposal struct {
 	Connector string             `json:"connector"`
 	Op        string             `json:"op"`
 	Prepared  connector.Prepared `json:"prepared"`
-	// Mailbox is the mailbox the chat is filed in, whose grant covers it.
-	Mailbox string `json:"mailbox"`
-	Note    string `json:"note"`
+	Note      string             `json:"note"`
 }
 
 func (s *Server) postProposal(w http.ResponseWriter, r *http.Request) {
@@ -30,6 +28,20 @@ func (s *Server) postProposal(w http.ResponseWriter, r *http.Request) {
 	if np.Op == "" || np.Prepared.Args == nil {
 		fail(w, http.StatusBadRequest, "op and prepared args are required")
 		return
+	}
+	// A grant on a server or mailbox covers the chat by where the
+	// connector, not the gateway, says it is.
+	var pl place
+	if c := np.Prepared.Container; c != "" && s.conns[np.Connector] != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), lookUpTimeout)
+		found, err := s.lookUp(ctx, np.Connector, []string{c})
+		cancel()
+		if err != nil {
+			s.log.Warn("proposal refused: chat lookup", "connector", np.Connector, "err", err)
+			fail(w, http.StatusServiceUnavailable, "the connector could not say where the chat is")
+			return
+		}
+		pl = found[c]
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -43,8 +55,7 @@ func (s *Server) postProposal(w http.ResponseWriter, r *http.Request) {
 	for _, g := range s.st.Grants {
 		chats := g.Record.Chats
 		covered = covered || g.Record.Identity == np.Identity && g.Record.Connector == np.Connector && g.live(s.now()) &&
-			(np.Prepared.Container == "" || len(chats) == 0 || slices.Contains(chats, np.Prepared.Container) ||
-				np.Mailbox != "" && slices.Contains(chats, np.Mailbox))
+			(np.Prepared.Container == "" || len(chats) == 0 || covers(chats, np.Prepared.Container, pl))
 	}
 	if !covered {
 		fail(w, http.StatusNotFound, "no live grant covers the chat")
@@ -112,6 +123,8 @@ type proposalView struct {
 	Status       string         `json:"status"`
 	CreatedAt    time.Time      `json:"created_at"`
 	ExpiresAt    time.Time      `json:"expires_at"`
+	// Chats is the chat the write goes to, if any.
+	Chats []chat `json:"chats,omitempty"`
 }
 
 func (s *Server) proposalView(p *proposal) proposalView {
@@ -128,18 +141,26 @@ func (s *Server) proposalView(p *proposal) proposalView {
 	if i := s.st.Identities[p.Identity]; i != nil {
 		v.IdentityName = i.Name
 	}
+	if p.Prepared.Container != "" {
+		v.Chats = []chat{{ID: p.Prepared.Container}}
+	}
 	return v
 }
 
 func (s *Server) getProposal(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	p := s.st.Proposals[r.PathValue("id")]
 	if p == nil {
+		s.mu.Unlock()
 		fail(w, http.StatusNotFound, "no such proposal")
 		return
 	}
-	reply(w, http.StatusOK, s.proposalView(p))
+	v := s.proposalView(p)
+	s.mu.Unlock()
+	refs := chatRefs{}
+	refs.chats(v.Connector, v.Chats)
+	s.place(r.Context(), refs).chats(v.Connector, v.Chats)
+	reply(w, http.StatusOK, v)
 }
 
 // The caller holds s.mu.

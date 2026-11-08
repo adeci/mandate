@@ -134,21 +134,25 @@ Calls that return nothing above answer `{}`.
 
 Times are RFC 3339 UTC, whole seconds. `…` stands for what the example would repeat.
 
-A grant is its record (`records.md`) plus `identity_name`, `chat_names` where the request named them, and `closed_at` once closed or paused:
+A chat is `{"id", "name"}`, with `kind`, `icon` and `parents` (`[{"id", "name", "kind", "icon"}]`, the outermost first) as its connector's listing gives them (`connector.md`), looked up per response; a chat the connector no longer has keeps its stored name and gets no parents. Request terms, activity entries, proposals and grants (`chat_refs`, in the order of `chats`) list chats this way. A chat of a holder's kind (`guild`, `space`, `forum`, `media`) stands for every chat under it.
+
+A grant is its record (`records.md`) plus `identity_name`, `chat_names` where the request named them, `chat_refs`, and `closed_at` once closed or paused:
 
 ```json
 {"id": "7RJ4P2W5ZK3HXQ6N5M2C4YB7DE", "identity": "QX3M7E2KQ4F5PN6ZJ7LDV2Y3AU", "identity_name": "laptop",
  "connector": "signal", "chats": ["group.6f1b2c"], "chat_names": {"group.6f1b2c": "~Family"},
+ "chat_refs": [{"id": "group.6f1b2c", "name": "~Family", "kind": "group"}],
  "horizon": 604800, "from": "2026-11-03T09:15:00Z", "until": "2026-11-03T10:15:00Z",
  "created_at": "2026-11-03T09:15:00Z", "closed_at": "2026-11-03T09:40:00Z"}
 ```
 
-A proposal, as `GET /owner/v1/proposals/{id}` and `now` show it; `editable` lists the `param`s of `display`:
+A proposal, as `GET /owner/v1/proposals/{id}` and `now` show it; `editable` lists the `param`s of `display`, and `chats` the chat it writes to, if any:
 
 ```json
 {"id": "Z2K7Q4M3P6X5W2N7D4R3J6YB5C", "identity": "QX3M…", "identity_name": "laptop", "connector": "signal", "op": "send",
  "display": [{"label": "To", "value": "~Family"}, {"label": "Text", "value": "See you at 8", "param": "text"}],
  "editable": ["text"], "note": "the owner asked me to reply", "status": "pending",
+ "chats": [{"id": "group.6f1b2c", "name": "~Family", "kind": "group"}],
  "created_at": "2026-11-03T09:30:00Z", "expires_at": "2026-11-04T09:30:00Z"}
 ```
 
@@ -169,8 +173,8 @@ A proposal, as `GET /owner/v1/proposals/{id}` and `now` show it; `editable` list
 `GET /owner/v1/activity`:
 
 ```json
-{"entries": [{"at": "2026-11-03T09:20:00Z", "kind": "read", "identity": "QX3M…", "connector": "signal",
-              "chats": [{"id": "group.6f1b2c", "name": "~Family"}], "count": 20, "detail": "messages"},
+{"entries": [{"at": "2026-11-03T09:20:00Z", "until": "2026-11-03T09:24:10Z", "kind": "read", "identity": "QX3M…", "connector": "signal",
+              "chats": [{"id": "group.6f1b2c", "name": "~Family"}], "count": 20, "detail": "chats", "verbs": ["chats", "messages"]},
              {"at": "2026-11-03T09:15:00Z", "kind": "request.approved", "identity": "QX3M…", "connector": "signal",
               "chats": [{"id": "group.6f1b2c", "name": "~Family"}], "detail": "30m window, 7d of history",
               "reason": "summarize the weekend plans", "terms": [{"term": "fam", "chats": [{"id": "group.6f1b2c", "name": "~Family"}]}],
@@ -180,7 +184,7 @@ A proposal, as `GET /owner/v1/proposals/{id}` and `now` show it; `editable` list
 
 An entry has `at` and `kind`, and `identity`, `connector`, `chats`, `count` and `detail` where they apply; request entries add the request's `reason` and `terms`, proposal entries the agent's `note`, what a device decided its display name as `device`, and logins and joins the new party's `address`. Never message text, except a write's signed display, which the owner approved. The kinds:
 
-- `read`: an agent read; `detail` is the read (`chats`, `messages`, `search`, `media` or a read op), `count` the messages.
+- `read`: an agent's reads. `verbs` are what it did, in order (`chats`, `messages`, `search`, `media` or a read op), `detail` the first; `count` sums the messages, `chats` lists each chat once. A read joins the entry written last when that is a read by the same identity on the same connector that began at most 10 minutes before; `until`, set on every merged entry, is then its last read, which may equal `at`. Anything else written between, another connector or another identity starts a new entry.
 - `request.asked`, `request.approved` (`detail`: window and history), `request.denied`, `request.expired`.
 - `proposal.made` (`detail`: the op), `proposal.approved`, then its outcome `proposal.done`, `proposal.failed` or `proposal.unknown` (`detail`: the signed display's text); `proposal.denied`, `proposal.expired`.
 - `grant.made` (by the owner), `grant.extended`, `grant.closed`, `routine.paused`, `routine.resumed`.
