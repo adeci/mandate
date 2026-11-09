@@ -34,16 +34,16 @@ pub struct Picker {
     pub path: Vec<Container>,
     /// What the search, or the place shown, holds; None until it comes.
     pub found: Option<Vec<Container>>,
-    /// At the top without a search: the newest chats anywhere.
-    pub recent: Option<Vec<Container>>,
     /// The picked chats' own rows, for their pictures and ages.
     pub picked: Vec<Container>,
 }
 
 /// How many chats a list shows before `Search for more`; shelves are never
-/// cut. RECENT shows the newest few.
+/// cut.
 const LIMIT: usize = 50;
-const RECENT: usize = 5;
+
+/// The columns an age takes: "2025", "12w", "Sep", "now".
+const AGE: usize = 4;
 
 /// Whether a chat only holds others, a Discord server or forum, or a Matrix
 /// space: listed apart, it opens to its chats, and a tick on it is all of
@@ -104,7 +104,6 @@ impl Shell {
             q: String::new(),
             path: Vec::new(),
             found: None,
-            recent: None,
             picked: Vec::new(),
         });
         self.find_chats(cx);
@@ -118,8 +117,8 @@ impl Shell {
 
     /// Asks the connector for what the picker shows (connector.md, Chats for
     /// the owner): the search's matches, inside the opened row if one is;
-    /// else the opened row's chats; else the top level, and the newest chats
-    /// anywhere for RECENT.
+    /// else the opened row's chats; else the top level. And the ticked
+    /// chats' own rows.
     pub(crate) fn find_chats(&mut self, cx: &mut Context<Self>) {
         let Some(p) = &self.picker else { return };
         let (q, conn) = (p.q.clone(), p.connector.clone());
@@ -133,17 +132,7 @@ impl Shell {
             (None, true) => path += "&parent=",
             (None, false) => {}
         }
-        let recent = (q.is_empty() && parent.is_none())
-            .then(|| format!("connectors/{}/chats?limit={RECENT}", segment(&conn)));
-        let picked: Vec<String> = match (&p.pick, &self.screen) {
-            (Pick::Request(id), _) => {
-                self.adjust.get(id).map(|a| a.names.keys().cloned().collect()).unwrap_or_default()
-            }
-            (Pick::Grant, Screen::Grant(g)) => {
-                g.chats.iter().flatten().map(|(id, _)| id.clone()).collect()
-            }
-            _ => Vec::new(),
-        };
+        let picked: Vec<String> = self.ticked().into_iter().collect();
         let picked = (!picked.is_empty()).then(|| {
             let ids: Vec<String> = picked.iter().map(|i| segment(i)).collect();
             format!("connectors/{}/chats?ids={}", segment(&conn), ids.join(","))
@@ -153,16 +142,15 @@ impl Shell {
             cx,
             move || {
                 let found = client.get::<Vec<Container>>(&path)?;
-                let recent = recent.map(|r| client.get::<Vec<Container>>(&r)).transpose()?;
                 let picked = picked.map(|r| client.get::<Vec<Container>>(&r)).transpose()?;
-                Ok((found, recent, picked.unwrap_or_default()))
+                Ok((found, picked.unwrap_or_default()))
             },
-            move |this, (found, recent, picked), _| {
+            move |this, (found, picked), _| {
                 if let Some(p) = &mut this.picker
                     && (&p.q, &p.connector, p.path.last().map(|c| &c.id))
                         == (&q, &conn, parent.as_ref())
                 {
-                    (p.found, p.recent, p.picked) = (Some(found), recent, picked);
+                    (p.found, p.picked) = (Some(found), picked);
                 }
             },
         );
@@ -172,7 +160,7 @@ impl Shell {
     pub(crate) fn open_row(&mut self, row: Container, cx: &mut Context<Self>) {
         if let Some(p) = &mut self.picker {
             p.path.push(row);
-            (p.found, p.recent) = (None, None);
+            p.found = None;
         }
         self.find_chats(cx);
         cx.notify();
@@ -184,7 +172,7 @@ impl Shell {
         if p.path.pop().is_none() {
             return false;
         }
-        (p.found, p.recent) = (None, None);
+        p.found = None;
         self.find_chats(cx);
         cx.notify();
         true
@@ -204,11 +192,12 @@ impl Shell {
     }
 
     /// One bordered element: the search over a scrollable list of the
-    /// connector's chats. At the top: PICKED, RECENT, the shelves (servers,
-    /// spaces, mailboxes) and the chats outside them; flat connectors list
-    /// their chats alone. `›` opens a row; the back row goes up one level.
-    /// pinned (the chats already picked) stay on top at the top level; row
-    /// draws a chat with its control, around the line the picker makes for it.
+    /// connector's chats. At the top: PICKED, the shelves (servers, spaces,
+    /// mailboxes) and the chats outside them; flat connectors list their
+    /// chats alone. `›` opens a row; the back row goes up one level. pinned
+    /// (the chats already picked) stay on top at the top level, under their
+    /// servers as a tree; row draws a chat with its control, around the
+    /// line the picker makes for it.
     pub(crate) fn picker(
         &self,
         t: Theme,
@@ -234,7 +223,7 @@ impl Shell {
         // rise to the top only at the top level: inside a shelf its own chats
         // keep their order, picks ticked in place.
         let known = |id: &str| {
-            let lists = [Some(&p.picked), p.found.as_ref(), p.recent.as_ref()];
+            let lists = [Some(&p.picked), p.found.as_ref()];
             lists.into_iter().flatten().flatten().find(|r| r.id == id).cloned()
         };
         let pinned: Vec<Container> = match inside {
@@ -244,8 +233,6 @@ impl Shell {
         let pinned_ids: BTreeSet<String> = pinned.iter().map(|c| c.id.clone()).collect();
         let mut parts = vec![part(labelled.then(|| "PICKED".into()), pinned)];
         if labelled {
-            let recent = p.recent.clone().unwrap_or_default().into_iter().take(RECENT).collect();
-            parts.push(part(Some("RECENT".into()), recent));
             let kind = shelves.first().map_or("", |s| s.kind.as_str());
             parts.push(part(Some(shelf_label(kind).into()), shelves));
             parts.push(part(Some("CHATS".into()), chats));
@@ -275,27 +262,74 @@ impl Shell {
         };
         let dim = Theme { text: t.alt, ..t };
         let mut rows: Vec<AnyElement> = Vec::new();
-        for (label, chats) in parts {
+        let draw = |c: &Container, place: Option<&Container>, cx: &mut Context<Self>| {
+            let line = self.chat_line(t, c, place, twin(c), cx);
+            match covered(c) && !c.hidden {
+                true => div()
+                    .flex()
+                    .items_center()
+                    .gap(chars(1.))
+                    .py(lines(0.25))
+                    .text_color(t.alt)
+                    .child(checkbox(dim, true))
+                    .child(line)
+                    .into_any_element(),
+                false => row(c, line, cx),
+            }
+        };
+        for (i, (label, chats)) in parts.into_iter().enumerate() {
             if chats.is_empty() {
                 continue;
             }
             rows.extend(
                 label.map(|l| t.alt(l).font_weight(MEDIUM).pt(lines(0.25)).into_any_element()),
             );
-            for c in &chats {
-                let line = self.chat_line(t, c, place(c), twin(c), cx);
-                rows.push(match covered(c) && !c.hidden {
-                    true => div()
+            if i > 0 {
+                rows.extend(chats.iter().map(|c| draw(c, place(c), cx)));
+                continue;
+            }
+            // PICKED: each server once, its picked chats beneath as a tree;
+            // a server picked whole heads them, and ends in "all channels".
+            for (head, cs) in picked_groups(&chats) {
+                let Some(head) = head else {
+                    rows.extend(cs.iter().map(|c| draw(c, None, cx)));
+                    continue;
+                };
+                let whole = cs.iter().find(|c| c.id == head.id);
+                rows.push(match whole {
+                    Some(h) => draw(h, None, cx),
+                    None => div()
                         .flex()
                         .items_center()
                         .gap(chars(1.))
                         .py(lines(0.25))
-                        .text_color(t.alt)
-                        .child(checkbox(dim, true))
-                        .child(line)
+                        .children(self.row_picture(t, &head, false, cx))
+                        .child(div().min_w_0().truncate().font_weight(MEDIUM).child(display(&head)))
                         .into_any_element(),
-                    false => row(c, line, cx),
                 });
+                let under: Vec<&Container> = cs.iter().filter(|c| c.id != head.id).collect();
+                let breadth = whole.and_then(|h| crate::chats::whole(&h.kind));
+                let n = under.len() + usize::from(breadth.is_some());
+                for (j, c) in under.into_iter().enumerate() {
+                    let row = draw(c, Some(&head), cx);
+                    rows.push(
+                        div()
+                            .flex()
+                            .items_center()
+                            .child(branch(t, j + 1 == n))
+                            .child(div().flex_1().min_w_0().child(row))
+                            .into_any_element(),
+                    );
+                }
+                rows.extend(breadth.map(|w| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .py(lines(0.25))
+                        .child(branch(t, true))
+                        .child(w)
+                        .into_any_element()
+                }));
             }
         }
         if rows.is_empty() {
@@ -396,6 +430,7 @@ impl Shell {
         let reserve = 3
             + if picture.is_some() { 4 } else { 0 }
             + if value.is_empty() { 0 } else { value.chars().count() + 1 }
+            + if age.is_empty() { 0 } else { AGE + 1 }
             + if c.opens { 3 } else { 0 };
         let room = words::chat_cols().saturating_sub(reserve);
         let name = words::fit_path(&parents, &own, room);
@@ -428,8 +463,16 @@ impl Shell {
                     .when(holds_chats(c), |d| d.font_weight(MEDIUM))
                     .child(name),
             )
-            .when(!value.is_empty(), |d| d.child(t.alt(value).flex_none()))
-            .child(t.alt(age).w(chars(4.)).flex_none().text_right())
+            .when(!value.is_empty(), |d| d.child(t.alt(value).flex_none().whitespace_nowrap()))
+            // The longest age, "2025", "12w" or "Sep", in a column of its own
+            // that never wraps: the name gives way.
+            .child(
+                t.alt(age)
+                    .w(chars(AGE as f32) + gpui::px(2.))
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .text_right(),
+            )
             .children(open)
     }
 
@@ -825,7 +868,7 @@ impl Shell {
     ) -> Div {
         let id = id.to_string();
         let ticked = a.chats.clone();
-        let pinned = a.names.values().map(as_row).collect();
+        let pinned = a.ticked().into_iter().map(as_row).collect();
         self.picker(t, pinned, cx, move |c, line, cx| {
             if c.hidden {
                 return div().py(lines(0.25)).pl(chars(3.)).child(line).into_any_element();
@@ -871,6 +914,47 @@ impl Shell {
         };
         Some(self.picture(t, &p.connector, id, icon, name, cx))
     }
+}
+
+/// Picked chats grouped under their outermost parent, in the order they
+/// come: a server picked whole heads its own group; a chat with no parent
+/// stands alone, with no head.
+fn picked_groups(chats: &[Container]) -> Vec<(Option<Container>, Vec<Container>)> {
+    let mut groups: Vec<(Option<Container>, Vec<Container>)> = Vec::new();
+    for c in chats {
+        let head = match (holds_chats(c), c.parents.first()) {
+            (true, _) => Some(Container { parents: Vec::new(), ..c.clone() }),
+            (false, Some(p)) => Some(Container {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                kind: p.kind.clone(),
+                icon: p.icon.clone(),
+                ..Container::default()
+            }),
+            (false, None) => None,
+        };
+        let key = head.as_ref().map(|h| h.id.clone());
+        match groups
+            .iter_mut()
+            .find(|(h, _)| key.is_some() && h.as_ref().map(|h| &h.id) == key.as_ref())
+        {
+            Some((h, cs)) => {
+                // The server's own row, once it comes, is its head.
+                if holds_chats(c) {
+                    *h = Some(c.clone());
+                }
+                cs.push(c.clone())
+            }
+            None => groups.push((head, vec![c.clone()])),
+        }
+    }
+    groups
+}
+
+/// A tree's branch before a chat under its server: "├─", or "└─" for the
+/// last, muted.
+pub(crate) fn branch(t: Theme, last: bool) -> Div {
+    t.alt(if last { "└─" } else { "├─" }).w(chars(3.)).flex_none()
 }
 
 /// A chat's own name, else the end of its ID.

@@ -118,9 +118,10 @@ def lines(png: bytes | None = None, *opts: str) -> list[list[tuple[str, int, int
 
 # The centre of the label's lowest appearance, below the label below if
 # given: "Let laptop in" is also the heading above its button, and a sheet's
-# buttons sit below what it covers.
-def find(label: str, below: str | None = None) -> tuple[int, int] | None:
-    found = lines()
+# buttons sit below what it covers. The page layout skips the picker's boxed
+# rows, which block reads as one block of text.
+def find(label: str, below: str | None = None, block: bool = False) -> tuple[int, int] | None:
+    found = lines(None, "--psm", "6") if block else lines()
 
     def lowest(label: str) -> tuple[int, int] | None:
         want = label.lower().split()
@@ -144,11 +145,11 @@ def find(label: str, below: str | None = None) -> tuple[int, int] | None:
 
 # Waits for the label to sit still (cards come and go as the server's news
 # arrives), scrolling down if asked.
-def see(label: str, scroll: bool = False, below: str | None = None) -> tuple[int, int]:
+def see(label: str, scroll: bool = False, below: str | None = None, block: bool = False) -> tuple[int, int]:
     last: list[tuple[int, int]] = []
 
     def look() -> tuple[int, int] | None:
-        at = find(label, below)
+        at = find(label, below, block)
         if at is None and scroll:
             adb("shell", "input", "swipe", "540", "1800", "540", "800", "600")
         settled = at and last and abs(at[0] - last[0][0]) + abs(at[1] - last[0][1]) < 8
@@ -161,8 +162,8 @@ def see(label: str, scroll: bool = False, below: str | None = None) -> tuple[int
         raise AssertionError(f"no {label!r} on screen, which reads: {seen}")
 
 
-def tap(label: str, scroll: bool = False, below: str | None = None) -> None:
-    x, y = see(label, scroll, below)
+def tap(label: str, scroll: bool = False, below: str | None = None, block: bool = False) -> None:
+    x, y = see(label, scroll, below, block)
     print(f"tap {label!r} at {x},{y}; the screen reads: {seen}")
     adb("shell", "input", "tap", str(x), str(y))
 
@@ -376,6 +377,27 @@ def save(name: str) -> None:
     (driver.out_dir / f"{name}.png").write_bytes(screenshot())
 
 
+# Back keeps what the picker has picked and goes up a level: out of an opened
+# server, then the picker, then the sheet. The sheet dims Now, which OCR then
+# doesn't read, so Now's heading shows once it closes.
+def close_sheet() -> None:
+    for _ in range(3):
+        adb("shell", "input", "keyevent", "KEYCODE_BACK")
+        try:
+            until("the sheet to close", lambda: find("Waiting for you"), 10)
+            return
+        except AssertionError:
+            print(f"after Back, the screen reads: {seen}")
+    raise AssertionError(f"the sheet stays open, and the screen reads: {seen}")
+
+
+# The words of each line of the waiting card that see() last read, Approve's
+# label left out: open grants follow under "OPEN NOW".
+def waiting_card() -> list[list[str]]:
+    waiting = itertools.takewhile(lambda line: not line.startswith("open"), seen)
+    return [line.split() for line in waiting if "min" not in line.split()]
+
+
 # The demo's discord has #general on servers "main" and "other", and a
 # thread under main's (nix/testconnector/shapes.go). With the chats in its
 # label, OCR can miss Approve's first letters; "30 min" is only there.
@@ -409,15 +431,7 @@ with subtest("a term that matched nothing is fixed in one place on its card"):
         print(f"the picker reads: {seen}")
     _, left, top, right, bottom = rows[-1]
     adb("shell", "input", "tap", str((left + right) // 2), str((top + bottom) // 2))
-    # Back confirms the pick and closes the sheet; the first may close the
-    # picker alone. The sheet covers Deny until it closes.
-    for _ in range(2):
-        adb("shell", "input", "keyevent", "KEYCODE_BACK")
-        try:
-            until("the sheet to close", lambda: find("Deny"), 15)
-            break
-        except AssertionError:
-            pass
+    close_sheet()
     tap("30 min")
     finger()
     server.wait_until_succeeds("mandate discord chats")
@@ -429,9 +443,7 @@ with subtest("a term naming a server and a channel finds that one channel"):
     assert status == 75, (status, out)
     tap("Now")
     see("30 min")
-    # Only the waiting card: open grants follow under "OPEN NOW".
-    waiting = list(itertools.takewhile(lambda line: not line.startswith("open"), seen))
-    card = [line.split() for line in waiting if "min" not in line.split()]
+    card = waiting_card()
     general = [words for words in card if "general" in words]
     # The server heads its chats, a line above them.
     has_main = any("main" in words for words in card)
@@ -446,13 +458,54 @@ with subtest("a term naming a server and a channel finds that one channel"):
     status, out = agent("discord messages main")
     assert status == 0 and "next: --before" in out, (status, out)
 
+with subtest("unticking unpicks, and only the ticks are granted"):
+
+    def discord_grants() -> int:
+        status, out = agent("access")
+        assert status == 0, (status, out)
+        return sum(line.split("\t")[0] == "discord" for line in out.splitlines()[1:])
+
+    before = discord_grants()
+    status, out = agent("request discord --chat 'main general' --for 30m --reason 'catch up' --wait 0")
+    assert status == 75, (status, out)
+    tap("Now")
+    see("30 min")
+    tap("Adjust")
+    # PICKED holds main with #general under it; SERVERS lists main and other.
+    see("Servers", block=True)
+    # A server row's text ticks it, all of it; the same tap unticks it.
+    tap("main", block=True)
+    see("all channels", block=True)
+    tap("main", block=True)
+    until("all of main to be unpicked", lambda: find("all channels", block=True) is None, 30)
+    # The › at the row's right end opens the server; ticking and unticking
+    # #random there leaves #general alone.
+    _, y = see("main", block=True)
+    adb("shell", "input", "tap", "1010", str(y))
+    see("random", block=True)
+    tap("random", block=True)
+    time.sleep(1)
+    tap("random", block=True)
+    time.sleep(1)
+    save("seed-untick")
+    close_sheet()
+    see("30 min")
+    card = waiting_card()
+    assert sum("general" in words for words in card) == 1 and any("main" in words for words in card), seen
+    assert not any("random" in words or "channels" in words for words in card), seen
+    tap("30 min")
+    finger()
+    until("the new grant", lambda: discord_grants() == before + 1, 60)
+    assert chat_ids("discord") == ["main"], chat_ids("discord")
+    gone("30 min")
+
 with subtest("a server's name asks for all of it"):
     status, out = agent("request discord --chat main --for 30m --reason 'catch up' --wait 0")
     assert status == 75, (status, out)
     tap("Now")
     see("30 min")
     see("all channels")
-    card = [line.split() for line in seen if "min" not in line.split()]
+    card = waiting_card()
     assert not any("other" in words or "general" in words for words in card), f"want all of main on the card, which reads: {seen}"
     tap("30 min")
     finger()

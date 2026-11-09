@@ -144,7 +144,7 @@ impl Shell {
                 )
             });
             let unmatched: Vec<_> = unmatched.collect();
-            let chats: Vec<&Chat> = a.names.values().collect();
+            let chats: Vec<&Chat> = a.ticked();
             let cols = words::chat_cols().saturating_sub(8).max(12);
             let key = format!("request/{}", r.id);
             column()

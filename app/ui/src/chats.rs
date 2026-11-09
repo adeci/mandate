@@ -1,9 +1,10 @@
 //! Sets of chats as the cards, Agents and Activity show them: each outermost
 //! parent (a server, space or mailbox) once, with its picture, and its chats
-//! beneath, one per line and indented; a chat with no parent on a line of its
+//! beneath it as a tree, one per line; a chat with no parent on a line of its
 //! own. A set longer than `LINES` lines folds into "+N more".
 
 use crate::api::{Chat, Grant};
+use crate::pick::branch;
 use crate::screens::{id_for, link};
 use crate::theme::{MEDIUM, Theme, chars};
 use crate::{Shell, words};
@@ -157,6 +158,8 @@ impl Shell {
                 Line::Alone(c) => Some(c.id.clone()),
                 _ => None,
             };
+            // The last line under a head closes its tree.
+            let last = !matches!(lines.get(i + 1), Some(Line::Under { .. } | Line::Whole(_)));
             let row = match line {
                 Line::Head { id, name, icon } => {
                     let next = lines.get(i + 1);
@@ -179,16 +182,15 @@ impl Shell {
                         .child(div().min_w_0().font_weight(MEDIUM).child(words::fit(name, room)))
                         .children(said.map(|w| div().font_weight(MEDIUM).child(format!("· {w}"))))
                 }
-                Line::Whole(w) => div().pl(chars(2.)).child(*w),
+                Line::Whole(w) => div().flex().child(branch(t, true)).child(*w),
                 Line::Under { chat, path } => {
-                    let room = cols.saturating_sub(2 + if twin { 9 } else { 0 });
+                    let room = cols.saturating_sub(3 + if twin { 9 } else { 0 });
                     let (own, above) = path.split_last().unwrap_or((&"", &[]));
                     div()
                         .flex()
-                        .gap_x(chars(1.))
-                        .pl(chars(2.))
+                        .child(branch(t, last))
                         .child(div().min_w_0().child(words::fit_path(above, own, room)))
-                        .when(twin, |d| d.child(t.alt(words::short_id(&chat.id))))
+                        .when(twin, |d| d.child(t.alt(words::short_id(&chat.id)).ml(chars(1.))))
                 }
                 Line::Alone(c) => {
                     let room = cols

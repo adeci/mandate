@@ -193,6 +193,12 @@ impl Adjust {
         let chats = names.keys().cloned().collect();
         Adjust { open: false, chats, names, for_: r.for_, horizon: r.horizon }
     }
+
+    /// The chats ticked now, as the card and PICKED show them: an untick
+    /// takes a chat out of both, where `names` keeps it to tick again.
+    fn ticked(&self) -> Vec<&api::Chat> {
+        self.names.values().filter(|c| self.chats.contains(&c.id)).collect()
+    }
 }
 
 pub struct Shell {
