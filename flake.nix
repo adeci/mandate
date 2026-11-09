@@ -74,6 +74,16 @@
               done
               touch $out
             '';
+          # Reads under grants must stay fast on a store the size of a real
+          # account; -race skews the timings, so this test runs on its own.
+          scale = packages.mandate.overrideAttrs {
+            pname = "mandate-scale";
+            preCheck = "";
+            checkFlags = [
+              "-run"
+              "TestReadsAtScale"
+            ];
+          };
         }
         // lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
           vm = pkgs.testers.runNixOSTest (import ./nix/vm-test.nix { inherit self pkgs; });

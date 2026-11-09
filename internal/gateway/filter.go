@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"slices"
 	"time"
 
 	"github.com/adeci/mandate/store"
@@ -65,18 +66,20 @@ named AS (
     AND COALESCE(c.parent_id, '') NOT IN (SELECT id FROM hidden)
     AND COALESCE(p1.parent_id, '') NOT IN (SELECT id FROM hidden)
     AND COALESCE(p2.parent_id, '') NOT IN (SELECT id FROM hidden)),
-covered AS (
-  SELECT n.id, n.kind, n.parent_id, n.last_message_at, n.via1, n.via2, n.via3, n.own, n.handle,
-         iif(n.prefix = '', n.own, n.prefix || ' / ' || COALESCE(n.own, n.id)) AS name,
-         (SELECT min(g.cutoff) FROM rule AS g
-          WHERE g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value IN (n.id, n.via1, n.via2, n.via3))) AS cutoff,
-         EXISTS (SELECT 1 FROM rule AS g
-          WHERE g.until != '' AND (g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value IN (n.id, n.via1, n.via2, n.via3)))) AS bounded
-  FROM named AS n),
+covered AS MATERIALIZED (
+  SELECT * FROM (
+    SELECT n.id, n.kind, n.parent_id, n.last_message_at, n.via1, n.via2, n.via3, n.own, n.handle,
+           iif(n.prefix = '', n.own, n.prefix || ' / ' || COALESCE(n.own, n.id)) AS name,
+           (SELECT min(g.cutoff) FROM rule AS g
+            WHERE g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value IN (n.id, n.via1, n.via2, n.via3))) AS cutoff,
+           EXISTS (SELECT 1 FROM rule AS g
+            WHERE g.until != '' AND (g.chats IS NULL OR EXISTS (SELECT 1 FROM json_each(g.chats) AS k WHERE k.value IN (n.id, n.via1, n.via2, n.via3)))) AS bounded
+    FROM named AS n)
+  WHERE cutoff IS NOT NULL),
 chats AS (
   SELECT id, kind, parent_id, last_message_at, via1, via2, via3, cutoff, bounded, iif(name_code, '[login code hidden]', name) AS name,
          iif(name_code, NULL, own) AS own, iif(name_code, NULL, handle) AS handle, name_code
-  FROM (SELECT *, name IS NOT NULL AND login_code(name) AS name_code FROM covered WHERE cutoff IS NOT NULL)),
+  FROM (SELECT *, name IS NOT NULL AND login_code(name) AS name_code FROM covered)),
 stored AS (
   SELECT m.*, COALESCE(
     (SELECT iif(count(*) = 1, '[' || type || COALESCE(' ' || name, '') || ']',
@@ -137,10 +140,13 @@ type view struct {
 	hideChats, hidePeople, sc string
 	// now dates chats for store.Matching, in RFC 3339.
 	now string
+	// named is a scope whose every rule names its chats.
+	named bool
 }
 
 func newView(db *sql.DB, ns neverShared, scope []rule, now time.Time) (*view, error) {
 	v := &view{db: db, now: now.UTC().Format(time.RFC3339Nano)}
+	v.named = !slices.ContainsFunc(scope, func(r rule) bool { return r.Chats == nil })
 	// A JSON null would be one NULL row in json_each, and NOT IN a list
 	// holding NULL is never true.
 	for _, p := range []struct {
@@ -268,10 +274,10 @@ const replyTo = `(SELECT r.seq FROM msgs AS r WHERE r.id = m.reply_to_id)`
 const listed = `, listed AS MATERIALIZED (
   SELECT * FROM (
     SELECT c.id, c.kind, c.parent_id, c.name, c.own, c.handle, c.name_code, c.cutoff, NULLIF(max(
-      COALESCE((SELECT max(sent_at) FROM msgs WHERE container_id = c.id), ''),
+      COALESCE((SELECT sent_at FROM msgs WHERE container_id = c.id AND sent_at >= c.cutoff ORDER BY sent_at DESC LIMIT 1), ''),
       COALESCE(c.last_message_at, '')), '') AS at
     FROM chats AS c
-    WHERE EXISTS (SELECT 1 FROM msgs WHERE container_id = c.id AND NOT code AND NOT deleted)
+    WHERE EXISTS (SELECT 1 FROM msgs WHERE container_id = c.id AND sent_at >= c.cutoff AND NOT code AND NOT deleted ORDER BY sent_at DESC)
        OR NOT EXISTS (SELECT 1 FROM messages WHERE container_id = c.id))
   WHERE cutoff = '' OR at >= cutoff)
 `
@@ -335,10 +341,17 @@ ORDER BY m.sent_at DESC, m.seq DESC LIMIT ?6`, chat, before, limit+1)
 const searchSelect = `SELECT m.seq, m.at, m.container_id, c.name, m.sender_id, m.sender, ` + replyTo + `, m.text`
 
 // search matches the shown body, where login codes are blank; before as in
-// messages.
+// messages. Within named chats or one chat it reads each chat's messages
+// by index; over every chat it reads the newest first and stops at the
+// limit, which a scan of chats would not.
 func (v *view) search(ctx context.Context, text, chat, since string, before, limit int64) (*table, error) {
-	rows, err := v.query(ctx, searchSelect+` FROM msgs AS m JOIN chats AS c ON c.id = m.container_id
-WHERE instr(lower(m.body), lower(?4)) AND (?5 = '' OR m.container_id = ?5) AND m.sent_at >= ?6
+	from := `msgs AS m JOIN chats AS c ON c.id = m.container_id`
+	if v.named || chat != "" {
+		from = `chats AS c CROSS JOIN msgs AS m ON m.container_id = c.id`
+	}
+	rows, err := v.query(ctx, searchSelect+` FROM `+from+`
+WHERE instr(lower(m.body), lower(?4)) AND (?5 = '' OR m.container_id = ?5)
+  AND m.sent_at >= max(?6, (SELECT min(cutoff) FROM covered))
   AND (?7 = 0 OR (m.sent_at, m.seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?7))
 ORDER BY m.sent_at DESC, m.seq DESC LIMIT ?8`, text, chat, since, before, limit+1)
 	if err != nil {
