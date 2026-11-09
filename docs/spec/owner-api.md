@@ -117,7 +117,7 @@ Chat names that start with `~` were chosen by other people. The app shows chat I
 | `GET /owner/v1/connectors/{name}/setup` | Setup steps as data (`connector.md`). |
 | `POST /owner/v1/connectors/{name}/setup` | `{step, values}` |
 | `POST /owner/v1/connectors/{name}/unlink` | |
-| `GET /owner/v1/connectors/{name}/chats` | `?q=`, `?parent=` or `?ids=`: chats for the picker, as `GET /containers` in `connector.md` lists them. |
+| `GET /owner/v1/connectors/{name}/chats` | `?q=`, `?parent=` or `?ids=`, else the top level: chats for the picker, as `GET /containers` in `connector.md` lists them. |
 | `GET /owner/v1/connectors/{name}/icon` | `?chat=ID&v=<icon>`: the chat's picture as a 64 px square PNG made here, cached on disk (20 MiB, least recently served dropped). At the listing's version it is `Cache-Control: private, max-age=31536000, immutable`; a picture changed since is served `no-store`. `404` without a picture; `503` with `Retry-After` while the connector fetches others. |
 | `GET /owner/v1/never-share` | `[{connector, kind, id, name}]`, `kind` being `chat` or `person` |
 | `PUT /owner/v1/never-share/{connector}/{kind}/{id}` | `{name?}`. Hides the chat, or the person's messages and DMs, from every read and chat list, whatever the grants say. |

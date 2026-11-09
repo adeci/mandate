@@ -10,9 +10,9 @@ import (
 	"github.com/adeci/mandate/store"
 )
 
-// The picker's listing: the newest chats; a level, its shelves before its
-// chats; search at any depth with headings, and by a DM's handle; lookup by
-// ID.
+// The picker's listing: a level, its shelves before its chats, the top
+// level by default; search at any depth with headings, and by a DM's
+// handle; lookup by ID.
 func TestContainers(t *testing.T) {
 	ctx := t.Context()
 	dir := t.TempDir()
@@ -58,17 +58,16 @@ func TestContainers(t *testing.T) {
 		}
 		return out
 	}
-	top, main := "", "guild:1"
+	main := "guild:1"
 	for name, tc := range map[string]struct {
 		q    ContainerQuery
 		want []string
 	}{
-		"recent":           {ContainerQuery{Limit: 3}, []string{"32", "31", "12"}},
-		"top level":        {ContainerQuery{Parent: &top, Limit: 50}, []string{"guild:1", "guild:2", "32", "31", "30"}},
-		"top level, cut":   {ContainerQuery{Parent: &top, Limit: 1}, []string{"guild:1", "guild:2", "32"}},
-		"in main":          {ContainerQuery{Parent: &main, Limit: 50}, []string{"13", "10", "11"}},
+		"top level":        {ContainerQuery{Limit: 50}, []string{"guild:1", "guild:2", "32", "31", "30"}},
+		"top level, cut":   {ContainerQuery{Limit: 1}, []string{"guild:1", "guild:2", "32"}},
+		"in main":          {ContainerQuery{Parent: main, Limit: 50}, []string{"13", "10", "11"}},
 		"search":           {ContainerQuery{Q: "main", Limit: 50}, []string{"guild:1"}}, // all of main
-		"search in main":   {ContainerQuery{Q: "general", Parent: &main, Limit: 50}, []string{"10", "14"}},
+		"search in main":   {ContainerQuery{Q: "general", Parent: main, Limit: 50}, []string{"10", "14"}},
 		"search, headings": {ContainerQuery{Q: "help", Limit: 50}, []string{"13"}},
 		"search, path":     {ContainerQuery{Q: "main general", Limit: 50}, []string{"10", "14"}},
 		"search, handle":   {ContainerQuery{Q: "@sam_p", Limit: 50}, []string{"30"}},

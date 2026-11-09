@@ -291,8 +291,7 @@ side never opens the store:
 
 | Query | Answers |
 |---|---|
-| none | the newest chats anywhere, no shelves |
-| `parent=` (empty) | the top level: every shelf without a parent, then the chats without one |
+| none, or `parent=` (empty) | the top level: every shelf without a parent, then the chats without one |
 | `parent=ID` | the same in ID |
 | `q` | the shelves whose own name has every word of `q`, as headings, then the chats `q` finds as an agent's request term does ([agent-api.md](agent-api.md#access)); in `parent` at any depth if set |
 | `ids=a,b` | exactly those chats, in that order |

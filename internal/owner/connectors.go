@@ -109,7 +109,7 @@ func (s *Server) connectorChats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v := r.URL.Query()
-	q := connector.ContainerQuery{Q: v.Get("q"), Limit: 100}
+	q := connector.ContainerQuery{Q: v.Get("q"), Parent: v.Get("parent"), Limit: 100}
 	if l := v.Get("limit"); l != "" {
 		n, err := strconv.Atoi(l)
 		if err != nil || n < 1 || n > 500 {
@@ -117,10 +117,6 @@ func (s *Server) connectorChats(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		q.Limit = n
-	}
-	if v.Has("parent") {
-		p := v.Get("parent")
-		q.Parent = &p
 	}
 	if ids := v.Get("ids"); ids != "" {
 		q.IDs = strings.Split(ids, ",")

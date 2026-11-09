@@ -460,16 +460,15 @@ type Parent struct {
 //   - Q: the shelves whose own name has every word, as headings, then the
 //     chats Q finds as an agent's request term would, all under Parent at
 //     any depth if it is set;
-//   - Parent: the shelves in it, then up to Limit of its other chats; "" is
-//     the top level;
-//   - nothing: up to Limit chats anywhere, the newest first, no shelves.
+//   - otherwise: the shelves in Parent, then up to Limit of its other
+//     chats; no Parent is the top level.
 //
 // Shelves, the guilds, spaces, forums and mailboxes a chat is filed in, are
 // never cut by Limit, up to the 500 a call returns. Each list is the newest
 // first.
 type ContainerQuery struct {
 	Q      string
-	Parent *string
+	Parent string
 	IDs    []string
 	Limit  int
 }
@@ -478,11 +477,7 @@ const maxContainers = 500
 
 func (s *Server) containers(w http.ResponseWriter, r *http.Request) {
 	v := r.URL.Query()
-	q := ContainerQuery{Q: v.Get("q"), Limit: 50}
-	if v.Has("parent") {
-		p := v.Get("parent")
-		q.Parent = &p
-	}
+	q := ContainerQuery{Q: v.Get("q"), Parent: v.Get("parent"), Limit: 50}
 	if ids := v.Get("ids"); ids != "" {
 		q.IDs = strings.Split(ids, ",")
 	}
@@ -577,10 +572,6 @@ func (s *Server) listContainers(ctx context.Context, q ContainerQuery) ([]Contai
 		slices.SortFunc(out, func(a, b Container) int { return pos[a.ID] - pos[b.ID] })
 		return out, nil
 	case q.Q != "":
-		parent := ""
-		if q.Parent != nil {
-			parent = *q.Parent
-		}
 		words, err := json.Marshal(store.Words(q.Q))
 		if err != nil {
 			return nil, err
@@ -588,7 +579,7 @@ func (s *Server) listContainers(ctx context.Context, q ContainerQuery) ([]Contai
 		if err := list("\n"+pickerColumns+` FROM candidates AS c
 WHERE c.kind IN `+store.HolderKinds+` AND (?2 = '' OR `+under+`) AND json_array_length(?1) > 0
   AND NOT EXISTS (SELECT 1 FROM json_each(?1) AS w WHERE instr(lower(COALESCE(c.own, '')), w.value) = 0)
-ORDER BY c.at DESC NULLS LAST, c.id LIMIT ?3`, string(words), parent, maxContainers); err != nil {
+ORDER BY c.at DESC NULLS LAST, c.id LIMIT ?3`, string(words), q.Parent, maxContainers); err != nil {
 			return nil, err
 		}
 		terms, err := store.Terms([]string{q.Q})
@@ -598,20 +589,16 @@ ORDER BY c.at DESC NULLS LAST, c.id LIMIT ?3`, string(words), parent, maxContain
 		// A holder the term names exactly is already among the headings.
 		err = list(", "+store.Matching("?1", "?4")+"\n"+pickerColumns+` FROM matched AS m JOIN candidates AS c ON c.id = m.id
 WHERE c.kind NOT IN `+store.HolderKinds+` AND (?2 = '' OR `+under+`)
-ORDER BY m.n LIMIT ?3`, terms, parent, q.Limit, time.Now().UTC().Format(time.RFC3339Nano))
-		return out, err
-	case q.Parent != nil:
-		in := `COALESCE(c.parent_id, '') = ?1`
-		if err := list("\n"+pickerColumns+` FROM candidates AS c WHERE c.shelf AND `+in+`
-ORDER BY c.at DESC NULLS LAST, c.id LIMIT ?2`, *q.Parent, maxContainers); err != nil {
-			return nil, err
-		}
-		err := list("\n"+pickerColumns+` FROM candidates AS c WHERE NOT c.shelf AND `+in+`
-ORDER BY c.at DESC NULLS LAST, c.id LIMIT ?2`, *q.Parent, q.Limit)
+ORDER BY m.n LIMIT ?3`, terms, q.Parent, q.Limit, time.Now().UTC().Format(time.RFC3339Nano))
 		return out, err
 	}
-	err = list("\n"+pickerColumns+` FROM candidates AS c WHERE NOT c.shelf
-ORDER BY c.at DESC NULLS LAST, c.id LIMIT ?1`, q.Limit)
+	in := `COALESCE(c.parent_id, '') = ?1`
+	if err := list("\n"+pickerColumns+` FROM candidates AS c WHERE c.shelf AND `+in+`
+ORDER BY c.at DESC NULLS LAST, c.id LIMIT ?2`, q.Parent, maxContainers); err != nil {
+		return nil, err
+	}
+	err = list("\n"+pickerColumns+` FROM candidates AS c WHERE NOT c.shelf AND `+in+`
+ORDER BY c.at DESC NULLS LAST, c.id LIMIT ?2`, q.Parent, q.Limit)
 	return out, err
 }
 

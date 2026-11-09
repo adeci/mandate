@@ -143,8 +143,8 @@ func (c *Client) Containers(ctx context.Context, q ContainerQuery) ([]Container,
 	if q.Q != "" {
 		v.Set("q", q.Q)
 	}
-	if q.Parent != nil {
-		v.Set("parent", *q.Parent)
+	if q.Parent != "" {
+		v.Set("parent", q.Parent)
 	}
 	if q.IDs != nil {
 		v.Set("ids", strings.Join(q.IDs, ","))

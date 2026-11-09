@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"strings"
 	"time"
@@ -108,25 +109,27 @@ func fastmail(now time.Time) ([]store.Container, []store.Message) {
 }
 
 // signal has contacts with emoji, "~" profile names and the same name
-// twice, Note to Self, and groups with emoji and a 120+ character name.
+// twice, Note to Self, groups with emoji and a 120+ character name, and
+// chats last active weeks to over a year ago.
 func signal(now time.Time) ([]store.Container, []store.Message) {
-	dm := func(id, name string) store.Container {
-		return store.Container{ID: id, Kind: "dm", Name: name, Participants: []store.Participant{{ID: id, Name: name}}}
+	dm := func(id, name, number string) store.Container {
+		return store.Container{ID: id, Kind: "dm", Name: name, Participants: []store.Participant{{ID: id, Name: name, Handle: number}}}
 	}
 	cs := []store.Container{
-		dm("aci-self", "Note to Self"),
-		dm("aci-mum", "Mum ❤️"),
-		dm("aci-sam", "~Sam"),
-		dm("aci-alex-1", "Alex"),
-		dm("aci-alex-2", "Alex"),
+		dm("aci-self", "Note to Self", ""),
+		dm("aci-mum", "Mum ❤️", "+15550101"),
+		dm("aci-sam", "~Sam", "+15550102"),
+		dm("aci-alex-1", "Alex", "+15550103"),
+		dm("aci-alex-2", "Alex", "+15550104"),
 		{ID: "grp-hike", Kind: "group", IsGroup: true, Name: "🏔️ Hiking crew 🥾"},
 		{ID: "grp-long", Kind: "group", IsGroup: true, Name: "Neighbourhood association for the streets between the river, the old railway line and the park, including the allotments"},
 	}
+	ago := map[string]time.Duration{"aci-mum": 21 * 24 * time.Hour, "aci-alex-2": 400 * 24 * time.Hour, "grp-long": 84 * 24 * time.Hour}
 	var ms []store.Message
 	for i, c := range cs {
 		ms = append(ms, store.Message{
 			ID: c.ID + "/1", ContainerID: c.ID, SenderID: c.ID, SenderName: c.Name,
-			SentAt: now.Add(-time.Duration(i+1) * time.Minute), Body: "hello from " + c.Name,
+			SentAt: now.Add(-cmp.Or(ago[c.ID], time.Duration(i+1)*time.Minute)), Body: "hello from " + c.Name,
 		})
 	}
 	return cs, ms

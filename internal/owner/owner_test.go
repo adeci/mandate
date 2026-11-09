@@ -1549,7 +1549,7 @@ func TestChatsPassThrough(t *testing.T) {
 		}
 		return out, chats
 	}
-	if got, _ := ids("/owner/v1/connectors/test/chats?parent="); !slices.Equal(got, []string{"g1", "c3", "d1"}) {
+	if got, _ := ids("/owner/v1/connectors/test/chats"); !slices.Equal(got, []string{"g1", "c3", "d1"}) {
 		t.Errorf("top level %v", got)
 	}
 	got, chats := ids("/owner/v1/connectors/test/chats?ids=g1-general,c3")
