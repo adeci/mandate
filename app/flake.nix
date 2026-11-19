@@ -80,5 +80,26 @@
         apk = import ./nix/apk.nix { inherit pkgs rust sdk; };
       };
       checks.x86_64-linux.desktop = import ./nix/desktop-journey.nix { inherit mandate desktop; };
+      # The Rust tests, which read their vectors from docs/spec, and clippy.
+      checks.x86_64-linux.cargo = desktop.overrideAttrs {
+        pname = "mandate-app-cargo";
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            ./core
+            ./ui
+            ../docs/spec
+          ];
+        };
+        sourceRoot = "source/app";
+        buildPhase = ''
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+        '';
+        installPhase = "touch $out";
+        dontFixup = true;
+      };
     };
 }

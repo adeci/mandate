@@ -2,10 +2,16 @@
 //! or hands the link to the one already open; `--item ID` opens it on a
 //! waiting item; `--background` notifies of what waits.
 
+// On Android the library is the app; this binary is empty there.
+#![cfg_attr(target_os = "android", no_main)]
+#![cfg(not(target_os = "android"))]
+
 use futures::StreamExt;
 use gpui::{Bounds, WindowBounds, WindowOptions, px, size};
 use mandate_app::desktop::{self, APP_ID, Opened};
 use std::env::var_os;
+use std::fs::{self, Permissions};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 fn main() {
@@ -14,6 +20,13 @@ fn main() {
         .or_else(|| var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .expect("HOME or XDG_DATA_HOME")
         .join("mandate");
+    // Private: the cache, prefs and pictures in it get the default mode.
+    let private = fs::create_dir_all(&dir)
+        .and_then(|()| fs::set_permissions(&dir, Permissions::from_mode(0o700)));
+    if let Err(e) = private {
+        eprintln!("mandate: {}: {e}", dir.display());
+        std::process::exit(1);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "--background") {
         if let Err(e) = desktop::background(&dir) {

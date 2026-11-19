@@ -173,21 +173,43 @@ impl Device {
         saved["active"] = id(&self.key).into();
         write(dir, &saved)
     }
+
+    /// Forgets this pairing here, device.json last: the Keystore keys, the
+    /// token, and on Android the stream service. A security key keeps its
+    /// credential.
+    pub fn unpair(&self, dir: &Path) -> Result<(), Error> {
+        #[cfg(target_os = "android")]
+        {
+            crate::android::unpair();
+            // A key left behind belongs to no pairing; the device goes anyway.
+            for k in &self.keys {
+                let _ = k.delete();
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        if let Ok(saved) = fs::read(dir.join(FILE))
+            && let Ok(saved) = serde_json::from_slice::<Value>(&saved)
+            && let Some(id) = saved["token_id"].as_str()
+        {
+            crate::desktop::delete_token(id);
+        }
+        fs::remove_file(dir.join(FILE))?;
+        Ok(())
+    }
 }
 
 fn unknown() -> Error {
     Error::Invalid("This device has no such key.".into())
 }
 
+/// Replaces device.json whole: a crash leaves the old file or the new one.
 fn write(dir: &Path, saved: &Value) -> Result<(), Error> {
-    fs::create_dir_all(dir)?;
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(dir.join(FILE))?;
+    let new = dir.join(format!("{FILE}.new"));
+    let mut f =
+        OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&new)?;
     f.write_all(saved.to_string().as_bytes())?;
+    f.sync_all()?;
+    fs::rename(new, dir.join(FILE))?;
     Ok(())
 }
 

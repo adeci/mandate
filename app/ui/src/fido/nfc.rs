@@ -19,16 +19,15 @@ pub struct Nfc<C> {
 }
 
 impl<C: Card> Nfc<C> {
-    /// Selects the FIDO applet on the key.
+    /// Selects the FIDO applet on the key. A key that also speaks U2F
+    /// answers U2F_V2 as one that speaks only U2F does (CTAP 2.1, 11.3.3);
+    /// the latter refuses the first CTAP2 command.
     pub fn open(card: C) -> Result<Nfc<C>, Error> {
         let mut nfc = Nfc { card };
         let select = [&[0x00, 0xa4, 0x04, 0x00, AID.len() as u8][..], &AID, &[0x00]].concat();
         let version = nfc.exchange(&select)?;
         if version != b"FIDO_2_0" && version != b"U2F_V2" {
             return Err(odd());
-        }
-        if version == b"U2F_V2" {
-            return Err(key_error("This key is U2F only. Use a FIDO2 key."));
         }
         Ok(nfc)
     }
@@ -54,6 +53,10 @@ impl<C: Card> Nfc<C> {
                 (0x91, 0x00) => next = vec![0x80, 0x11, 0x00, 0x00, 0x00],
                 (0x6a, 0x82) => {
                     return Err(key_error("This card has no FIDO2 security key on it."));
+                }
+                // INS or CLA not supported: NFCCTAP_MSG, on a key that speaks only U2F.
+                (0x6d | 0x6e, 0x00) => {
+                    return Err(key_error("This key is U2F only. Use a FIDO2 key."));
                 }
                 (a, b) => {
                     return Err(Error::Key(format!("The security key answered {a:02x}{b:02x}.")));
@@ -148,6 +151,16 @@ mod tests {
         ]));
         let mut nfc = Nfc::open(script).unwrap();
         assert_eq!(nfc.call(0x02, &request).unwrap(), hex("00a101020304"));
+    }
+
+    #[test]
+    fn takes_a_key_that_also_speaks_u2f() {
+        let script = Script(VecDeque::from([
+            (select().0, [&b"U2F_V2"[..], &[0x90, 0x00]].concat()),
+            (hex("80100000010400"), hex("00a19000")),
+        ]));
+        let mut nfc = Nfc::open(script).unwrap();
+        assert_eq!(nfc.call(0x04, &[]).unwrap(), hex("00a1"));
     }
 
     #[test]

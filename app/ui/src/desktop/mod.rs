@@ -183,6 +183,15 @@ pub fn load_token(saved: &Value, id: &str) -> Option<String> {
     })
 }
 
+/// Removes what save_token kept under id from the Secret Service.
+pub fn delete_token(id: &str) {
+    let _ = futures::executor::block_on(async {
+        let keyring = oo7::Keyring::new().await?;
+        keyring.unlock().await?;
+        keyring.delete(&vec![(TOKEN_ATTRIBUTE, id)]).await
+    });
+}
+
 const TOKEN_LABEL: &str = "mandate device token";
 /// The ID of the device's first key, so that each data dir finds its own
 /// token.
@@ -237,7 +246,6 @@ pub fn forward(dir: &Path, opened: &Opened) -> bool {
 pub fn listen(dir: &Path) -> futures::channel::mpsc::UnboundedReceiver<Opened> {
     let (tx, rx) = futures::channel::mpsc::unbounded();
     let path = socket(dir);
-    let _ = std::fs::create_dir_all(dir);
     // Nothing answered forward, so a socket left here is stale.
     let _ = std::fs::remove_file(&path);
     match UnixListener::bind(&path) {
@@ -260,7 +268,6 @@ pub fn listen(dir: &Path) -> futures::channel::mpsc::UnboundedReceiver<Opened> {
 /// notification for each waiting item, naming only its identity, connector
 /// and kind; a click opens the app on the item. One runs per data dir.
 pub fn background(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    std::fs::create_dir_all(dir)?;
     let lock = std::fs::File::create(dir.join("background.lock"))?;
     if lock.try_lock().is_err() {
         return Ok(()); // the autostart entry and the user unit both start one

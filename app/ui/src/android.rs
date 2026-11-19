@@ -21,7 +21,7 @@ use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -397,7 +397,7 @@ pub enum Key {
 impl Key {
     pub fn method(&self) -> Method {
         match self {
-            Key::Keystore(k) => k.method(),
+            Key::Keystore(k) => k.method,
             Key::Fido(_) => Method::SecurityKey,
         }
     }
@@ -469,7 +469,7 @@ impl Key {
     /// Removes a Keystore key; a security key's credential stays on it.
     pub fn delete(&self) -> Result<(), Error> {
         match self {
-            Key::Keystore(k) => k.delete(),
+            Key::Keystore(k) => delete(&k.alias),
             Key::Fido(_) => Ok(()),
         }
     }
@@ -502,6 +502,7 @@ impl DeviceKey for Key {
 pub struct Keystore {
     point: [u8; 65],
     alias: String,
+    method: Method,
 }
 
 /// The alias of keys made before each key had its own.
@@ -519,7 +520,7 @@ impl Keystore {
             let sig = jni_sig!("(Ljava/lang/String;I)[B");
             keys(env, c, jni_str!("generate"), sig, &[(&name).into(), JValue::Int(method as i32)])
         })?;
-        Keystore::from_spki(&spki, alias)
+        Keystore::from_spki(&spki, alias, method)
     }
 
     pub fn load(alias: &str) -> Option<Keystore> {
@@ -528,35 +529,23 @@ impl Keystore {
             let sig = jni_sig!("(Ljava/lang/String;)[B");
             keys(env, c, jni_str!("publicKey"), sig, &[(&name).into()])
         });
-        spki.and_then(|spki| Keystore::from_spki(&spki, alias.into()))
+        let method = java(|env, c| {
+            let name = env.new_string(alias)?;
+            let sig = jni_sig!("(Ljava/lang/String;)I");
+            env.call_static_method(&c.keys, jni_str!("method"), sig, &[(&name).into()])?.i()
+        });
+        let method = if method.is_ok_and(|m| m == Method::ScreenLock as i32) {
+            Method::ScreenLock
+        } else {
+            Method::Biometric
+        };
+        spki.and_then(|spki| Keystore::from_spki(&spki, alias.into(), method))
             .inspect_err(|e| log::error!("{e}"))
             .ok()
     }
 
     pub fn alias(&self) -> &str {
         &self.alias
-    }
-
-    /// Removes the key from the Keystore; it signs nothing after.
-    pub fn delete(&self) -> Result<(), Error> {
-        java(|env, c| {
-            let name = env.new_string(&self.alias)?;
-            let sig = jni_sig!("(Ljava/lang/String;)V");
-            env.call_static_method(&c.keys, jni_str!("delete"), sig, &[(&name).into()])?.v()
-        })
-    }
-
-    pub fn method(&self) -> Method {
-        let method = java(|env, c| {
-            let name = env.new_string(&self.alias)?;
-            let sig = jni_sig!("(Ljava/lang/String;)I");
-            env.call_static_method(&c.keys, jni_str!("method"), sig, &[(&name).into()])?.i()
-        });
-        if method.is_ok_and(|m| m == Method::ScreenLock as i32) {
-            Method::ScreenLock
-        } else {
-            Method::Biometric
-        }
     }
 
     /// Asks the owner to authenticate as this key would, signing nothing.
@@ -573,14 +562,14 @@ impl Keystore {
 
     /// The point in an X.509 public key, which for P-256 is a fixed header
     /// and then the uncompressed point.
-    fn from_spki(spki: &[u8], alias: String) -> Result<Keystore, Error> {
+    fn from_spki(spki: &[u8], alias: String, method: Method) -> Result<Keystore, Error> {
         const HEADER: [u8; 26] = [
             0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
             0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
         ];
         let point = spki.strip_prefix(&HEADER).and_then(|p| p.try_into().ok());
         let point = point.ok_or_else(|| Error::Key("the Keystore key is not P-256".into()))?;
-        Ok(Keystore { point, alias })
+        Ok(Keystore { point, alias, method })
     }
 }
 
@@ -603,23 +592,36 @@ impl DeviceKey for Keystore {
     }
 }
 
+/// Removes the Keystore entry at alias.
+fn delete(alias: &str) -> Result<(), Error> {
+    java(|env, c| {
+        let name = env.new_string(alias)?;
+        let sig = jni_sig!("(Ljava/lang/String;)V");
+        env.call_static_method(&c.keys, jni_str!("delete"), sig, &[(&name).into()])?.v()
+    })
+}
+
+/// Keys.available, as Main says on every resume: bit 1 a strong biometric
+/// is enrolled, bit 2 a secure screen lock is set.
+static AVAILABLE: AtomicI32 = AtomicI32::new(0);
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_dev_mandate_app_Main_available(
+    _: EnvUnowned,
+    _: JClass,
+    bits: jni::sys::jint,
+) {
+    AVAILABLE.store(bits, Relaxed);
+}
+
 /// Whether a strong biometric is enrolled.
 pub fn biometrics_enrolled() -> bool {
-    available() & 1 != 0
+    AVAILABLE.load(Relaxed) & 1 != 0
 }
 
 /// Whether a secure screen lock (PIN, pattern or password) is set.
 pub fn screen_lock_set() -> bool {
-    available() & 2 != 0
-}
-
-fn available() -> i32 {
-    let bits = java(|env, c| {
-        let activity = activity(env);
-        let sig = jni_sig!("(Landroid/app/Activity;)I");
-        env.call_static_method(&c.keys, jni_str!("available"), sig, &[(&activity).into()])?.i()
-    });
-    bits.inspect_err(|e| log::error!("available: {e}")).unwrap_or(0)
+    AVAILABLE.load(Relaxed) & 2 != 0
 }
 
 /// The token sealed by a Keystore key.
@@ -647,6 +649,19 @@ pub fn listen() {
     });
     if let Err(e) = started {
         log::error!("starting the stream service: {e}");
+    }
+}
+
+/// Ends what pairing started outside device.json: the stream service, with
+/// its notifications, and the key that sealed the token (Keys.TOKEN).
+pub fn unpair() {
+    let stopped = java(|env, c| {
+        let activity = activity(env);
+        let sig = jni_sig!("(Landroid/app/Activity;)V");
+        env.call_static_method(&c.stream, jni_str!("stop"), sig, &[(&activity).into()])?.v()
+    });
+    if let Err(e) = stopped.and_then(|()| delete("token")) {
+        log::error!("unpairing: {e}");
     }
 }
 

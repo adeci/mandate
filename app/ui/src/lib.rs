@@ -97,10 +97,8 @@ enum Screen {
         exchange: Exchange,
         envelope: Envelope,
     },
-    Review {
-        proposal: Proposal,
-        envelope: Envelope,
-    },
+    /// The server answered that it does not know this device.
+    Forgotten,
     /// Linking a connector: the step it asked last, None while it loads.
     Link {
         name: String,
@@ -405,8 +403,19 @@ impl Shell {
     }
 
     /// Shows what failed: a server out of reach as the one notice, tried
-    /// again after a backoff until it answers; anything else as an error.
+    /// again after a backoff until it answers; a server that no longer knows
+    /// this device as its own screen; anything else as an error.
     fn fail(&mut self, e: Error, cx: &mut Context<Self>) {
+        if matches!(&e, Error::Api { status: 401, code, .. } if code == "token")
+            && self.device.is_some()
+        {
+            self.reached();
+            if !matches!(self.screen, Screen::Forgotten) {
+                self.back.clear();
+                self.swap(Screen::Forgotten, cx);
+            }
+            return;
+        }
         if !matches!(e, Error::Io(_)) || self.device.is_none() {
             self.error = Some(e.to_string());
             return;
@@ -490,10 +499,10 @@ impl Shell {
         let Some(id) = self.pending.take() else { return };
         if let Some(ex) = self.exchanges.iter().find(|e| e.id == id && e.state == "confirmed") {
             self.admit_exchange(ex.clone(), cx);
-        } else if let Some(p) = self.now.proposals.iter().find(|p| p.id == id) {
-            self.review(p.clone(), cx);
-        } else if self.now.requests.iter().any(|r| r.id == id) {
-            // Requests are decided on their card in Now.
+        } else if self.now.requests.iter().any(|r| r.id == id)
+            || self.now.proposals.iter().any(|p| p.id == id)
+        {
+            // Requests and sends are decided on their card in Now.
             self.root(Tab::Now, cx);
         }
     }
@@ -632,10 +641,10 @@ impl Shell {
         }
     }
 
-    /// After a decision: a screen made for it (Review, Let in, a new grant)
-    /// is left; a tab or Settings stays.
+    /// After a decision: a screen made for it (Let in, a new grant) is left;
+    /// a tab or Settings stays.
     fn decided_here(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.screen, Screen::Review { .. } | Screen::Admit { .. } | Screen::Grant(_)) {
+        if matches!(self.screen, Screen::Admit { .. } | Screen::Grant(_)) {
             self.up(cx);
         }
     }
@@ -729,19 +738,54 @@ impl Shell {
         });
         cx.spawn(async move |this, cx| {
             while let Some(connected) = rx.next().await {
-                let update = this.update(cx, |this, cx| match connected {
-                    Ok(()) => this.refresh(cx),
-                    Err(e) => {
-                        this.fail(e, cx);
-                        cx.notify();
+                // A device forgotten here stops listening.
+                let update = this.update(cx, |this, cx| {
+                    if this.device.is_none() {
+                        return false;
                     }
+                    match connected {
+                        Ok(()) => this.refresh(cx),
+                        Err(e) => {
+                            this.fail(e, cx);
+                            cx.notify();
+                        }
+                    }
+                    true
                 });
-                if update.is_err() {
+                if !matches!(update, Ok(true)) {
                     break;
                 }
             }
         })
         .detach();
+    }
+
+    /// Forgets the pairing with a server that no longer knows this device,
+    /// and starts over.
+    fn unpair(&mut self, cx: &mut Context<Self>) {
+        let (device, dir) = (self.device(), self.dir.clone());
+        self.call(
+            cx,
+            move || {
+                let gone = |r: std::io::Result<()>| match r {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        Err(Error::Invalid(e.to_string()))
+                    }
+                    _ => Ok(()),
+                };
+                gone(std::fs::remove_file(dir.join(CACHE)))?;
+                gone(std::fs::remove_dir_all(dir.join("pictures")))?;
+                device.unpair(&dir)
+            },
+            |this, (), cx| {
+                (this.device, this.nudge, this.pending, this.join_key) = (None, None, None, None);
+                (this.history, this.marks, this.server) = (None, None, String::new());
+                this.pictures = picture::Pictures::new(this.dir.join("pictures"));
+                this.cache.clear();
+                this.show_cache(cx);
+                this.swap(Screen::Welcome, cx);
+            },
+        );
     }
 
     /// Fetches everything but Activity; a failed fetch leaves what showed.
@@ -1113,7 +1157,7 @@ impl Shell {
         }
     }
 
-    /// Signs a record already shown in full: an admit or a reviewed send.
+    /// Signs a record already shown in full: an admit.
     fn approve(&mut self, mut envelope: Envelope, cx: &mut Context<Self>) {
         if self.signing {
             return;
@@ -1124,7 +1168,6 @@ impl Shell {
         }
         let device = self.device();
         let decided = match &self.screen {
-            Screen::Review { proposal, .. } => format!("proposals/{}", proposal.id),
             Screen::Admit { exchange, .. } => format!("exchanges/{}", exchange.id),
             _ => String::new(),
         };
@@ -1146,46 +1189,28 @@ impl Shell {
         if named {
             body["chats"] = json!(a.chats);
         }
+        let zone = words::zone();
         match r.kind.as_str() {
-            "routine" => body["zone"] = words::zone().into(),
+            "routine" => body["zone"] = zone.clone().into(),
             "once" => body["for"] = a.for_.into(),
             _ => body = json!({}),
         }
-        let (connector, kind) = (r.connector.clone(), r.kind.clone());
-        let check = move |record: &Record| {
-            let Record::Grant(g) = record else { return false };
-            let window = match kind.as_str() {
-                "once" => {
-                    g.until.zip(g.from).is_some_and(|(u, f)| (u.unix() - f.unix()) as u64 == a.for_)
-                }
-                "routine" => g.schedule.is_some(),
-                _ => return g.connector == connector,
-            };
-            let chats = if named {
-                g.chats.iter().cloned().collect::<BTreeSet<_>>() == a.chats
-            } else {
-                g.chats.is_empty()
-            };
-            g.connector == connector && chats && g.horizon == a.horizon && window
-        };
-        self.sign(format!("requests/{}/challenge", r.id), body, check, cx);
+        // An extend lengthens the agent's open window on the connector that
+        // ends last, as the server picks it.
+        let old = (self.now.grants.iter())
+            .filter(|g| g.identity == r.identity && g.connector == r.connector)
+            .filter(|g| g.schedule.is_none())
+            .max_by_key(|g| g.until.as_deref().and_then(words::unix))
+            .cloned();
+        let (path, r) = (format!("requests/{}/challenge", r.id), r.clone());
+        let check = move |record: &Record| matches!(record, Record::Grant(g) if answers(&r, &a, old.as_ref(), &zone, g));
+        self.sign(path, body, check, cx);
     }
 
     fn approve_send(&mut self, p: &Proposal, cx: &mut Context<Self>) {
         let (connector, display) = (p.connector.clone(), p.display.clone());
         let check = move |record: &Record| matches!(record, Record::Write(w) if w.connector == connector && w.display == display);
         self.sign(format!("proposals/{}/challenge", p.id), json!({"edits": {}}), check, cx);
-    }
-
-    fn review(&mut self, proposal: Proposal, cx: &mut Context<Self>) {
-        let client = self.device().client;
-        let path = format!("proposals/{}/challenge", proposal.id);
-        self.error = None;
-        self.call(
-            cx,
-            move || client.challenge(&path, &json!({"edits": {}})),
-            |this, envelope, cx| this.go(Screen::Review { proposal, envelope }, cx),
-        );
     }
 
     /// Sends a route that answers JSON, then refreshes, with notice saying
@@ -1425,30 +1450,7 @@ impl Shell {
     /// Typing into the field that takes it, from the keyboard or a paste.
     fn typed(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
-        // Every field is one line: a pasted line break types a space.
-        let typed = k.key_char.as_deref().unwrap_or_default().replace(['\n', '\r'], " ");
-        let typed = typed.as_str();
-        if let Some(p) = &mut self.picker {
-            // Search runs as it is typed; Enter only puts the keyboard away.
-            if k.key == "enter" {
-                keyboard(false);
-                return cx.notify();
-            }
-            if k.key == "backspace" {
-                p.q.pop();
-            } else {
-                p.q.push_str(typed);
-            }
-            self.find_chats(cx);
-            return cx.notify();
-        }
-        if let Some(name) = &mut self.renaming {
-            if k.key == "enter" {
-                return self.rename(cx);
-            }
-            type_into(name, ev, cx);
-            return cx.notify();
-        }
+        // A PIN prompt takes every key, whatever else is open.
         if let Some(unlock) = &mut self.unlock {
             match k.key.as_str() {
                 "enter" => self.submit_pin(cx),
@@ -1460,6 +1462,23 @@ impl Shell {
             }
             return cx.notify();
         }
+        if let Some(p) = &mut self.picker {
+            // Search runs as it is typed; Enter only puts the keyboard away.
+            if k.key == "enter" {
+                keyboard(false);
+                return cx.notify();
+            }
+            type_into(&mut p.q, ev, cx);
+            self.find_chats(cx);
+            return cx.notify();
+        }
+        if let Some(name) = &mut self.renaming {
+            if k.key == "enter" {
+                return self.rename(cx);
+            }
+            type_into(name, ev, cx);
+            return cx.notify();
+        }
         match (&mut self.screen, &mut self.search) {
             #[cfg(not(target_os = "android"))]
             (Screen::Choose(_), _) => return self.choose_key(ev, cx),
@@ -1469,19 +1488,14 @@ impl Shell {
             (Screen::Method { pin: Some(pin), .. }, _) => type_into(pin, ev, cx),
             (Screen::Link { focus: Some(_), .. }, _) if k.key == "enter" => self.submit_step(cx),
             (Screen::Link { values, focus: Some(f), step: Some(step), .. }, _) => {
-                let number = step.fields.iter().any(|x| &x.name == f && x.kind == "number");
                 let value = values.entry(f.clone()).or_default();
-                if k.key == "backspace" {
-                    value.pop();
-                } else if !number || typed.chars().all(|c| c.is_ascii_digit()) {
-                    value.push_str(typed);
+                type_into(value, ev, cx);
+                if step.fields.iter().any(|x| &x.name == f && x.kind == "number") {
+                    value.retain(|c| c.is_ascii_digit());
                 }
             }
             (Screen::Tab(_), Some(_)) if k.key == "enter" => keyboard(false),
-            (Screen::Tab(_), Some(q)) if k.key == "backspace" => {
-                q.pop();
-            }
-            (Screen::Tab(_), Some(q)) => q.push_str(typed),
+            (Screen::Tab(_), Some(q)) => type_into(q, ev, cx),
             (Screen::Join { code_field, .. }, _) if k.key == "enter" => {
                 if *code_field {
                     self.submit_join(cx);
@@ -1545,6 +1559,65 @@ fn type_into(text: &mut String, ev: &KeyDownEvent, cx: &App) {
     } else {
         text.push_str(&k.key_char.as_deref().unwrap_or_default().replace(['\n', '\r'], " "));
     }
+}
+
+/// Whether g answers r as its card shows it, narrowed as a says: the same
+/// agent, connector, chats, history and window. An extend lengthens old,
+/// the open grant it extends, and keeps the rest of it.
+fn answers(
+    r: &Request,
+    a: &Adjust,
+    old: Option<&api::Grant>,
+    zone: &str,
+    g: &mandate_core::Grant,
+) -> bool {
+    if g.identity != r.identity || g.connector != r.connector {
+        return false;
+    }
+    let window = match (r.kind.as_str(), &r.schedule, &g.schedule) {
+        ("extend", ..) => return old.is_some_and(|old| extends(old, r.for_, g)),
+        ("once", _, None) => {
+            g.until.zip(g.from).is_some_and(|(u, f)| (u.unix() - f.unix()) as u64 == a.for_)
+        }
+        ("routine", Some(s), Some(x)) => schedule_is(s, zone, x),
+        _ => false,
+    };
+    let chats = if r.terms.is_some() || !a.chats.is_empty() {
+        g.chats.iter().cloned().collect::<BTreeSet<_>>() == a.chats
+    } else {
+        g.chats.is_empty()
+    };
+    window && chats && g.horizon == a.horizon
+}
+
+/// Whether g is old again, ending seconds past whichever is later, old's
+/// end or g's start.
+fn extends(old: &api::Grant, seconds: u64, g: &mandate_core::Grant) -> bool {
+    let end = old.until.as_deref().and_then(words::unix);
+    let window = match (end, g.from, g.until) {
+        (Some(end), Some(f), Some(u)) => u.unix() == end.max(f.unix()) + seconds as i64,
+        _ => false,
+    };
+    window && keeps(old, g)
+}
+
+/// Whether g keeps old's agent, connector, chats, history and routine.
+fn keeps(old: &api::Grant, g: &mandate_core::Grant) -> bool {
+    let schedule = match (&old.schedule, &g.schedule) {
+        (None, None) => true,
+        (Some(s), Some(x)) => schedule_is(s, &s.zone, x),
+        _ => false,
+    };
+    g.identity == old.identity
+        && g.connector == old.connector
+        && g.chats == old.chats
+        && g.horizon == old.horizon
+        && schedule
+}
+
+/// Whether x runs on s's days, from its start, for its length, in zone.
+fn schedule_is(s: &api::Schedule, zone: &str, x: &mandate_core::Schedule) -> bool {
+    x.days == s.days && x.start == s.start && u64::from(x.length) == s.length && x.zone == zone
 }
 
 /// What waits for the owner, for notifications: each item's ID and a line
@@ -1667,4 +1740,106 @@ pub fn open(cx: &mut App, options: WindowOptions, dir: PathBuf) -> Entity<Shell>
     })
     .expect("open window");
     opened.expect("the window's view")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::from_value;
+
+    /// base with change applied, a null dropping a field.
+    fn with<T: serde::de::DeserializeOwned>(base: &Value, change: &Value) -> T {
+        let mut v = base.clone();
+        for (k, x) in change.as_object().expect("an object") {
+            match x {
+                Value::Null => drop(v.as_object_mut().expect("an object").remove(k)),
+                x => v[k] = x.clone(),
+            }
+        }
+        from_value(v).expect("as the server sends it")
+    }
+
+    #[test]
+    fn signs_only_the_grant_the_card_shows() {
+        let zone = "Europe/Berlin";
+        let once: Request = from_value(json!({
+            "id": "B5TQ", "identity": "QX3M", "identity_name": "laptop", "connector": "signal",
+            "kind": "once", "for": 1800, "horizon": 604800, "reason": "plan dinner",
+            "terms": [{"term": "family", "chats": [{"id": "g1", "name": "Family", "kind": "group"}]}],
+        }))
+        .unwrap();
+        let open = json!({
+            "id": "7RJ4", "identity": "QX3M", "connector": "signal", "chats": ["g1"],
+            "horizon": 604800, "from": "2026-11-03T09:00:00Z", "until": "2026-11-03T09:30:00Z",
+            "created_at": "2026-11-03T09:00:00Z",
+        });
+        let a = Adjust::of(&once);
+        for (change, ok) in [
+            (json!({}), true),
+            (json!({"identity": "ZZZZ"}), false),
+            (json!({"chats": ["g1", "g2"]}), false),
+            (json!({"chats": null}), false),
+            (json!({"horizon": 0}), false),
+            (json!({"until": "2026-11-03T21:00:00Z"}), false),
+        ] {
+            assert_eq!(answers(&once, &a, None, zone, &with(&open, &change)), ok, "once {change}");
+        }
+
+        let schedule = json!({"days": [1, 2, 3, 4, 5], "start": "07:00", "length": 1200});
+        let routine: Request = from_value(json!({
+            "id": "C6UR", "identity": "QX3M", "identity_name": "laptop", "connector": "signal",
+            "kind": "routine", "horizon": 86400, "schedule": schedule,
+        }))
+        .unwrap();
+        let runs = json!({
+            "id": "8SK5", "identity": "QX3M", "connector": "signal", "horizon": 86400,
+            "schedule": {"days": [1, 2, 3, 4, 5], "start": "07:00", "length": 1200, "zone": zone},
+            "created_at": "2026-11-03T09:00:00Z",
+        });
+        let a = Adjust::of(&routine);
+        let widened = |k: &str, x: Value| {
+            let mut s = runs["schedule"].clone();
+            s[k] = x;
+            json!({ "schedule": s })
+        };
+        for (change, ok) in [
+            (json!({}), true),
+            (json!({"identity": "ZZZZ"}), false),
+            (widened("days", json!([0, 1, 2, 3, 4, 5, 6])), false),
+            (widened("start", json!("00:00")), false),
+            (widened("length", json!(86400)), false),
+            (widened("zone", json!("Pacific/Kiritimati")), false),
+        ] {
+            let g = with(&runs, &change);
+            assert_eq!(answers(&routine, &a, None, zone, &g), ok, "routine {change}");
+            // Resume signs the paused routine again, unchanged.
+            assert_eq!(keeps(&with(&runs, &json!({})), &g), ok, "resume {change}");
+        }
+
+        let extend: Request = from_value(json!({
+            "id": "D7VS", "identity": "QX3M", "identity_name": "laptop", "connector": "signal",
+            "kind": "extend", "for": 1800,
+        }))
+        .unwrap();
+        let old: api::Grant = with(&open, &json!({}));
+        let longer = json!({
+            "id": "9TL6", "identity": "QX3M", "connector": "signal", "chats": ["g1"],
+            "horizon": 604800, "from": "2026-11-03T09:10:00Z", "until": "2026-11-03T10:00:00Z",
+            "created_at": "2026-11-03T09:10:00Z",
+        });
+        let a = Adjust::of(&extend);
+        for (change, ok) in [
+            (json!({}), true),
+            // Past its end, it runs from now.
+            (json!({"from": "2026-11-03T09:40:00Z", "until": "2026-11-03T10:10:00Z"}), true),
+            (json!({"identity": "ZZZZ"}), false),
+            (json!({"chats": null}), false),
+            (json!({"horizon": 0}), false),
+            (json!({"until": "2026-11-03T21:30:00Z"}), false),
+        ] {
+            let g = with(&longer, &change);
+            assert_eq!(answers(&extend, &a, Some(&old), zone, &g), ok, "extend {change}");
+        }
+        assert!(!answers(&extend, &a, None, zone, &with(&longer, &json!({}))));
+    }
 }

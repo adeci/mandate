@@ -41,6 +41,9 @@ public final class Main extends NativeActivity {
     /** Whether Android lets what waits reach the owner while the app is away. */
     private static native void kept(boolean kept);
 
+    /** Keys.available: which ways to approve the phone is set up for. */
+    private static native void available(int bits);
+
     /** Whether gpui has started drawing. */
     private static native boolean started();
 
@@ -106,13 +109,14 @@ public final class Main extends NativeActivity {
 
     /**
      * Also after Settings, where the owner may have switched 12/24-hour time,
-     * notifications or battery optimisation.
+     * notifications, battery optimisation, a fingerprint or the screen lock.
      */
     @Override
     protected void onResume() {
         super.onResume();
         clock(DateFormat.is24HourFormat(this));
         kept(Stream.kept(this));
+        available(Keys.available(this));
     }
 
     @Override

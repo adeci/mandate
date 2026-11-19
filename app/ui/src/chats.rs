@@ -25,11 +25,11 @@ pub(crate) fn whole(kind: &str) -> Option<&'static str> {
 
 /// One line of a set.
 enum Line<'a> {
-    /// An outermost parent, or a holder granted whole.
-    Head { id: &'a str, name: &'a str, icon: Option<&'a str> },
+    /// An outermost parent, or a holder granted whole, with what it covers.
+    Head { id: &'a str, name: &'a str, icon: Option<&'a str>, covers: Option<&'static str> },
     /// A chat under the head above it, by its path below that head.
     Under { chat: &'a Chat, path: Vec<&'a str> },
-    /// What a holder above covers: "all channels".
+    /// What the holder above covers, on a line of its own: "all channels".
     Whole(&'static str),
     /// A chat with no parent.
     Alone(&'a Chat),
@@ -41,6 +41,64 @@ enum Line<'a> {
 pub(crate) enum Whole {
     Beneath,
     Inline,
+}
+
+/// The lines of chats as a set: groups in the order their first chat comes.
+fn set_lines<'a>(chats: &[&'a Chat], whole_shows: Whole) -> Vec<Line<'a>> {
+    let mut groups: Vec<(Option<&str>, Vec<&Chat>)> = Vec::new();
+    for c in chats {
+        let parent = match (c.parents.first(), whole(&c.kind)) {
+            (_, Some(_)) => Some(c.id.as_str()),
+            (Some(p), None) => Some(p.id.as_str()),
+            (None, None) => None,
+        };
+        match groups.iter_mut().find(|(k, _)| k.is_some() && *k == parent) {
+            Some((_, cs)) => cs.push(c),
+            None => groups.push((parent, vec![c])),
+        }
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    for (parent, cs) in &groups {
+        let Some(parent) = parent else {
+            lines.extend(cs.iter().map(|c| Line::Alone(c)));
+            continue;
+        };
+        // A holder granted whole heads its group, and covers the rest.
+        if let Some(h) = cs.iter().find(|c| c.id == *parent) {
+            let covers = whole(&h.kind);
+            lines.push(Line::Head { id: &h.id, name: h.own(), icon: h.icon.as_deref(), covers });
+            if whole_shows == Whole::Beneath {
+                lines.push(Line::Whole(covers.unwrap_or_default()));
+            }
+            continue;
+        }
+        let p = &cs[0].parents[0];
+        lines.push(Line::Head { id: &p.id, name: &p.name, icon: p.icon.as_deref(), covers: None });
+        lines.extend(cs.iter().map(|c| {
+            let path = c.parents[1..].iter().map(|p| p.name.as_str()).chain([c.own()]);
+            Line::Under { chat: c, path: path.collect() }
+        }));
+    }
+    lines
+}
+
+/// Folds lines longer than LINES and one more, and says how many chats that
+/// hides: each chat, and each holder granted whole, once.
+fn fold(lines: &mut Vec<Line>) -> usize {
+    if lines.len() <= LINES + 1 {
+        return 0;
+    }
+    let mut cut = lines.split_off(LINES);
+    // A head whose lines beneath were cut waits for the unfolded set.
+    if matches!(lines.last(), Some(Line::Head { .. }))
+        && matches!(cut.first(), Some(Line::Under { .. } | Line::Whole(_)))
+    {
+        cut.extend(lines.pop());
+    }
+    let chat = |l: &&Line| {
+        matches!(l, Line::Under { .. } | Line::Alone(_) | Line::Head { covers: Some(_), .. })
+    };
+    cut.iter().filter(chat).count()
 }
 
 impl Shell {
@@ -76,55 +134,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Div {
         let cols = cols.saturating_sub(if remove.is_some() { 7 } else { 0 });
-        // Groups in the order their first chat comes.
-        let mut groups: Vec<(Option<&str>, Vec<&Chat>)> = Vec::new();
-        for c in chats {
-            let parent = match (c.parents.first(), whole(&c.kind)) {
-                (_, Some(_)) => Some(c.id.as_str()),
-                (Some(p), None) => Some(p.id.as_str()),
-                (None, None) => None,
-            };
-            match groups.iter_mut().find(|(k, _)| k.is_some() && *k == parent) {
-                Some((_, cs)) => cs.push(c),
-                None => groups.push((parent, vec![c])),
-            }
-        }
-        let mut lines: Vec<Line> = Vec::new();
-        for (parent, cs) in &groups {
-            let Some(parent) = parent else {
-                lines.extend(cs.iter().map(|c| Line::Alone(c)));
-                continue;
-            };
-            // A holder granted whole heads its group, and covers the rest.
-            if let Some(h) = cs.iter().find(|c| c.id == *parent) {
-                lines.push(Line::Head { id: &h.id, name: h.own(), icon: h.icon.as_deref() });
-                lines.push(Line::Whole(whole(&h.kind).unwrap_or_default()));
-                continue;
-            }
-            let p = &cs[0].parents[0];
-            lines.push(Line::Head { id: &p.id, name: &p.name, icon: p.icon.as_deref() });
-            lines.extend(cs.iter().map(|c| {
-                let path = c.parents[1..].iter().map(|p| p.name.as_str()).chain([c.own()]);
-                Line::Under { chat: c, path: path.collect() }
-            }));
-        }
-        let open = self.sets_open.contains(key);
-        let fold = !open && lines.len() > LINES + 1;
-        let hidden = if fold {
-            lines[LINES..]
-                .iter()
-                .filter(|l| matches!(l, Line::Under { .. } | Line::Alone(_)))
-                .count()
-        } else {
-            0
-        };
-        if fold {
-            lines.truncate(LINES);
-            // A head with nothing beneath it waits for the unfolded set.
-            if matches!(lines.last(), Some(Line::Head { .. })) {
-                lines.pop();
-            }
-        }
+        let mut lines = set_lines(chats, whole_shows);
+        let hidden = if self.sets_open.contains(key) { 0 } else { fold(&mut lines) };
         // Lines named alike under one head tell themselves apart by their
         // IDs' ends.
         let mut head = "";
@@ -142,18 +153,11 @@ impl Shell {
             .collect();
         let pictures = connector != "fastmail";
         let mut rows: Vec<AnyElement> = Vec::new();
-        let mut inline = false;
         for (i, line) in lines.iter().enumerate() {
             let twin =
                 !labels[i].is_empty() && labels.iter().filter(|l| **l == labels[i]).count() > 1;
-            // A holder's breadth already said on its own line.
-            if matches!(line, Line::Whole(_)) && std::mem::take(&mut inline) {
-                continue;
-            }
             let removes = match line {
-                Line::Head { id, .. } if matches!(lines.get(i + 1), Some(Line::Whole(_))) => {
-                    Some(id.to_string())
-                }
+                Line::Head { id, covers: Some(_), .. } => Some(id.to_string()),
                 Line::Under { chat, .. } => Some(chat.id.clone()),
                 Line::Alone(c) => Some(c.id.clone()),
                 _ => None,
@@ -161,15 +165,8 @@ impl Shell {
             // The last line under a head closes its tree.
             let last = !matches!(lines.get(i + 1), Some(Line::Under { .. } | Line::Whole(_)));
             let row = match line {
-                Line::Head { id, name, icon } => {
-                    let next = lines.get(i + 1);
-                    let said = match next {
-                        Some(Line::Whole(w)) if whole_shows == Whole::Inline => {
-                            inline = true;
-                            Some(*w)
-                        }
-                        _ => None,
-                    };
+                Line::Head { id, name, icon, covers } => {
+                    let said = covers.filter(|_| whole_shows == Whole::Inline);
                     let room = cols.saturating_sub(if pictures { 3 } else { 0 });
                     let room = room.saturating_sub(said.map_or(0, |w| w.len() + 3));
                     div()
@@ -239,7 +236,8 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::whole;
+    use super::{Chat, Line, Whole, fold, set_lines, whole};
+    use serde_json::{from_value, json};
 
     #[test]
     fn holders_say_what_they_cover() {
@@ -247,5 +245,46 @@ mod tests {
         assert_eq!(whole("space"), Some("all rooms"));
         assert_eq!(whole("forum"), Some("all posts"));
         assert_eq!(whole("channel"), None);
+    }
+
+    #[test]
+    fn a_folded_set_counts_every_chat_it_hides() {
+        let guild = |i: usize| -> Chat {
+            from_value(
+                json!({"id": format!("90{i}"), "name": format!("Server {i}"), "kind": "guild"}),
+            )
+            .unwrap()
+        };
+        let dm: Chat = from_value(json!({"id": "D1", "name": "Sam", "kind": "dm"})).unwrap();
+        let channels: Vec<Chat> = (0..3)
+            .map(|i| {
+                from_value(json!({
+                    "id": format!("81{i}"), "name": format!("Home / #c{i}"), "kind": "text",
+                    "parents": [{"id": "800", "name": "Home", "kind": "guild"}],
+                }))
+                .unwrap()
+            })
+            .collect();
+        let guilds = |n: usize| (0..n).map(guild).collect::<Vec<_>>();
+        let cases: [(Vec<Chat>, Whole, usize); 5] = [
+            (guilds(5), Whole::Beneath, 1),
+            ([vec![dm], guilds(5)].concat(), Whole::Beneath, 2),
+            ([channels, guilds(3)].concat(), Whole::Beneath, 1),
+            (guilds(12), Whole::Inline, 4),
+            (guilds(8), Whole::Inline, 0),
+        ];
+        for (chats, whole_shows, hides) in cases {
+            let refs: Vec<&Chat> = chats.iter().collect();
+            let mut lines = set_lines(&refs, whole_shows);
+            let hidden = fold(&mut lines);
+            let shown = lines.iter().filter(|l| {
+                matches!(
+                    l,
+                    Line::Under { .. } | Line::Alone(_) | Line::Head { covers: Some(_), .. }
+                )
+            });
+            assert_eq!(hidden, hides, "{} chats", chats.len());
+            assert_eq!(shown.count() + hidden, chats.len());
+        }
     }
 }

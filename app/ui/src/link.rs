@@ -41,8 +41,8 @@ impl Shell {
         );
     }
 
-    /// Shows the step the connector answered, and re-sends it once its
-    /// poll is due while it still shows.
+    /// Shows the step the connector answered, and asks again once its poll
+    /// is due while it still shows.
     fn took(&mut self, next: Step, cx: &mut Context<Self>) {
         let Screen::Link { name, step, values, focus } = &mut self.screen else { return };
         if next.done {
@@ -59,17 +59,33 @@ impl Shell {
         }
         let (poll, id, name) = (next.poll, next.step.clone(), name.clone());
         *step = Some(next);
-        if poll == 0 {
-            return;
+        if poll > 0 {
+            self.poll(name, id, poll, cx);
         }
+    }
+
+    /// Asks for step id again after secs while it shows; a failed poll waits
+    /// and asks again.
+    fn poll(&mut self, name: String, id: String, secs: u64, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(poll)).await;
+            cx.background_executor().timer(Duration::from_secs(secs)).await;
             this.update(cx, |this, cx| {
                 let showing = matches!(&this.screen, Screen::Link { name: n, step: Some(s), .. }
                     if *n == name && s.step == id);
-                if showing && this.error.is_none() {
-                    this.answer(id, BTreeMap::new(), cx);
+                if !showing {
+                    return;
                 }
+                let client = this.device().client;
+                let path = format!("connectors/{}/setup", segment(&name));
+                let body = json!({"step": id, "values": {}});
+                this.call(
+                    cx,
+                    move || Ok(client.send::<Step>("POST", &path, &body)),
+                    move |this, answered, cx| match answered {
+                        Ok(step) => this.took(step, cx),
+                        Err(_) => this.poll(name, id, secs, cx),
+                    },
+                );
             })
         })
         .detach();
@@ -184,24 +200,18 @@ fn field(
             .child(label)
             .child(div().flex().flex_wrap().gap(chars(1.)).children(chips));
     }
-    let on = focus == Some(f.name.as_str());
     let shown = if f.kind == "secret" { "•".repeat(value.chars().count()) } else { value };
     let name = f.name.clone();
-    column().gap(lines(0.5)).child(label).child(
-        clickable(id_for("field", &f.name), cx, move |this, cx| {
-            if let Screen::Link { focus, .. } = &mut this.screen {
-                *focus = Some(name.clone());
-            }
-            keyboard(true);
-            cx.notify();
-        })
-        .border_2()
-        .border_color(if on { t.text } else { t.alt })
-        .px(chars(1.))
-        .py(lines(0.5))
-        .min_h(lines(2.))
-        .child(format!("{shown}{}", if on { "▏" } else { "" })),
-    )
+    let take = move |this: &mut Shell| {
+        if let Screen::Link { focus, .. } = &mut this.screen {
+            *focus = Some(name.clone());
+        }
+    };
+    let on = focus == Some(f.name.as_str());
+    column()
+        .gap(lines(0.5))
+        .child(label)
+        .child(crate::screens::field(t, &f.name, &shown, "", on, take, cx))
 }
 
 /// The text as a QR code, dark on light in either theme so the service's

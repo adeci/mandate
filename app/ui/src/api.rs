@@ -19,6 +19,7 @@ pub struct Now {
 #[serde(default)]
 pub struct Request {
     pub id: String,
+    pub identity: String,
     pub identity_name: String,
     pub connector: String,
     /// once, routine or extend.
@@ -86,6 +87,8 @@ pub struct Schedule {
     pub days: Vec<u8>,
     pub start: String,
     pub length: u64,
+    /// The IANA zone a routine runs in; empty on a request.
+    pub zone: String,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -99,16 +102,11 @@ pub struct Proposal {
     pub note: String,
 }
 
-impl Proposal {
-    pub fn field(&self, label: &str) -> Option<&str> {
-        self.display.iter().find(|f| f.label == label).map(|f| f.value.as_str())
-    }
-}
-
 #[derive(Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Grant {
     pub id: String,
+    pub identity: String,
     pub identity_name: String,
     pub connector: String,
     pub chats: Vec<String>,
@@ -302,7 +300,8 @@ pub struct Container {
     pub icon: Option<String>,
     pub last_activity: Option<String>,
     /// The people in it, where the connector lists them (connector.md,
-    /// Chats); a person is hidden by their own ID, not the chat's.
+    /// Chats): a DM's person; a group's members only when asked for by ID.
+    /// A person is hidden by their own ID, not the chat's.
     pub participants: Vec<Person>,
 }
 
@@ -323,6 +322,7 @@ pub struct ParentRef {
 pub struct Person {
     pub id: String,
     pub name: String,
+    pub handle: Option<String>,
 }
 
 /// One step of linking a connector, as the connector describes it

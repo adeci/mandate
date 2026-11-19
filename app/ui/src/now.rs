@@ -419,19 +419,20 @@ fn login_card(t: Theme, ex: &Exchange, cx: &mut Context<Shell>) -> Div {
 }
 
 fn send_card(t: Theme, p: &Proposal, cx: &mut Context<Shell>) -> Div {
-    let to = p.field("To").map(|to| format!(" → {to}")).unwrap_or_default();
-    let (a, b, deny, name) =
-        (p.clone(), p.clone(), format!("proposals/{}/deny", p.id), p.identity_name.clone());
-    let verb =
-        if p.op == "send" { "wants to send".to_string() } else { format!("wants to {}", p.op) };
+    let (a, deny, name) = (p.clone(), format!("proposals/{}/deny", p.id), p.identity_name.clone());
+    // Every field, in order: Approve signs them all.
+    let fields = p
+        .display
+        .iter()
+        .map(|f| (f.label.clone(), div().child(f.value.clone()).into_any_element()));
     panel(t)
-        .child(
-            headline(t, &p.identity_name, &verb, &p.connector).children(
-                to.split(' ').filter(|w| !w.is_empty()).map(|w| div().child(w.to_string())),
-            ),
-        )
-        .children(p.field("Text").map(|text| text.to_string()))
+        .child(headline(t, &p.identity_name, &format!("wants to {}", p.op), &p.connector))
+        .child(table(t, fields.collect()))
         .children(reason(t, &p.note))
+        .child(button(t, id_for("deny", &p.id), "Deny", cx, move |this, cx| {
+            let notice = format!("You denied {name}'s send.");
+            this.post("POST", deny.clone(), cx, move |_| Some(notice))
+        }))
         .child(approve(
             t,
             id_for("send", &p.id),
@@ -440,24 +441,6 @@ fn send_card(t: Theme, p: &Proposal, cx: &mut Context<Shell>) -> Div {
             cx,
             move |this, cx| this.approve_send(&a, cx),
         ))
-        .child(
-            div()
-                .flex()
-                .gap(chars(1.))
-                .child(
-                    button(t, id_for("review", &p.id), "Review", cx, move |this, cx| {
-                        this.review(b.clone(), cx)
-                    })
-                    .flex_1(),
-                )
-                .child(
-                    button(t, id_for("deny", &p.id), "Deny", cx, move |this, cx| {
-                        let notice = format!("You denied {name}'s send.");
-                        this.post("POST", deny.clone(), cx, move |_| Some(notice))
-                    })
-                    .flex_1(),
-                ),
-        )
 }
 
 /// "laptop · [mark] Signal", in bold.
@@ -477,7 +460,7 @@ fn open_grant(t: Theme, g: &Grant, chats: Div, cx: &mut Context<Shell>) -> Div {
     // No bracket: its glyph sits right of its cell, off the text's edge.
     let until =
         g.until.as_deref().map(|u| format!("until {} · {}", words::clock(u), words::left(u)));
-    let (id, id2, conn) = (g.id.clone(), g.id.clone(), g.connector.clone());
+    let (id, id2, old) = (g.id.clone(), g.id.clone(), g.clone());
     let what = format!("{}'s grant on {}", g.identity_name, connector(&g.connector));
     panel(t)
         .border_color(t.open)
@@ -493,9 +476,9 @@ fn open_grant(t: Theme, g: &Grant, chats: Div, cx: &mut Context<Shell>) -> Div {
                 .flex()
                 .gap(chars(1.))
                 .child(button(t, id_for("extend", &id), "+30m", cx, move |this, cx| {
-                    let conn = conn.clone();
+                    let old = old.clone();
                     let check =
-                        move |r: &Record| matches!(r, Record::Grant(g) if g.connector == conn);
+                        move |r: &Record| matches!(r, Record::Grant(g) if crate::extends(&old, 1800, g));
                     this.sign(
                         format!("grants/{id}/extend/challenge"),
                         json!({"for": 1800}),
@@ -515,7 +498,7 @@ fn routine(t: Theme, g: &Grant, stopped: bool, chats: Div, cx: &mut Context<Shel
         let start = words::time_of_day(&s.start);
         format!("{} at {start} for {} · ", words::days(&s.days), span(s.length))
     });
-    let id = g.id.clone();
+    let (id, old) = (g.id.clone(), g.clone());
     let running = g
         .schedule
         .as_ref()
@@ -524,7 +507,8 @@ fn routine(t: Theme, g: &Grant, stopped: bool, chats: Div, cx: &mut Context<Shel
         .map(|end| format!("running until {end}"));
     let action = if stopped {
         button(t, id_for("resume", &id), "Resume", cx, move |this, cx| {
-            let check = |r: &Record| matches!(r, Record::Grant(g) if g.schedule.is_some());
+            let old = old.clone();
+            let check = move |r: &Record| matches!(r, Record::Grant(g) if crate::keeps(&old, g));
             this.sign(format!("grants/{id}/resume/challenge"), json!({}), check, cx)
         })
     } else {

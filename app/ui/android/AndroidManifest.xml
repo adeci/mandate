@@ -13,7 +13,14 @@
     <uses-permission android:name="android.permission.NFC" />
     <uses-feature android:name="android.hardware.nfc" android:required="false" />
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
-    <application android:label="mandate" android:icon="@mipmap/icon" android:theme="@style/Main">
+    <!-- Nothing leaves the phone: the pairing is useless without its Keystore keys, which
+         stay, and the cache holds what agents asked and sent. -->
+    <application
+        android:label="mandate"
+        android:icon="@mipmap/icon"
+        android:theme="@style/Main"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/extraction">
         <!-- singleTask: a second instance would be a second android_main in this process.
              stateNotNeeded: android_main leaves the process when the activity ends, also
              on a recreation, and this lets Android start it again in a new process. -->

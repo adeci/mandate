@@ -11,7 +11,7 @@ use gpui::{
     ScrollWheelEvent, SharedString, Stateful, Svg, TouchDragEvent, TouchPhase, Window, canvas, div,
     ease_out_quint, fill, hsla, prelude::*, px, relative, rgb, svg,
 };
-use mandate_core::{Envelope, PairLink, Record};
+use mandate_core::{Envelope, PairLink};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -158,7 +158,7 @@ impl Render for Shell {
             None
         };
         let title = match &self.screen {
-            Screen::Welcome => "",
+            Screen::Welcome | Screen::Forgotten => "",
             Screen::Pair { .. } => "Initial setup",
             Screen::Join { .. } | Screen::Joining => "Join",
             Screen::Invite { kind: "agent", .. } => "Add an agent",
@@ -171,14 +171,15 @@ impl Render for Shell {
             Screen::Tab(Tab::Activity) => "Activity",
             Screen::Settings => "Settings",
             Screen::Admit { .. } => "Let in",
-            Screen::Review { .. } => "Review",
+            Screen::Entry(_) => "Activity",
             Screen::Link { .. } => "Link",
             Screen::Hide { .. } => "Never share",
             Screen::Grant(_) => "New grant",
             #[cfg(target_os = "android")]
             Screen::Method { .. } => "How you approve",
-            Screen::Entry(_) => "Activity",
         };
+        let host = self.server.split("://").last().unwrap_or_default();
+        let host = host.split(['/', ':']).next().unwrap_or_default().to_string();
         let screen = match &self.screen {
             Screen::Welcome => welcome(t, cx),
             Screen::Pair { text } => {
@@ -201,61 +202,28 @@ impl Render for Shell {
             Screen::Settings => self.settings(t, cx),
             Screen::Entry(a) => self.entry_screen(t, a, cx),
             Screen::Admit { exchange, envelope } => admit(t, exchange, envelope, cx),
-            Screen::Review { proposal, envelope } => {
-                let fields: Vec<(String, AnyElement)> = match envelope.record() {
-                    Ok(Record::Write(w)) => w
-                        .display
-                        .into_iter()
-                        .map(|f| (f.label, div().child(f.value).into_any_element()))
-                        .collect(),
-                    _ => vec![(
-                        "Error".into(),
-                        div().child("This is not a write record.").into_any_element(),
-                    )],
-                };
-                let (envelope, deny) =
-                    (envelope.clone(), format!("proposals/{}/deny", proposal.id));
-                column()
-                    .child(headline(
-                        t,
-                        &proposal.identity_name,
-                        "wants to send",
-                        &proposal.connector,
-                    ))
-                    .child(table(t, fields))
-                    .children(reason(t, &proposal.note))
-                    .child(approve(
-                        t,
-                        "approve",
-                        "Approve and send".into(),
-                        true,
-                        cx,
-                        move |this, cx| this.approve(envelope.clone(), cx),
-                    ))
-                    .child(button(t, "deny", "Deny", cx, move |this, cx| {
-                        this.post("POST", deny.clone(), cx, |_| Some("You denied the send.".into()))
-                    }))
-            }
+            Screen::Forgotten => forgotten(t, &host, cx),
         };
-        let notes = |d: Div| {
-            d.when_some(self.error.clone(), |d, e| d.child(flash(t, e)))
-                .when_some(self.notice.clone(), |d, n| d.child(flash(t, n)))
-                .when_some(self.prompt, |d, p| d.child(flash(t, p.into())))
-                .children(pin)
-                .child(screen.gap(lines(1.)))
-        };
+        // Errors, notices and the key's prompts stay in sight, above the page.
+        let notes: Vec<Div> = (self.error.clone().into_iter())
+            .chain(self.notice.clone())
+            .chain(self.prompt.map(String::from))
+            .map(|n| flash(t, n))
+            .chain(pin)
+            .collect();
+        let screen = screen.gap(lines(1.));
         // Before pairing, each screen is a short column in the middle of the
         // window, a little above center; once paired, pages read from the top.
-        let body = if self.device.is_none() {
+        let body = if self.device.is_none() || matches!(self.screen, Screen::Forgotten) {
             column()
                 .min_h(relative(1.))
                 .justify_center()
                 .px(chars(pad))
                 .pt(lines(1.))
                 .pb(lines(4.))
-                .child(notes(column().w_full().max_w(chars(46.)).mx_auto().gap(lines(1.))))
+                .child(column().w_full().max_w(chars(46.)).mx_auto().child(screen))
         } else {
-            notes(page(pad).pt(lines(1.)).pb(lines(2.)).gap(lines(1.)))
+            page(pad).pt(lines(1.)).pb(lines(2.)).child(screen)
         };
         // The page after the launch shows at once, as the wordmark already
         // led into it; later pages fade in.
@@ -271,17 +239,18 @@ impl Render for Shell {
         };
         // One quiet notice while the server can't be reached; every page
         // keeps what it last showed.
-        let host = self.server.split("://").last().unwrap_or_default();
-        let host = host.split(['/', ':']).next().unwrap_or_default().to_string();
         let offline = div()
             .bg(t.bg_alt)
             .text_color(t.alt)
             .py(lines(0.25))
             .child(page(pad).child(format!("Can't reach {host}")));
-        root.when(!matches!(self.screen, Screen::Welcome), |d| {
+        root.when(!matches!(self.screen, Screen::Welcome | Screen::Forgotten), |d| {
             d.child(self.top_bar(t, title, tab.is_some(), pad, cx))
         })
         .when(self.offline, |d| d.child(offline))
+        .when(!notes.is_empty(), |d| {
+            d.child(page(pad).pt(lines(1.)).gap(lines(1.)).children(notes))
+        })
         .child(
             div()
                 .relative()
@@ -915,11 +884,26 @@ fn welcome(t: Theme, cx: &mut Context<Shell>) -> Div {
         ))
 }
 
+/// A server that no longer knows this device: it was reset, or the device
+/// was removed.
+fn forgotten(t: Theme, host: &str, cx: &mut Context<Shell>) -> Div {
+    column()
+        .child(
+            div()
+                .font_weight(BOLD)
+                .text_size(px(SIZE * 1.5))
+                .line_height(lines(1.5))
+                .child(host.to_string()),
+        )
+        .child("This server no longer knows this device.")
+        .child(button(t, "pair-again", "Pair again", cx, |this, cx| this.unpair(cx)))
+}
+
 /// A box the owner types or pastes into: a tap gives it the typing and
 /// opens the keyboard, and Paste beside it takes the clipboard.
 pub(crate) fn field(
     t: Theme,
-    id: &'static str,
+    id: &str,
     text: &str,
     empty: &str,
     focused: bool,
@@ -931,14 +915,14 @@ pub(crate) fn field(
         (false, true) => format!("{text}▏"),
         (false, false) => text.to_string(),
     };
-    let paste_id = ElementId::Name(format!("paste-{id}").into());
+    let (box_id, paste_id) = (id_for("field", id), id_for("paste", id));
     let take = std::rc::Rc::new(focus);
     let take2 = take.clone();
     div()
         .flex()
         .gap(chars(1.))
         .child(
-            clickable(id, cx, move |this, cx| {
+            clickable(box_id, cx, move |this, cx| {
                 take(this);
                 crate::keyboard(true);
                 cx.notify();
@@ -949,6 +933,7 @@ pub(crate) fn field(
             .border_color(if focused { t.text } else { t.alt })
             .px(chars(1.))
             .py(lines(0.5))
+            .min_h(lines(2.))
             .when(text.is_empty(), |d| d.text_color(t.alt))
             .child(shown),
         )

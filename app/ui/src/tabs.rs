@@ -838,8 +838,14 @@ impl Shell {
                     ),
                 )
                 .child(link(t, id_for("share", &path), "Share again", cx, move |this, cx| {
-                    let notice = format!("{name} is shared again, where grants allow.");
-                    this.post("DELETE", path.clone(), cx, move |_| Some(notice))
+                    let (path, name) = (path.clone(), name.clone());
+                    this.gate(
+                        move |this, cx| {
+                            let notice = format!("{name} is shared again, where grants allow.");
+                            this.post("DELETE", path, cx, move |_| Some(notice))
+                        },
+                        cx,
+                    )
                 }))
         });
         let hidden: Vec<Div> = hidden.collect();

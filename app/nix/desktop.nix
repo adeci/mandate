@@ -33,7 +33,7 @@ rustPlatform.buildRustPackage {
     "-p"
     "mandate-app"
   ];
-  # The checks run the tests.
+  # checks.x86_64-linux.cargo runs the tests.
   doCheck = false;
   nativeBuildInputs = [ pkgs.pkg-config ];
   buildInputs = runtime ++ [ pkgs.fontconfig ];

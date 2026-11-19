@@ -51,6 +51,11 @@ public final class Stream extends Service {
                 });
     }
 
+    /** Stops the service once the device unpaired. */
+    static void stop(Activity activity) {
+        activity.stopService(new Intent(activity, Stream.class));
+    }
+
     /**
      * Asks once to leave the stream out of battery optimisation, which some
      * phones use to end it; Settings asks again while it applies.
@@ -115,6 +120,13 @@ public final class Stream extends Service {
                         .build();
         startForeground(1, connected);
         return START_STICKY;
+    }
+
+    /** Hides what waits, and ends the process: run never returns, so a later start needs a new one. */
+    @Override
+    public void onDestroy() {
+        getSystemService(NotificationManager.class).cancelAll();
+        System.exit(0);
     }
 
     @Override

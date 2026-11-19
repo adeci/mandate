@@ -508,12 +508,18 @@ impl Shell {
                         hidden.contains(&(conn.clone(), kind.into(), id.into()))
                     };
                     // The chat itself, then each person in it, hidden by
-                    // their own ID: a DM's one person, a group's members.
+                    // their own ID: a DM's one person, a group's members once
+                    // People fetched them.
                     let noun = if c.kind == "mailbox" { "mailbox" } else { "chat" };
                     let chat = (("chat", c.id.clone()), format!("Hide {noun}"), display(c));
                     let people = c.participants.iter().map(|p| {
                         let name = if p.name.is_empty() { p.id.clone() } else { p.name.clone() };
-                        (("person", p.id.clone()), format!("Hide {name}"), name)
+                        let handle = p.handle.as_ref().filter(|h| !h.is_empty() && c.kind != "dm");
+                        let label = match handle {
+                            Some(h) => format!("Hide {name} {h}"),
+                            None => format!("Hide {name}"),
+                        };
+                        (("person", p.id.clone()), label, name)
                     });
                     let links = std::iter::once(chat).chain(people).filter_map(
                         |((kind, id), label, name)| {
@@ -534,6 +540,13 @@ impl Shell {
                     );
                     let links: Vec<AnyElement> =
                         if c.hidden { Vec::new() } else { links.collect() };
+                    let group = c.members.is_some_and(|n| n > 0) && c.participants.is_empty();
+                    let id = c.id.clone();
+                    let people = (group && !c.hidden).then(|| {
+                        link(t, id_for("people", &c.id), "People", cx, move |this, cx| {
+                            this.open_people(id.clone(), cx)
+                        })
+                    });
                     div()
                         .flex()
                         .flex_wrap()
@@ -542,6 +555,7 @@ impl Shell {
                         .py(lines(0.25))
                         .child(line)
                         .children(links)
+                        .children(people)
                         .into_any_element()
                 }))
             })
@@ -555,6 +569,29 @@ impl Shell {
             cx,
             move || client.send::<Value>("PUT", &path, &json!({"name": name})),
             |this, _, cx| this.refresh(cx),
+        );
+    }
+
+    /// Fetches one group again by its ID, which brings its members that
+    /// listings leave out, and shows them on its row.
+    fn open_people(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(p) = &self.picker else { return };
+        let conn = p.connector.clone();
+        let path = format!("connectors/{}/chats?ids={}", segment(&conn), segment(&id));
+        let client = self.device().client;
+        self.error = None;
+        self.call(
+            cx,
+            move || client.get::<Vec<Container>>(&path),
+            move |this, rows, _| {
+                let Some(row) = rows.into_iter().find(|r| r.id == id) else { return };
+                if let Some(p) = &mut this.picker
+                    && p.connector == conn
+                    && let Some(c) = p.found.iter_mut().flatten().find(|c| c.id == id)
+                {
+                    *c = row;
+                }
+            },
         );
     }
 
