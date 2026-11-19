@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"slices"
 	"strings"
 	"time"
@@ -24,6 +25,10 @@ const (
 	maxBackoff  = time.Minute
 	// Presence and typing are never stored.
 	syncFilter = `{"presence":{"not_types":["*"]},"room":{"ephemeral":{"not_types":["*"]}}}`
+	// fill reads at most this many pages of maxLimit events back, and none
+	// older than maxGapAge.
+	maxGapPages = 10
+	maxGapAge   = 7 * 24 * time.Hour
 )
 
 // sync stores what /sync brings until ctx is done or the homeserver ends
@@ -114,8 +119,11 @@ func (c *mxConnector) syncOnce(ctx context.Context, a *account) error {
 		}
 		a.full = true
 	}
-	if err := a.crypto.PutNextBatch(ctx, resp.NextBatch); err != nil {
-		return err
+	// A response that brought nothing need not survive a crash.
+	if !resp.Rooms.IsZero() || !resp.ToDevice.IsZero() || !resp.AccountData.IsZero() || !resp.DeviceLists.IsZero() {
+		if err := a.crypto.PutNextBatch(ctx, resp.NextBatch); err != nil {
+			return err
+		}
 	}
 	a.since = &resp.NextBatch
 	return nil
@@ -157,10 +165,21 @@ func (c *mxConnector) ingest(ctx context.Context, a *account, resp *mautrix.Resp
 	}
 	restate := false
 	for room, data := range resp.Rooms.Join {
-		if err := c.ingestRoom(ctx, a, room, data); err != nil {
+		if err := c.ingestRoom(ctx, a, room, data, since != ""); err != nil {
 			return err
 		}
 		restate = restate || len(data.State.Events) > 0 || slices.ContainsFunc(data.Timeline.Events, func(e *event.Event) bool { return e.StateKey != nil })
+	}
+	// A space's children are checked against their own state, which may
+	// come after the space's in this batch.
+	for _, data := range resp.Rooms.Join {
+		for _, evt := range slices.Concat(data.State.Events, data.Timeline.Events) {
+			if evt.Type == event.StateSpaceChild {
+				if err := c.spaceChild(ctx, a, evt); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	if restate {
 		return c.nest(ctx)
@@ -168,10 +187,11 @@ func (c *mxConnector) ingest(ctx context.Context, a *account, resp *mautrix.Resp
 	return nil
 }
 
-func (c *mxConnector) ingestRoom(ctx context.Context, a *account, room id.RoomID, data *mautrix.SyncJoinedRoom) error {
+// ingestRoom stores what a sync brought of room. After a gap, when sync
+// left out events older than its timeline, it fills them in first.
+func (c *mxConnector) ingestRoom(ctx context.Context, a *account, room id.RoomID, data *mautrix.SyncJoinedRoom, gap bool) error {
 	var name, alias *string
-	var stateErr error
-	state := func(evt *event.Event) {
+	state := func(ctx context.Context, evt *event.Event) {
 		mautrix.UpdateStateStore(ctx, a.state, evt)
 		switch evt.Type {
 		case event.StateMember:
@@ -189,19 +209,32 @@ func (c *mxConnector) ingestRoom(ctx context.Context, a *account, room id.RoomID
 		case event.StateCanonicalAlias:
 			s := evt.Content.AsCanonicalAlias().Alias.String()
 			alias = &s
-		case event.StateSpaceChild:
-			stateErr = cmp.Or(stateErr, c.spaceChild(ctx, evt))
 		}
 	}
-	for _, evt := range data.State.Events {
+	if len(data.State.Events) > 0 {
+		// One commit, as a first sync brings every member of every room.
+		if err := a.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+			for _, evt := range data.State.Events {
+				prepare(evt, room)
+				state(ctx, evt)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	for _, evt := range data.Timeline.Events {
 		prepare(evt, room)
-		state(evt)
+	}
+	if gap && data.Timeline.Limited && data.Timeline.PrevBatch != "" && !slices.ContainsFunc(data.Timeline.Events, a.joins) {
+		if err := c.fill(ctx, a, room, data.Timeline.PrevBatch); err != nil {
+			return err
+		}
 	}
 	var last int64 // ms
 	for _, evt := range data.Timeline.Events {
-		prepare(evt, room)
 		if evt.StateKey != nil {
-			state(evt)
+			state(ctx, evt)
 			continue
 		}
 		if isMessage(evt.Type) {
@@ -210,9 +243,6 @@ func (c *mxConnector) ingestRoom(ctx context.Context, a *account, room id.RoomID
 		if _, err := c.apply(ctx, a, evt, nil); err != nil {
 			return err
 		}
-	}
-	if stateErr != nil {
-		return stateErr
 	}
 	ct, err := c.container(ctx, a, room, name, alias, data.Summary.Heroes)
 	if err != nil {
@@ -224,13 +254,63 @@ func (c *mxConnector) ingestRoom(ctx context.Context, a *account, room id.RoomID
 	return c.st.UpsertContainer(ctx, ct)
 }
 
+// fill stores the events sync left out of room before a limited timeline,
+// reading back from from until a stored event, the owner's join, or the
+// bound; fetch reads further back.
+func (c *mxConnector) fill(ctx context.Context, a *account, room id.RoomID, from string) error {
+	oldest := time.Now().Add(-maxGapAge).UnixMilli()
+	names := map[id.UserID]string{}
+	var evts []*event.Event // newest first
+pages:
+	for range maxGapPages {
+		resp, err := a.page(ctx, room, from, maxLimit, names)
+		var he mautrix.HTTPError
+		if errors.As(err, &he) && he.Response != nil && he.Response.StatusCode/100 == 4 && he.Response.StatusCode != http.StatusTooManyRequests {
+			// Retrying the batch would hold up every room's sync for good.
+			c.log.Warn("fill a gap", "room", room, "err", err)
+			break
+		} else if err != nil {
+			return err
+		}
+		for _, evt := range resp.Chunk {
+			if a.joins(evt) || evt.Timestamp < oldest {
+				break pages
+			}
+			err := c.st.DB().QueryRowContext(ctx, `SELECT 1 FROM messages WHERE id = ?1`, evt.ID.String()).Scan(new(int))
+			if err == nil {
+				break pages
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			evts = append(evts, evt)
+		}
+		if resp.End == "" || len(resp.Chunk) == 0 {
+			break
+		}
+		from = resp.End
+	}
+	_, err := c.storeBack(ctx, a, evts, names)
+	return err
+}
+
+// joins reports whether evt is the owner joining its room.
+func (a *account) joins(evt *event.Event) bool {
+	return evt.Type == event.StateMember && evt.GetStateKey() == a.sess.UserID.String() &&
+		evt.Content.AsMember().Membership == event.MembershipJoin && prevMembership(evt) != event.MembershipJoin
+}
+
 func joinedFromInvite(evt *event.Event) bool {
+	return evt.Content.AsMember().Membership == event.MembershipJoin && prevMembership(evt) == event.MembershipInvite
+}
+
+// prevMembership is the membership a member event replaced, if any.
+func prevMembership(evt *event.Event) event.Membership {
 	prev := evt.Unsigned.PrevContent
-	if prev == nil || evt.Content.AsMember().Membership != event.MembershipJoin {
-		return false
+	if prev == nil {
+		return ""
 	}
 	_ = prev.ParseRaw(evt.Type) // HandleMemberEvent may have parsed it
-	return prev.AsMember().Membership == event.MembershipInvite
+	return prev.AsMember().Membership
 }
 
 // container describes room: a DM by the other person's name, with their

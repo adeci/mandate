@@ -71,6 +71,7 @@ type homeserver struct {
 	holdMail bool // keep to-device messages back
 
 	history map[id.RoomID][]map[string]any // newest first, for /messages
+	pages   int                            // /messages requests answered
 	members map[id.RoomID][]map[string]any // lazy-loaded members for /messages
 	media   map[string][]byte              // by mxc:// URI
 	events  map[string]map[string]any      // served by /event in place of the history's
@@ -417,10 +418,11 @@ func (h *homeserver) sync(w http.ResponseWriter, r *http.Request, dev device) {
 	}
 }
 
-// waitSynced waits until the connector has stored the first n batches.
+// waitSynced waits until the connector has stored the first n batches; a
+// batch of a few dozen messages can take seconds on a busy disk.
 func (h *homeserver) waitSynced(n int) {
 	h.t.Helper()
-	for range 500 {
+	for range 3000 {
 		h.mu.Lock()
 		done := h.since >= n
 		h.mu.Unlock()
@@ -439,6 +441,7 @@ func (h *homeserver) messages(w http.ResponseWriter, r *http.Request, _ device) 
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.pages++
 	all := h.history[room]
 	from = min(from, len(all))
 	end := min(from+limit, len(all))

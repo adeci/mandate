@@ -313,6 +313,8 @@ func (a *account) recover(ctx context.Context, recoveryKey string) error {
 	if err != nil && !errors.Is(err, ssss.ErrUnverifiableKey) {
 		return errWrongRecoveryKey
 	}
+	// mandate needs them only to sign this device.
+	defer func() { a.mach.CrossSigningKeys = nil }()
 	if err := a.mach.FetchCrossSigningKeysFromSSSS(ctx, key); err != nil {
 		if errors.Is(err, ssss.ErrKeyDataMACMismatch) || errors.Is(err, ssss.ErrNotEncryptedForKey) {
 			return errWrongRecoveryKey

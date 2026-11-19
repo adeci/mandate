@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -336,6 +337,12 @@ func TestLink(t *testing.T) {
 	if !signed {
 		t.Fatalf("device %s was not cross-signed", dev)
 	}
+	a := f.c.use()
+	held := a.mach.CrossSigningKeys != nil
+	a.release()
+	if held {
+		t.Error("mandate holds cross-signing keys")
+	}
 
 	if _, err := f.c.Setup(context.Background(), "login", f.setupArgs()); err == nil || !strings.Contains(err.Error(), "already linked") {
 		t.Fatalf("second setup: %v", err)
@@ -431,6 +438,62 @@ func TestSyncStoresRoomsAndMessages(t *testing.T) {
 	f.hs.waitSynced(n)
 	if m := f.message("$re"); !m.Deleted {
 		t.Fatalf("$re after its sender redacted it: %+v", m)
+	}
+}
+
+// A timeline that sync cut short is filled from history, back to what was
+// stored or to the bound, and only once.
+func TestSyncFillsGaps(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	f.link()
+	start := time.Now().Add(-time.Hour).UnixMilli()
+	n := f.hs.push(joined(map[id.RoomID]map[string]any{
+		teamRoom:  room([]map[string]any{member(owner, "Owner"), member(bob, "Bob")}, []map[string]any{textEvent("$old", bob, start, "old")}),
+		vaultRoom: room([]map[string]any{member(owner, "Owner"), member(bob, "Bob")}, nil),
+	}))
+	f.hs.waitSynced(n)
+
+	// Each room's history, newest first: the event sync sends, those it left
+	// out, then $old in the team room and, in the vault, events older than
+	// the bound.
+	history := func(room string, gap int, before ...map[string]any) []map[string]any {
+		var all []map[string]any
+		for i := 1 + gap; i > 0; i-- {
+			all = append(all, textEvent(fmt.Sprintf("$%s%d", room, i), bob, start+int64(i), "hi"))
+		}
+		return append(all, before...)
+	}
+	ancient := time.Now().Add(-maxGapAge - time.Hour).UnixMilli()
+	team := history("team", 35, textEvent("$old", bob, start, "old"))
+	vault := history("vault", 2, textEvent("$ancient2", bob, ancient, "hi"), textEvent("$ancient1", bob, ancient-1, "hi"))
+	f.hs.mu.Lock()
+	f.hs.history[teamRoom], f.hs.history[vaultRoom] = team, vault
+	f.hs.mu.Unlock()
+	limited := func(history []map[string]any) map[string]any {
+		return map[string]any{"timeline": map[string]any{"events": history[:1], "limited": true, "prev_batch": "1"}}
+	}
+	n = f.hs.push(joined(map[id.RoomID]map[string]any{teamRoom: limited(team), vaultRoom: limited(vault)}))
+	f.hs.waitSynced(n)
+	count := func(room id.RoomID) (n int) {
+		t.Helper()
+		if err := f.st.DB().QueryRow(`SELECT count(*) FROM messages WHERE container_id = ?1`, room.String()).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if got, got2 := count(teamRoom), count(vaultRoom); got != 1+35+1 || got2 != 2+1 {
+		t.Fatalf("stored %d in the team room, want 37, and %d in the vault, want 3", got, got2)
+	}
+	if m := f.message("$team1"); m.Body != "hi" || m.Sender != "~Bob" {
+		t.Fatalf("the oldest event of the gap: %+v", m)
+	}
+
+	pages := locked(f.hs, func() int { return f.hs.pages })
+	n = f.hs.push(joined(map[id.RoomID]map[string]any{teamRoom: room(nil, []map[string]any{textEvent("$new", bob, start+100, "new")})}))
+	f.hs.waitSynced(n)
+	if got := locked(f.hs, func() int { return f.hs.pages }); got != pages || count(teamRoom) != 38 {
+		t.Fatalf("read history %d times after the gap was filled, stored %d", got-pages, count(teamRoom))
 	}
 }
 
@@ -823,29 +886,46 @@ func TestNesting(t *testing.T) {
 	t.Parallel()
 	ids := []string{"a", "b", "c", "d", "e", "x", "y", "lone"}
 	want := map[string]string{
-		"b": "a", "c": "b", "d": "c", "e": "d", // a chain four deep and more
+		"b": "a", "c": "b", "d": "c", "e": "d", // a chain five deep
 		"x": "y", "y": "x", // a cycle
 	}
 	got := nesting(ids, want)
-	if exp := map[string]string{"b": "a", "c": "b", "e": "d", "x": "y"}; !reflect.DeepEqual(got, exp) {
+	if exp := map[string]string{"b": "a", "c": "b", "d": "c", "e": "c", "x": "y"}; !reflect.DeepEqual(got, exp) {
 		t.Fatalf("got %v, want %v", got, exp)
 	}
 }
 
-// A space the owner joined parents the rooms it lists.
+// A space the owner joined parents the rooms it lists, but no DM, and no
+// room whose admins did not list it.
 func TestSpaces(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	f.link()
 	const space = id.RoomID("!space:example.org")
-	n := f.hs.push(joined(map[id.RoomID]map[string]any{
+	levels := func(users ...id.UserID) map[string]any {
+		m := map[string]any{}
+		for _, u := range users {
+			m[u.String()] = 100
+		}
+		return stateEvent("m.room.power_levels", "", owner, map[string]any{"users": m})
+	}
+	child := func(room id.RoomID) map[string]any {
+		return stateEvent("m.space.child", room.String(), bob, map[string]any{"via": []string{"example.org"}})
+	}
+	batch := joined(map[id.RoomID]map[string]any{
 		space: room([]map[string]any{
 			stateEvent("m.room.create", "", bob, map[string]any{"type": "m.space"}),
 			stateEvent("m.room.name", "", bob, map[string]any{"name": "Club"}),
-			stateEvent("m.space.child", teamRoom.String(), bob, map[string]any{"via": []string{"example.org"}}),
+			child(teamRoom), child(dmRoom), child(vaultRoom),
 		}, nil),
-		teamRoom: room([]map[string]any{stateEvent("m.room.name", "", bob, map[string]any{"name": "Team"})}, nil),
-	}))
+		teamRoom:  room([]map[string]any{levels(owner, bob), stateEvent("m.room.name", "", bob, map[string]any{"name": "Team"})}, nil),
+		dmRoom:    room([]map[string]any{levels(owner, bob), member(owner, "Owner"), member(bob, "Bob")}, nil),
+		vaultRoom: room([]map[string]any{levels(owner), stateEvent("m.room.name", "", owner, map[string]any{"name": "Vault"})}, nil),
+	})
+	batch["account_data"] = map[string]any{"events": []map[string]any{
+		{"type": "m.direct", "content": map[string]any{bob.String(): []id.RoomID{dmRoom}}},
+	}}
+	n := f.hs.push(batch)
 	f.hs.waitSynced(n)
 	var kind, parent string
 	query := func(id id.RoomID, dst *string, col string) {
@@ -858,6 +938,11 @@ func TestSpaces(t *testing.T) {
 	query(teamRoom, &parent, "parent_id")
 	if kind != kindSpace || parent != space.String() {
 		t.Fatalf("space kind %q, team parent %q", kind, parent)
+	}
+	for _, r := range []id.RoomID{dmRoom, vaultRoom} {
+		if query(r, &parent, "parent_id"); parent != "" {
+			t.Errorf("%s under %q", r, parent)
+		}
 	}
 
 	n = f.hs.push(joined(map[id.RoomID]map[string]any{space: room(nil, []map[string]any{

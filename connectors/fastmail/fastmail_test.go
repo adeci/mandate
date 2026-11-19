@@ -225,7 +225,7 @@ func TestSync(t *testing.T) {
 
 	want := map[string]storedMessage{
 		"e1": {
-			Chat: "t1", SenderID: "alice@example.com", Sender: "Alice Doe",
+			Chat: "t1", SenderID: "alice@example.com", Sender: "~Alice Doe",
 			Body: "Subject: Lunch?\nTo: Owner Name <owner@fastmail.com>\n\nLunch on Friday?\n\nAlice",
 		},
 		"e2": {
@@ -233,7 +233,7 @@ func TestSync(t *testing.T) {
 			Body: "Subject: Re: Lunch?\nTo: Alice Doe <Alice@Example.com>\n\nSure.",
 		},
 		"e3": {
-			Chat: "t2", SenderID: "news@shop.example", Sender: "Shop",
+			Chat: "t2", SenderID: "news@shop.example", Sender: "~Shop",
 			Body: "Subject: Deals\nTo: hi@owner.dev\n\nBig & bold\n\nSee this (https://shop.example/x)",
 		},
 	}
@@ -292,13 +292,19 @@ func TestSync(t *testing.T) {
 		t.Fatalf("t1 last message at %s", got)
 	}
 
-	// Back out of Trash; then Fastmail forgets the old state.
+	// Back out of Trash, into Trash, and deleted for good; then Fastmail
+	// forgets the old state.
 	f.jm.update("e1", func(e *email) { e.MailboxIDs = map[string]bool{"mb-inbox": true} })
+	f.jm.update("e4", func(e *email) { e.MailboxIDs = map[string]bool{"mb-trash": true} })
+	f.jm.destroy("e2")
 	f.jm.set(func(j *fakeJMAP) { j.minState = j.state + 1 })
 	f.jm.add(textEmail("e5", "t6", alice, []address{owner}, "Hello", "hi", now, "mb-inbox"))
 	f.synced()
 	if f.message("e1").Deleted {
 		t.Fatal("e1 still deleted after leaving Trash")
+	}
+	if !f.message("e4").Deleted || !f.message("e2").Deleted {
+		t.Fatal("mail trashed or destroyed while Fastmail forgot the state is not marked deleted")
 	}
 	if got := f.message("e5"); got.Chat != "t6" {
 		t.Fatalf("e5 after a full resync: %+v", got)
@@ -755,8 +761,8 @@ func TestUntrustedHeaders(t *testing.T) {
 	spoof.MessageID = []string{"a@b\r\nBcc: mallory@example.com"}
 	f.jm.add(spoof)
 	f.link()
-	if f.message("spoof").FromMe {
-		t.Fatal("mail outside Sent with the owner's From is the owner's")
+	if m := f.message("spoof"); m.FromMe || m.Sender != "~Owner Name" {
+		t.Fatalf("mail outside Sent with the owner's From is the owner's: %+v", m)
 	}
 	_, err := f.c.Prepare(context.Background(), "reply", map[string]string{"chat": "t1", "seq": f.seq("spoof"), "body": "b"})
 	var ce *connector.Error

@@ -103,22 +103,11 @@ func (c *mxConnector) fetch(ctx context.Context, a *account, req fetchRequest) (
 	var evts []*event.Event // newest first
 	found, more := 0, false
 	for range maxPages {
-		resp, err := a.cli.Messages(ctx, req.room, from, "", mautrix.DirectionBackward, &mautrix.FilterPart{LazyLoadMembers: true}, req.limit)
+		resp, err := a.page(ctx, req.room, from, req.limit, names)
 		if err != nil {
 			return connector.ReadResult{}, upstream("read history", err)
 		}
-		// Members as of these messages, for sender names; the current room
-		// state, which encryption relies on, is left to sync.
-		for _, evt := range resp.State {
-			if evt.Type == event.StateMember && evt.StateKey != nil {
-				prepare(evt, req.room)
-				if n := evt.Content.AsMember().Displayname; n != "" {
-					names[id.UserID(*evt.StateKey)] = n
-				}
-			}
-		}
 		for _, evt := range resp.Chunk {
-			prepare(evt, req.room)
 			if isMessage(evt.Type) {
 				found++
 			}
@@ -130,8 +119,43 @@ func (c *mxConnector) fetch(ctx context.Context, a *account, req fetchRequest) (
 		}
 		from = resp.End
 	}
+	ids, err := c.storeBack(ctx, a, evts, names)
+	if err != nil {
+		return connector.ReadResult{}, err
+	}
+	if len(ids) > req.limit {
+		ids, more = ids[:req.limit], true
+	}
+	return connector.ReadResult{MessageIDs: ids, More: more}, nil
+}
 
-	// Oldest first, so an edit or redaction finds its message stored.
+// page reads up to limit events of room's history back from from, and
+// adds their senders' names to names.
+func (a *account) page(ctx context.Context, room id.RoomID, from string, limit int, names map[id.UserID]string) (*mautrix.RespMessages, error) {
+	resp, err := a.cli.Messages(ctx, room, from, "", mautrix.DirectionBackward, &mautrix.FilterPart{LazyLoadMembers: true}, limit)
+	if err != nil {
+		return nil, err
+	}
+	// Members as of these messages, for sender names; the current room
+	// state, which encryption relies on, is left to sync.
+	for _, evt := range resp.State {
+		if evt.Type == event.StateMember && evt.StateKey != nil {
+			prepare(evt, room)
+			if n := evt.Content.AsMember().Displayname; n != "" {
+				names[id.UserID(*evt.StateKey)] = n
+			}
+		}
+	}
+	for _, evt := range resp.Chunk {
+		prepare(evt, room)
+	}
+	return resp, nil
+}
+
+// storeBack stores evts, newest first, from the oldest so that an edit or
+// redaction finds its message stored, and returns the IDs of the stored
+// messages, newest first.
+func (c *mxConnector) storeBack(ctx context.Context, a *account, evts []*event.Event, names map[id.UserID]string) ([]string, error) {
 	var ids []string
 	for _, evt := range slices.Backward(evts) {
 		if evt.StateKey != nil {
@@ -139,15 +163,12 @@ func (c *mxConnector) fetch(ctx context.Context, a *account, req fetchRequest) (
 		}
 		stored, err := c.apply(ctx, a, evt, names)
 		if err != nil {
-			return connector.ReadResult{}, err
+			return nil, err
 		}
 		if stored {
 			ids = append(ids, evt.ID.String())
 		}
 	}
 	slices.Reverse(ids)
-	if len(ids) > req.limit {
-		ids, more = ids[:req.limit], true
-	}
-	return connector.ReadResult{MessageIDs: ids, More: more}, nil
+	return ids, nil
 }

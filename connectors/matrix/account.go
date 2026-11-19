@@ -122,6 +122,8 @@ func (a *account) load(ctx context.Context, zl zerolog.Logger) error {
 	// homeserver adds to a member's account would read the room.
 	a.mach.SendKeysMinTrust = id.TrustStateCrossSignedTOFU
 	a.mach.ShareKeysMinTrust = id.TrustStateCrossSignedTOFU
+	// Tracking serves only ratchet options left off, at a commit per message.
+	a.mach.DisableRatchetTracking = true
 	a.cli.Crypto = olmCrypto{a}
 	a.mach.SessionReceived = func(_ context.Context, _ id.RoomID, sid id.SessionID, _ uint32) {
 		a.mu.Lock()

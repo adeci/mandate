@@ -23,8 +23,8 @@ CREATE TABLE IF NOT EXISTS matrix_space_children (
 );
 CREATE TABLE IF NOT EXISTS matrix_full_state (done INTEGER NOT NULL)`
 
-	// Space, subspace, room.
-	maxDepth = 3
+	// The three ancestors the store allows.
+	maxDepth = 4
 )
 
 func (a *account) isSpace(ctx context.Context, room id.RoomID) bool {
@@ -32,27 +32,35 @@ func (a *account) isSpace(ctx context.Context, room id.RoomID) bool {
 	return err == nil && cr != nil && cr.Content.AsCreate().Type == event.RoomTypeSpace
 }
 
-// spaceChild records or removes a space's child; a child without via is
-// removed.
-func (c *mxConnector) spaceChild(ctx context.Context, evt *event.Event) error {
+// spaceChild records or removes a space's child. A child without via is
+// removed, and so is a room the owner is in when the space's sender could
+// not have named the space its parent: a space's admins cannot pull in a
+// room of the owner's, and with it change what a grant or Never share on
+// the space covers.
+func (c *mxConnector) spaceChild(ctx context.Context, a *account, evt *event.Event) error {
 	space, child := evt.RoomID.String(), *evt.StateKey
-	if len(evt.Content.AsSpaceChild().Via) == 0 {
+	pl, err := a.state.GetPowerLevels(ctx, id.RoomID(child))
+	if err != nil {
+		return err
+	}
+	if len(evt.Content.AsSpaceChild().Via) == 0 || pl != nil && pl.GetUserLevel(evt.Sender) < pl.GetEventLevel(event.StateSpaceParent) {
 		_, err := c.st.DB().ExecContext(ctx, `DELETE FROM matrix_space_children WHERE space_id = ?1 AND child_id = ?2`, space, child)
 		return err
 	}
-	_, err := c.st.DB().ExecContext(ctx, `INSERT OR IGNORE INTO matrix_space_children (space_id, child_id) VALUES (?1, ?2)`, space, child)
+	_, err = c.st.DB().ExecContext(ctx, `INSERT OR IGNORE INTO matrix_space_children (space_id, child_id) VALUES (?1, ?2)`, space, child)
 	return err
 }
 
-// nest makes each stored room the child of a stored space listing it, the
-// first by ID if several do, so that hiding a space hides its rooms. A room
-// that would sit deeper than maxDepth, or close a cycle, has no parent.
+// nest makes each stored room but a DM the child of a stored space listing
+// it, the first by ID if several do, so that hiding a space hides its rooms.
+// A room that would sit deeper than maxDepth goes under the deepest ancestor
+// that fits; one that would close a cycle has no parent.
 func (c *mxConnector) nest(ctx context.Context) error {
 	rows, err := c.st.DB().QueryContext(ctx, `
 SELECT c.id, COALESCE(c.parent_id, ''), COALESCE((
     SELECT min(s.space_id) FROM matrix_space_children AS s
     JOIN containers AS p ON p.id = s.space_id AND p.kind = 'space'
-    WHERE s.child_id = c.id AND s.space_id != c.id), '')
+    WHERE s.child_id = c.id AND s.space_id != c.id AND c.kind != 'dm'), '')
 FROM containers AS c ORDER BY c.id`)
 	if err != nil {
 		return err
@@ -87,8 +95,9 @@ FROM containers AS c ORDER BY c.id`)
 	return tx.Commit()
 }
 
-// nesting keeps the wanted parents that leave every chain acyclic and at
-// most maxDepth deep.
+// nesting keeps the wanted parents that leave every chain acyclic, and
+// moves a room that would sit deeper than maxDepth up to the deepest
+// ancestor that fits.
 func nesting(ids []string, want map[string]string) map[string]string {
 	const visiting = 0
 	depth := map[string]int{}
@@ -101,7 +110,11 @@ func nesting(ids []string, want map[string]string) map[string]string {
 		depth[id] = visiting
 		d := 1
 		if p := want[id]; p != "" {
-			if pd := depthOf(p); pd != visiting && pd < maxDepth {
+			pd := depthOf(p)
+			if pd == maxDepth {
+				p, pd = parent[p], pd-1
+			}
+			if pd != visiting {
 				parent[id], d = p, pd+1
 			}
 		}

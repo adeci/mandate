@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/adeci/mandate/store"
 )
@@ -190,6 +191,34 @@ func (c *fmConnector) initial(ctx context.Context, a *account, cn *conn) error {
 	if err := c.store(ctx, a, cn, ids); err != nil {
 		return err
 	}
+	// Stored mail the query left out may have gone to Trash or been
+	// destroyed while Fastmail forgot the state it was synced to.
+	queried := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		queried[id] = true
+	}
+	rows, err := c.st.DB().QueryContext(ctx, `SELECT id FROM messages WHERE NOT deleted`)
+	if err != nil {
+		return err
+	}
+	var stale []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		if !queried[id] {
+			stale = append(stale, id)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := c.apply(ctx, a, cn, nil, stale); err != nil {
+		return err
+	}
 	c.log.Info("first sync done", "emails", len(ids))
 	return c.saveState(ctx, cn.accountID, state)
 }
@@ -210,13 +239,8 @@ func (c *fmConnector) changes(ctx context.Context, a *account, cn *conn, since s
 		} else if err != nil {
 			return err
 		}
-		for _, id := range ch.Destroyed {
-			if err := c.st.DeleteMessage(ctx, id); err != nil {
-				return err
-			}
-			if err := c.unfile(ctx, id); err != nil {
-				return err
-			}
+		if err := c.destroy(ctx, ch.Destroyed); err != nil {
+			return err
 		}
 		if err := c.apply(ctx, a, cn, ch.Created, ch.Updated); err != nil {
 			return err
@@ -232,8 +256,8 @@ func (c *fmConnector) changes(ctx context.Context, a *account, cn *conn, since s
 }
 
 // apply stores created emails and follows updated ones in and out of Trash
-// and Spam, and between mailboxes. An email's content never changes, so a
-// stored one is not read again.
+// and Spam, between mailboxes, and out of existence. An email's content
+// never changes, so a stored one is not read again.
 func (c *fmConnector) apply(ctx context.Context, a *account, cn *conn, created, updated []string) error {
 	need := slices.Clone(created)
 	for batch := range slices.Chunk(updated, getBatch) {
@@ -242,6 +266,12 @@ func (c *fmConnector) apply(ctx context.Context, a *account, cn *conn, created, 
 			return err
 		}
 		if err := c.file(ctx, cn, list); err != nil {
+			return err
+		}
+		gone := slices.DeleteFunc(slices.Clone(batch), func(id string) bool {
+			return slices.ContainsFunc(list, func(e email) bool { return e.ID == id })
+		})
+		if err := c.destroy(ctx, gone); err != nil {
 			return err
 		}
 		for _, e := range list {
@@ -255,6 +285,19 @@ func (c *fmConnector) apply(ctx context.Context, a *account, cn *conn, created, 
 		}
 	}
 	return c.store(ctx, a, cn, need)
+}
+
+// destroy forgets emails destroyed on Fastmail.
+func (c *fmConnector) destroy(ctx context.Context, ids []string) error {
+	for _, id := range ids {
+		if err := c.st.DeleteMessage(ctx, id); err != nil {
+			return err
+		}
+		if err := c.unfile(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *fmConnector) store(ctx context.Context, a *account, cn *conn, ids []string) error {
@@ -329,6 +372,10 @@ func (c *fmConnector) put(ctx context.Context, cn *conn, e email) error {
 		// mandate on their behalf, actually sent.
 		_, own := cn.identity(e.From[0].Email)
 		msg.IsFromMe = own && e.MailboxIDs[cn.roles["sent"]]
+		// Unless the mail is the owner's, the sender chose the name.
+		if n := strings.TrimLeftFunc(msg.SenderName, func(r rune) bool { return r == '~' || unicode.IsSpace(r) }); n != "" && !msg.IsFromMe {
+			msg.SenderName = "~" + n
+		}
 	}
 	if len(e.InReplyTo) > 0 {
 		err := c.st.DB().QueryRowContext(ctx, `SELECT id FROM fastmail_emails WHERE message_id = ?1 AND id != ?2 LIMIT 1`,
