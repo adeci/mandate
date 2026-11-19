@@ -121,11 +121,11 @@ hit AS MATERIALIZED (
          iif(l.kind = 'mailbox' OR l.kind IN %[2]s,
            NULLIF(max(COALESCE(l.at, ''), COALESCE((SELECT n.at FROM newest AS n WHERE n.id = l.id), '')), ''), l.at) AS at,
          term.raw IN (l.id_l, l.user_l) OR term.digits != '' AND term.digits = ltrim(l.user_l, '+') AS same_id,
-         (l.kind = 'mailbox' OR l.kind IN %[2]s) AND ltrim(l.own_l, '#~') = term.name AS alone,
+         (l.kind = 'mailbox' OR l.kind IN %[2]s) AND ltrim(l.own_l, '#~') IN (term.name, ltrim(term.raw, '#~')) AS alone,
          iif(term.digits = '', NOT EXISTS (SELECT 1 FROM json_each(term.words) AS w WHERE instr(l.own_l, w.value) = 0),
            instr(l.own_d, term.digits) > 0 OR %[6]s) AS own
   FROM term JOIN pathed AS l
-    ON l.kind IN %[2]s AND term.name != '' AND ltrim(l.own_l, '#~') = term.name
+    ON l.kind IN %[2]s AND term.name != '' AND ltrim(l.own_l, '#~') IN (term.name, ltrim(term.raw, '#~'))
     OR l.kind NOT IN %[2]s AND (
       term.raw IN (l.id_l, l.user_l)
       OR term.digits = '' AND term.name != '' AND (l.path_l != '' OR l.handle_l != '') AND NOT EXISTS (SELECT 1 FROM json_each(term.words) AS w

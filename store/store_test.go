@@ -1,9 +1,11 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -103,6 +105,45 @@ func TestSelfParentRefused(t *testing.T) {
 	s := open(t)
 	if err := s.UpsertContainer(t.Context(), Container{ID: "c", Kind: "channel", ParentID: "c"}); err == nil {
 		t.Fatal("stored a chat as its own parent")
+	}
+}
+
+// What a connector stores again unchanged, such as every chat on each
+// reconnect, leaves the file alone; a change writes.
+func TestUnchangedUpsertWritesNothing(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "data.db")
+	s, err := Open(ctx, path)
+	must(t, err)
+	defer s.Close()
+	at := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	chat := Container{ID: "c1", Kind: "dm", Name: "~Sam", Participants: []Participant{{ID: "u1", Name: "~Sam", Handle: "@sam_p"}}, LastMessageAt: at, Icon: "avatars/1/a"}
+	files := []Media{{Type: "image/png", Name: "a.png", Size: 10, Ref: []byte("a")}, {Type: "image/png", Ref: []byte("b")}}
+	msg := Message{ID: "m1", ContainerID: "c1", SenderID: "u1", SenderName: "~Sam", SentAt: at, Body: "hi", Media: files}
+	must(t, s.UpsertContainer(ctx, chat))
+	must(t, s.UpsertMessage(ctx, msg))
+	file := func() []byte {
+		b, err := os.ReadFile(path)
+		must(t, err)
+		return b
+	}
+	before := file()
+	must(t, s.UpsertContainers(ctx, []Container{chat, {ID: "c1", Kind: "dm", LastMessageAt: at.Add(-time.Hour)}}))
+	must(t, s.UpsertMessage(ctx, msg))
+	if !bytes.Equal(file(), before) {
+		t.Fatal("storing the same chat and message again wrote the store")
+	}
+
+	chat.Name = "Sam Park"
+	must(t, s.UpsertContainer(ctx, chat))
+	msg.Media = files[:1]
+	must(t, s.UpsertMessage(ctx, msg))
+	var name string
+	var n int
+	must(t, s.DB().QueryRowContext(ctx, `SELECT name, (SELECT count(*) FROM media) FROM containers`).Scan(&name, &n))
+	if name != "Sam Park" || n != 1 || bytes.Equal(file(), before) {
+		t.Fatalf("after a change: name %q, %d files", name, n)
 	}
 }
 

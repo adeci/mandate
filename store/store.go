@@ -15,6 +15,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	_ "embed"
@@ -171,10 +172,20 @@ func migrate(ctx context.Context, db *sql.DB) error {
 const ReadTimeout = 2 * time.Second
 
 // OpenReadOnly opens the store at path for reading only and refuses any
-// version but Version. init, if not nil, runs on each new connection, such
-// as to register functions. Its queries run under ReadTimeout.
+// version but Version. Its lower() folds case as Terms does; init, if not
+// nil, runs on each new connection, such as to register functions. Its
+// queries run under ReadTimeout.
 func OpenReadOnly(ctx context.Context, path string, init func(*sqlite3.Conn) error) (*sql.DB, error) {
-	db, err := driver.Open("file:"+path+"?mode=ro&_pragma=busy_timeout(10000)", init)
+	db, err := driver.Open("file:"+path+"?mode=ro&_pragma=busy_timeout(10000)", func(c *sqlite3.Conn) error {
+		// SQLite's own lower() folds ASCII only.
+		err := c.CreateFunction("lower", 1, sqlite3.DETERMINISTIC|sqlite3.INNOCUOUS, func(ctx sqlite3.Context, arg ...sqlite3.Value) {
+			ctx.ResultRawText(bytes.ToLower(arg[0].RawText()))
+		})
+		if err != nil || init == nil {
+			return err
+		}
+		return init(c)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("open store %s: %w", path, err)
 	}
@@ -194,7 +205,8 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) DB() *sql.DB { return s.db }
 
-// Empty Name/ParentID/Icon and nil Participants do not overwrite existing values.
+// Empty Name/ParentID/Icon and nil Participants do not overwrite existing
+// values, and a chat that would stay as stored is not written.
 func (s *Store) UpsertContainer(ctx context.Context, c Container) error {
 	return upsertContainer(ctx, s.db, c)
 }
@@ -247,7 +259,11 @@ ON CONFLICT(id) DO UPDATE SET
     participants_json = COALESCE(?6, containers.participants_json),
     updated_at        = excluded.updated_at,
     last_message_at   = NULLIF(max(COALESCE(?8, ''), COALESCE(containers.last_message_at, '')), ''),
-    icon              = COALESCE(excluded.icon, containers.icon)`,
+    icon              = COALESCE(excluded.icon, containers.icon)
+WHERE (excluded.kind, COALESCE(excluded.parent_id, containers.parent_id), COALESCE(excluded.name, containers.name),
+       excluded.is_group, COALESCE(?6, containers.participants_json), COALESCE(excluded.icon, containers.icon))
+      IS NOT (containers.kind, containers.parent_id, containers.name, containers.is_group, containers.participants_json, containers.icon)
+   OR ?8 > COALESCE(containers.last_message_at, '')`,
 		c.ID, c.Kind, c.ParentID, c.Name, c.IsGroup, participants, now(), lastMessageAt, c.Icon)
 	return err
 }
@@ -271,30 +287,38 @@ func (s *Store) UpsertMessage(ctx context.Context, m Message) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }() // a no-op after Commit
-	ts := now()
+	args := []any{
+		m.ID, m.ContainerID, m.SenderID, m.SenderName, formatTime(m.SentAt), m.IsFromMe,
+		m.Body, m.MediaType, m.ReplyToID, now(),
+	}
+	// Not an upsert: its INSERT would take an AUTOINCREMENT value, and so
+	// write, for a message already stored.
+	if _, err := tx.ExecContext(ctx, `
+UPDATE messages SET
+    sender_name = COALESCE(NULLIF(?4, ''), sender_name),
+    media_type  = COALESCE(NULLIF(?8, ''), media_type),
+    edited_at   = CASE WHEN ?7 IS NOT body THEN ?10 ELSE edited_at END,
+    body        = ?7
+WHERE id = ?1 AND NOT deleted`, args...); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO messages (id, container_id, sender_id, sender_name, sent_at, is_from_me,
                       body, media_type, reply_to_id, ingested_at)
-VALUES (?1, ?2, NULLIF(?3, ''), NULLIF(?4, ''), ?5, ?6, ?7, NULLIF(?8, ''), NULLIF(?9, ''), ?10)
-ON CONFLICT(id) DO UPDATE SET
-    sender_name = COALESCE(excluded.sender_name, messages.sender_name),
-    media_type  = COALESCE(excluded.media_type, messages.media_type),
-    edited_at   = CASE WHEN excluded.body IS NOT messages.body THEN ?10 ELSE messages.edited_at END,
-    body        = excluded.body
-WHERE NOT messages.deleted`,
-		m.ID, m.ContainerID, m.SenderID, m.SenderName, formatTime(m.SentAt), m.IsFromMe,
-		m.Body, m.MediaType, m.ReplyToID, ts); err != nil {
+SELECT ?1, ?2, NULLIF(?3, ''), NULLIF(?4, ''), ?5, ?6, ?7, NULLIF(?8, ''), NULLIF(?9, ''), ?10
+WHERE NOT EXISTS (SELECT 1 FROM messages WHERE id = ?1)`, args...); err != nil {
 		return err
 	}
 	if m.Media != nil {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM media WHERE message_id = ?1`, m.ID); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM media WHERE message_id = ?1 AND idx >= ?2`, m.ID, len(m.Media)); err != nil {
 			return err
 		}
 		for i, md := range m.Media {
 			if _, err := tx.ExecContext(ctx, `
 INSERT INTO media (message_id, idx, type, name, size, ref)
 SELECT ?1, ?2, ?3, NULLIF(?4, ''), NULLIF(?5, 0), ?6
-WHERE EXISTS (SELECT 1 FROM messages WHERE id = ?1 AND NOT deleted)`,
+WHERE EXISTS (SELECT 1 FROM messages WHERE id = ?1 AND NOT deleted)
+ON CONFLICT (message_id, idx) DO UPDATE SET type = excluded.type, name = excluded.name, size = excluded.size, ref = excluded.ref`,
 				m.ID, i, md.Type, md.Name, md.Size, md.Ref); err != nil {
 				return err
 			}
