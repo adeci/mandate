@@ -4,6 +4,8 @@ import (
 	"cmp"
 	"context"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -89,6 +91,9 @@ func (s *Server) connectorUnlink(w http.ResponseWriter, r *http.Request) {
 		failErr(w, connectorError(err))
 		return
 	}
+	if err := os.RemoveAll(filepath.Join(s.dir, "icons", r.PathValue("name"))); err != nil {
+		s.log.Warn("delete chat pictures", "connector", r.PathValue("name"), "err", err)
+	}
 	s.mu.Lock()
 	by, _ := s.callerKey(r)
 	s.note(activity{Kind: "connector.unlinked", Connector: r.PathValue("name")}, by)
@@ -136,9 +141,7 @@ func (s *Server) connectorChats(w http.ResponseWriter, r *http.Request) {
 }
 
 // markHidden marks the chats never-share hides: one named, one in a chat
-// named, and a DM whose person is named. An entry from before Discord
-// stored a guild as guild:ID names it by its bare ID, as the gateway reads
-// it.
+// named, and a DM whose person is named.
 func (s *Server) markHidden(conn string, chats []connector.Container) {
 	hidden := map[string]bool{}
 	people := map[string]bool{}
@@ -147,7 +150,7 @@ func (s *Server) markHidden(conn string, chats []connector.Container) {
 		switch {
 		case n.Connector != conn:
 		case n.Kind == "chat":
-			hidden[n.ID], hidden["guild:"+n.ID] = true, true
+			hidden[n.ID] = true
 		case n.Kind == "person":
 			people[n.ID] = true
 		}

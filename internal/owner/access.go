@@ -45,40 +45,19 @@ func (s *Server) postRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.st.Identities[nr.Identity] == nil || s.conns[nr.Connector] == nil {
+	switch {
+	case s.st.Identities[nr.Identity] == nil || s.conns[nr.Connector] == nil:
 		fail(w, http.StatusNotFound, "unknown identity or connector")
+		return
+	case nr.Kind == "extend" && s.extendable(nr.Identity, nr.Connector) == nil:
+		fail(w, http.StatusConflict, "no window on "+nr.Connector+" to extend; ask for a new one")
+		return
+	}
+	if e := s.requestLimit(nr.Identity); e != nil {
+		reply(w, http.StatusTooManyRequests, e)
 		return
 	}
 	now := s.now()
-	// A waiting request expires within the hour, so either limit lifts by
-	// the time the oldest request it counts is an hour old.
-	var waiting, recent []time.Time
-	for _, req := range s.st.Requests {
-		if req.Identity != nr.Identity {
-			continue
-		}
-		if req.Status == "pending" {
-			waiting = append(waiting, req.CreatedAt)
-		}
-		if now.Sub(req.CreatedAt) < time.Hour {
-			recent = append(recent, req.CreatedAt)
-		}
-	}
-	limited := waiting
-	if len(waiting) < requestsWaiting {
-		limited = nil
-		if len(recent) >= requestsPerHour {
-			limited = recent
-		}
-	}
-	if limited != nil {
-		lifts := slices.MinFunc(limited, time.Time.Compare).Add(time.Hour)
-		reply(w, http.StatusTooManyRequests, apiError{
-			Error: "at most 3 waiting requests and 10 an hour; wait for the owner",
-			Code:  codes[http.StatusTooManyRequests], RetryAfter: int(lifts.Sub(now).Seconds()) + 1,
-		})
-		return
-	}
 	req := &request{
 		ID: record.NewID(), Identity: nr.Identity, Connector: nr.Connector, Kind: nr.Kind,
 		Terms: nr.Terms, For: nr.For, Horizon: nr.Horizon, Schedule: nr.Schedule, Reason: nr.Reason,
@@ -95,7 +74,53 @@ func (s *Server) postRequest(w http.ResponseWriter, r *http.Request) {
 	reply(w, http.StatusCreated, map[string]string{"id": req.ID})
 }
 
-// The caller holds s.mu and commits.
+// mayRequest answers 204 while identity may ask, else postRequest's 429,
+// so the gateway matches terms only for a request that can be made.
+func (s *Server) mayRequest(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e := s.requestLimit(r.URL.Query().Get("identity")); e != nil {
+		reply(w, http.StatusTooManyRequests, e)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// requestLimit is the refusal of a new request by identity, or nil. A
+// waiting request expires within the hour, so either limit lifts by the
+// time the oldest request it counts is an hour old. The caller holds s.mu.
+func (s *Server) requestLimit(identity string) *apiError {
+	now := s.now()
+	var waiting, recent []time.Time
+	for _, req := range s.st.Requests {
+		if req.Identity != identity {
+			continue
+		}
+		if req.Status == "pending" {
+			waiting = append(waiting, req.CreatedAt)
+		}
+		if now.Sub(req.CreatedAt) < time.Hour {
+			recent = append(recent, req.CreatedAt)
+		}
+	}
+	limited := waiting
+	if len(waiting) < requestsWaiting {
+		limited = nil
+		if len(recent) >= requestsPerHour {
+			limited = recent
+		}
+	}
+	if limited == nil {
+		return nil
+	}
+	lifts := slices.MinFunc(limited, time.Time.Compare).Add(time.Hour)
+	return &apiError{
+		Error: "at most 3 waiting requests and 10 an hour; wait for the owner",
+		Code:  codes[http.StatusTooManyRequests], RetryAfter: int(lifts.Sub(now).Seconds()) + 1,
+	}
+}
+
+// The caller holds s.mu; the next commit saves it.
 func (s *Server) seen(id string, at time.Time) {
 	if i := s.st.Identities[id]; i != nil {
 		if i.FirstSeen.IsZero() {
@@ -342,8 +367,12 @@ func (s *Server) grantChallenge(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &ng) {
 		return
 	}
-	if (ng.For > 0) == (ng.Schedule != nil) {
+	switch {
+	case (ng.For > 0) == (ng.Schedule != nil):
 		fail(w, http.StatusBadRequest, "give either for or schedule")
+		return
+	case ng.Chats != nil && len(ng.Chats) == 0:
+		fail(w, http.StatusBadRequest, "no chat to grant")
 		return
 	}
 	s.mu.Lock()

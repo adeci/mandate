@@ -30,6 +30,7 @@ config = { phone = "+4912345", retries = 3 }
 		{"agent port", `agent_listen = ":8444"`, true},
 		{"agent port same as listen", "listen = \":8443\"\nagent_listen = \":8443\"", false},
 		{"connector name as path", "[connectors.\"../x\"]\ncommand = \"/bin/x\"", false},
+		{"connector named like a unit", "[connectors.owner]\ncommand = \"/bin/x\"", false},
 		{"relative command", "[connectors.signal]\ncommand = \"signal\"", false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

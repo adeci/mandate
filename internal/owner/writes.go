@@ -2,6 +2,7 @@ package owner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"maps"
 	"net/http"
@@ -29,6 +30,10 @@ func (s *Server) postProposal(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "op and prepared args are required")
 		return
 	}
+	if b, _ := json.Marshal(np.Prepared); len(b) > maxPrepared {
+		fail(w, http.StatusBadRequest, "the write is over 64 KiB; make it shorter")
+		return
+	}
 	// A grant on a server or mailbox covers the chat by where the
 	// connector, not the gateway, says it is.
 	var pl place
@@ -49,19 +54,32 @@ func (s *Server) postProposal(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, "unknown identity or connector")
 		return
 	}
+	now := s.now()
+	var waiting []time.Time
+	for _, p := range s.st.Proposals {
+		if p.Identity == np.Identity && p.Status == "pending" && now.Before(p.ExpiresAt) {
+			waiting = append(waiting, p.ExpiresAt)
+		}
+	}
+	if len(waiting) >= proposalsWaiting {
+		reply(w, http.StatusTooManyRequests, apiError{
+			Error: "at most 10 waiting proposals; wait for the owner",
+			Code:  codes[http.StatusTooManyRequests], RetryAfter: int(slices.MinFunc(waiting, time.Time.Compare).Sub(now).Seconds()) + 1,
+		})
+		return
+	}
 	// The gateway checked the chat against its live set, which may lag a
 	// Close; the proposal becomes durable only under a grant still live.
 	covered := false
 	for _, g := range s.st.Grants {
 		chats := g.Record.Chats
-		covered = covered || g.Record.Identity == np.Identity && g.Record.Connector == np.Connector && g.live(s.now()) &&
+		covered = covered || g.Record.Identity == np.Identity && g.Record.Connector == np.Connector && g.live(now) &&
 			(np.Prepared.Container == "" || len(chats) == 0 || covers(chats, np.Prepared.Container, pl))
 	}
 	if !covered {
 		fail(w, http.StatusNotFound, "no live grant covers the chat")
 		return
 	}
-	now := s.now()
 	p := &proposal{
 		ID: record.NewID(), Identity: np.Identity, Connector: np.Connector, Op: np.Op,
 		Prepared: np.Prepared, Note: np.Note, CreatedAt: now, ExpiresAt: now.Add(proposalTTL),
@@ -194,6 +212,10 @@ func (s *Server) proposalChallenge(w http.ResponseWriter, r *http.Request) {
 	}
 	prepared, conn, op := p.Prepared, s.conns[p.Connector], p.Op
 	s.mu.Unlock()
+	if conn == nil {
+		fail(w, http.StatusConflict, p.Connector+" is no longer set up on the server; deny the proposal")
+		return
+	}
 
 	if len(body.Edits) > 0 {
 		args := maps.Clone(prepared.Args)

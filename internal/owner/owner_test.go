@@ -1042,6 +1042,64 @@ func TestResetForget(t *testing.T) {
 	}
 }
 
+// A connector that points its private/ elsewhere gets nothing outside its
+// directory removed.
+func TestResetForgetStaysInside(t *testing.T) {
+	dir, elsewhere := t.TempDir(), t.TempDir()
+	kept := filepath.Join(elsewhere, "kept")
+	if err := os.WriteFile(kept, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(dir, "private")); err != nil {
+		t.Fatal(err)
+	}
+	_ = forget(dir, false) // refusing is as good as skipping it
+	if _, err := os.Stat(kept); err != nil {
+		t.Errorf("a file the session pointed at: %v", err)
+	}
+}
+
+func TestUnlinkDropsPictures(t *testing.T) {
+	h := start(t, serveConnector(t, &unlinkable{}, t.TempDir()))
+	owner := h.pair()
+	pic := iconFile(h.s.dir, "test", "c3", "0123456789ab")
+	if err := os.MkdirAll(filepath.Dir(pic), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pic, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if st := h.do("POST", "/owner/v1/connectors/test/unlink", owner.token, nil, nil); st != http.StatusOK {
+		t.Fatalf("unlink = %d", st)
+	}
+	if _, err := os.Stat(pic); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the account's picture after unlink: %v", err)
+	}
+}
+
+func TestSetupWhenPaired(t *testing.T) {
+	h := start(t, nowhere())
+	h.pair()
+	t.Setenv("MANDATE_ROOT", t.TempDir())
+	b, err := os.ReadFile(stateFile(h.s.dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(config.StateDir("owner"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateFile(config.StateDir("owner")), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	if err := Setup(t.Context(), &config.Config{Listen: ":8443", TLS: config.TLS{Mode: "own"}}, &out); err != nil || strings.Contains(out.String(), "/setup/") {
+		t.Errorf("setup once paired = %v, printed %q", err, out.String())
+	}
+	if _, err := os.Stat(config.SetupPasswordFile()); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a setup password once paired: %v", err)
+	}
+}
+
 func TestCertModeSetupHost(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name string, c x509.Certificate) string {
@@ -1136,7 +1194,15 @@ func TestChallengeRules(t *testing.T) {
 	if st, _ := h.sign(owner, extend); st != http.StatusConflict {
 		t.Errorf("challenge after Close = %d", st)
 	}
+	ext := requestBody(agent)
+	ext["kind"] = "extend"
+	if st := h.do("POST", "/internal/requests", "", ext, nil); st != http.StatusConflict {
+		t.Errorf("extend with no window = %d", st)
+	}
 
+	if st := h.do("GET", "/internal/requests?identity="+agent, "", nil, nil); st != http.StatusNoContent {
+		t.Errorf("may ask with one waiting = %d", st)
+	}
 	h.request(agent)
 	h.request(agent) // three wait now
 	var limited struct {
@@ -1144,6 +1210,9 @@ func TestChallengeRules(t *testing.T) {
 	}
 	if st := h.do("POST", "/internal/requests", "", requestBody(agent), &limited); st != http.StatusTooManyRequests || limited.RetryAfter < 1 {
 		t.Errorf("fourth waiting request = %d, retry after %d", st, limited.RetryAfter)
+	}
+	if st := h.do("GET", "/internal/requests?identity="+agent, "", nil, nil); st != http.StatusTooManyRequests {
+		t.Errorf("may ask with three waiting = %d", st)
 	}
 }
 
@@ -1576,6 +1645,22 @@ func TestChatsPassThrough(t *testing.T) {
 	}
 }
 
+// Hiding an old Discord server's first channel, which has the server's
+// ID, hides the channel alone.
+func TestHideFirstChannel(t *testing.T) {
+	s := &Server{st: state{NeverShare: []neverShare{{Connector: "discord", Kind: "chat", ID: "1100000000000000001"}}}}
+	server := []connector.Parent{{ID: "guild:1100000000000000001", Name: "main", Kind: "guild"}}
+	chats := []connector.Container{
+		{ID: "guild:1100000000000000001", Kind: "guild", Name: "main"},
+		{ID: "1100000000000000001", Kind: "channel", Name: "#general", Parents: server},
+		{ID: "1100000000000000002", Kind: "channel", Name: "#random", Parents: server},
+	}
+	s.markHidden("discord", chats)
+	if chats[0].Hidden || !chats[1].Hidden || chats[2].Hidden {
+		t.Errorf("hidden %+v", chats)
+	}
+}
+
 // A grant on a server covers a reply in its channel, which the owner side
 // finds is in it by asking the connector; every chat the app is shown
 // carries its kind and parents, and a chat since gone keeps its stored name.
@@ -1590,6 +1675,9 @@ func TestServerGrant(t *testing.T) {
 	body["terms"] = []term{{Term: "main", Chats: []chat{{ID: "g1", Name: "main", Kind: "guild"}, {ID: "gone", Name: "Old"}}}}
 	if st := h.do("POST", "/internal/requests", "", body, nil); st != http.StatusCreated {
 		t.Fatalf("request = %d", st)
+	}
+	if st := h.do("POST", "/owner/v1/grants/challenge", owner.token, map[string]any{"identity": agent, "connector": "test", "for": 600, "chats": []string{}}, nil); st != http.StatusBadRequest {
+		t.Errorf("a grant on no chat = %d", st)
 	}
 	env := h.challenge(owner, "/owner/v1/grants/challenge", map[string]any{"identity": agent, "connector": "test", "for": 600, "horizon": 0, "chats": []string{"g1"}})
 	if st, _ := h.sign(owner, env); st != http.StatusOK {
@@ -1679,6 +1767,52 @@ func TestWriteExecutedOnce(t *testing.T) {
 	}
 	if got := f.sent.Load(); got != "on my way, 10 min" {
 		t.Errorf("sent %q, not the owner's edit", got)
+	}
+}
+
+func TestProposalLimits(t *testing.T) {
+	f := &fakeConnector{}
+	h := start(t, serveConnector(t, f, t.TempDir()))
+	owner := h.pair()
+	agent := h.agent(owner)
+	h.grant(owner, agent)
+	var limited struct {
+		RetryAfter int `json:"retry_after_seconds"`
+	}
+	send := func(text string) int {
+		prepared, _ := f.Prepare(t.Context(), "send", map[string]string{"chat": "c1", "text": text})
+		return h.do("POST", "/internal/proposals", "", map[string]any{"identity": agent, "connector": "test", "op": "send", "prepared": prepared}, &limited)
+	}
+	if st := send(strings.Repeat("x", maxPrepared/2)); st != http.StatusBadRequest {
+		t.Errorf("a write over the size limit = %d", st)
+	}
+	for i := range proposalsWaiting {
+		if st := send(fmt.Sprint("reply ", i)); st != http.StatusCreated {
+			t.Fatalf("proposal %d = %d", i, st)
+		}
+	}
+	if st := send("one more"); st != http.StatusTooManyRequests || limited.RetryAfter < 1 {
+		t.Errorf("a proposal past the limit = %d, retry after %d", st, limited.RetryAfter)
+	}
+}
+
+// A proposal for a connector since removed from the config is refused
+// approval, and can still be denied.
+func TestProposalConnectorGone(t *testing.T) {
+	h := start(t, nowhere(), func(s *Server) {
+		now := s.now()
+		s.st.Proposals["P"] = &proposal{
+			ID: "P", Identity: "agent", Connector: "gone", Op: "send",
+			Prepared:  connector.Prepared{Args: map[string]string{"text": "hi"}},
+			CreatedAt: now, ExpiresAt: now.Add(proposalTTL), Status: "pending",
+		}
+	})
+	owner := h.pair()
+	if st := h.do("POST", "/owner/v1/proposals/P/challenge", owner.token, nil, nil); st != http.StatusConflict {
+		t.Errorf("approving = %d", st)
+	}
+	if st := h.do("POST", "/owner/v1/proposals/P/deny", owner.token, nil, nil); st != http.StatusOK {
+		t.Errorf("denying = %d", st)
 	}
 }
 
@@ -1782,6 +1916,42 @@ func TestReadsMerge(t *testing.T) {
 	last := h.readsOf(owner)
 	if n := last[len(last)-1]; n.Count != 5 || !slices.Equal(n.Verbs, []string{"chats", "messages", "media"}) || len(n.Chats) != 3 {
 		t.Errorf("after a restart = %+v", n)
+	}
+
+	// A run that names runChats chats ends there.
+	t4 := t3.Add(time.Hour)
+	var long []map[string]any
+	for i := range runChats + 1 {
+		long = append(long, read(t4, agent, "test", "messages", fmt.Sprint("d", i), 1))
+	}
+	h.postReads(long...)
+	end := h.readsOf(owner)
+	if a, b := end[len(end)-2], end[len(end)-1]; len(a.Chats) != runChats || len(b.Chats) != 1 {
+		t.Errorf("%d chats read in a run made entries of %d and %d", runChats+1, len(a.Chats), len(b.Chats))
+	}
+}
+
+// Reads keep the identity's last-seen time without saving the state.
+func TestReadsSeen(t *testing.T) {
+	h := start(t, nowhere())
+	owner := h.pair()
+	agent := h.agent(owner)
+	saved, err := os.ReadFile(stateFile(h.s.dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := h.clock.now().Add(time.Minute)
+	h.postReads(read(at, agent, "test", "messages", "c0", 1))
+	if b, _ := os.ReadFile(stateFile(h.s.dir)); !bytes.Equal(b, saved) {
+		t.Error("reads saved the state")
+	}
+	var ids []struct {
+		ID       string
+		LastSeen time.Time `json:"last_seen"`
+	}
+	h.do("GET", "/owner/v1/identities", owner.token, nil, &ids)
+	if len(ids) != 1 || !ids[0].LastSeen.Equal(at) {
+		t.Errorf("identities %+v, want last seen %v", ids, at)
 	}
 }
 

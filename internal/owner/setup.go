@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -348,7 +347,8 @@ func tokenSHA256(token string) string {
 }
 
 // Setup makes a setup password unless one is waiting, and prints the setup
-// page's address, the password and the server key's fingerprint.
+// page's address, the password and the server key's fingerprint. Once a
+// device is paired there is nothing to set up.
 func Setup(ctx context.Context, cfg *config.Config, out io.Writer) error {
 	dir := config.StateDir("owner")
 	st, err := loadState(dir)
@@ -356,7 +356,8 @@ func Setup(ctx context.Context, cfg *config.Config, out io.Writer) error {
 		return err
 	}
 	if len(st.Keys) > 0 {
-		return errors.New("a device is paired already; mandate reset starts over")
+		_, err := fmt.Fprintln(out, "A device is paired.")
+		return err
 	}
 	password, err := setupPassword(dir)
 	if err != nil {
@@ -409,7 +410,7 @@ func writeOwned(path string, b []byte, mode fs.FileMode) error {
 	if !ok || os.Geteuid() != 0 {
 		return nil
 	}
-	return os.Chown(path, int(st.Uid), int(st.Gid))
+	return os.Lchown(path, int(st.Uid), int(st.Gid))
 }
 
 // unstored marks the setup pages' answers, whose links may hold the setup

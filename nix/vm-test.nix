@@ -203,7 +203,7 @@ in
         # reload of the spent link lands there too.
         assert server.succeed(f"curl -sk -o /dev/null -w '%{{http_code}} %{{redirect_url}}' {url}") == "302 https://localhost:8443/"
         server.fail(f"testdevice --state /root/thief.json pair '{link}'")
-        server.fail("mandate setup")
+        assert "/setup/" not in server.succeed("mandate setup")
         server.wait_until_succeeds("test $(testdevice --state /root/phone.json call GET /owner/v1/keys | jq '.body.trusted | length') = 1")
         # The owner side pushes the key log to connectors after pairing.
         retry(lambda _: connector_keys() == 1)

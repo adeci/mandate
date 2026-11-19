@@ -577,7 +577,7 @@ func (s *Server) listContainers(ctx context.Context, q ContainerQuery) ([]Contai
 			return nil, err
 		}
 		if err := list("\n"+pickerColumns+` FROM candidates AS c
-WHERE c.kind IN `+store.HolderKinds+` AND (?2 = '' OR `+under+`) AND json_array_length(?1) > 0
+WHERE c.shelf AND (?2 = '' OR `+under+`) AND json_array_length(?1) > 0
   AND NOT EXISTS (SELECT 1 FROM json_each(?1) AS w WHERE instr(lower(COALESCE(c.own, '')), w.value) = 0)
 ORDER BY c.at DESC NULLS LAST, c.id LIMIT ?3`, string(words), q.Parent, maxContainers); err != nil {
 			return nil, err
@@ -586,10 +586,19 @@ ORDER BY c.at DESC NULLS LAST, c.id LIMIT ?3`, string(words), q.Parent, maxConta
 		if err != nil {
 			return nil, err
 		}
-		// A holder the term names exactly is already among the headings.
+		heads := make([]string, len(out))
+		for i, c := range out {
+			heads[i] = c.ID
+		}
+		shown, err := json.Marshal(heads)
+		if err != nil {
+			return nil, err
+		}
+		// A holder the term finds is one it names exactly, so already among
+		// the headings; a mailbox may be found by its path too.
 		err = list(", "+store.Matching("?1", "?4")+"\n"+pickerColumns+` FROM matched AS m JOIN candidates AS c ON c.id = m.id
-WHERE c.kind NOT IN `+store.HolderKinds+` AND (?2 = '' OR `+under+`)
-ORDER BY m.n LIMIT ?3`, terms, q.Parent, q.Limit, time.Now().UTC().Format(time.RFC3339Nano))
+WHERE c.kind NOT IN `+store.HolderKinds+` AND c.id NOT IN (SELECT value FROM json_each(?5)) AND (?2 = '' OR `+under+`)
+ORDER BY m.n LIMIT ?3`, terms, q.Parent, q.Limit, time.Now().UTC().Format(time.RFC3339Nano), string(shown))
 		return out, err
 	}
 	in := `COALESCE(c.parent_id, '') = ?1`

@@ -65,8 +65,12 @@ func activityFile(dir string, day time.Time) string {
 }
 
 // mergeWindow is how long after its first read a run of reads stays one
-// entry.
-const mergeWindow = 10 * time.Minute
+// entry, and runChats how many chats it may name before the next read
+// starts another.
+const (
+	mergeWindow = 10 * time.Minute
+	runChats    = 200
+)
 
 // activityLog appends to the history, merging a run of reads into one
 // entry: a read joins the entry written last when that is a read of the
@@ -90,7 +94,7 @@ type written struct {
 // mergeable reports whether read e joins the run of reads l.
 func mergeable(l, e activity) bool {
 	return l.Kind == "read" && e.Kind == "read" && l.Identity == e.Identity && l.Connector == e.Connector &&
-		e.At.Sub(l.At) <= mergeWindow && l.At.Sub(e.At) <= mergeWindow
+		e.At.Sub(l.At) <= mergeWindow && l.At.Sub(e.At) <= mergeWindow && len(l.Chats) < runChats
 }
 
 // merge is the run l with read e: every chat once, the counts summed, the
@@ -324,10 +328,6 @@ func (s *Server) postActivity(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 	for _, a := range entries {
 		s.seen(a.Identity, a.At)
-	}
-	if err := s.commit("now"); err != nil {
-		failErr(w, err)
-		return
 	}
 	reply(w, http.StatusOK, struct{}{})
 }

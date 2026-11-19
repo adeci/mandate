@@ -73,7 +73,7 @@ config = {}             # written as JSON for the connector's --config
 
 Unknown keys are refused. Paths are fixed (the table above) rather than configurable. The NixOS VM test can override them through `MANDATE_ROOT`, a prefix for `/etc`, `/var/lib` and `/run` used only in tests.
 
-Connector names match `[a-z][a-z0-9-]{0,23}`, so that `mandate-NAME` fits useradd's 32-character limit, and `command` is an absolute path. ACME does not force `listen` to port 443, since the port the CA sees may be forwarded. Front caps request bodies at 1 MiB, as connectors do.
+Connector names match `[a-z][a-z0-9-]{0,23}`, so that `mandate-NAME` fits useradd's 32-character limit, and are not a word of mandate's own: `front`, `gateway`, `owner`, a CLI command or an agent API route. `command` is an absolute path. ACME does not force `listen` to port 443, since the port the CA sees may be forwarded. Front caps request bodies at 1 MiB, as connectors do.
 
 ## Internal API (gateway ↔ owner)
 
@@ -83,11 +83,12 @@ JSON over the two sockets, under `/internal/`, and caller-checked by group as in
 
 | Route | Body → answer |
 |---|---|
+| `GET /internal/requests?identity=…` | `204` while the identity may ask, else the `429` that `POST` would answer, so terms are matched only for a request that can be made. |
 | `POST /internal/requests` | `{identity, connector, kind: once\|routine\|extend, terms: [{term, chats: [{id, name, kind}]}], for, horizon, schedule, reason}` → `{id}`. The gateway has already matched the terms against the visible chats; a term with no chats reaches the owner as "no visible chat matched". |
 | `GET /internal/requests/{id}?identity=…&wait=` | `{status, grant_id, until}`. `404` for another identity's request. |
 | `POST /internal/proposals` | `{identity, connector, op, prepared: {args, display, container, message}, note}` → `{id}`. The gateway has already called `prepare` and checked the chat and message against the grants. The owner side checks the chat again under its live grants, asking the connector which chats it is in for a grant on a server or mailbox; `503` if the connector can't say. |
 | `GET /internal/proposals/{id}?identity=…&wait=` | `{id, status, result}` |
-| `POST /internal/activity` | `[{at, identity, connector, verb, chats, count}]`, batched |
+| `POST /internal/activity` | `[{at, identity, connector, verb, chats, count}]`, batched in bodies under 1 MiB |
 | `POST /internal/join`, `GET /internal/join/{id}?wait=`, `POST /internal/join/{id}` | The agent side of the code exchange, relayed as-is from `/agent/v1/join…`. Exchanges live on the owner side, for agents and devices alike, and the gateway passes `X-Forwarded-For` and `Mandate-Spki-Sha256` on. |
 
 **The gateway serves the owner:**

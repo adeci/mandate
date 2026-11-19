@@ -35,6 +35,9 @@ func TestContainers(t *testing.T) {
 		{ID: "30", Kind: "dm", Name: "~Sam", Participants: []store.Participant{{ID: "u1", Name: "~Sam", Handle: "@sam_p"}}, LastMessageAt: day(4)},
 		{ID: "31", Kind: "group", IsGroup: true, Name: "climbing", Participants: []store.Participant{{ID: "u1"}, {ID: "u2"}}, LastMessageAt: day(7)},
 		{ID: "32", Kind: "dm", Name: "~Kai"},
+		{ID: "mailbox:mb-inbox", Kind: "mailbox", Name: "Inbox"},
+		{ID: "mailbox:mb-rec", Kind: "mailbox", ParentID: "mailbox:mb-inbox", Name: "Receipts"},
+		{ID: "t3", Kind: "thread", ParentID: "mailbox:mb-inbox", Name: "Receipts for March", LastMessageAt: day(8)},
 	} {
 		if err := st.UpsertContainer(ctx, c); err != nil {
 			t.Fatal(err)
@@ -63,12 +66,13 @@ func TestContainers(t *testing.T) {
 		q    ContainerQuery
 		want []string
 	}{
-		"top level":        {ContainerQuery{Limit: 50}, []string{"guild:1", "guild:2", "32", "31", "30"}},
-		"top level, cut":   {ContainerQuery{Limit: 1}, []string{"guild:1", "guild:2", "32"}},
+		"top level":        {ContainerQuery{Limit: 50}, []string{"mailbox:mb-inbox", "guild:1", "guild:2", "32", "31", "30"}},
+		"top level, cut":   {ContainerQuery{Limit: 1}, []string{"mailbox:mb-inbox", "guild:1", "guild:2", "32"}},
 		"in main":          {ContainerQuery{Parent: main, Limit: 50}, []string{"13", "10", "11"}},
 		"search":           {ContainerQuery{Q: "main", Limit: 50}, []string{"guild:1"}}, // all of main
 		"search in main":   {ContainerQuery{Q: "general", Parent: main, Limit: 50}, []string{"10", "14"}},
 		"search, headings": {ContainerQuery{Q: "help", Limit: 50}, []string{"13"}},
+		"search, mailbox":  {ContainerQuery{Q: "receipt", Limit: 1}, []string{"mailbox:mb-rec", "t3"}},
 		"search, path":     {ContainerQuery{Q: "main general", Limit: 50}, []string{"10", "14"}},
 		"search, handle":   {ContainerQuery{Q: "@sam_p", Limit: 50}, []string{"30"}},
 		"by id":            {ContainerQuery{IDs: []string{"31", "12", "nosuch"}}, []string{"31", "12"}},

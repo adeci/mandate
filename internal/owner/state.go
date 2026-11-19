@@ -122,6 +122,9 @@ const (
 	// Per identity, counted from the requests kept here.
 	requestsWaiting = 3
 	requestsPerHour = 10
+	// Per identity; and the size of a proposal's prepared write as JSON.
+	proposalsWaiting = 10
+	maxPrepared      = 64 << 10
 )
 
 func newState() state {

@@ -43,9 +43,10 @@ func Reset(ctx context.Context, cfg *config.Config, out io.Writer, unlink bool) 
 	}
 	password, err := wipe()
 	if err == nil && unlink {
+		err = os.RemoveAll(filepath.Join(config.StateDir("owner"), "icons"))
 		for _, a := range accounts {
-			if err = forget(config.ConnectorDir(a.name), a.loggedOut); err != nil {
-				break
+			if err == nil {
+				err = forget(config.ConnectorDir(a.name), a.loggedOut)
 			}
 		}
 	}
@@ -119,26 +120,42 @@ func survey(ctx context.Context, conns map[string]*connector.Client, unlink bool
 }
 
 // forget deletes a stopped connector's store and, unless it logged out
-// itself, its session in private/. Its spent approvals stay.
+// itself, its session in private/. Its spent approvals stay. The connector
+// owns dir, so nothing is removed outside it.
 func forget(dir string, loggedOut bool) error {
+	root, err := os.OpenRoot(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer root.Close()
 	for _, f := range []string{"data.db", "data.db-wal", "data.db-shm", "data.db-journal"} {
-		if err := os.Remove(filepath.Join(dir, f)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := root.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("delete the store: %w", err)
 		}
 	}
 	if loggedOut {
 		return nil
 	}
-	private := filepath.Join(dir, "private")
-	entries, err := os.ReadDir(private)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	private, err := root.Open("private")
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	entries, err := private.ReadDir(-1)
+	private.Close()
+	if err != nil {
 		return err
 	}
 	for _, e := range entries {
 		if e.Name() == "spent" {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(private, e.Name())); err != nil {
+		if err := root.RemoveAll(filepath.Join("private", e.Name())); err != nil {
 			return fmt.Errorf("delete the session: %w", err)
 		}
 	}
@@ -208,12 +225,17 @@ func wipe() (string, error) {
 	if err := writeOwned(stateFile(dir), b, 0o600); err != nil {
 		return "", fmt.Errorf("reset owner state: %w", err)
 	}
-	logs, err := filepath.Glob(filepath.Join(config.ConnectorDir("*"), "private", "keylog.json"))
+	dirs, err := filepath.Glob(config.ConnectorDir("*"))
 	if err != nil {
 		return "", err
 	}
-	for _, f := range logs {
-		if err := os.Remove(f); err != nil {
+	for _, d := range dirs {
+		root, err := os.OpenRoot(d)
+		if err == nil {
+			err = root.Remove(filepath.Join("private", "keylog.json"))
+			root.Close()
+		}
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return "", fmt.Errorf("reset connector key log: %w", err)
 		}
 	}

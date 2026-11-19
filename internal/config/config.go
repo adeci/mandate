@@ -91,8 +91,9 @@ func (c *Config) validate() error {
 		if !connectorName.MatchString(name) {
 			return fmt.Errorf("connector %q: name must be a-z, 0-9 and -, start with a letter, at most 24 characters", name)
 		}
-		// Agent API routes and CLI commands share the namespace with connectors.
-		if slices.Contains([]string{"access", "connectors", "help", "join", "login", "proposals", "request", "reset", "serve", "setup", "status", "store-acl", "units"}, name) {
+		// Agent API routes, CLI commands and mandate's own units share the
+		// namespace with connectors.
+		if slices.Contains([]string{"access", "conformance", "connectors", "front", "gateway", "help", "join", "login", "owner", "proposals", "request", "reset", "serve", "setup", "status", "store-acl", "units"}, name) {
 			return fmt.Errorf("connector %q: the name is taken by mandate itself", name)
 		}
 		if !filepath.IsAbs(conn.Command) {

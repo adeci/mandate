@@ -172,7 +172,8 @@ CREATE TABLE media (
   them, never the owner.
 - `is_from_me` marks the owner's messages; `reply_to_id` the message answered.
 - An edit updates `body` and sets `edited_at`; an identical redelivery changes
-  nothing. A delete sets `deleted = 1`.
+  nothing. A delete sets `deleted = 1`. A chat the service deleted, or one
+  the account left, may be removed with the chats under it and their messages.
 - A reader holding the store past the connector's busy timeout makes its
   writes fail with `SQLITE_BUSY`, and nothing may be lost to that: the write
   waits in memory and is stored in order once the reader lets go, so an edit

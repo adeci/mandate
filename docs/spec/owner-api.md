@@ -56,7 +56,7 @@ On an existing device, the owner:
 - the owner side's key log, identities, grants, device tokens, requests and proposals;
 - every connector's key log, and the gateway's copy of the live set.
 
-It keeps never-share, activity and every connector's spent approvals, so nothing signed before the reset can run again. Then it issues a new setup password and starts `mandate.target` again. Linked accounts stay linked, and it lists them (`Still linked`). With `--unlink`, it first has each linked connector `POST /unlink` while it still runs, then deletes every connector's `data.db` and, for those that did not log out (no `unlink`, or not answering), its session in `private/`, listing them (`Not logged out`).
+It keeps never-share, activity and every connector's spent approvals, so nothing signed before the reset can run again. Then it issues a new setup password and starts `mandate.target` again. Linked accounts stay linked, and it lists them (`Still linked`). With `--unlink`, it first has each linked connector `POST /unlink` while it still runs, then deletes the cached chat pictures, every connector's `data.db` and, for those that did not log out (no `unlink`, or not answering), its session in `private/`, listing them (`Not logged out`).
 
 ## Device token
 
@@ -69,7 +69,7 @@ It keeps never-share, activity and every connector's spent approvals, so nothing
 Changes that grant access take two calls:
 
 1. A `…/challenge` call returns an unsigned envelope: `{kind, record, nonce, issued_at}`.
-2. The app shows the owner what the record says, rendered from the record bytes. The owner authenticates on the device, and the app signs and posts the envelope:
+2. The app shows the owner what the request, grant or send asks for, and signs only if the record says exactly that. The owner authenticates on the device, and the app signs and posts the envelope:
 
    ```
    POST /owner/v1/signed {kind, record, nonce, issued_at, key, sig, authenticator_data?}
@@ -100,7 +100,7 @@ Chat names that start with `~` were chosen by other people. The app shows chat I
 | `GET /owner/v1/proposals/{id}` | The display fields, which of them can be edited, and the agent's note. |
 | `POST /owner/v1/proposals/{id}/challenge` | `{edits: {param: value}}`: the write record. |
 | `POST /owner/v1/proposals/{id}/deny` | |
-| `POST /owner/v1/grants/challenge` | `{identity, connector, chats?, for \| schedule, horizon, note?}` |
+| `POST /owner/v1/grants/challenge` | `{identity, connector, chats?, for \| schedule, horizon, note?}`. Without `chats`, every chat; an empty list is refused. |
 | `POST /owner/v1/grants/{id}/extend/challenge` | `{for}`: the grant again from now, until `for` past whichever is later, its end or now. |
 | `POST /owner/v1/grants/{id}/resume/challenge` | A paused routine, under a new ID. |
 | `POST /owner/v1/grants/{id}/close` | Ends a window or pauses a routine. |
@@ -116,7 +116,7 @@ Chat names that start with `~` were chosen by other people. The app shows chat I
 | `GET /owner/v1/connectors` | Names, health, and whether setup is needed. |
 | `GET /owner/v1/connectors/{name}/setup` | Setup steps as data (`connector.md`). |
 | `POST /owner/v1/connectors/{name}/setup` | `{step, values}` |
-| `POST /owner/v1/connectors/{name}/unlink` | |
+| `POST /owner/v1/connectors/{name}/unlink` | Also deletes the account's cached chat pictures. |
 | `GET /owner/v1/connectors/{name}/chats` | `?q=`, `?parent=` or `?ids=`, else the top level: chats for the picker, as `GET /containers` in `connector.md` lists them. |
 | `GET /owner/v1/connectors/{name}/icon` | `?chat=ID&v=<icon>`: the chat's picture as a 64 px square PNG made here, cached on disk (20 MiB, least recently served dropped). At the listing's version it is `Cache-Control: private, max-age=31536000, immutable`; a picture changed since is served `no-store`. `404` without a picture; `503` with `Retry-After` while the connector fetches others. |
 | `GET /owner/v1/never-share` | `[{connector, kind, id, name}]`, `kind` being `chat` or `person` |
@@ -156,6 +156,8 @@ A proposal, as `GET /owner/v1/proposals/{id}` and `now` show it; `editable` list
  "created_at": "2026-11-03T09:30:00Z", "expires_at": "2026-11-04T09:30:00Z"}
 ```
 
+An identity has at most 10 waiting proposals, each at most 64 KiB as the connector prepared it; the agent is refused more (`agent-api.md`).
+
 `GET /owner/v1/now`:
 
 ```json
@@ -184,7 +186,7 @@ A proposal, as `GET /owner/v1/proposals/{id}` and `now` show it; `editable` list
 
 An entry has `at` and `kind`, and `identity`, `connector`, `chats`, `count` and `detail` where they apply; request entries add the request's `reason` and `terms`, proposal entries the agent's `note`, what a device decided its display name as `device`, and logins and joins the new party's `address`. Never message text, except a write's signed display, which the owner approved. The kinds:
 
-- `read`: an agent's reads. `verbs` are what it did, in order (`chats`, `messages`, `search`, `media` or a read op), `detail` the first; `count` sums the messages, `chats` lists each chat once. A read joins the entry written last when that is a read by the same identity on the same connector that began at most 10 minutes before; `until`, set on every merged entry, is then its last read, which may equal `at`. Anything else written between, another connector or another identity starts a new entry.
+- `read`: an agent's reads. `verbs` are what it did, in order (`chats`, `messages`, `search`, `media` or a read op), `detail` the first; `count` sums the messages, `chats` lists each chat once. A read joins the entry written last when that is a read by the same identity on the same connector that began at most 10 minutes before and names fewer than 200 chats; `until`, set on every merged entry, is then its last read, which may equal `at`. Anything else written between, another connector or another identity starts a new entry.
 - `request.asked`, `request.approved` (`detail`: window and history), `request.denied`, `request.expired`.
 - `proposal.made` (`detail`: the op), `proposal.approved`, then its outcome `proposal.done`, `proposal.failed` or `proposal.unknown` (`detail`: the signed display's text); `proposal.denied`, `proposal.expired`.
 - `grant.made` (by the owner), `grant.extended`, `grant.closed`, `routine.paused`, `routine.resumed`.
@@ -239,7 +241,7 @@ A notification shows the identity, the connector and what kind of thing it is, e
 | 401 | `token` | missing or unknown device token |
 | 403 | `forbidden` | bad signature, untrusted key, wrong code |
 | 404 | `not_found` | |
-| 409 | `conflict` | decided, closed, replaced, or the challenge was cancelled |
+| 409 | `conflict` | decided, closed, replaced, the challenge was cancelled, or the connector is no longer set up |
 | 410 | `expired` | challenge, proposal or exchange past its time |
 | 429 | `rate_limited` | |
 | 502 | `connector` | the connector is down or refused for its own reasons |

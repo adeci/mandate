@@ -48,30 +48,43 @@ func main() {
 }
 
 func run(ctx context.Context, args []string) error {
-	switch {
-	case len(args) > 0 && args[0] == "serve":
+	cmd := ""
+	if len(args) > 0 {
+		cmd = args[0]
+	}
+	switch cmd {
+	case "serve":
 		if len(args) != 2 {
 			return errUsage
 		}
 		return serve(ctx, args[1])
-	case len(args) == 1 && args[0] == "setup",
-		len(args) > 0 && args[0] == "reset" && (len(args) == 1 || len(args) == 2 && args[1] == "--unlink"):
-		if args[0] == "setup" {
-			if err := owner.Install(ctx); err != nil {
-				return err
-			}
+	case "setup":
+		if len(args) != 1 {
+			return errUsage
+		}
+		if err := owner.Install(ctx); err != nil {
+			return err
 		}
 		cfg, err := config.Load(config.File())
 		if err != nil {
 			return err
 		}
-		if args[0] == "setup" {
-			return owner.Setup(ctx, cfg, os.Stdout)
+		return owner.Setup(ctx, cfg, os.Stdout)
+	case "reset":
+		if len(args) > 2 || len(args) == 2 && args[1] != "--unlink" {
+			return errUsage
+		}
+		cfg, err := config.Load(config.File())
+		if err != nil {
+			return err
 		}
 		return owner.Reset(ctx, cfg, os.Stdout, len(args) == 2)
-	case len(args) == 2 && args[0] == "store-acl":
+	case "store-acl":
+		if len(args) != 2 {
+			return errUsage
+		}
 		return owner.StoreACL(args[1])
-	case len(args) > 0 && args[0] == "units":
+	case "units":
 		fs := flag.NewFlagSet("units", flag.ContinueOnError)
 		file := fs.String("config", config.File(), "")
 		out := fs.String("out", "", "")
@@ -79,7 +92,7 @@ func run(ctx context.Context, args []string) error {
 			return errUsage
 		}
 		return owner.WriteUnits(*file, *out)
-	case len(args) > 0 && args[0] == "conformance":
+	case "conformance":
 		return conformance.Run(ctx, args[1:], os.Stdout)
 	}
 	return cli.Run(ctx, args)

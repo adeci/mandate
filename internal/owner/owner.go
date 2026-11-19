@@ -236,6 +236,7 @@ func (s *Server) handler(front, gateway uint32) http.Handler {
 	authed("POST /owner/v1/keys/{id}/remove/challenge", s.removeKeyChallenge)
 
 	internal := http.NewServeMux()
+	internal.HandleFunc("GET /internal/requests", s.mayRequest)
 	internal.HandleFunc("POST /internal/requests", s.postRequest)
 	internal.HandleFunc("GET /internal/requests/{id}", s.requestStatus)
 	internal.HandleFunc("POST /internal/proposals", s.postProposal)
