@@ -245,7 +245,6 @@ func (c *gmConnector) event(cli gmClient, evt any) {
 	case *events.ListenRecovered:
 		c.log.Info("reconnected")
 		c.update(cli, func() { c.listenErr = nil })
-		go c.in.sync(c.ctx, cli)
 	case *events.PhoneNotResponding:
 		c.log.Warn("the phone is not responding")
 		c.update(cli, func() { c.phoneDown = true })
@@ -253,7 +252,6 @@ func (c *gmConnector) event(cli gmClient, evt any) {
 		c.log.Info("the phone is responding again")
 		c.update(cli, func() { c.phoneDown = false })
 		go c.activate(cli)
-		go c.in.sync(c.ctx, cli)
 	case *events.HackySetActiveMayFail:
 		// The phone may miss libgm's first activation; ask again if it stays
 		// unanswered, as mautrix-gmessages does.
@@ -279,8 +277,12 @@ func (c *gmConnector) alert(cli gmClient, t gmproto.AlertType) {
 	switch t {
 	case gmproto.AlertType_BROWSER_ACTIVE:
 		c.log.Info("connected")
-		c.update(cli, func() { c.active, c.elsewhere = true, false })
-		go c.in.sync(c.ctx, cli)
+		var was bool
+		c.update(cli, func() { was, c.active, c.elsewhere = c.active, true, false })
+		// As in mautrix-gmessages, a session that stayed active missed nothing.
+		if !was {
+			go c.in.sync(c.ctx, cli)
+		}
 	case gmproto.AlertType_BROWSER_INACTIVE:
 		c.log.Warn("google messages for web was opened in another browser; restart to take the session back")
 		c.update(cli, func() { c.active, c.elsewhere = false, true })

@@ -220,7 +220,7 @@ func (c *waConnector) record(ctx context.Context, dev *wastore.Device, to types.
 	if at.IsZero() {
 		at = time.Now()
 	}
-	ct := store.Container{ID: to.String(), Kind: kindFor(to), IsGroup: to.Server == types.GroupServer, LastMessageAt: at}
+	ct := store.Container{ID: to.String(), Kind: kindFor(to), IsGroup: to.Server == types.GroupServer}
 	if err := c.st.UpsertContainer(ctx, ct); err != nil {
 		return err
 	}

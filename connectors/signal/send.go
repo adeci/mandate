@@ -231,7 +231,7 @@ func groupResult(r *signalmeow.GroupMessageSendResult, err error) connector.Resu
 
 func (c *sgConnector) record(ctx context.Context, own uuid.UUID, chat, text string, ts uint64) error {
 	at := time.UnixMilli(int64(ts)).UTC()
-	ct := store.Container{ID: chat, Kind: kindFor(chat), IsGroup: isGroup(chat), LastMessageAt: at}
+	ct := store.Container{ID: chat, Kind: kindFor(chat), IsGroup: isGroup(chat)}
 	if err := c.st.UpsertContainer(ctx, ct); err != nil {
 		return err
 	}

@@ -57,7 +57,7 @@ func (in *ingester) reset() {
 	in.convs = make(map[string]*gmproto.Conversation)
 	in.sims = make(map[string]*gmproto.SIMPayload)
 	in.pending = make(map[string][]*gmproto.Message)
-	in.phoneSyncing = false
+	in.phoneSyncing, in.dmsFilled, in.listed, in.caughtUp = false, false, false, false
 }
 
 func (in *ingester) setPhoneSyncing(on bool) {
@@ -117,11 +117,10 @@ func (in *ingester) sim(conv *gmproto.Conversation) *gmproto.SIMPayload {
 
 func (in *ingester) conversationEvent(conv *gmproto.Conversation) {
 	in.remember(conv)
-	in.storeConversation(conv)
+	in.storeChat(unfetched(conv))
 }
 
-func (in *ingester) storeConversation(conv *gmproto.Conversation) {
-	c := unfetched(conv)
+func (in *ingester) storeChat(c store.Container) {
 	in.writes.Do("conversation "+c.ID, func(ctx context.Context) error { return in.st.UpsertContainer(ctx, c) })
 }
 
@@ -172,20 +171,21 @@ func (in *ingester) resolve(ctx context.Context, cli gmClient, id string) {
 		in.log.Warn("look up conversation", "conversation", id, "err", err)
 		return
 	}
-	in.storeConversation(conv)
+	in.storeChat(unfetched(conv))
 	for _, m := range msgs {
 		in.store(m, conv)
 	}
 }
 
-func (in *ingester) store(m *gmproto.Message, conv *gmproto.Conversation) {
+// store stores m unless it is nothing to store, and says which.
+func (in *ingester) store(m *gmproto.Message, conv *gmproto.Conversation) bool {
 	o, ok := convert(m, conv)
-	if !ok {
-		return
+	if ok {
+		in.writes.Do("message "+m.GetMessageID()+" in "+m.GetConversationID(), func(ctx context.Context) error {
+			return in.apply(ctx, o)
+		})
 	}
-	in.writes.Do("message "+m.GetMessageID()+" in "+m.GetConversationID(), func(ctx context.Context) error {
-		return in.apply(ctx, o)
-	})
+	return ok
 }
 
 func (in *ingester) apply(ctx context.Context, o op) error {
@@ -249,9 +249,7 @@ func (in *ingester) syncOnce(ctx context.Context, cli gmClient) error {
 	for _, conv := range resp.GetConversations() {
 		c := container(conv)
 		if !c.LastMessageAt.Truncate(time.Millisecond).After(stored[c.ID]) {
-			if err := in.st.UpsertContainer(ctx, c); err != nil {
-				return err
-			}
+			in.storeChat(c)
 			continue
 		}
 		n, ok, err := in.fetch(ctx, cli, conv)
@@ -279,9 +277,7 @@ func (in *ingester) syncOnce(ctx context.Context, cli gmClient) error {
 // is retried by the next sync. Only a phone gone away is an error; ok says
 // whether the messages are in.
 func (in *ingester) fetch(ctx context.Context, cli gmClient, conv *gmproto.Conversation) (n int, ok bool, err error) {
-	if err := in.st.UpsertContainer(ctx, unfetched(conv)); err != nil {
-		return 0, false, err
-	}
+	in.storeChat(unfetched(conv))
 	n, err = in.backfill(ctx, cli, conv)
 	if errors.Is(err, libgm.ErrPhoneNotResponding) || errors.Is(err, libgm.ErrConnectionClosed) || ctx.Err() != nil {
 		return 0, false, err
@@ -290,7 +286,8 @@ func (in *ingester) fetch(ctx context.Context, cli gmClient, conv *gmproto.Conve
 		in.log.Warn("fetch messages", "conversation", conv.GetConversationID(), "err", err)
 		return 0, false, nil
 	}
-	return n, true, in.st.UpsertContainer(ctx, container(conv))
+	in.storeChat(container(conv))
+	return n, true, nil
 }
 
 // catchUp fetches, once per process, the conversations whose stored activity
@@ -360,11 +357,7 @@ func (in *ingester) listAll(ctx context.Context, cli gmClient, inbox *gmproto.Li
 				seen[conv.GetConversationID()] = true
 				added++
 				in.remember(conv)
-				c := container(conv)
-				c.LastMessageAt = time.Time{}
-				if err := in.st.UpsertContainer(ctx, c); err != nil {
-					return err
-				}
+				in.storeChat(unfetched(conv))
 			}
 			n += added
 			// A cursor that brings nothing new would page forever.
@@ -410,9 +403,7 @@ func (in *ingester) fillDMs(ctx context.Context, cli gmClient) error {
 			in.log.Warn("look up conversation", "conversation", id, "err", err)
 			continue
 		}
-		if err := in.st.UpsertContainer(ctx, container(conv)); err != nil {
-			return err
-		}
+		in.storeChat(container(conv))
 	}
 	in.mu.Lock()
 	in.dmsFilled = true
@@ -427,14 +418,9 @@ func (in *ingester) backfill(ctx context.Context, cli gmClient, conv *gmproto.Co
 	}
 	n := 0
 	for _, m := range resp.GetMessages() {
-		o, ok := convert(m, conv)
-		if !ok {
-			continue
+		if in.store(m, conv) {
+			n++
 		}
-		if err := in.apply(ctx, o); err != nil {
-			return n, fmt.Errorf("store message %s: %w", m.GetMessageID(), err)
-		}
-		n++
 	}
 	return n, nil
 }

@@ -99,7 +99,7 @@ func (in *ingester) chatEvent(ctx context.Context, e *events.ChatEvent) bool {
 	return in.writes.Do(what, func(ctx context.Context) error {
 		switch o.kind {
 		case opUpsert:
-			if err := in.ensureContainer(ctx, chat, e.Info.GroupRevision, o.msg.SentAt); err != nil {
+			if err := in.ensureContainer(ctx, chat, e.Info.GroupRevision, time.Time{}); err != nil {
 				return err
 			}
 			if !o.msg.IsFromMe {

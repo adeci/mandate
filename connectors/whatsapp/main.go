@@ -100,7 +100,8 @@ func openSession(ctx context.Context, path string) (*sqlstore.Container, *wastor
 	dsn := "file:" + path +
 		"?_pragma=foreign_keys(1)" +
 		"&_pragma=busy_timeout(10000)" +
-		"&_pragma=journal_mode(WAL)"
+		"&_pragma=journal_mode(WAL)" +
+		"&_txlock=immediate"
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open session: %w", err)

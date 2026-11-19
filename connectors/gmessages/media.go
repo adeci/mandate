@@ -175,11 +175,7 @@ func (c *gmConnector) refetch(ctx context.Context, cli gmClient, message string,
 			continue
 		}
 		conv, _ := c.in.conversation(chat)
-		if o, ok := convert(m, conv); ok {
-			if err := c.in.apply(ctx, o); err != nil {
-				c.log.Error("store refetched message", "id", message, "err", err)
-			}
-		}
+		c.in.store(m, conv)
 		_, files := content(m)
 		if index < len(files) {
 			var ref mediaRef

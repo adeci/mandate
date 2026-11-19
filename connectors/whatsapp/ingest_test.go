@@ -122,11 +122,13 @@ func TestStoreChatsWithoutMessages(t *testing.T) {
 	}
 }
 
-// storedChat reads the name and last activity stored for id.
+// storedChat reads the name stored for id and its last activity as readers
+// take it, the later of the chat's and its newest message's.
 func storedChat(t *testing.T, st *store.Store, id types.JID) (name, last string) {
 	t.Helper()
-	if err := st.DB().QueryRowContext(t.Context(), `SELECT COALESCE(name, ''), COALESCE(last_message_at, '') FROM containers WHERE id = ?`,
-		id.String()).Scan(&name, &last); err != nil {
+	if err := st.DB().QueryRowContext(t.Context(), `SELECT COALESCE(name, ''),
+  max(COALESCE(last_message_at, ''), COALESCE((SELECT max(sent_at) FROM messages WHERE container_id = containers.id), ''))
+FROM containers WHERE id = ?`, id.String()).Scan(&name, &last); err != nil {
 		t.Fatal(err)
 	}
 	return name, last

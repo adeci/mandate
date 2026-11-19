@@ -108,7 +108,7 @@ func (in *ingester) apply(ctx context.Context, o op) error {
 		if s, found, err := in.stored(ctx, o.msg.ID); err != nil || found && !in.sameAuthor(s, o) {
 			return err
 		}
-		if err := in.ensureContainer(ctx, o.chat, store.Container{LastMessageAt: o.msg.SentAt}); err != nil {
+		if err := in.ensureContainer(ctx, o.chat, store.Container{}); err != nil {
 			return err
 		}
 		in.enrichSender(ctx, &o)
