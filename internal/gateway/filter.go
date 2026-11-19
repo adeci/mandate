@@ -33,16 +33,12 @@ import (
 // cheaper than a recursive walk per query; a deeper chain is left out, so
 // every ancestor is checked.
 //
-// Discord guilds were stored under their bare snowflake before they became
-// guild:ID, so a never-share entry made then names the guild that way.
-//
 // The login-code check reads file names too, as senders name a file after
 // the code; deleted bodies stay in the store for restore and never show.
 const filter = `WITH
 hidden_person(id) AS (SELECT value FROM json_each(?2)),
 hidden(id) AS (
   SELECT value FROM json_each(?1)
-  UNION SELECT 'guild:' || value FROM json_each(?1)
   UNION SELECT id FROM hidden_person
   UNION SELECT c.id FROM hidden_person AS s CROSS JOIN containers AS c CROSS JOIN json_each(c.participants_json) AS p
     WHERE +c.kind = 'dm' AND p.value ->> 'id' = s.id
@@ -327,10 +323,15 @@ WHERE m.n <= ?5 ORDER BY m.k, m.n`, ts, per, v.now)
 }
 
 // before is the seq of the last message seen; the page continues after it in
-// (sent_at, seq) order, since seq follows ingestion, not sending.
-func (v *view) messages(ctx context.Context, chat string, before, limit int64) (*table, error) {
+// (sent_at, seq) order, since seq follows ingestion, not sending. seq picks
+// one message instead.
+func (v *view) messages(ctx context.Context, chat string, before, seq, limit int64) (*table, error) {
+	where := `(?5 = 0 OR (m.sent_at, m.seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?5))`
+	if seq > 0 {
+		where, before = `m.seq = ?5`, seq
+	}
 	rows, err := v.query(ctx, `SELECT m.seq, m.at, m.sender_id, m.sender, `+replyTo+`, m.text FROM msgs AS m
-WHERE m.container_id = ?4 AND (?5 = 0 OR (m.sent_at, m.seq) < (SELECT sent_at, seq FROM msgs WHERE seq = ?5))
+WHERE m.container_id = ?4 AND `+where+`
 ORDER BY m.sent_at DESC, m.seq DESC LIMIT ?6`, chat, before, limit+1)
 	if err != nil {
 		return nil, err

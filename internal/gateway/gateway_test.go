@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,7 @@ import (
 type fakeConn struct {
 	st       *store.Store
 	prepares atomic.Int32
+	fetches  atomic.Int32
 	// during runs inside Prepare, as if the owner acted meanwhile.
 	during atomic.Pointer[func()]
 }
@@ -75,8 +77,9 @@ func (*fakeConn) Execute(context.Context, record.Write) connector.Result {
 	return connector.Result{Status: connector.Failed}
 }
 
+// Read fetches a chat, which goes back further than it returns.
 func (f *fakeConn) Read(ctx context.Context, _ string, args map[string]string) (connector.ReadResult, error) {
-	var res connector.ReadResult
+	res := connector.ReadResult{More: true}
 	rows, err := f.st.DB().QueryContext(ctx, `SELECT id FROM messages WHERE container_id = ? ORDER BY seq`, args["chat"])
 	if err != nil {
 		return res, err
@@ -92,11 +95,21 @@ func (f *fakeConn) Read(ctx context.Context, _ string, args map[string]string) (
 	return res, rows.Err()
 }
 
+const photo = "\xff\xd8\xff\xe0JFIF"
+
+func (f *fakeConn) Media(context.Context, string, int, int64) (connector.MediaFile, error) {
+	f.fetches.Add(1)
+	return connector.MediaFile{Type: "image/jpeg", Name: "IMG_0412.jpg", Size: int64(len(photo)), Body: io.NopCloser(strings.NewReader(photo))}, nil
+}
+
 // fakeOwner is the owner side's /internal/ routes, answering a fixed ID.
 type fakeOwner struct {
 	mu        sync.Mutex
 	requests  []ownerRequest
 	proposals []json.RawMessage
+	activity  int
+	// full has the identity at the request limits.
+	full bool
 }
 
 const fixedID = "AAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -105,6 +118,12 @@ func (o *fakeOwner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	switch r.Method + " " + r.URL.Path {
+	case "GET /internal/requests":
+		if o.full {
+			writeJSON(w, http.StatusTooManyRequests, connector.Error{Message: "at most 3 waiting requests and 10 an hour; wait for the owner", RetryAfter: 600})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	case "POST /internal/requests":
 		var req ownerRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -118,6 +137,12 @@ func (o *fakeOwner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		o.proposals = append(o.proposals, b)
 		writeJSON(w, http.StatusOK, map[string]string{"id": fixedID})
 	case "POST /internal/activity":
+		var batch []entry
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody)).Decode(&batch); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		o.activity += len(batch)
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		http.NotFound(w, r)
@@ -128,7 +153,7 @@ func (o *fakeOwner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (o *fakeOwner) got() fakeOwner {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return fakeOwner{requests: o.requests, proposals: o.proposals}
+	return fakeOwner{requests: o.requests, proposals: o.proposals, activity: o.activity}
 }
 
 type device struct {
@@ -460,27 +485,6 @@ func TestNeverShare(t *testing.T) {
 	}
 }
 
-// Never-share entries made while Discord stored a guild under its bare ID
-// still hide it as guild:ID, and its channels.
-func TestNeverShareOldGuildID(t *testing.T) {
-	e := newEnv(t, self(), self())
-	for _, c := range []store.Container{
-		{ID: "guild:9", Kind: "guild", Name: "Club"},
-		{ID: "c9", Kind: "channel", Name: "#general", ParentID: "guild:9"},
-	} {
-		if err := e.conn.st.UpsertContainer(t.Context(), c); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := e.conn.st.UpsertMessage(t.Context(), store.Message{ID: "c9-m", ContainerID: "c9", SentAt: time.Now().Add(-time.Hour), Body: "hi"}); err != nil {
-		t.Fatal(err)
-	}
-	e.push([]record.Envelope{e.grant(e.phone, nil, 0, -time.Hour, time.Hour)}, neverShare{Connector: "chat", Kind: "chat", ID: "9"})
-	if s, _ := e.rows("/agent/v1/chat/messages?chat=c9"); s != http.StatusNotFound {
-		t.Errorf("channel of a guild never shared by its old ID: %d", s)
-	}
-}
-
 func TestLoginCodesHidden(t *testing.T) {
 	e := newEnv(t, self(), self())
 	e.push([]record.Envelope{e.grant(e.phone, []string{"fam"}, 0, -time.Hour, time.Hour)})
@@ -748,5 +752,137 @@ func TestCallerGroups(t *testing.T) {
 				t.Errorf("GET /agent/v1/connectors: %d", s)
 			}
 		})
+	}
+}
+
+// messages?seq answers that one message, the newest in the store or the
+// chat as any other; one in another chat or past the horizon answers as an
+// unknown one does.
+func TestMessageBySeq(t *testing.T) {
+	e := newEnv(t, self(), self())
+	e.push([]record.Envelope{e.grant(e.phone, []string{"fam", "dm"}, 48*time.Hour, -time.Hour, time.Hour)})
+	for _, m := range [][3]string{{"fam", "f-new", "see you at 6?"}, {"fam", "f-code", "[login code hidden]"}, {"dm", "d-new", "private"}} {
+		if s, got := e.rows("/agent/v1/chat/messages?chat=" + m[0] + "&seq=" + seqOf(t, e, m[1])); s != http.StatusOK || !eq(got, []string{m[2]}) {
+			t.Errorf("%s: %d %v", m[1], s, got)
+		}
+	}
+	answer := func(seq string) (int, string) {
+		s, body := e.call(http.MethodGet, "/agent/v1/chat/messages?chat=fam&seq="+seq, nil)
+		return s, strings.ReplaceAll(body, seq, "N")
+	}
+	_, unknown := answer("999")
+	for _, id := range []string{"f-old", "w-new", "d-new"} {
+		if s, got := answer(seqOf(t, e, id)); s != http.StatusNotFound || got != unknown {
+			t.Errorf("%s in fam: %d %s, unknown %s", id, s, got, unknown)
+		}
+	}
+}
+
+// A file comes only from a message the grant shows: one in a never-shared
+// chat, past the horizon or with a login code answers 404 before the
+// connector is asked.
+func TestMedia(t *testing.T) {
+	e := newEnv(t, self(), self())
+	now := time.Now()
+	jpeg := []store.Media{{Type: "image/jpeg", Name: "IMG_0412.jpg", Size: int64(len(photo)), Ref: []byte("mmsc/0412")}}
+	for _, m := range []store.Message{
+		{ID: "f-photo", ContainerID: "fam", SenderID: "+1", SenderName: "~Sam", SentAt: now.Add(-time.Hour), Media: jpeg},
+		{ID: "f-old-photo", ContainerID: "fam", SenderID: "+1", SenderName: "~Sam", SentAt: now.Add(-10 * 24 * time.Hour), Media: jpeg},
+		{ID: "f-code-photo", ContainerID: "fam", SenderID: "+1", SenderName: "~Sam", SentAt: now.Add(-time.Hour), Body: "Your login code is 482913", Media: jpeg},
+		{ID: "s-photo", ContainerID: "secret", SenderID: "+2", SenderName: "Kim", SentAt: now.Add(-time.Hour), Media: jpeg},
+	} {
+		if err := e.conn.st.UpsertMessage(t.Context(), m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.push([]record.Envelope{e.grant(e.phone, []string{"fam", "secret"}, 48*time.Hour, -time.Hour, time.Hour)},
+		neverShare{Connector: "chat", Kind: "chat", ID: "secret"})
+	media := func(chat, id string) (int, string) {
+		return e.call(http.MethodGet, "/agent/v1/chat/media?chat="+chat+"&seq="+seqOf(t, e, id), nil)
+	}
+	if s, body := media("fam", "f-photo"); s != http.StatusOK || body != photo {
+		t.Errorf("granted photo: %d %q", s, body)
+	}
+	for _, m := range [][2]string{{"fam", "f-old-photo"}, {"fam", "f-code-photo"}, {"secret", "s-photo"}} {
+		if s, body := media(m[0], m[1]); s != http.StatusNotFound {
+			t.Errorf("%s: %d %q", m[1], s, body)
+		}
+	}
+	if n := e.conn.fetches.Load(); n != 1 {
+		t.Errorf("connector fetched %d files, want 1", n)
+	}
+}
+
+// A read op answers what it stored as the grants show it, and says there
+// is more only when it left nothing out.
+func TestReadOp(t *testing.T) {
+	e := newEnv(t, self(), self())
+	fetch := func() ([]string, bool) {
+		t.Helper()
+		s, body := e.call(http.MethodPost, "/agent/v1/chat/fetch", opRequest{Args: map[string]string{"chat": "fam"}})
+		var tab table
+		if s != http.StatusOK || json.Unmarshal([]byte(body), &tab) != nil {
+			t.Fatalf("fetch: %d %s", s, body)
+		}
+		var bodies []string
+		for _, r := range tab.Rows {
+			bodies = append(bodies, r[len(r)-1].(string))
+		}
+		return bodies, tab.More
+	}
+	fam := e.grant(e.phone, []string{"fam"}, 0, -time.Hour, time.Hour)
+	e.push([]record.Envelope{fam})
+	if got, more := fetch(); !eq(got, []string{"old news", "see you at 6?", "eve says hi", "[login code hidden]"}) || !more {
+		t.Errorf("fetch: %v, more %v", got, more)
+	}
+	e.push([]record.Envelope{fam}, neverShare{Connector: "chat", Kind: "person", ID: "+3"})
+	if got, more := fetch(); !eq(got, []string{"old news", "see you at 6?", "[login code hidden]"}) || more {
+		t.Errorf("fetch with Eve never shared: %v, more %v", got, more)
+	}
+}
+
+// A request over the limits is refused before its terms are matched.
+func TestRequestOverLimits(t *testing.T) {
+	e := newEnv(t, self(), self())
+	e.push(nil)
+	e.owner.mu.Lock()
+	e.owner.full = true
+	e.owner.mu.Unlock()
+	s, body := e.call(http.MethodPost, "/agent/v1/access/requests", map[string]any{"connector": "chat", "chats": []string{"fam"}, "reason": "summarize"})
+	if s != http.StatusTooManyRequests || !strings.Contains(body, `"retry_after_seconds":600`) || len(e.owner.got().requests) != 0 {
+		t.Errorf("%d %s, owner side got %d requests", s, body, len(e.owner.got().requests))
+	}
+}
+
+// Terms are counted before they are compared, so a body full of them is
+// refused at once.
+func TestTermsCountedFirst(t *testing.T) {
+	raw := make([]string, maxBody/8)
+	for i := range raw {
+		raw[i] = strconv.Itoa(i)
+	}
+	start := time.Now()
+	if _, err := cleanTerms(raw); err == nil {
+		t.Error("accepted", len(raw), "terms")
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("took %v", took)
+	}
+}
+
+// Activity reaches the owner side in pieces its body limit takes.
+func TestActivityPieces(t *testing.T) {
+	e := newEnv(t, self(), self())
+	a := &activity{owner: dialOwner(filepath.Join(filepath.Dir(e.sock), "o")), log: slog.New(slog.DiscardHandler)}
+	chats := make([]chatRef, maxLimit)
+	for i := range chats {
+		chats[i] = chatRef{ID: strconv.Itoa(1100000000000000000 + i), Name: "Rollout crew / #channel-" + strconv.Itoa(i)}
+	}
+	for range 40 {
+		a.add(entry{At: time.Now(), Identity: e.identity, Connector: "chat", Verb: "search", Chats: chats, Count: maxLimit})
+	}
+	a.flush(t.Context())
+	if n := e.owner.got().activity; n != 40 || len(a.pending) != 0 {
+		t.Errorf("owner side got %d entries, %d pending", n, len(a.pending))
 	}
 }

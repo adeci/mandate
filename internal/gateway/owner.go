@@ -191,18 +191,33 @@ func (a *activity) flush(ctx context.Context) {
 	if dropped > 0 {
 		a.log.Warn("activity dropped while the owner side was not answering", "entries", dropped)
 	}
-	if len(batch) == 0 {
-		return
-	}
 	ctx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
-	if err := a.owner.do(ctx, http.MethodPost, "/internal/activity", batch, nil); err != nil {
-		a.log.Warn("send activity", "entries", len(batch), "err", err)
-		a.mu.Lock()
-		a.pending = append(batch, a.pending...)
-		if over := len(a.pending) - maxPending; over > 0 {
-			a.pending, a.dropped = a.pending[over:], a.dropped+over
+	for len(batch) > 0 {
+		// Pieces fit the owner side's body limit.
+		var piece []json.RawMessage
+		for size := 2; len(piece) < len(batch); {
+			b, _ := json.Marshal(batch[len(piece)])
+			if size += len(b) + 1; size > maxBody && len(piece) > 0 {
+				break
+			}
+			piece = append(piece, b)
 		}
-		a.mu.Unlock()
+		err := a.owner.do(ctx, http.MethodPost, "/internal/activity", piece, nil)
+		switch e, ok := errors.AsType[*connector.Error](err); {
+		case ok && e.Status/100 == 4:
+			// The owner side refuses these entries however often they come.
+			a.log.Warn("activity refused", "entries", len(piece), "err", err)
+		case err != nil:
+			a.log.Warn("send activity", "entries", len(batch), "err", err)
+			a.mu.Lock()
+			a.pending = append(batch, a.pending...)
+			if over := len(a.pending) - maxPending; over > 0 {
+				a.pending, a.dropped = a.pending[over:], a.dropped+over
+			}
+			a.mu.Unlock()
+			return
+		}
+		batch = batch[len(piece):]
 	}
 }

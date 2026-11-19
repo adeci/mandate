@@ -230,7 +230,7 @@ func (req *accessRequest) check() (ownerRequest, error) {
 // cleanTerms trims and deduplicates chat terms, ignoring case as matching
 // does.
 func cleanTerms(raw []string) ([]string, error) {
-	if raw != nil && len(raw) == 0 {
+	if raw != nil && len(raw) == 0 || len(raw) > maxTerms {
 		return nil, fmt.Errorf("chats must hold 1 to %d terms, or be left out for every chat", maxTerms)
 	}
 	var terms []string
@@ -242,9 +242,6 @@ func cleanTerms(raw []string) ([]string, error) {
 		if !slices.ContainsFunc(terms, func(x string) bool { return strings.EqualFold(x, t) }) {
 			terms = append(terms, t)
 		}
-	}
-	if len(terms) > maxTerms {
-		return nil, fmt.Errorf("at most %d chat terms", maxTerms)
 	}
 	return terms, nil
 }
@@ -267,12 +264,18 @@ func (g *gateway) requestAccess(w http.ResponseWriter, r *http.Request, cl *call
 		return
 	}
 	o.Identity = cl.identity
-	if o.Kind == "extend" && len(writeScope(cl.live.grantsOn(cl.identity, c.name), time.Now())) == 0 {
-		writeError(w, http.StatusConflict, fmt.Sprintf("no window on %s is open or ended in the last day, so there is nothing to extend", c.name))
-		return
-	}
-	if !g.matchTerms(r.Context(), w, cl, c, o.Terms) {
-		return
+	if len(o.Terms) > 0 {
+		// One at a time, so that a request over the limits is refused
+		// before its terms cost a match.
+		g.asking.Lock()
+		defer g.asking.Unlock()
+		if err := g.toOwner.do(r.Context(), http.MethodGet, "/internal/requests"+query(cl.identity, 0), nil, nil); err != nil {
+			relay(w, cl, "check request limits", err)
+			return
+		}
+		if !g.matchTerms(r.Context(), w, cl, c, o.Terms) {
+			return
+		}
 	}
 	var created struct {
 		ID string `json:"id"`
@@ -289,9 +292,6 @@ func (g *gateway) requestAccess(w http.ResponseWriter, r *http.Request, cl *call
 // store.Matching ranks them, and marks the terms that found more. Grants do
 // not limit the search: the agent asks for chats it may not read yet.
 func (g *gateway) matchTerms(ctx context.Context, w http.ResponseWriter, cl *caller, c *conn, terms []term) bool {
-	if len(terms) == 0 {
-		return true
-	}
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 	v, err := g.view(ctx, cl, c, everything)

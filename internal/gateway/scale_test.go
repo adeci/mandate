@@ -63,7 +63,7 @@ FROM n`, now.Format(sentAt)); err != nil {
 			"chats":        func() (*table, error) { return v.chats(t.Context(), "", 50) },
 			"chats search": func() (*table, error) { return v.chats(t.Context(), "channel-7", 50) },
 			"search":       func() (*table, error) { return v.search(t.Context(), "rollout", "", "", 0, 20) },
-			"messages":     func() (*table, error) { return v.messages(t.Context(), "c7", 0, 20) },
+			"messages":     func() (*table, error) { return v.messages(t.Context(), "c7", 0, 0, 20) },
 		} {
 			start := time.Now()
 			tab, err := read()

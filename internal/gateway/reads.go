@@ -105,6 +105,7 @@ func (g *gateway) read(w http.ResponseWriter, r *http.Request, cl *caller) {
 		return
 	}
 	chat := q.Get("chat")
+	var seq int64
 	var run func(context.Context, *view) (*table, error)
 	switch verb {
 	case "chats":
@@ -114,7 +115,11 @@ func (g *gateway) read(w http.ResponseWriter, r *http.Request, cl *caller) {
 			writeError(w, http.StatusBadRequest, "chat is required")
 			return
 		}
-		run = func(ctx context.Context, v *view) (*table, error) { return v.messages(ctx, chat, before, limit) }
+		if seq, err = intParam(q, "seq", 0, 1, math.MaxInt64); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		run = func(ctx context.Context, v *view) (*table, error) { return v.messages(ctx, chat, before, seq, limit) }
 	case "search":
 		text, since := q.Get("text"), q.Get("since")
 		if text == "" {
@@ -152,6 +157,10 @@ func (g *gateway) read(w http.ResponseWriter, r *http.Request, cl *caller) {
 	t, err := run(ctx, v)
 	if err != nil {
 		unavailable(w, cl, verb, err)
+		return
+	}
+	if seq > 0 && len(t.Rows) == 0 {
+		noSeq(w, c, chat, seq)
 		return
 	}
 	writeJSON(w, http.StatusOK, t)
@@ -252,7 +261,7 @@ func (g *gateway) media(w http.ResponseWriter, r *http.Request, cl *caller, c *c
 	}
 	switch {
 	case f == nil || f.hidden:
-		writeError(w, http.StatusNotFound, fmt.Sprintf("no message %d in chat %q; see mandate %s messages", seq, chat, c.name))
+		noSeq(w, c, chat, seq)
 		return
 	case f.count == 0 && !f.marked:
 		writeError(w, http.StatusNotFound, fmt.Sprintf("message %d has no files", seq))
@@ -308,6 +317,11 @@ func (g *gateway) media(w http.ResponseWriter, r *http.Request, cl *caller, c *c
 
 func tooLarge(size int64) string {
 	return fmt.Sprintf("the file is %.1f MiB, over the %d MiB limit for files", float64(size)/(1<<20), maxMedia>>20)
+}
+
+// noSeq is the one answer for a message in chat the agent may not read.
+func noSeq(w http.ResponseWriter, c *conn, chat string, seq int64) {
+	writeError(w, http.StatusNotFound, fmt.Sprintf("no message %d in chat %q; see mandate %s messages", seq, chat, c.name))
 }
 
 // relayConnector passes a connector's refusal through; anything else means

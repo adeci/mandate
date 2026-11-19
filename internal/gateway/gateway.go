@@ -91,6 +91,7 @@ type gateway struct {
 	conns    map[string]*conn
 	toOwner  *ownerClient
 	activity *activity
+	asking   sync.Mutex // serializes access requests that match terms
 
 	liveMu sync.Mutex // serializes pushes
 	live   atomic.Pointer[live]

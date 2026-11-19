@@ -91,7 +91,6 @@ type cli struct {
 	http       *http.Client
 
 	full bool   // print bodies whole
-	seq  int64  // the one message asked for, if any
 	name string // the connector
 }
 
@@ -103,7 +102,13 @@ func Run(ctx context.Context, args []string) error {
 	return c.run(ctx, args)
 }
 
-func (c *cli) run(ctx context.Context, args []string) error {
+func (c *cli) run(ctx context.Context, args []string) (err error) {
+	// parse printed the usage.
+	defer func() {
+		if errors.Is(err, flag.ErrHelp) {
+			err = nil
+		}
+	}()
 	if len(args) == 0 || isHelp(args[0]) {
 		return c.help()
 	}
@@ -165,6 +170,10 @@ var errNegativeWait = errors.New("--wait must not be negative")
 // positional arguments (hi < 0: no limit).
 func (c *cli) parse(fs *flag.FlagSet, help string, args []string, lo, hi int) ([]string, error) {
 	pos, err := parseInterspersed(fs, args)
+	if errors.Is(err, flag.ErrHelp) {
+		fmt.Fprintln(c.out, "usage: "+help)
+		return nil, err
+	}
 	if err != nil {
 		return nil, usage(help, err)
 	}

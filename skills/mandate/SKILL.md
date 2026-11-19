@@ -47,6 +47,7 @@ mandate request signal --chat alice --for 30m --since 2d \
 ```sh
 mandate signal chats --search alice          # find the chat id
 mandate signal messages CHAT_ID --limit 50
+mandate signal messages CHAT_ID --seq 41     # one message, whole
 mandate signal search "dinner friday"
 mandate signal send CHAT_ID "on my way" --note "you asked me to reply"
 ```

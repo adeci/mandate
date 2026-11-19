@@ -17,7 +17,8 @@ Writes are proposals the owner approves on a device.
   certificate chains to a root the machine trusts (ACME, the owner's own
   certificate), normal checks apply from then on; otherwise the client pins
   the key.
-- Bodies are JSON. Times are RFC 3339 in UTC. Durations are integer seconds.
+- Bodies are JSON. Times are RFC 3339 in UTC, except in read tables, where
+  they are `YYYY-MM-DD HH:MM` in UTC. Durations are integer seconds.
   IDs of identities, grants, requests and proposals are record IDs: 26
   base32 characters ([records.md](records.md)).
 - Every route except `join` needs `Authorization: Bearer <token>`.
@@ -194,7 +195,7 @@ Reads answer a table:
 | Route | Parameters | Columns |
 |---|---|---|
 | `GET {c}/chats` | `search`, `limit` (20, max 500) | `id kind name last_message` |
-| `GET {c}/messages` | `chat`*, `before`, `limit` (20) | `seq sent_at sender_id sender reply_to body` |
+| `GET {c}/messages` | `chat`*, `seq`, `before`, `limit` (20) | `seq sent_at sender_id sender reply_to body` |
 | `GET {c}/search` | `text`*, `chat`, `since` (YYYY-MM-DD), `before`, `limit` (50) | `seq sent_at chat_id chat sender_id sender reply_to body` |
 | `GET {c}/media` | `chat`*, `seq`*, `index` | the file |
 | `POST {c}/{op}` (read op) | `{"args": {…}}` | as `search` |
@@ -207,7 +208,8 @@ Reads answer a table:
   order.
 - A chat's `name`, in `chats`, `search` and `access`, is its path,
   `main / #general`, even where the grant covers only the chat.
-- `messages` and `search` page by `(sent_at, seq)`, newest first.
+- `messages` and `search` page by `(sent_at, seq)`, newest first. With
+  `seq`, `messages` answers that one message, or `404` as for an unknown one.
 - `media` streams the file with `Content-Type`, `Content-Length` and
   `Content-Disposition`.
 - A read op's `container` and `message` params are checked before the
@@ -238,10 +240,10 @@ A one-off grant has `from` and `until` instead of `schedule`.
 | routine | `{"connector", "chats", "schedule": {"days", "start", "length"}, "horizon", "reason"}` |
 | extend | `{"connector", "extend": true, "for", "reason"}` |
 
-- `chats` are 1–10 search terms of 1–200 characters. Each finds at most 5
-  visible chats, and the owner sees when it matched more; terms that match
-  nothing reach the owner as such. The answer does not depend on what
-  matched.
+- `chats` are 1–10 search terms of 1–200 characters; left out, the request
+  is for every chat. Each term finds at most 5 visible chats, and the owner
+  sees when it matched more; terms that match nothing reach the owner as
+  such. The answer does not depend on what matched.
 - A term's words (split on spaces and `/`, a leading `#` or `~` ignored) must
   all be in a chat's path, `Server / #channel`, a DM's handle counting as
   part of it for words that aren't all digits (`sam_p`, `@sam_p` and
@@ -283,7 +285,10 @@ The answer is `202 {"id": "…"}`. `GET /agent/v1/access/requests/{id}?wait=SECO
   now, or one whose window ended in the last 24 hours and was not closed;
   under an ended grant, only messages sent before its end. Anything else is
   `404`, before the connector is asked.
-- `note` is shown to the owner as the agent's words.
+- `note` is shown to the owner as the agent's words, at most 1000
+  characters.
+- At most 10 waiting proposals per identity, beyond that `429`; a write over
+  64 KiB as the connector prepares it is `400`.
 
 The answer is `202 {"id": "…", "status": "pending"}`.
 `GET /agent/v1/proposals/{id}?wait=SECONDS` (at most 900) answers

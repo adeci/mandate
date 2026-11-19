@@ -24,7 +24,7 @@ const (
 	searchUsage   = "mandate %s search TEXT [--chat CHAT_ID] [--since YYYY-MM-DD] [--limit 50] [--before SEQ] [--full]"
 	mediaUsage    = "mandate %s media CHAT_ID SEQ [--index N] [-o PATH]"
 	sendUsage     = "mandate %s send CHAT_ID TEXT [--note WHY] [--wait 15m]"
-	opUsage       = "mandate %s %s [KEY=VALUE...] [--note WHY] [--wait 15m]"
+	opUsage       = "mandate %s %s [KEY=VALUE...] [--note WHY] [--wait 15m] [--full]"
 )
 
 type connectorInfo struct {
@@ -64,11 +64,8 @@ func (c *cli) connector(ctx context.Context, name string, args []string) error {
 		if err != nil {
 			return err
 		}
-		if *seq > 0 {
-			c.seq, c.full = int64(*seq), true
-			*before, *limit = *seq+1, 1
-		}
-		return c.rows(ctx, base+"messages"+query("chat", pos[0], "limit", *limit, "before", *before))
+		c.full = c.full || *seq > 0
+		return c.rows(ctx, base+"messages"+query("chat", pos[0], "limit", *limit, "before", *before, "seq", *seq))
 	case "search":
 		help := fmt.Sprintf(searchUsage, name)
 		chat := fs.String("chat", "", "")
@@ -90,6 +87,7 @@ func (c *cli) connector(ctx context.Context, name string, args []string) error {
 	}
 	note := fs.String("note", "", "")
 	wait := fs.Duration("wait", defaultWait, "")
+	fs.BoolVar(&c.full, "full", false, "")
 	pos, err := c.parse(fs, help, args, 0, -1)
 	if err != nil {
 		return err
@@ -334,6 +332,8 @@ func writeConnectorHelp(w io.Writer, ci connectorInfo) {
 		}
 		if op.Kind == connector.Write {
 			fmt.Fprint(w, " [--note WHY] [--wait 15m]")
+		} else {
+			fmt.Fprint(w, " [--full]")
 		}
 		fmt.Fprintf(w, "\n      %s (%s)\n", op.Summary, kind)
 		for _, p := range op.Params {

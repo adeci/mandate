@@ -81,6 +81,49 @@ func TestRead(t *testing.T) {
 	}
 }
 
+// --seq asks for that one message, and it and a read op's --full print
+// a body past the preview whole.
+func TestWholeBody(t *testing.T) {
+	t.Parallel()
+	long := strings.Repeat("x", bodyPreview+1)
+	message := `{"columns":["seq","sent_at","sender_id","sender","reply_to","body"],"rows":[[9,"2026-11-02 08:10","+15550001","~Sam",null,"` + long + `"]]}`
+	fetched := `{"columns":["seq","sent_at","chat_id","chat","sender_id","sender","reply_to","body"],"rows":[[12,"2026-11-02 08:10","T1","Inbox / Rent","sam@example.org","Sam",null,"` + long + `"]]}`
+	c, g := newGateway(t, map[string][]string{
+		"GET /agent/v1/fastmail/messages": {"200 " + message},
+		"POST /agent/v1/fastmail/fetch":   {"200 " + fetched, "200 " + fetched},
+	})
+	for _, tc := range []struct {
+		args  []string
+		whole bool
+	}{
+		{[]string{"fastmail", "messages", "T1", "--seq", "9"}, true},
+		{[]string{"fastmail", "fetch", "chat=T1", "seq=12", "--full"}, true},
+		{[]string{"fastmail", "fetch", "chat=T1", "seq=12"}, false},
+	} {
+		c.out.(*bytes.Buffer).Reset()
+		if err := c.run(t.Context(), tc.args); err != nil {
+			t.Fatalf("%v: %v", tc.args, err)
+		}
+		if out, _ := output(c); strings.Contains(out, long+"\n") != tc.whole {
+			t.Errorf("%v: whole body %v, want %v", tc.args, !tc.whole, tc.whole)
+		}
+	}
+	if g.got[0] != "GET /agent/v1/fastmail/messages?chat=T1&seq=9" {
+		t.Errorf("request %q", g.got[0])
+	}
+}
+
+func TestHelpFlag(t *testing.T) {
+	t.Parallel()
+	c, _ := newGateway(t, nil)
+	if err := c.run(t.Context(), []string{"request", "--help"}); err != nil {
+		t.Fatalf("exit %d: %v", ExitCode(err), err)
+	}
+	if out, _ := output(c); !strings.HasPrefix(out, "usage: mandate request CONNECTOR") {
+		t.Errorf("output %q", out)
+	}
+}
+
 func TestRefusal(t *testing.T) {
 	t.Parallel()
 	c, _ := newGateway(t, map[string][]string{"GET /agent/v1/signal/chats": {

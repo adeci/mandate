@@ -29,15 +29,10 @@ func (c *cli) table(raw []byte) error {
 	if err := json.Unmarshal(raw, &t); err != nil {
 		return err
 	}
-	seqCol := slices.Index(t.Columns, "seq")
-	if c.seq > 0 && (len(t.Rows) == 0 || seqCol < 0 || cell(t.Rows[0][seqCol]) != strconv.FormatInt(c.seq, 10)) {
-		return fmt.Errorf("no message %d in that chat", c.seq)
-	}
 	if err := c.printTable(t); err != nil {
 		return err
 	}
 	switch {
-	case c.seq > 0:
 	case t.NextBefore > 0:
 		fmt.Fprintf(c.errOut, "next: --before %d\n", t.NextBefore)
 	case t.More:
