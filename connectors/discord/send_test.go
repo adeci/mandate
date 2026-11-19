@@ -35,8 +35,8 @@ func newSendHarness(t *testing.T, seed func(*state)) *harness {
 	t.Helper()
 	h := newHarness(t, seed)
 	for _, c := range []store.Container{
-		{ID: guildID, Kind: kindGuild, Name: "Club"},
-		{ID: chanGeneral, Kind: kindChannel, ParentID: guildID, Name: "#general"},
+		{ID: "guild:" + guildID, Kind: kindGuild, Name: "Club"},
+		{ID: chanGeneral, Kind: kindChannel, ParentID: "guild:" + guildID, Name: "#general"},
 		{ID: threadID, Kind: kindThread, ParentID: chanGeneral, Name: "rig thread"},
 		{ID: dmID, Kind: kindDM, Name: "~Alice A", Participants: []store.Participant{{ID: aliceUser, Name: "~Alice A", Handle: "@alice"}}},
 		{ID: dm2ID, Kind: kindDM, Name: "~Alice A", Participants: []store.Participant{{ID: "1000000000000000007", Name: "~Alice A", Handle: "@mallory"}}},
@@ -128,7 +128,6 @@ func TestPrepareSend(t *testing.T) {
 		}
 	}
 	for name, args := range map[string]map[string]string{
-		"guild":     {"chat": guildID, "text": "hi"},
 		"blank":     {"chat": dmID, "text": " \n"},
 		"too long":  {"chat": dmID, "text": strings.Repeat("é", maxMessageLength+1)},
 		"extra arg": {"chat": dmID, "text": "hi", "reply_to": msg4},
@@ -136,6 +135,10 @@ func TestPrepareSend(t *testing.T) {
 		if _, err := h.client.Prepare(ctx, "send", args); errStatus(err) != http.StatusBadRequest {
 			t.Errorf("%s: %v, want 400", name, err)
 		}
+	}
+	_, err := h.client.Prepare(ctx, "send", map[string]string{"chat": "guild:" + guildID, "text": "hi"})
+	if e, ok := errors.AsType[*connector.Error](err); !ok || e.Status != http.StatusBadRequest || !strings.Contains(e.Message, "cannot send to a guild") {
+		t.Errorf("server: %v, want 400 cannot send to a guild", err)
 	}
 	if hits := h.discord.all(); len(hits) != 0 {
 		t.Errorf("prepare reached Discord: %v", h.discord.paths())

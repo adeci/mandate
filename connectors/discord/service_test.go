@@ -139,6 +139,7 @@ func (s *syncBuffer) String() string {
 type harness struct {
 	t         *testing.T
 	clock     *fakeClock
+	rng       rng
 	discord   *fakeDiscord
 	gw        *fakeGateway
 	startup   []hit // what start sent before the gateway connected
@@ -215,6 +216,7 @@ func newHarness(t *testing.T, seed func(*state)) *harness {
 	h := &harness{
 		t:         t,
 		clock:     &fakeClock{now: noon},
+		rng:       fixedRand(0.5),
 		dir:       dir,
 		statePath: filepath.Join(dir, "private", "state.json"),
 		token:     (&connector.Env{StateDir: dir}).Secret("token"),
@@ -276,7 +278,7 @@ func (h *harness) start() {
 	h.t.Helper()
 	ctx, cancel := context.WithCancelCause(context.Background())
 	h.done = make(chan error, 1)
-	mark := len(h.discord.all())
+	mark, logMark := len(h.discord.all()), len(h.logs.String())
 	cfg := config{
 		store:       h.st,
 		statePath:   h.statePath,
@@ -290,7 +292,7 @@ func (h *harness) start() {
 		gatewayURL:  h.gw.url,
 		dialGateway: testDial,
 		clock:       h.clock,
-		rng:         fixedRand(0.5),
+		rng:         h.rng,
 		log:         slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		fail:        cancel,
 	}
@@ -337,8 +339,11 @@ func (h *harness) start() {
 		time.Sleep(5 * time.Millisecond)
 	}
 	// A linked service is up once it opened the app and its gateway session
-	// is; tests count the requests after that.
-	eventually(h.t, "the gateway session", func() bool { return w.svc.gw.health() == "" })
+	// is, or once the pacer held the app page back; tests count the requests
+	// after that.
+	eventually(h.t, "the gateway session", func() bool {
+		return w.svc.gw.health() == "" || strings.Contains(h.logs.String()[logMark:], "not opening the app yet")
+	})
 	h.discord.mu.Lock()
 	h.startup = slices.Clone(h.discord.hits[mark:])
 	h.discord.hits = h.discord.hits[:mark]
@@ -636,7 +641,7 @@ func TestFetchOpensLikeTheWebClient(t *testing.T) {
 	for _, tt := range tests {
 		t.Run("limit "+tt.limit, func(t *testing.T) {
 			h := newHarness(t, func(s *state) { s.SelfID, s.SelfCheckedAt = selfUser, noon })
-			if err := h.st.UpsertContainer(context.Background(), store.Container{ID: chanGeneral, Kind: kindChannel, ParentID: guildID}); err != nil {
+			if err := h.st.UpsertContainer(context.Background(), store.Container{ID: chanGeneral, Kind: kindChannel, ParentID: "guild:" + guildID}); err != nil {
 				t.Fatal(err)
 			}
 			h.discord.handle(path, func(w http.ResponseWriter, r *http.Request, _ int) {
@@ -1056,13 +1061,15 @@ func TestLinkUnlinkRelink(t *testing.T) {
 
 // Discord issues the installation ID to a logged-out app, so linking starts
 // like the app before login; the ID then goes with every request and
-// identify, and outlives an unlink.
+// identify, and outlives an unlink. A reading pause the pacer draws never
+// keeps a link from finishing in time.
 func TestLinkStartsLoggedOut(t *testing.T) {
 	const (
 		fingerprint  = "1566000000000000001.ZmluZ2VycHJpbnRmaW5nZXJwcmlu"
 		installation = "1566000000000000002.aW5zdGFsbGF0aW9uaW5zdGFsbGF0"
 	)
 	h := newHarness(t, func(s *state) { s.InstallationID = "" })
+	h.rng = fixedRand(0.1) // draws a reading pause after every request
 	if err := h.token.Delete(); err != nil {
 		t.Fatal(err)
 	}
@@ -1087,7 +1094,8 @@ func TestLinkStartsLoggedOut(t *testing.T) {
 		apex.at.Sub(exp.at) > followMax {
 		t.Errorf("/apex/experiments %v %v", apex.query, apex.header)
 	}
-	if me.header.Get("Authorization") != testToken || me.header.Get("X-Installation-Id") != installation || me.header.Get("X-Fingerprint") != "" {
+	if me.header.Get("Authorization") != testToken || me.header.Get("X-Installation-Id") != installation || me.header.Get("X-Fingerprint") != "" ||
+		me.at.Sub(apex.at) > followMax {
 		t.Errorf("/users/@me %v", me.header)
 	}
 	if h.state().InstallationID != installation {
@@ -1323,6 +1331,15 @@ func TestSlotWaitCap(t *testing.T) {
 			if len(h.discord.all()) != 0 || !h.clock.Now().Equal(noon) {
 				t.Error("refused call waited or sent a request")
 			}
+			// Live updates are off until the app page may load, then come
+			// back without a call.
+			eventually(t, "a retry when the app page may load", func() bool { return h.clock.pending(91 * time.Second) })
+			h.clock.Advance(90 * time.Second)
+			if got := h.health(); got.State != connector.Connecting {
+				t.Errorf("health before the retry %+v", got)
+			}
+			h.clock.Advance(time.Second)
+			eventually(t, "live updates", func() bool { return h.health().State == connector.Healthy })
 		})
 	}
 }

@@ -37,9 +37,9 @@ type Config struct{}
 
 func main() {
 	connector.Main(func(ctx context.Context, env *connector.Env, c Config) (connector.Connector, error) {
-		// Sent as X-Discord-Timezone, so it must be a name a browser reports;
-		// unset means UTC, as everywhere else on Unix.
-		tz := cmp.Or(os.Getenv("TZ"), "UTC")
+		// Sent as X-Discord-Timezone, so it must be a name a browser reports:
+		// TZ, else the machine's zone, else UTC.
+		tz := cmp.Or(os.Getenv("TZ"), localZone("/etc/localtime"), "UTC")
 		if _, err := time.LoadLocation(tz); strings.HasPrefix(tz, ":") || err != nil {
 			return nil, fmt.Errorf("TZ must name an IANA time zone such as Europe/Berlin, got %q", tz)
 		}
@@ -81,6 +81,20 @@ func main() {
 		}
 		return withStore{w, st}, nil
 	})
+}
+
+// localZone is the IANA name of the zone the link at path points into a
+// zoneinfo tree, "" if path is no such link.
+func localZone(path string) string {
+	target, err := os.Readlink(path)
+	if err != nil {
+		return ""
+	}
+	_, name, _ := strings.Cut(target, "zoneinfo/")
+	if _, err := time.LoadLocation(name); name == "" || err != nil {
+		return ""
+	}
+	return name
 }
 
 // withStore closes the store once the worker has stopped.
@@ -337,11 +351,13 @@ func (w *worker) Health(context.Context) connector.Health {
 func (w *worker) loop() {
 	// A tab being closed.
 	defer w.svc.gw.stop(websocket.CloseGoingAway)
-	w.syncGateway()
+	retry := w.syncGateway()
 	for {
 		select {
 		case <-w.ctx.Done():
 			return
+		case <-retry:
+			retry = w.syncGateway()
 		case token := <-w.svc.gw.rejected:
 			if token == "" || token != w.svc.up.token {
 				continue // a token already replaced
@@ -349,7 +365,7 @@ func (w *worker) loop() {
 			w.svc.up.fatal = &ownerStop{"token rejected by the gateway (4004)", fixToken}
 			w.check()
 			w.snapshot()
-			w.syncGateway()
+			retry = w.syncGateway()
 		case j := <-w.jobs:
 			switch {
 			case j.link:
@@ -368,31 +384,34 @@ func (w *worker) loop() {
 			w.check()
 			w.snapshot()
 			j.done <- jobResult{v: v, err: err}
-			w.syncGateway()
+			retry = w.syncGateway()
 		}
 	}
 }
 
 // syncGateway keeps the gateway connection open while the account is linked
 // and usable, for the tab the REST calls come from. A tab that opens loads
-// the app page first, as a browser restoring it does. It runs on the worker
+// the app page first, as a browser restoring it does; while the pacer holds
+// the page back, it returns when to try again. It runs on the worker
 // goroutine.
-func (w *worker) syncGateway() {
+func (w *worker) syncGateway() <-chan time.Time {
 	up := w.svc.up
 	if up.token == "" || w.stopped != nil {
 		w.svc.gw.stop(closeNone)
-		return
+		return nil
 	}
 	if !up.relaunched && !w.svc.gw.running() {
 		err := up.openApp(w.ctx, w.clock.Now().Add(maxSlotWait))
 		var pe *pacedError
 		if errors.As(err, &pe) || w.ctx.Err() != nil || up.fatal != nil {
-			// Nothing loaded; the next call tries again.
 			w.log.Info("not opening the app yet", "err", err)
-			w.svc.gw.setStatus("")
 			w.check()
 			w.snapshot()
-			return
+			if pe == nil {
+				return nil
+			}
+			w.svc.gw.setStatus("live updates connecting")
+			return w.clock.After(pe.retryAfter)
 		}
 	}
 	st := up.st
@@ -408,9 +427,10 @@ func (w *worker) syncGateway() {
 	if up.relaunched {
 		up.relaunched = false
 		w.svc.gw.reload(t)
-		return
+		return nil
 	}
 	w.svc.gw.start(t)
+	return nil
 }
 
 // check acts on what upstream ran into. A rejected token is discarded so the
@@ -511,7 +531,7 @@ func (w *worker) link(ctx context.Context, dl time.Time, token string) error {
 	err := up.ensureInstallation(ctx, dl)
 	if err == nil {
 		up.token = token
-		_, err = w.svc.selfID(ctx, dl)
+		_, err = w.svc.selfID(ctx, dl, true)
 	}
 	if err != nil {
 		up.token = ""
@@ -545,11 +565,11 @@ func (w *worker) Unlink(ctx context.Context) error {
 var spec = connector.Spec{
 	Doc: "sync, fetch and guild-search ask Discord and store what they get; chats, messages and search answer from what is stored.\n" +
 		"send proposes a message; it goes out from the owner's account once they approve it.\n" +
-		"Discord calls are paced like a person and may take a while. Start with sync, then sync guild_id=guild:ID (a server's chat ID) for its channels.",
+		"Discord calls are paced like a person and may take a while.",
 	Ops: []connector.Op{
 		{
 			Name: "sync", Kind: connector.Read,
-			Summary: "Store the server and DM lists; with guild_id, also that server's channels and threads. Cached for a day.",
+			Summary: "Store the server and DM lists; with guild_id, also that server's channels. Cached for a day.",
 			Params: []connector.Param{
 				{Name: "guild_id", Doc: "server chat ID, guild:…", Container: true},
 			},

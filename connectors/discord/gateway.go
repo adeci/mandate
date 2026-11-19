@@ -670,22 +670,26 @@ func (c *conn) dispatch(p payload, bo *backoff) error {
 		g.storeCreated(p.D, s)
 	case "MESSAGE_UPDATE":
 		g.storeEdit(p.D)
-	case "MESSAGE_DELETE":
-		var m struct {
-			ID        string `json:"id"`
-			ChannelID string `json:"channel_id"`
-		}
-		if json.Unmarshal(p.D, &m) == nil && isSnowflake(m.ID) {
-			g.writes.Do("deletion of "+m.ID+" in "+m.ChannelID, func(ctx context.Context) error {
-				return g.store.DeleteMessage(ctx, m.ID)
-			})
-		}
+	case "MESSAGE_DELETE", "MESSAGE_DELETE_BULK":
+		g.storeDeleted(p.D)
 	case "CHANNEL_CREATE", "CHANNEL_UPDATE", "THREAD_CREATE", "THREAD_UPDATE":
 		g.storeChannel(s, p.D)
+	case "CHANNEL_DELETE", "THREAD_DELETE":
+		var ch apiChannel
+		// Closing a DM only hides it in the client.
+		if json.Unmarshal(p.D, &ch) == nil && isSnowflake(ch.ID) && ch.Type != channelDM {
+			g.forgetChat(ch.ID)
+		}
 	case "GUILD_CREATE", "GUILD_UPDATE":
 		var gg gwGuild
 		if json.Unmarshal(p.D, &gg) == nil {
 			g.storeContainers(s, "chats of guild "+gg.ID, gg.containers())
+		}
+	case "GUILD_DELETE":
+		var gg gwGuild
+		// An unavailable guild is an outage; one the account left is not.
+		if json.Unmarshal(p.D, &gg) == nil && isSnowflake(gg.ID) && !gg.Unavailable {
+			g.forgetChat(guildChat(gg.ID))
 		}
 	}
 	return nil
@@ -913,6 +917,9 @@ func (g *gateway) storeCreated(d json.RawMessage, s *session) {
 		c.Name = s.voice[c.ID] // "" keeps a stored name
 	}
 	msg, ok := toMessage(&m.apiMessage, s.selfID)
+	if ok {
+		c.LastMessageAt = time.Time{} // readers date a chat by its newest message
+	}
 	g.writes.Do("message "+m.ID+" in "+c.ID, func(ctx context.Context) error {
 		if err := g.store.UpsertContainer(ctx, c); err != nil {
 			return err
@@ -943,6 +950,53 @@ func (g *gateway) storeEdit(d json.RawMessage) {
 	}
 	g.writes.Do("edit of "+m.ID+" in "+m.ChannelID, func(ctx context.Context) error {
 		return g.store.EditMessage(ctx, m.ID, m.Content, *m.EditedTimestamp)
+	})
+}
+
+// storeDeleted applies MESSAGE_DELETE and MESSAGE_DELETE_BULK.
+func (g *gateway) storeDeleted(d json.RawMessage) {
+	var m struct {
+		ID        string   `json:"id"`
+		IDs       []string `json:"ids"`
+		ChannelID string   `json:"channel_id"`
+	}
+	if json.Unmarshal(d, &m) != nil {
+		return
+	}
+	ids := slices.DeleteFunc(append(m.IDs, m.ID), func(id string) bool { return !isSnowflake(id) })
+	if len(ids) == 0 {
+		return
+	}
+	g.writes.Do("deletion of "+strings.Join(ids, " ")+" in "+m.ChannelID, func(ctx context.Context) error {
+		for _, id := range ids {
+			if err := g.store.DeleteMessage(ctx, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// forgetChat drops a chat Discord deleted or the account left, the chats
+// under it and their messages, so none is listed or read again.
+func (g *gateway) forgetChat(id string) {
+	g.writes.Do("removal of chat "+id, func(ctx context.Context) error {
+		tx, err := g.store.DB().BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }() // a no-op after Commit
+		const gone = `WITH RECURSIVE gone(id) AS (SELECT ?1 UNION SELECT c.id FROM containers AS c JOIN gone ON c.parent_id = gone.id) `
+		for _, q := range []string{
+			`DELETE FROM media WHERE message_id IN (SELECT id FROM messages WHERE container_id IN (SELECT id FROM gone))`,
+			`DELETE FROM messages WHERE container_id IN (SELECT id FROM gone)`,
+			`DELETE FROM containers WHERE id IN (SELECT id FROM gone)`,
+		} {
+			if _, err := tx.ExecContext(ctx, gone+q, id); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
 	})
 }
 

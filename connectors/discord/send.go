@@ -79,9 +79,6 @@ FROM containers WHERE id = ?1`, chat).Scan(&kind, &name, &parent, &parts)
 	if err != nil {
 		return record.Field{}, fmt.Errorf("look up chat: %w", err)
 	}
-	if !isSnowflake(chat) {
-		return record.Field{}, connector.Invalid("invalid chat ID %q", chat)
-	}
 	switch kind {
 	case kindDM:
 		var ps []store.Participant

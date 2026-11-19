@@ -132,6 +132,10 @@ func TestMediaRefreshesTheStoredLink(t *testing.T) {
 	// Deleted from Discord: the CDN no longer has it.
 	h.discord.reply(planPath, http.StatusNotFound, map[string]any{})
 	h.mediaErr(msgFile, 0, http.StatusNotFound)
+
+	// A refused refresh is logged without Discord's message, which may quote the chat.
+	h.discord.reply(api(refreshPath), http.StatusBadRequest, map[string]any{"message": secretBody, "code": 50035})
+	h.mediaErr(msgFile, 0, http.StatusBadGateway)
 }
 
 func TestMediaOfOldMessagesIsLookedUpAgain(t *testing.T) {

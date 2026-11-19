@@ -276,6 +276,8 @@ func channelURL(guildID, channelID string) string {
 	return "https://discord.com/channels/" + guildID + "/" + channelID
 }
 
+// The loaders store a list when they fetch it, never from the cache, which
+// would undo what the gateway stored since.
 func (s *service) loadGuilds(ctx context.Context, dl time.Time) ([]apiGuild, error) {
 	if s.guilds.fresh(s.clock.Now()) {
 		return s.guilds.v, nil
@@ -285,8 +287,21 @@ func (s *service) loadGuilds(ctx context.Context, dl time.Time) ([]apiGuild, err
 	if err := s.up.get(ctx, dl, r, &gs); err != nil {
 		return nil, err
 	}
+	if err := s.st.UpsertContainers(ctx, guildContainers(gs)); err != nil {
+		return nil, err
+	}
 	s.guilds = cachedList[apiGuild]{at: s.clock.Now(), v: gs}
 	return gs, nil
+}
+
+func guildContainers(gs []apiGuild) []store.Container {
+	var cs []store.Container
+	for i := range gs {
+		if c, ok := guildContainer(&gs[i]); ok {
+			cs = append(cs, c)
+		}
+	}
+	return cs
 }
 
 func (s *service) loadDMs(ctx context.Context, dl time.Time) ([]apiChannel, error) {
@@ -298,8 +313,21 @@ func (s *service) loadDMs(ctx context.Context, dl time.Time) ([]apiChannel, erro
 	if err := s.up.get(ctx, dl, r, &cs); err != nil {
 		return nil, err
 	}
+	if err := s.st.UpsertContainers(ctx, dmListContainers(cs)); err != nil {
+		return nil, err
+	}
 	s.dms = cachedList[apiChannel]{at: s.clock.Now(), v: cs}
 	return cs, nil
+}
+
+func dmListContainers(dms []apiChannel) []store.Container {
+	var cs []store.Container
+	for i := range dms {
+		if c, ok := channelContainer(&dms[i]); ok {
+			cs = append(cs, c)
+		}
+	}
+	return cs
 }
 
 func (s *service) loadChannels(ctx context.Context, dl time.Time, guildID string) ([]apiChannel, error) {
@@ -323,17 +351,22 @@ func (s *service) loadChannels(ctx context.Context, dl time.Time, guildID string
 			cs[i].GuildID = guildID
 		}
 	}
+	if _, err := storeListed(ctx, s.st, guildChannelContainers(guildID, cs)); err != nil {
+		return nil, err
+	}
 	s.channels[guildID] = &cachedList[apiChannel]{at: s.clock.Now(), v: cs}
 	return cs, nil
 }
 
-func (s *service) selfID(ctx context.Context, dl time.Time) (string, error) {
+// selfID asks for the account's own ID; a link asks as a follow-up, as
+// logging in does, so no reading pause comes before it.
+func (s *service) selfID(ctx context.Context, dl time.Time, follow bool) (string, error) {
 	st := s.up.st
 	if st.SelfID != "" && s.clock.Now().Sub(st.SelfCheckedAt) < selfTTL {
 		return st.SelfID, nil
 	}
 	var me apiUser
-	r := route{template: "/users/@me", path: "/users/@me", referer: refererHome}
+	r := route{template: "/users/@me", path: "/users/@me", referer: refererHome, follow: follow}
 	if err := s.up.get(ctx, dl, r, &me); err != nil {
 		return "", err
 	}
@@ -355,65 +388,32 @@ func (s *service) joinedGuild(ctx context.Context, dl time.Time, guildID string)
 			return &gs[i], nil
 		}
 	}
-	return nil, &deniedError{status: 404, what: "guild " + guildID + ": the account has not joined it"}
-}
-
-func (s *service) upsertGuild(ctx context.Context, g *apiGuild, chans []apiChannel) error {
-	cs := guildChannelContainers(g.ID, chans)
-	if c, ok := guildContainer(g); ok {
-		cs = append(cs, c)
-	}
-	_, err := storeListed(ctx, s.st, cs)
-	return err
+	return nil, &deniedError{what: "guild " + guildID + ": the account has not joined it"}
 }
 
 func (s *service) sync(ctx context.Context, dl time.Time, req syncRequest) (connector.ReadResult, error) {
 	var resp connector.ReadResult
-	upsert := func(c store.Container) error {
-		if err := s.st.UpsertContainer(ctx, c); err != nil {
-			return err
-		}
-		resp.ContainerIDs = append(resp.ContainerIDs, c.ID)
-		return nil
-	}
 	gs, err := s.loadGuilds(ctx, dl)
 	if err != nil {
 		return resp, err
-	}
-	for i := range gs {
-		if c, ok := guildContainer(&gs[i]); ok {
-			if err := upsert(c); err != nil {
-				return resp, err
-			}
-		}
 	}
 	dms, err := s.loadDMs(ctx, dl)
 	if err != nil {
 		return resp, err
 	}
-	for i := range dms {
-		if c, ok := channelContainer(&dms[i]); ok {
-			if err := upsert(c); err != nil {
-				return resp, err
-			}
+	cs := slices.Concat(guildContainers(gs), dmListContainers(dms))
+	if req.GuildID != "" {
+		g, err := s.joinedGuild(ctx, dl, req.GuildID)
+		if err != nil {
+			return resp, err
 		}
+		chans, err := s.loadChannels(ctx, dl, g.ID)
+		if err != nil {
+			return resp, err
+		}
+		cs = append(cs, guildChannelContainers(g.ID, chans)...)
 	}
-	if req.GuildID == "" {
-		return resp, nil
-	}
-	g, err := s.joinedGuild(ctx, dl, req.GuildID)
-	if err != nil {
-		return resp, err
-	}
-	chans, err := s.loadChannels(ctx, dl, g.ID)
-	if err != nil {
-		return resp, err
-	}
-	stored, err := storeListed(ctx, s.st, guildChannelContainers(g.ID, chans))
-	if err != nil {
-		return resp, err
-	}
-	for _, c := range stored {
+	for _, c := range cs {
 		resp.ContainerIDs = append(resp.ContainerIDs, c.ID)
 	}
 	return resp, nil
@@ -446,10 +446,7 @@ func (s *service) search(ctx context.Context, dl time.Time, req searchRequest) (
 	if err != nil {
 		return connector.ReadResult{}, err
 	}
-	if err := s.upsertGuild(ctx, g, chans); err != nil {
-		return connector.ReadResult{}, err
-	}
-	self, err := s.selfID(ctx, dl)
+	self, err := s.selfID(ctx, dl, false)
 	if err != nil {
 		return connector.ReadResult{}, err
 	}
@@ -525,15 +522,15 @@ func (s *service) search(ctx context.Context, dl time.Time, req searchRequest) (
 	return connector.ReadResult{MessageIDs: slices.Clone(ids), More: more}, nil
 }
 
-// storeHitChat stores the chat of a search hit. One the results did not
-// describe is filed under the guild, unless it is stored already.
+// storeHitChat stores the chat of a search hit unless it is stored already.
+// One the results did not describe is filed under the guild.
 func (s *service) storeHitChat(ctx context.Context, known map[string]store.Container, id, guildID string) error {
+	stored, err := s.storedContainer(ctx, id)
+	if err != nil || stored.ID != "" {
+		return err
+	}
 	c, ok := known[id]
 	if !ok {
-		stored, err := s.storedContainer(ctx, id)
-		if err != nil || stored.ID != "" {
-			return err
-		}
 		c = fallbackContainer(id, guildID)
 	}
 	if err := s.st.UpsertContainer(ctx, c); err != nil {
@@ -564,6 +561,10 @@ func searchReferer(guildID, channelID string, chans []apiChannel) string {
 }
 
 func (s *service) resolveContainer(ctx context.Context, dl time.Time, channelID string) (c store.Container, upsert bool, err error) {
+	stored, err := s.storedContainer(ctx, channelID)
+	if err != nil || stored.ID != "" {
+		return stored, false, err
+	}
 	for gid, list := range s.channels {
 		for i := range list.v {
 			if list.v[i].ID == channelID {
@@ -584,10 +585,6 @@ func (s *service) resolveContainer(ctx context.Context, dl time.Time, channelID 
 	}
 	if cc, ok := findDM(); ok {
 		return cc, true, nil
-	}
-	stored, err := s.storedContainer(ctx, channelID)
-	if err != nil || stored.ID != "" {
-		return stored, false, err
 	}
 	if !s.dms.fresh(s.clock.Now()) {
 		if _, err := s.loadDMs(ctx, dl); err != nil {
@@ -699,7 +696,7 @@ func (s *service) fetch(ctx context.Context, dl time.Time, req fetchRequest) (co
 	if err != nil {
 		return connector.ReadResult{}, err
 	}
-	self, err := s.selfID(ctx, dl)
+	self, err := s.selfID(ctx, dl, false)
 	if err != nil {
 		return connector.ReadResult{}, err
 	}

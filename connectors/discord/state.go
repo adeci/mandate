@@ -43,8 +43,7 @@ type state struct {
 }
 
 type denial struct {
-	Status int       `json:"status"`
-	Until  time.Time `json:"until"`
+	Until time.Time `json:"until"`
 }
 
 // Session cookies are not kept: a browser drops them on restart.

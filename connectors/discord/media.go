@@ -169,7 +169,7 @@ func (s *service) refresh(ctx context.Context, dl time.Time, referer, path strin
 	if _, err := s.up.post(ctx, dl, kindAPI, r, time.Time{}, body, &res); err != nil {
 		var refused *refusedError
 		if errors.As(err, &refused) {
-			return "", &upstreamError{status: refused.status, msg: refused.msg}
+			return "", &upstreamError{status: refused.status}
 		}
 		return "", err
 	}

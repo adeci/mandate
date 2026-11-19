@@ -521,7 +521,7 @@ func TestGatewayStoresLiveMessages(t *testing.T) {
 		t.Fatalf("DM messages %v", row)
 	}
 	if row := h.queryRow(`SELECT kind, name, last_message_at, icon FROM containers WHERE id = ?`, dmID); row[0] != kindDM || row[1] != "~Alice A" ||
-		row[2] != snowflakeTimeString(msg1) || row[3] != "avatars/"+aliceUser+"/"+pictureHash {
+		row[2] != nil || row[3] != "avatars/"+aliceUser+"/"+pictureHash {
 		t.Errorf("DM row %v", row)
 	}
 	if row := h.queryRow(`SELECT kind, parent_id FROM containers WHERE id = ?`, chanGeneral); row[0] != kindChannel || row[1] != "guild:"+guildID {
@@ -655,7 +655,7 @@ FROM containers AS c LEFT JOIN containers AS p ON p.id = c.parent_id WHERE c.id 
 	c.dispatch("THREAD_CREATE", map[string]any{"id": newThread, "type": 11, "guild_id": newGuild, "parent_id": newChan, "name": "plans"})
 	c.dispatch("CHANNEL_UPDATE", map[string]any{"id": chanGeneral, "type": 0, "guild_id": guildID, "name": "general-chat"})
 	eventually(t, "events stored", func() bool { return chat(chanGeneral)[1] == "Club / #general-chat" })
-	if row := chat(chanGeneral); row[1] != "Club / #general-chat" || row[2] != snowflakeTimeString(msg4) {
+	if row := chat(chanGeneral); row[1] != "Club / #general-chat" || row[2] != snowflakeTimeString(msg3) {
 		t.Errorf("channel after a message and a rename %v", row)
 	}
 	if row := chat(newChan); row[1] != "Other / #lobby" {
@@ -812,6 +812,89 @@ FROM containers WHERE id = ?`, id)
 		if row := chat(id); !reflect.DeepEqual(row, want) {
 			t.Errorf("after a post and a message, chat %s is %v, want %v", id, row, want)
 		}
+	}
+}
+
+// What Discord deletes is no longer listed or read: a purge's messages, and
+// a thread, channel or server with what is under it. A closed DM and a
+// server in an outage stay.
+func TestGatewayAppliesDeletions(t *testing.T) {
+	h := newHarness(t, nil)
+	ctx := context.Background()
+	for _, c := range []store.Container{
+		{ID: "guild:" + guildID, Kind: kindGuild, Name: "Club"},
+		{ID: chanGeneral, Kind: kindChannel, ParentID: "guild:" + guildID, Name: "#general"},
+		{ID: chanRandom, Kind: kindChannel, ParentID: "guild:" + guildID, Name: "#random"},
+		{ID: threadID, Kind: kindThread, ParentID: chanGeneral, Name: "rig thread"},
+		{ID: dmID, Kind: kindDM, Name: "~Alice A", Participants: []store.Participant{{ID: aliceUser, Name: "~Alice A", Handle: "@alice"}}},
+	} {
+		if err := h.st.UpsertContainer(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, m := range []store.Message{
+		{ID: msg1, ContainerID: chanGeneral, SenderID: aliceUser, SentAt: noon, Body: "one"},
+		{ID: msg2, ContainerID: chanGeneral, SenderID: aliceUser, SentAt: noon, Body: "two"},
+		{ID: msg3, ContainerID: threadID, SenderID: aliceUser, SentAt: noon, Media: []store.Media{{Type: "application/pdf", Name: "plan.pdf"}}},
+		{ID: msg4, ContainerID: dmID, SenderID: aliceUser, SentAt: noon, Body: "see you"},
+	} {
+		if err := h.st.UpsertMessage(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.start()
+	c := h.gw.conn(t)
+	c.ops(t, 5)
+	count := func(q string, args ...any) int64 { return h.queryRow(q, args...)[0].(int64) }
+
+	c.dispatch("MESSAGE_DELETE_BULK", map[string]any{"ids": []string{msg1, msg2}, "channel_id": chanGeneral, "guild_id": guildID})
+	c.dispatch("THREAD_DELETE", map[string]any{"id": threadID, "type": channelPublicThread, "guild_id": guildID, "parent_id": chanGeneral})
+	c.dispatch("CHANNEL_DELETE", map[string]any{"id": chanRandom, "type": 0, "guild_id": guildID, "name": "random"})
+	c.dispatch("CHANNEL_DELETE", map[string]any{"id": dmID, "type": channelDM, "recipients": []map[string]any{{"id": aliceUser, "username": "alice"}}})
+	c.dispatch("GUILD_DELETE", map[string]any{"id": guildID, "unavailable": true})
+	c.synced(t, "online")
+	if n := count(`SELECT count(*) FROM messages WHERE container_id = ? AND deleted`, chanGeneral); n != 2 {
+		t.Errorf("%d of the purged messages deleted", n)
+	}
+	if n := count(`SELECT count(*) FROM containers WHERE id IN (?, ?)`, threadID, chanRandom); n != 0 {
+		t.Errorf("%d deleted chats still stored", n)
+	}
+	if n := count(`SELECT (SELECT count(*) FROM messages WHERE id = ?) + (SELECT count(*) FROM media)`, msg3); n != 0 {
+		t.Errorf("the deleted thread's message or file is still stored")
+	}
+	if n := count(`SELECT count(*) FROM containers WHERE id IN (?, ?, ?)`, dmID, "guild:"+guildID, chanGeneral); n != 3 {
+		t.Errorf("a closed DM or a server in an outage was dropped: %d of 3 left", n)
+	}
+
+	c.dispatch("GUILD_DELETE", map[string]any{"id": guildID})
+	c.synced(t, "idle")
+	if n := count(`SELECT count(*) FROM containers WHERE id IN (?, ?)`, "guild:"+guildID, chanGeneral); n != 0 {
+		t.Errorf("%d chats of the left server still stored", n)
+	}
+	if n := count(`SELECT count(*) FROM messages`); n != 1 {
+		t.Errorf("%d messages stored, want the DM's alone", n)
+	}
+}
+
+// A list cached for a day never undoes a rename the gateway stored since.
+func TestCachedListsKeepLiveNames(t *testing.T) {
+	h := newHarness(t, nil)
+	h.start()
+	c := h.gw.conn(t)
+	c.ops(t, 5)
+	h.callOK("sync", map[string]string{"guild_id": "guild:" + guildID}, &connector.ReadResult{})
+	c.dispatch("GUILD_UPDATE", map[string]any{"id": guildID, "properties": map[string]any{"name": "Club House"}})
+	c.dispatch("CHANNEL_UPDATE", map[string]any{"id": chanGeneral, "type": 0, "guild_id": guildID, "name": "general-chat"})
+	name := func(id string) any { return h.queryRow(`SELECT name FROM containers WHERE id = ?`, id)[0] }
+	renamed := func() bool { return name("guild:"+guildID) == "Club House" && name(chanGeneral) == "#general-chat" }
+	eventually(t, "the renames stored", renamed)
+	h.callOK("sync", map[string]string{"guild_id": "guild:" + guildID}, &connector.ReadResult{})
+	h.callOK("guild-search", map[string]string{"guild_id": "guild:" + guildID, "content": "rig"}, &connector.ReadResult{})
+	if n := len(h.discord.to(api("/guilds/" + guildID + "/channels"))); n != 1 {
+		t.Fatalf("channel list fetched %d times, want once", n)
+	}
+	if !renamed() {
+		t.Errorf("names after cached lists: %v, %v", name("guild:"+guildID), name(chanGeneral))
 	}
 }
 

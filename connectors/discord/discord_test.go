@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -25,6 +27,34 @@ func TestCheckToken(t *testing.T) {
 		}
 		if tt.ok && tok != "abc.def.ghi" {
 			t.Errorf("%s: token %q", tt.name, tok)
+		}
+	}
+}
+
+// The browser's time zone is the machine's, as /etc/localtime names it.
+func TestLocalZone(t *testing.T) {
+	dir := t.TempDir()
+	link := func(name, target string) string {
+		p := filepath.Join(dir, name)
+		if err := os.Symlink(target, p); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	file := filepath.Join(dir, "copied")
+	if err := os.WriteFile(file, []byte("TZif"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]string{
+		link("nixos", "/etc/zoneinfo/Europe/Berlin"):                    "Europe/Berlin",
+		link("debian", "../usr/share/zoneinfo/America/Argentina/Salta"): "America/Argentina/Salta",
+		link("unknown", "/usr/share/zoneinfo/Mars/Olympus"):             "",
+		link("elsewhere", "/opt/zones/Europe/Berlin"):                   "",
+		file:                          "",
+		filepath.Join(dir, "missing"): "",
+	} {
+		if got := localZone(path); got != want {
+			t.Errorf("%s: %q, want %q", path, got, want)
 		}
 	}
 }

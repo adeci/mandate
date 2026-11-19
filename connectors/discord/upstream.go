@@ -78,16 +78,15 @@ func (e *pacedError) Error() string {
 }
 
 type deniedError struct {
-	status int
-	what   string
-	until  time.Time
+	what  string
+	until time.Time
 }
 
 func (e *deniedError) Error() string {
 	if e.until.IsZero() {
 		return e.what
 	}
-	return fmt.Sprintf("discord answered %d for %s (not retried until %s)", e.status, e.what, e.until.UTC().Format(time.RFC3339))
+	return fmt.Sprintf("no access to %s; retry after %s", e.what, e.until.UTC().Format(time.RFC3339))
 }
 
 type notReadyError struct{ retryAfter time.Duration }
@@ -165,7 +164,7 @@ func (u *upstream) denied(key, what string) error {
 		return nil
 	}
 	if d, ok := u.st.Denied[key]; ok && d.Until.After(u.clock.Now()) {
-		return &deniedError{status: d.Status, what: what, until: d.Until}
+		return &deniedError{what: what, until: d.Until}
 	}
 	return nil
 }
@@ -226,7 +225,7 @@ func (u *upstream) get(ctx context.Context, dl time.Time, r route, out any) erro
 			}
 			notBefore = now.Add(wait)
 		case (s == fhttp.StatusForbidden || s == fhttp.StatusNotFound) && r.deny != "":
-			d := denial{Status: s, Until: now.Add(denialTTL)}
+			d := denial{Until: now.Add(denialTTL)}
 			if u.st.Denied == nil {
 				u.st.Denied = make(map[string]denial)
 			}
@@ -234,7 +233,7 @@ func (u *upstream) get(ctx context.Context, dl time.Time, r route, out any) erro
 			if err := u.saveState(); err != nil {
 				return err
 			}
-			return &deniedError{status: s, what: r.denyWhat, until: d.Until}
+			return &deniedError{what: r.denyWhat, until: d.Until}
 		default:
 			return &upstreamError{status: s, msg: errorCode(body)}
 		}
